@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  platform-contracts:
+    name: Platform, Contracts, and Smoke Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      MIN_COVERAGE: "70"
+      POSTGRES_USER: doubleu
+      POSTGRES_PASSWORD: doubleu
+      POSTGRES_DB: doubleu
+      POSTGRES_PORT: 5432
+      REDIS_PORT: 6379
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.x"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Contract and security tests
+        run: scripts/contract-security-tests.sh
+
+      - name: Go tests
+        run: scripts/ci-go.sh
+
+      - name: Python tests
+        run: scripts/ci-python.sh
+
+      - name: Coverage checks
+        run: scripts/coverage-check.sh
+
+      - name: Migration and seed smoke
+        run: scripts/migration-seed-smoke.sh
+
+      - name: Docker Compose config validation
+        run: docker compose config --quiet

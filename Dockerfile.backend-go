@@ -1,0 +1,44 @@
+FROM golang:1.23-alpine AS builder
+
+WORKDIR /src
+COPY backend-go/ ./backend-go/
+
+RUN set -eu; \
+    if [ -f backend-go/go.mod ]; then \
+      cd backend-go; \
+      go mod download; \
+      go build -o /out/backend ./cmd/backend; \
+    else \
+      mkdir -p /tmp/fallback; \
+      printf '%s\n' \
+        'package main' \
+        'import (' \
+        '  "encoding/json"' \
+        '  "net/http"' \
+        '  "os"' \
+        ')' \
+        'func main() {' \
+        '  addr := os.Getenv("BACKEND_HTTP_ADDR")' \
+        '  if addr == "" { addr = ":8080" }' \
+        '  http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { _ = json.NewEncoder(w).Encode(map[string]string{"status":"ok","service":"backend"}) })' \
+        '  http.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) { _ = json.NewEncoder(w).Encode(map[string]string{"status":"ready","service":"backend"}) })' \
+        '  http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { _ = json.NewEncoder(w).Encode(map[string]string{"service":"backend","mode":"fallback"}) })' \
+        '  if err := http.ListenAndServe(addr, nil); err != nil { panic(err) }' \
+        '}' \
+        > /tmp/fallback/main.go; \
+      cd /tmp/fallback; \
+      go mod init doubleu/fallback-backend; \
+      go build -o /out/backend .; \
+    fi
+
+FROM alpine:3.20
+
+RUN addgroup -S app && adduser -S app -G app
+WORKDIR /app
+COPY --from=builder /out/backend /app/backend
+# Bake Mini App static files into the image; docker-compose can override with a bind mount for dev.
+COPY miniapp/ /app/miniapp/
+USER app
+EXPOSE 8080
+HEALTHCHECK --interval=10s --timeout=3s --retries=12 CMD wget -qO- http://127.0.0.1:8080/healthz >/dev/null || exit 1
+CMD ["/app/backend"]

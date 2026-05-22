@@ -1,0 +1,113 @@
+openapi: 3.1.0
+info:
+  title: DoubleU Technical MVP Contract
+  version: 0.1.0
+paths:
+  /ai/process-message:
+    post:
+      summary: Process a normalized Telegram message and return an AI decision proposal.
+      operationId: processMessage
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AIProcessMessageRequest"
+      responses:
+        "200":
+          description: AI process response.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AIProcessMessageResponse"
+components:
+  schemas:
+    NormalizedTelegramEvent:
+      type: object
+      required:
+        - event_id
+        - tenant_id
+        - chat_id
+        - telegram_update_id
+        - business_connection_id
+        - source_message_id
+        - sender_id
+        - message_text
+        - message_type
+        - created_at
+      properties:
+        event_id: { type: string }
+        tenant_id: { type: string }
+        chat_id: { type: string }
+        telegram_update_id: { type: integer, format: int64 }
+        business_connection_id: { type: string }
+        source_message_id: { type: string }
+        sender_id: { type: string }
+        message_text: { type: string }
+        message_type: { type: string, default: text }
+        created_at: { type: string, format: date-time }
+    ChatSettings:
+      type: object
+      required: [tenant_id, chat_id, mode, privacy_flags]
+      properties:
+        tenant_id: { type: string }
+        chat_id: { type: string }
+        mode:
+          type: string
+          enum: [disabled, silent, manual, semi_auto, auto]
+        privacy_flags:
+          type: array
+          items:
+            type: string
+            enum: [no_memory, no_training, private, no_summary]
+    AIProcessMessageRequest:
+      type: object
+      required: [request_id, event, chat_settings, memory_context]
+      properties:
+        request_id: { type: string }
+        event:
+          $ref: "#/components/schemas/NormalizedTelegramEvent"
+        chat_settings:
+          $ref: "#/components/schemas/ChatSettings"
+        memory_context:
+          type: array
+          items: { type: string }
+    AIProcessMessageResponse:
+      type: object
+      required: [decision, response_text, confidence, risk_level, intent, model_used, usage, memory_used]
+      properties:
+        decision:
+          type: string
+          enum: [draft, auto_reply, ignore, observe, ask_owner, error_fallback]
+        response_text: { type: string }
+        confidence:
+          type: number
+          minimum: 0
+          maximum: 1
+        risk_level:
+          type: string
+          enum: [low, medium, high, critical]
+        intent: { type: string }
+        model_used: { type: string }
+        usage:
+          type: object
+          required: [input_tokens, output_tokens]
+          properties:
+            input_tokens: { type: integer, minimum: 0 }
+            output_tokens: { type: integer, minimum: 0 }
+        memory_used:
+          type: array
+          items: { type: string }
+    AuditEvent:
+      type: object
+      required: [audit_id, tenant_id, chat_id, source_message_id, decision, reason, created_at]
+      properties:
+        audit_id: { type: string }
+        tenant_id: { type: string }
+        chat_id: { type: string }
+        source_message_id: { type: string }
+        decision:
+          type: string
+          enum: [draft, auto_reply, ignore, observe, ask_owner, error_fallback]
+        reason: { type: string }
+        created_at: { type: string, format: date-time }

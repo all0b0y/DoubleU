@@ -1,0 +1,53 @@
+FROM python:3.12-alpine
+
+WORKDIR /app
+COPY ai-python/ /app/
+
+RUN set -eu; \
+    if [ -f requirements.txt ]; then \
+      pip install --no-cache-dir -r requirements.txt; \
+    fi; \
+    printf '%s\n' \
+      'import json' \
+      'import os' \
+      'from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer' \
+      '' \
+      'class Handler(BaseHTTPRequestHandler):' \
+      '    def _json(self, status, payload):' \
+      '        body = json.dumps(payload).encode("utf-8")' \
+      '        self.send_response(status)' \
+      '        self.send_header("content-type", "application/json")' \
+      '        self.send_header("content-length", str(len(body)))' \
+      '        self.end_headers()' \
+      '        self.wfile.write(body)' \
+      '' \
+      '    def do_GET(self):' \
+      '        if self.path in ("/health", "/ready"):' \
+      '            self._json(200, {"status": "ok", "service": "ai-service"})' \
+      '            return' \
+      '        self._json(200, {"service": "ai-service", "mode": "fallback"})' \
+      '' \
+      '    def do_POST(self):' \
+      '        if self.path == "/ai/process-message":' \
+      '            self._json(200, {' \
+      '                "decision": "draft",' \
+      '                "response_text": "",' \
+      '                "confidence": 0.0,' \
+      '                "risk_level": "low",' \
+      '                "intent": "fallback",' \
+      '                "model_used": "fallback",' \
+      '                "usage": {"input_tokens": 0, "output_tokens": 0},' \
+      '                "memory_used": [],' \
+      '            })' \
+      '            return' \
+      '        self._json(404, {"error": "not_found"})' \
+      '' \
+      'if __name__ == "__main__":' \
+      '    host = os.getenv("HTTP_HOST", "0.0.0.0")' \
+      '    port = int(os.getenv("HTTP_PORT", "8090"))' \
+      '    ThreadingHTTPServer((host, port), Handler).serve_forever()' \
+      > /app/fallback_ai_service.py
+
+EXPOSE 8090
+HEALTHCHECK --interval=10s --timeout=3s --retries=12 CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=2).read()" || exit 1
+CMD ["sh", "-c", "if [ -f ai_agent/__main__.py ]; then python -m ai_agent; else python /app/fallback_ai_service.py; fi"]

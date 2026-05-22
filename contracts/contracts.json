@@ -1,0 +1,72 @@
+{
+  "version": "0.1.0",
+  "decisions": [
+    "draft",
+    "auto_reply",
+    "ignore",
+    "observe",
+    "ask_owner",
+    "error_fallback"
+  ],
+  "chat_modes": [
+    "disabled",
+    "silent",
+    "manual",
+    "semi_auto",
+    "auto"
+  ],
+  "privacy_flags": [
+    "no_memory",
+    "no_training",
+    "private",
+    "no_summary"
+  ],
+  "risk_levels": [
+    "low",
+    "medium",
+    "high",
+    "critical"
+  ],
+  "confidence_thresholds": {
+    "semi_auto_min": 0.85,
+    "auto_min": 0.92
+  },
+  "approval_actions": [
+    "approve",
+    "reject",
+    "regenerate",
+    "edit",
+    "make_shorter",
+    "make_more_formal",
+    "no_memory"
+  ],
+  "message_states": [
+    "received",
+    "normalized",
+    "policy_checked",
+    "ai_requested",
+    "ai_generated",
+    "decision_made",
+    "draft_sent_to_owner",
+    "approved_by_owner",
+    "sent_to_recipient",
+    "ignored",
+    "failed"
+  ],
+  "risk_policy": {
+    "low": "can_auto_if_allowed",
+    "medium": "draft_by_default",
+    "high": "draft_only",
+    "critical": "ignore_or_ask_owner"
+  },
+  "memory_scopes": {
+    "conversation": ["tenant_id", "chat_id"],
+    "rag": ["tenant_id", "knowledge_base_id"],
+    "persona": ["tenant_id"]
+  },
+  "idempotency": {
+    "receive": ["telegram_update_id", "business_connection_id"],
+    "send": ["tenant_id", "chat_id", "source_message_id", "decision_id"],
+    "approval_callback": ["idempotency_key"]
+  }
+}
