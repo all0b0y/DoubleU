@@ -36,7 +36,9 @@ export const api = {
       { action, ...(editedText ? { edited_text: editedText } : {}) }),
   chatSettings: (chatId)        => request('GET',   `/api/v1/chats/${chatId}/settings`),
   updateSettings: (chatId, patch) => request('PATCH', `/api/v1/chats/${chatId}/settings`, patch),
-  contacts:     ()              => request('GET',   '/api/v1/contacts'),
+  contacts:       ()              => request('GET',   '/api/v1/contacts'),
+  getProfile:     (chatId)        => request('GET',   `/api/v1/chats/${chatId}/profile`),
+  saveProfile:    (chatId, data)  => request('PUT',   `/api/v1/chats/${chatId}/profile`, data),
 };
 
 /** Open an SSE stream; returns the EventSource. Caller owns closing it. */

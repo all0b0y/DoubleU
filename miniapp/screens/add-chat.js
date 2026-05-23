@@ -12,11 +12,8 @@ export function renderAddChat(navigate) {
   el.className = 'screen';
   el.innerHTML = `
     <div class="topbar">
-      <button class="btn-icon" id="btn-back">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 18l-6-6 6-6"/></svg>
-      </button>
       <div class="topbar-title">Добавить чаты</div>
-      <button class="topbar-action" id="btn-add" style="color:var(--accent)">Добавить</button>
+      <button class="topbar-action" id="btn-add" style="color:var(--accent);display:none;">Добавить</button>
     </div>
     <div class="search-bar">
       <span class="search-icon">🔍</span>
@@ -30,8 +27,9 @@ export function renderAddChat(navigate) {
     </div>
   `;
 
+  const handleBack = () => navigate('/chats');
   twa?.BackButton?.show();
-  twa?.BackButton?.onClick(() => navigate('/chats'));
+  twa?.BackButton?.onClick(handleBack);
 
   const selected = new Set();
   let allContacts = [];
@@ -95,11 +93,6 @@ export function renderAddChat(navigate) {
     }
   }
 
-  el.querySelector('#btn-back').addEventListener('click', () => {
-    twa?.HapticFeedback?.impactOccurred('light');
-    navigate('/chats');
-  });
-
   el.querySelector('#search-input').addEventListener('input', (e) => renderContacts(e.target.value));
 
   el.querySelector('#btn-add').addEventListener('click', async () => {
@@ -120,9 +113,11 @@ export function renderAddChat(navigate) {
     }
   });
 
-  // BackButton cleanup
   const obs = new MutationObserver(() => {
-    if (!document.body.contains(el)) { twa?.BackButton?.hide(); obs.disconnect(); }
+    if (!document.body.contains(el)) {
+      twa?.BackButton?.offClick(handleBack);
+      obs.disconnect();
+    }
   });
   obs.observe(document.body, { childList: true, subtree: true });
 

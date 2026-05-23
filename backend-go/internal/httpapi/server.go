@@ -73,6 +73,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/v1/chats/{chat_id}/settings", s.tmaAuth(s.apiGetChatSettings))
 	s.mux.HandleFunc("PATCH /api/v1/chats/{chat_id}/settings", s.tmaAuth(s.apiUpdateChatSettings))
 	s.mux.HandleFunc("GET /api/v1/contacts", s.tmaAuth(s.apiContacts))
+	s.mux.HandleFunc("GET /api/v1/chats/{chat_id}/profile", s.tmaAuth(s.apiGetProfile))
+	s.mux.HandleFunc("PUT /api/v1/chats/{chat_id}/profile", s.tmaAuth(s.apiSaveProfile))
 
 	// Mini App static files
 	if s.miniappDir != "" {

@@ -3,11 +3,11 @@ import { api } from '/miniapp/api/client.js';
 const twa = window.Telegram?.WebApp;
 
 const MODE_INFO = {
-  disabled:  { label: 'Отключено',        desc: 'AI не обрабатывает сообщения' },
-  silent:    { label: 'Наблюдение',        desc: 'Только анализ, без ответов' },
-  manual:    { label: 'Ручной режим',      desc: 'Все черновики требуют одобрения' },
-  semi_auto: { label: 'Полуавтомат',       desc: 'Уверенные ответы отправляются сами' },
-  auto:      { label: 'Полная автономия',  desc: 'AI отвечает самостоятельно' },
+  disabled:  { label: 'disabled',  desc: 'DoubleU не работает в этом чате' },
+  silent:    { label: 'silent',    desc: 'только анализ, без черновиков' },
+  manual:    { label: 'manual',    desc: 'черновики только по запросу' },
+  semi_auto: { label: 'semi_auto', desc: 'генерит, ты подтверждаешь' },
+  auto:      { label: 'auto',      desc: 'отвечает самостоятельно' },
 };
 const MODE_ORDER = ['disabled', 'silent', 'manual', 'semi_auto', 'auto'];
 
@@ -15,143 +15,203 @@ export function renderSettings(navigate, chatId) {
   const el = document.createElement('div');
   el.className = 'screen';
   el.innerHTML = `
-    <div class="topbar">
-      <button class="btn-icon" id="btn-back">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 18l-6-6 6-6"/></svg>
-      </button>
-      <div class="topbar-title">Настройки чата</div>
+    <div class="chat-topbar">
+      <div class="chat-topbar-info">
+        <div class="chat-topbar-name">настройки чата</div>
+        <div class="chat-topbar-mode" id="st-chatname" style="color:var(--hint)">…</div>
+      </div>
     </div>
-    <div class="scroll">
+    <div class="scroll" id="st-scroll">
       <div class="loading-row"><div class="spinner"></div></div>
     </div>
   `;
 
+  const handleBack = () => navigate(`/chat/${chatId}`);
   twa?.BackButton?.show();
-  twa?.BackButton?.onClick(() => navigate(`/chat/${chatId}`));
+  twa?.BackButton?.onClick(handleBack);
 
-  el.querySelector('#btn-back').addEventListener('click', () => {
-    twa?.HapticFeedback?.impactOccurred('light');
-    navigate(`/chat/${chatId}`);
-  });
+  let currentMode = 'manual';
+  let currentFlags = [];
+  let availableModes = new Set(['disabled', 'silent', 'manual']);
 
-  let currentSettings = null;
+  function modeRowHTML(mode) {
+    const info = MODE_INFO[mode] || { label: mode, desc: '' };
+    const isActive  = currentMode === mode;
+    const isLocked  = !availableModes.has(mode);
+
+    if (isLocked) {
+      const threshold = mode === 'auto' ? 50 : 30;
+      return `
+        <div class="st-mode-row st-mode-locked">
+          <span class="st-mode-icon">🔒</span>
+          <div class="st-mode-body">
+            <p class="st-mode-name st-mode-name-locked">${info.label}</p>
+            <p class="st-mode-desc">${info.desc}</p>
+          </div>
+          <span class="st-mode-lock-badge">0 / ${threshold}</span>
+        </div>`;
+    }
+    return `
+      <div class="st-mode-row ${isActive ? 'st-mode-active' : ''}" data-mode="${mode}">
+        <span class="st-mode-icon">${isActive ? '◉' : '○'}</span>
+        <div class="st-mode-body">
+          <p class="st-mode-name ${isActive ? 'st-mode-name-active' : ''}">${info.label}</p>
+          <p class="st-mode-desc">${info.desc}</p>
+        </div>
+      </div>`;
+  }
 
   function renderContent(settings) {
-    currentSettings = settings;
-    const scroll = el.querySelector('.scroll');
-    const available = new Set(settings.available_modes || ['disabled', 'silent', 'manual']);
+    currentMode  = settings.mode || 'manual';
+    currentFlags = settings.privacy_flags || [];
+    availableModes = new Set(settings.available_modes || ['disabled', 'silent', 'manual']);
 
-    const memoryOn = !(settings.privacy_flags || []).includes('no_memory');
-    const privateOn = (settings.privacy_flags || []).includes('private');
+    const memoryOn  = !currentFlags.includes('no_memory');
 
-    scroll.innerHTML = `
-      <div class="settings-section">
-        <div class="settings-label">Режим автономии</div>
-        <div class="mode-list" id="mode-list">
-          ${MODE_ORDER.map(mode => {
-            const info = MODE_INFO[mode];
-            const isAvail = available.has(mode);
-            const isActive = settings.mode === mode;
-            return `
-              <div class="mode-option ${isActive ? 'active' : ''} ${isAvail ? '' : 'locked'}"
-                   data-mode="${mode}" style="${isAvail ? '' : 'opacity:0.4;pointer-events:none'}">
-                <div class="mode-option-dot"></div>
-                <div class="mode-option-body">
-                  <div class="mode-option-title">${info.label}${isAvail ? '' : ' 🔒'}</div>
-                  <div class="mode-option-desc">${info.desc}</div>
+    el.querySelector('#st-scroll').innerHTML = `
+      <div class="st-content">
+
+        <!-- режим автоматизации -->
+        <div class="st-section">
+          <p class="st-section-label">режим автоматизации</p>
+          <div class="st-card" id="mode-list">
+            ${MODE_ORDER.map((m, i) => `
+              <div class="st-card-divider-wrap ${i < MODE_ORDER.length - 1 ? 'st-divider' : ''}">
+                ${modeRowHTML(m)}
+              </div>`).join('')}
+          </div>
+        </div>
+
+        <!-- память -->
+        <div class="st-section">
+          <p class="st-section-label">память</p>
+          <div class="st-card">
+            <div class="st-row">
+              <span class="st-row-icon">🧠</span>
+              <div class="st-row-body">
+                <p class="st-row-title">помнить контекст</p>
+                <p class="st-row-desc">учитывать прошлые сообщения</p>
+              </div>
+              <label class="toggle">
+                <input type="checkbox" id="toggle-memory" ${memoryOn ? 'checked' : ''}>
+                <div class="toggle-track"></div>
+                <div class="toggle-knob"></div>
+              </label>
+            </div>
+          </div>
+        </div>
+
+        <!-- дополнительно -->
+        <div class="st-section">
+          <p class="st-section-label">дополнительно</p>
+          <div class="st-card">
+            <div class="st-card-divider-wrap st-divider">
+              <div class="st-row st-row-link" id="btn-profile-link">
+                <span class="st-row-icon">ⓘ</span>
+                <div class="st-row-body">
+                  <p class="st-row-title">досье собеседника</p>
+                </div>
+                <span class="st-chevron">›</span>
+              </div>
+            </div>
+            <div class="st-card-divider-wrap">
+              <div class="st-row st-row-danger" id="btn-delete">
+                <span class="st-row-icon">🗑</span>
+                <div class="st-row-body">
+                  <p class="st-row-title" style="color:var(--danger)">удалить чат из DoubleU</p>
                 </div>
               </div>
-            `;
-          }).join('')}
-        </div>
-        <div style="font-size:11px;color:var(--hint);padding:6px 4px">
-          Расширенные режимы разблокируются по мере одобрения черновиков
-        </div>
-      </div>
-
-      <div class="settings-section">
-        <div class="settings-label">Приватность</div>
-        <div class="settings-group">
-          <div class="settings-row">
-            <div class="settings-row-icon" style="background:rgba(99,102,241,0.14)">🧠</div>
-            <div class="settings-row-body">
-              <div class="settings-row-title">Память</div>
-              <div class="settings-row-subtitle">AI запоминает факты о собеседнике</div>
             </div>
-            <label class="toggle">
-              <input type="checkbox" id="toggle-memory" ${memoryOn ? 'checked' : ''}>
-              <div class="toggle-track"></div>
-              <div class="toggle-knob"></div>
-            </label>
-          </div>
-          <div class="settings-row">
-            <div class="settings-row-icon" style="background:rgba(239,68,68,0.1)">🔒</div>
-            <div class="settings-row-body">
-              <div class="settings-row-title">Приватный чат</div>
-              <div class="settings-row-subtitle">Блокирует автоответы</div>
-            </div>
-            <label class="toggle">
-              <input type="checkbox" id="toggle-private" ${privateOn ? 'checked' : ''}>
-              <div class="toggle-track"></div>
-              <div class="toggle-knob"></div>
-            </label>
           </div>
         </div>
-      </div>
 
-      <div style="padding:16px">
-        <button class="btn btn-primary" id="btn-save">Сохранить</button>
       </div>
     `;
 
-    // Mode selection
-    scroll.querySelectorAll('.mode-option').forEach(opt => {
-      opt.addEventListener('click', () => {
+    wireInteractions();
+  }
+
+  function wireInteractions() {
+    // Mode selection — immediate save
+    el.querySelectorAll('[data-mode]').forEach(row => {
+      row.addEventListener('click', async () => {
+        const mode = row.dataset.mode;
+        if (mode === currentMode) return;
         twa?.HapticFeedback?.selectionChanged();
-        scroll.querySelectorAll('.mode-option').forEach(o => o.classList.remove('active'));
-        opt.classList.add('active');
+        currentMode = mode;
+        // Re-render mode list only
+        el.querySelectorAll('#mode-list .st-card-divider-wrap').forEach((wrap, i) => {
+          const m = MODE_ORDER[i];
+          wrap.querySelector('.st-mode-row').outerHTML;
+          wrap.innerHTML = modeRowHTML(m);
+        });
+        wireInteractions();
+        try {
+          await api.updateSettings(chatId, { mode, privacy_flags: currentFlags });
+        } catch (err) {
+          twa?.showAlert(`Ошибка: ${err.message}`);
+        }
       });
     });
 
-    // Save
-    scroll.querySelector('#btn-save').addEventListener('click', async () => {
+    // Memory toggle — immediate save
+    const memToggle = el.querySelector('#toggle-memory');
+    if (memToggle) {
+      memToggle.addEventListener('change', async () => {
+        twa?.HapticFeedback?.selectionChanged();
+        const noMemory = !memToggle.checked;
+        currentFlags = noMemory
+          ? [...new Set([...currentFlags, 'no_memory'])]
+          : currentFlags.filter(f => f !== 'no_memory');
+        try {
+          await api.updateSettings(chatId, { mode: currentMode, privacy_flags: currentFlags });
+        } catch (err) {
+          twa?.showAlert(`Ошибка: ${err.message}`);
+        }
+      });
+    }
+
+    // Досье
+    el.querySelector('#btn-profile-link')?.addEventListener('click', () => {
+      twa?.HapticFeedback?.impactOccurred('light');
+      navigate(`/chat/${chatId}/profile`);
+    });
+
+    // Удалить
+    el.querySelector('#btn-delete')?.addEventListener('click', () => {
       twa?.HapticFeedback?.impactOccurred('medium');
-      const btn = scroll.querySelector('#btn-save');
-      btn.disabled = true;
-      btn.textContent = 'Сохраняем…';
-
-      const selectedMode = scroll.querySelector('.mode-option.active')?.dataset.mode || settings.mode;
-      const noMemory = !scroll.querySelector('#toggle-memory').checked;
-      const isPrivate = scroll.querySelector('#toggle-private').checked;
-      const flags = [];
-      if (noMemory) flags.push('no_memory');
-      if (isPrivate) flags.push('private');
-      // Preserve other flags that aren't controlled by this UI
-      for (const f of (settings.privacy_flags || [])) {
-        if (f !== 'no_memory' && f !== 'private') flags.push(f);
-      }
-
-      try {
-        await api.updateSettings(chatId, { mode: selectedMode, privacy_flags: flags });
-        twa?.HapticFeedback?.notificationOccurred('success');
-        navigate(`/chat/${chatId}`);
-      } catch (err) {
-        twa?.HapticFeedback?.notificationOccurred('error');
-        twa?.showAlert(`Ошибка: ${err.message}`);
-        btn.disabled = false;
-        btn.textContent = 'Сохранить';
-      }
+      twa?.showPopup({
+        title: 'Удалить чат?',
+        message: 'DoubleU перестанет обрабатывать этот чат. Историю восстановить нельзя.',
+        buttons: [
+          { id: 'cancel', type: 'cancel', text: 'Отмена' },
+          { id: 'delete', type: 'destructive', text: 'Удалить' },
+        ],
+      }, (btnId) => {
+        if (btnId === 'delete') {
+          twa?.HapticFeedback?.notificationOccurred('warning');
+          twa?.showAlert('Функция будет доступна в следующем обновлении.');
+        }
+      });
     });
   }
 
-  // Wire Telegram BackButton cleanup
   const obs = new MutationObserver(() => {
-    if (!document.body.contains(el)) { twa?.BackButton?.hide(); obs.disconnect(); }
+    if (!document.body.contains(el)) {
+      twa?.BackButton?.offClick(handleBack);
+      obs.disconnect();
+    }
   });
   obs.observe(document.body, { childList: true, subtree: true });
 
-  api.chatSettings(chatId).then(renderContent).catch(err => {
-    el.querySelector('.scroll').innerHTML = `<div class="empty-state"><div class="empty-icon">⚠️</div><div class="empty-subtitle">${err.message}</div></div>`;
+  // Load chat name + settings
+  Promise.all([api.chats(), api.chatSettings(chatId)]).then(([chatsData, settings]) => {
+    const chat = chatsData.chats?.find(c => c.chat_id === chatId);
+    if (chat) el.querySelector('#st-chatname').textContent = chat.display_name || chatId;
+    renderContent(settings);
+  }).catch(err => {
+    el.querySelector('#st-scroll').innerHTML = `
+      <div class="empty-state"><div class="empty-icon">⚠️</div><div class="empty-subtitle">${err.message}</div></div>`;
   });
 
   return el;

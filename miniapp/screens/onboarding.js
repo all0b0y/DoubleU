@@ -8,7 +8,7 @@ export function renderOnboarding(navigate, reason) {
   el.style.cssText = 'height:100%;display:flex;flex-direction:column;overflow:hidden;';
 
   el.innerHTML = `
-    <div style="flex:1;display:flex;flex-direction:column;padding:20px 20px 16px;overflow:hidden;">
+    <div style="flex:1;display:flex;flex-direction:column;padding:calc(14px + var(--inset-top, 0px)) 20px 16px;overflow:hidden;">
 
       <!-- Top row: back + step counter -->
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;flex-shrink:0;">

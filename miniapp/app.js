@@ -5,6 +5,7 @@ import { renderChats }     from '/miniapp/screens/chats.js';
 import { renderChat }      from '/miniapp/screens/chat.js';
 import { renderSettings }  from '/miniapp/screens/settings.js';
 import { renderAddChat }   from '/miniapp/screens/add-chat.js';
+import { renderProfile }   from '/miniapp/screens/profile.js';
 
 const twa = window.Telegram?.WebApp;
 const app = document.getElementById('app');
@@ -12,6 +13,24 @@ const app = document.getElementById('app');
 // ── TMA initialisation ────────────────────────────────────────────────────────
 twa?.ready();
 twa?.expand();
+twa?.requestFullscreen?.();
+twa?.setHeaderColor?.('#14141A');
+twa?.setBackgroundColor?.('#14141A');
+twa?.setBottomBarColor?.('#14141A');
+
+// Push our UI below Telegram's native header in fullscreen mode.
+// safeAreaInset.top = status bar; contentSafeAreaInset.top = Telegram header.
+function applyInsets() {
+  const safeTop    = twa?.safeAreaInset?.top        ?? 0;
+  const contentTop = twa?.contentSafeAreaInset?.top ?? 0;
+  document.documentElement.style.setProperty('--inset-top', `${safeTop + contentTop}px`);
+  const safeBottom    = twa?.safeAreaInset?.bottom        ?? 0;
+  const contentBottom = twa?.contentSafeAreaInset?.bottom ?? 0;
+  document.documentElement.style.setProperty('--inset-bottom', `${safeBottom + contentBottom}px`);
+}
+applyInsets();
+twa?.onEvent?.('safeAreaChanged', applyInsets);
+twa?.onEvent?.('contentSafeAreaChanged', applyInsets);
 
 // Apply Telegram theme to document
 if (twa?.colorScheme === 'light') document.documentElement.classList.add('light');
@@ -31,6 +50,7 @@ const routes = {
   '/chats':               () => renderChats(navigate),
   '/chat/:id':            (p) => renderChat(navigate, p.id),
   '/chat/:id/settings':   (p) => renderSettings(navigate, p.id),
+  '/chat/:id/profile':    (p) => renderProfile(navigate, p.id),
   '/add-chat':            () => renderAddChat(navigate),
 };
 

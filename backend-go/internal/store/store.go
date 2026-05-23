@@ -49,8 +49,10 @@ type DraftRecord struct {
 	SourceMessageText    string // original contact message text; stored so regen works even with no_memory
 	ResponseText         string
 	Status               DraftStatus
-	OwnerChatID          string // owner's bot chat ID (for editing the draft card)
-	OwnerMessageID       string // Telegram message_id of the draft card in owner's chat
+	OwnerChatID          string   // owner's bot chat ID (for editing the draft card)
+	OwnerMessageID       string   // Telegram message_id of the draft card in owner's chat
+	SentMessageID        string   // Telegram message_id of the reply sent to the contact
+	ActionHistory        []string // sequence of modification actions taken before final approve
 	CreatedAt            time.Time
 	UpdatedAt            time.Time
 }
@@ -439,6 +441,28 @@ func (r *Repository) DraftByMessage(tenantID, chatID, sourceMessageID string) (D
 	return draft, ok
 }
 
+// IsChatClaimed returns true when the chat has been explicitly added to this tenant.
+// Staging chats (tenant_id starting with "staging:") are NOT considered claimed.
+func (r *Repository) IsChatClaimed(tenantID, chatID string) bool {
+	if r.db != nil {
+		var count int
+		_ = r.db.QueryRow(
+			`SELECT COUNT(*) FROM chats WHERE tenant_id = $1 AND chat_id = $2`,
+			tenantID, chatID,
+		).Scan(&count)
+		return count > 0
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, ok := r.chats[chatKey(tenantID, chatID)]
+	return ok
+}
+
+// StagingChatsForConnection returns unclaimed chats observed on a business connection.
+func (r *Repository) StagingChatsForConnection(connectionID string) []ChatRecord {
+	return r.ChatsForTenant("staging:" + connectionID)
+}
+
 // DraftsForChat returns all drafts for a tenant/chat pair, newest first.
 func (r *Repository) DraftsForChat(tenantID, chatID string) []DraftRecord {
 	r.mu.Lock()
@@ -460,6 +484,21 @@ func (r *Repository) UpdateDraft(draft DraftRecord) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.drafts[draft.DraftID] = draft
+}
+
+// DraftBySentMessageID returns the draft whose reply was sent as the given Telegram message_id.
+func (r *Repository) DraftBySentMessageID(tenantID, chatID, sentMessageID string) (DraftRecord, bool) {
+	if sentMessageID == "" {
+		return DraftRecord{}, false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, d := range r.drafts {
+		if d.TenantID == tenantID && d.ChatID == chatID && d.SentMessageID == sentMessageID {
+			return d, true
+		}
+	}
+	return DraftRecord{}, false
 }
 
 // SendCount returns the number of unique outbound sends.

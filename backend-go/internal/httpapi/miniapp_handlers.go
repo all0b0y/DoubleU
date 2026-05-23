@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -91,9 +92,17 @@ func (s *Server) apiAddChats(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
+	userID := strings.TrimPrefix(tenantID, "tenant:user:")
+	conn, _ := s.service.Repository().BusinessConnectionByUser(userID)
+	stagingTenant := "staging:" + conn.ConnectionID
+
 	claimed := make([]string, 0, len(req.ChatIDs))
 	for _, chatID := range req.ChatIDs {
-		chat, ok := s.service.Repository().ChatBySelector("", chatID)
+		// Look for the chat in the staging tenant first, then fall back to global lookup.
+		chat, ok := s.service.Repository().ChatBySelector(stagingTenant, chatID)
+		if !ok {
+			chat, ok = s.service.Repository().ChatBySelector("", chatID)
+		}
 		if !ok {
 			continue
 		}
@@ -110,22 +119,45 @@ func (s *Server) apiMessages(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing chat_id"})
 		return
 	}
+
+	ownerUserID := strings.TrimPrefix(tenantID, "tenant:user:")
+	chat, _ := s.service.Repository().ChatBySelector(tenantID, chatID)
+	contactName := chat.DisplayName
+	if contactName == "" {
+		contactName = chatID
+	}
+
 	msgs := s.service.Repository().RecentMessages(tenantID, chatID, 50)
 	type msgItem struct {
-		ID        string `json:"id"`
-		Text      string `json:"text"`
-		SenderID  string `json:"sender_id"`
-		Type      string `json:"type"`
-		CreatedAt string `json:"created_at"`
+		ID         string `json:"id"`
+		Text       string `json:"text"`
+		SenderID   string `json:"sender_id"`
+		SenderName string `json:"sender_name"`
+		Direction  string `json:"direction"`
+		Label      string `json:"label,omitempty"` // set only for DoubleU-sent messages
+		CreatedAt  string `json:"created_at"`
 	}
 	items := make([]msgItem, 0, len(msgs))
 	for _, m := range msgs {
+		direction := "incoming"
+		senderName := contactName
+		label := ""
+		if m.Event.SenderID == ownerUserID {
+			direction = "outgoing"
+			senderName = "Вы"
+			// Look up whether this message was sent through DoubleU.
+			if draft, ok := s.service.Repository().DraftBySentMessageID(tenantID, chatID, m.Event.SourceMessageID); ok {
+				label = doubleULabel(draft.ActionHistory)
+			}
+		}
 		items = append(items, msgItem{
-			ID:        m.Event.SourceMessageID,
-			Text:      m.Event.MessageText,
-			SenderID:  m.Event.SenderID,
-			Type:      m.Event.MessageType,
-			CreatedAt: m.Event.CreatedAt.UTC().Format("2006-01-02T15:04:05Z"),
+			ID:         m.Event.SourceMessageID,
+			Text:       m.Event.MessageText,
+			SenderID:   m.Event.SenderID,
+			SenderName: senderName,
+			Direction:  direction,
+			Label:      label,
+			CreatedAt:  m.Event.CreatedAt.UTC().Format("2006-01-02T15:04:05Z"),
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"messages": items})
@@ -276,23 +308,23 @@ func (s *Server) apiUpdateChatSettings(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) apiContacts(w http.ResponseWriter, r *http.Request) {
 	tenantID := tenantFromContext(r.Context())
-	claimed := s.service.Repository().ChatsForTenant(tenantID)
-	claimedIDs := make(map[string]struct{}, len(claimed))
-	for _, c := range claimed {
-		claimedIDs[c.ChatID] = struct{}{}
-	}
-	// Unclaimed business chats (observed but not yet assigned to any tenant).
-	all := s.service.Repository().ChatsForTenant("")
+	userID := strings.TrimPrefix(tenantID, "tenant:user:")
+
+	// Staging chats are stored under "staging:<connectionID>" by the webhook handler.
+	conn, ok := s.service.Repository().BusinessConnectionByUser(userID)
 	type contactItem struct {
 		ChatID      string `json:"chat_id"`
 		DisplayName string `json:"display_name"`
 		LastSeenAt  string `json:"last_seen_at,omitempty"`
 	}
-	items := make([]contactItem, 0)
-	for _, c := range all {
-		if _, ok := claimedIDs[c.ChatID]; ok {
-			continue
-		}
+	if !ok {
+		writeJSON(w, http.StatusOK, map[string]any{"contacts": []contactItem{}})
+		return
+	}
+
+	stagingChats := s.service.Repository().StagingChatsForConnection(conn.ConnectionID)
+	items := make([]contactItem, 0, len(stagingChats))
+	for _, c := range stagingChats {
 		items = append(items, contactItem{
 			ChatID:      c.ChatID,
 			DisplayName: c.DisplayName,
@@ -300,6 +332,84 @@ func (s *Server) apiContacts(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"contacts": items})
+}
+
+func (s *Server) apiGetProfile(w http.ResponseWriter, r *http.Request) {
+	tenantID := tenantFromContext(r.Context())
+	chatID := r.PathValue("chat_id")
+	if chatID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing chat_id"})
+		return
+	}
+	profile, _ := s.service.Repository().ContactProfile(tenantID, chatID)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"chat_id":           chatID,
+		"name":              profile.Name,
+		"gender":            profile.Gender,
+		"role":              profile.Role,
+		"relationship_type": profile.RelationshipType,
+		"notes":             profile.Notes,
+	})
+}
+
+func (s *Server) apiSaveProfile(w http.ResponseWriter, r *http.Request) {
+	tenantID := tenantFromContext(r.Context())
+	chatID := r.PathValue("chat_id")
+	if chatID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing chat_id"})
+		return
+	}
+	defer r.Body.Close()
+	var req struct {
+		Name             string `json:"name"`
+		Gender           string `json:"gender"`
+		Role             string `json:"role"`
+		RelationshipType string `json:"relationship_type"`
+		Notes            string `json:"notes"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	profile := contracts.ContactProfile{
+		TenantID:         tenantID,
+		ChatID:           chatID,
+		Name:             req.Name,
+		Gender:           req.Gender,
+		Role:             req.Role,
+		RelationshipType: req.RelationshipType,
+		Notes:            req.Notes,
+	}
+	s.service.Repository().SaveContactProfile(profile)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "saved"})
+}
+
+// doubleULabel builds a human-readable label for a DoubleU-sent message
+// based on the sequence of actions the owner took before approving the draft.
+func doubleULabel(history []string) string {
+	hasEdit := false
+	hasRefine := false
+	for _, a := range history {
+		switch a {
+		case "edit", "shorter", "formal":
+			hasEdit = true
+		case "ai_refine":
+			hasRefine = true
+		}
+	}
+	label := "DoubleU"
+	switch {
+	case hasEdit && hasRefine:
+		label = "поправленный DoubleU с уточнением"
+	case hasEdit:
+		label = "поправленный DoubleU"
+	case hasRefine:
+		label = "DoubleU с уточнением"
+	}
+	if n := len(history); n > 1 {
+		label += fmt.Sprintf(" ×%d", n)
+	}
+	return label
 }
 
 func privacyFlagsToStrings(flags contracts.PrivacyFlags) []string {

@@ -230,7 +230,30 @@ func (s *Service) HandleTelegramWebhook(ctx context.Context, payload []byte, ten
 	if hasConnection {
 		ownerID = connection.UserID
 	}
-	event.ChatDisplayName = anonymousChatName(event.ChatID)
+	if event.ChatDisplayName == "" {
+		event.ChatDisplayName = anonymousChatName(event.ChatID)
+	}
+
+	// Gate: only process chats the owner has explicitly added.
+	// New contacts go to a staging tenant so they appear in "Предложения" without AI handling.
+	if event.BusinessConnectionID != "" && !s.repository.IsChatClaimed(event.TenantID, event.ChatID) {
+		stagingTenant := "staging:" + event.BusinessConnectionID
+		s.repository.SaveChat(store.ChatRecord{
+			TenantID:             stagingTenant,
+			ChatID:               event.ChatID,
+			DisplayName:          event.ChatDisplayName,
+			ChatType:             event.ChatType,
+			BusinessConnectionID: event.BusinessConnectionID,
+			LastSourceMessageID:  event.SourceMessageID,
+			LastSeenAt:           s.now(),
+		})
+		s.logger.Info("unclaimed business chat staged for owner review",
+			"chat_id", event.ChatID,
+			"tenant_id", event.TenantID,
+			"staging_tenant", stagingTenant,
+		)
+		return InboundResult{Event: event, Decision: contracts.DecisionIgnore, Reason: "chat_not_claimed"}, nil
+	}
 
 	s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateReceived)
 	s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateNormalized)
@@ -378,7 +401,7 @@ func (s *Service) HandleTelegramWebhook(ctx context.Context, payload []byte, ten
 	result := InboundResult{Event: event, Decision: decision, Reason: reason}
 	switch decision {
 	case contracts.DecisionAutoReply:
-		if err := s.sendRecipient(ctx, event, event.EventID, proposal.ResponseText); err != nil {
+		if _, err := s.sendRecipient(ctx, event, event.EventID, proposal.ResponseText); err != nil {
 			s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateFailed)
 			s.repository.AppendAudit(s.auditEvent(event, contracts.DecisionErrorFallback, "send_error:"+err.Error()))
 			s.logger.Error("telegram send failed", "tenant_id", event.TenantID, "chat_id", event.ChatID, "error", err)
@@ -755,16 +778,18 @@ func (s *Service) HandleApprovalCallback(ctx context.Context, payload contracts.
 	switch payload.Action {
 	case contracts.ApprovalApprove:
 		s.repository.AppendState(draft.TenantID, draft.ChatID, draft.SourceMessageID, contracts.StateApprovedByOwner)
-		if err := s.sendRecipient(ctx, contracts.NormalizedTelegramEvent{
+		sentMsgID, err := s.sendRecipient(ctx, contracts.NormalizedTelegramEvent{
 			TenantID:             draft.TenantID,
 			ChatID:               draft.ChatID,
 			BusinessConnectionID: draft.BusinessConnectionID,
 			SourceMessageID:      draft.SourceMessageID,
-		}, draft.DecisionID, draft.ResponseText); err != nil {
+		}, draft.DecisionID, draft.ResponseText)
+		if err != nil {
 			s.repository.AppendState(draft.TenantID, draft.ChatID, draft.SourceMessageID, contracts.StateFailed)
 			return ApprovalResult{}, err
 		}
 		draft.Status = store.DraftSent
+		draft.SentMessageID = sentMsgID
 		draft.UpdatedAt = now
 		s.repository.UpdateDraft(draft)
 		s.repository.AppendState(draft.TenantID, draft.ChatID, draft.SourceMessageID, contracts.StateSentToRecipient)
@@ -793,17 +818,27 @@ func (s *Service) HandleApprovalCallback(ctx context.Context, payload contracts.
 			return ApprovalResult{}, fmt.Errorf("edited_text is required for edit action")
 		}
 		draft.ResponseText = payload.EditedText
+		draft.ActionHistory = append(draft.ActionHistory, "edit")
 		draft.UpdatedAt = now
 		s.repository.UpdateDraft(draft)
 		s.repository.AppendState(draft.TenantID, draft.ChatID, draft.SourceMessageID, contracts.StateDraftSentToOwner)
 		return ApprovalResult{Action: payload.Action, DraftID: draft.DraftID, Status: string(draft.Status)}, nil
 	case contracts.ApprovalRegenerate:
+		draft.ActionHistory = append(draft.ActionHistory, "regenerate")
+		s.repository.UpdateDraft(draft)
 		updated, err := s.regenerateDraft(ctx, draft)
 		if err != nil {
 			return ApprovalResult{}, err
 		}
 		return ApprovalResult{Action: payload.Action, DraftID: updated.DraftID, Status: string(updated.Status)}, nil
-	case contracts.ApprovalMakeShorter, contracts.ApprovalMakeMoreFormal:
+	case contracts.ApprovalMakeShorter:
+		draft.ActionHistory = append(draft.ActionHistory, "shorter")
+		s.repository.UpdateDraft(draft)
+		updated := s.reviseDraft(ctx, draft, payload.Action)
+		return ApprovalResult{Action: payload.Action, DraftID: updated.DraftID, Status: string(updated.Status)}, nil
+	case contracts.ApprovalMakeMoreFormal:
+		draft.ActionHistory = append(draft.ActionHistory, "formal")
+		s.repository.UpdateDraft(draft)
 		updated := s.reviseDraft(ctx, draft, payload.Action)
 		return ApprovalResult{Action: payload.Action, DraftID: updated.DraftID, Status: string(updated.Status)}, nil
 	case contracts.ApprovalEditRequest, contracts.ApprovalAIRefine:
@@ -926,6 +961,7 @@ func (s *Service) regenerateDraftWithHint(ctx context.Context, draft store.Draft
 		return store.DraftRecord{}, err
 	}
 	s.repository.AppendState(draft.TenantID, draft.ChatID, draft.SourceMessageID, contracts.StateAIGenerated)
+	draft.ActionHistory = append(draft.ActionHistory, "ai_refine")
 	draft.ResponseText = proposal.ResponseText
 	draft.UpdatedAt = s.now()
 	s.repository.UpdateDraft(draft)
@@ -995,7 +1031,8 @@ func (s *Service) notifyDraftStatus(draft store.DraftRecord) {
 	})
 }
 
-func (s *Service) sendRecipient(ctx context.Context, event contracts.NormalizedTelegramEvent, decisionID, text string) error {
+// sendRecipient sends a reply to the contact and returns the Telegram message_id of the sent message.
+func (s *Service) sendRecipient(ctx context.Context, event contracts.NormalizedTelegramEvent, decisionID, text string) (string, error) {
 	key := contracts.SendIdempotencyKey(event.TenantID, event.ChatID, event.SourceMessageID, decisionID)
 	duplicate := s.repository.MarkSend(store.SendRecord{
 		Key:             key,
@@ -1007,16 +1044,22 @@ func (s *Service) sendRecipient(ctx context.Context, event contracts.NormalizedT
 		CreatedAt:       s.now(),
 	})
 	if duplicate {
-		return nil
+		return "", nil
 	}
-	return s.sender.SendMessage(ctx, telegram.OutboundMessage{
+	msg := telegram.OutboundMessage{
 		TenantID:             event.TenantID,
 		ChatID:               event.ChatID,
 		BusinessConnectionID: event.BusinessConnectionID,
 		SourceMessageID:      event.SourceMessageID,
 		DecisionID:           decisionID,
 		Text:                 text,
-	})
+	}
+	if idSender, ok := s.sender.(interface {
+		SendMessageGetID(context.Context, telegram.OutboundMessage) (string, error)
+	}); ok {
+		return idSender.SendMessageGetID(ctx, msg)
+	}
+	return "", s.sender.SendMessage(ctx, msg)
 }
 
 func (s *Service) auditEvent(event contracts.NormalizedTelegramEvent, decision contracts.Decision, reason string) contracts.AuditEvent {

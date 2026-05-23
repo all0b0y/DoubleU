@@ -9,48 +9,64 @@ function initials(name) {
 
 function formatTime(iso) {
   if (!iso) return '';
-  const d = new Date(iso);
-  return d.toLocaleTimeString('ru', { hour: '2-digit', minute: '2-digit' });
+  return new Date(iso).toLocaleTimeString('ru', { hour: '2-digit', minute: '2-digit' });
 }
+
+function dateSepLabel(iso) {
+  const d = new Date(iso);
+  const today = new Date();
+  const yest  = new Date(today); yest.setDate(today.getDate() - 1);
+  if (d.toDateString() === today.toDateString()) return 'сегодня';
+  if (d.toDateString() === yest.toDateString())  return 'вчера';
+  return d.toLocaleDateString('ru', { day: 'numeric', month: 'long' });
+}
+
+const MODE_LABELS = {
+  auto: '⚡ auto', semi_auto: '⚡ semi_auto', manual: '✋ manual',
+  silent: 'silent', disabled: 'disabled',
+};
+const MODE_COLORS = {
+  auto: 'var(--success)', semi_auto: 'var(--accent)',
+  manual: 'var(--warning)', silent: 'var(--muted)', disabled: 'var(--muted)',
+};
 
 export function renderChat(navigate, chatId) {
   const el = document.createElement('div');
   el.className = 'screen';
   el.innerHTML = `
-    <div class="topbar">
-      <button class="btn-icon" id="btn-back">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 18l-6-6 6-6"/></svg>
-      </button>
-      <div class="avatar avatar-sm" id="chat-avatar" style="flex-shrink:0"></div>
-      <div style="flex:1;min-width:0">
-        <div class="topbar-title" id="chat-name" style="font-size:15px">…</div>
-        <div style="font-size:11px;color:var(--hint)" id="chat-mode-label"></div>
+    <div class="chat-topbar">
+      <div class="chat-av" id="chat-avatar"></div>
+      <div class="chat-topbar-info">
+        <div class="chat-topbar-name" id="chat-name">…</div>
+        <div class="chat-topbar-mode" id="chat-mode"></div>
       </div>
-      <button class="topbar-action" id="btn-settings">⚙️</button>
+      <button class="chat-topbar-btn" id="btn-profile" title="Досье">ⓘ</button>
+      <button class="chat-topbar-btn" id="btn-settings" title="Настройки">⚙</button>
     </div>
+
     <div class="scroll" id="msg-list">
       <div class="loading-row"><div class="spinner"></div></div>
     </div>
-    <div id="drafts-area"></div>
+
+    <div id="draft-panel"></div>
   `;
 
-  el.querySelector('#btn-back').addEventListener('click', () => {
-    twa?.HapticFeedback?.impactOccurred('light');
-    navigate('/chats');
-  });
+  const handleBack = () => navigate('/chats');
+  twa?.BackButton?.show();
+  twa?.BackButton?.onClick(handleBack);
 
   el.querySelector('#btn-settings').addEventListener('click', () => {
     twa?.HapticFeedback?.impactOccurred('light');
     navigate(`/chat/${chatId}/settings`);
   });
+  el.querySelector('#btn-profile').addEventListener('click', () => {
+    twa?.HapticFeedback?.impactOccurred('light');
+    navigate(`/chat/${chatId}/profile`);
+  });
 
-  // Wire Telegram BackButton
-  twa?.BackButton?.show();
-  twa?.BackButton?.onClick(() => navigate('/chats'));
-
-  let chatName = chatId;
-  let chatMode = '';
   let currentDrafts = [];
+
+  // ── Messages ──────────────────────────────────────────────────────────────
 
   function renderMessages(messages) {
     const list = el.querySelector('#msg-list');
@@ -58,65 +74,92 @@ export function renderChat(navigate, chatId) {
       list.innerHTML = `<div class="empty-state"><div class="empty-icon">💬</div><div class="empty-subtitle">Нет сообщений</div></div>`;
       return;
     }
-    list.innerHTML = `<div class="messages-list">${
-      messages.map(m => {
-        const isOwner = m.type === 'outgoing' || m.sender_id === 'owner';
-        return `
-          <div class="msg-bubble ${isOwner ? 'outgoing' : 'incoming'}">
-            ${m.text || '—'}
-            <div class="msg-time">${formatTime(m.created_at)}</div>
-          </div>
-        `;
-      }).join('')
-    }</div>`;
+
+    let html = '<div class="msg-list-inner">';
+    let lastDateStr = null;
+
+    for (const m of messages) {
+      const dateStr = dateSepLabel(m.created_at);
+      if (dateStr !== lastDateStr) {
+        html += `<div class="msg-date-sep"><span>${dateStr}</span></div>`;
+        lastDateStr = dateStr;
+      }
+      const out = m.direction === 'outgoing';
+      if (out) {
+        const footer = m.label
+          ? `<div class="msg-footer-out">
+               <span class="msg-footer-du">✨ ${m.label}</span>
+               <span class="msg-footer-time">${formatTime(m.created_at)} ✓✓</span>
+             </div>`
+          : `<p class="msg-time-in" style="color:rgba(255,255,255,0.5)">${formatTime(m.created_at)}</p>`;
+        html += `
+          <div class="msg-bubble msg-out">
+            <p class="msg-text">${m.text || '—'}</p>
+            ${footer}
+          </div>`;
+      } else {
+        html += `
+          <div class="msg-bubble msg-in">
+            <p class="msg-text">${m.text || '—'}</p>
+            <p class="msg-time-in">${formatTime(m.created_at)}</p>
+          </div>`;
+      }
+    }
+    html += '</div>';
+    list.innerHTML = html;
     list.scrollTop = list.scrollHeight;
   }
 
-  function renderDrafts(drafts) {
-    const area = el.querySelector('#drafts-area');
+  // ── Draft panel ───────────────────────────────────────────────────────────
+
+  function renderDraftPanel(drafts) {
+    const panel = el.querySelector('#draft-panel');
     const pending = drafts.filter(d => d.status === 'pending');
     currentDrafts = pending;
+    twa?.MainButton?.hide();
 
     if (!pending.length) {
-      area.innerHTML = '';
-      twa?.MainButton?.hide();
+      panel.innerHTML = '';
       return;
     }
 
-    area.innerHTML = pending.map(d => `
-      <div class="draft-card" data-id="${d.draft_id}">
-        <div class="draft-card-header">
-          <span>✨</span>
-          <div class="draft-card-header-title">Черновик DoubleU</div>
+    const d = pending[0];
+    panel.innerHTML = `
+      <div class="draft-panel">
+        <div class="draft-panel-header">
+          <div class="draft-panel-label">
+            <div class="draft-panel-dot">✨</div>
+            <span class="draft-panel-title">черновик</span>
+          </div>
+          <div style="display:flex;gap:2px;">
+            <button class="draft-icon-btn" data-action="thumb_up"   data-id="${d.draft_id}" title="Нравится">👍</button>
+            <button class="draft-icon-btn" data-action="thumb_down" data-id="${d.draft_id}" title="Не нравится">👎</button>
+          </div>
         </div>
-        ${d.source_text ? `<div class="draft-source">«${d.source_text}»</div>` : ''}
-        <div class="draft-text">${d.response_text}</div>
-        <div class="draft-actions">
-          <button class="draft-btn danger" data-action="reject" data-id="${d.draft_id}">✗ Отклонить</button>
-          <button class="draft-btn" data-action="regenerate" data-id="${d.draft_id}">🔄 Ещё раз</button>
-          <button class="draft-btn primary" data-action="approve" data-id="${d.draft_id}">✓ Отправить</button>
+
+        <div class="draft-bubble">
+          <p class="draft-bubble-text">${d.response_text}</p>
+          <div class="draft-bubble-actions">
+            <button class="draft-text-btn" data-action="edit_request" data-id="${d.draft_id}">✏ править</button>
+            <button class="draft-text-btn" data-action="ai_refine"   data-id="${d.draft_id}">💬 уточнить</button>
+            <button class="draft-text-btn" data-action="regenerate"  data-id="${d.draft_id}">🔄 ещё</button>
+          </div>
+        </div>
+
+        <div class="draft-send-row">
+          <button class="draft-trash-btn" data-action="reject"  data-id="${d.draft_id}" title="Отклонить">🗑</button>
+          <button class="draft-send-btn"  data-action="approve" data-id="${d.draft_id}">↑ отправить</button>
         </div>
       </div>
-    `).join('');
+    `;
 
-    // Wire action buttons
-    area.querySelectorAll('[data-action]').forEach(btn => {
+    panel.querySelectorAll('[data-action]').forEach(btn => {
       btn.addEventListener('click', () => handleDraftAction(btn.dataset.id, btn.dataset.action));
     });
-
-    // Show MainButton for the first pending draft approval
-    if (pending.length > 0) {
-      const first = pending[0];
-      twa?.MainButton?.setText('Отправить черновик');
-      twa?.MainButton?.setParams({ color: '#6366F1', text_color: '#FFFFFF' });
-      twa?.MainButton?.show();
-      twa?.MainButton?.onClick(() => handleDraftAction(first.draft_id, 'approve'));
-    }
   }
 
   async function handleDraftAction(draftId, action) {
     twa?.HapticFeedback?.impactOccurred('medium');
-
     if (action === 'reject') {
       twa?.showPopup({
         title: 'Отклонить черновик?',
@@ -126,19 +169,15 @@ export function renderChat(navigate, chatId) {
           { id: 'reject', type: 'destructive', text: 'Отклонить' },
         ],
       }, async (btnId) => {
-        if (btnId !== 'reject') return;
-        await executeDraftAction(draftId, 'reject');
+        if (btnId === 'reject') await executeDraftAction(draftId, 'reject');
       });
       return;
     }
-
     await executeDraftAction(draftId, action);
   }
 
   async function executeDraftAction(draftId, action) {
-    const btn = el.querySelector(`[data-action="${action}"][data-id="${draftId}"]`);
-    if (btn) { btn.disabled = true; btn.style.opacity = '0.5'; }
-
+    el.querySelectorAll(`[data-id="${draftId}"]`).forEach(b => { b.disabled = true; b.style.opacity = '0.5'; });
     try {
       await api.draftAction(chatId, draftId, action);
       twa?.HapticFeedback?.notificationOccurred('success');
@@ -147,9 +186,11 @@ export function renderChat(navigate, chatId) {
     } catch (err) {
       twa?.HapticFeedback?.notificationOccurred('error');
       twa?.showAlert(`Ошибка: ${err.message}`);
-      if (btn) { btn.disabled = false; btn.style.opacity = ''; }
+      el.querySelectorAll(`[data-id="${draftId}"]`).forEach(b => { b.disabled = false; b.style.opacity = ''; });
     }
   }
+
+  // ── Data loaders ──────────────────────────────────────────────────────────
 
   async function loadMessages() {
     try {
@@ -161,7 +202,7 @@ export function renderChat(navigate, chatId) {
   async function loadDrafts() {
     try {
       const data = await api.drafts(chatId);
-      renderDrafts(data.drafts || []);
+      renderDraftPanel(data.drafts || []);
     } catch (_) {}
   }
 
@@ -170,24 +211,21 @@ export function renderChat(navigate, chatId) {
       const [chatsData, settingsData] = await Promise.all([api.chats(), api.chatSettings(chatId)]);
       const chat = chatsData.chats?.find(c => c.chat_id === chatId);
       if (chat) {
-        chatName = chat.display_name || chatId;
-        chatMode = chat.mode;
-        el.querySelector('#chat-name').textContent = chatName;
-        el.querySelector('#chat-avatar').textContent = chat.display_name?.split(/\s+/).map(w => w[0]).join('').slice(0, 2).toUpperCase() || '?';
+        el.querySelector('#chat-name').textContent = chat.display_name || chatId;
+        el.querySelector('#chat-avatar').textContent = initials(chat.display_name);
       }
       if (settingsData) {
-        el.querySelector('#chat-mode-label').textContent = modeLabel(settingsData.mode);
+        const modeEl = el.querySelector('#chat-mode');
+        modeEl.textContent = MODE_LABELS[settingsData.mode] || settingsData.mode;
+        modeEl.style.color  = MODE_COLORS[settingsData.mode] || 'var(--hint)';
       }
     } catch (_) {}
   }
 
-  function modeLabel(mode) {
-    return { auto: 'Полная автономия', semi_auto: 'Полуавтомат', manual: 'Ручной режим', silent: 'Наблюдение', disabled: 'Отключено' }[mode] || mode;
-  }
+  // ── Real-time ─────────────────────────────────────────────────────────────
 
-  // Real-time events for this chat
   const es = openEvents({
-    new_draft: (d) => { if (d.chat_id === chatId) loadDrafts(); },
+    new_draft:    (d) => { if (d.chat_id === chatId) loadDrafts(); },
     draft_status: (d) => {
       if (currentDrafts.find(x => x.draft_id === d.draft_id)) {
         loadDrafts();
@@ -199,7 +237,7 @@ export function renderChat(navigate, chatId) {
 
   const obs = new MutationObserver(() => {
     if (!document.body.contains(el)) {
-      twa?.BackButton?.hide();
+      twa?.BackButton?.offClick(handleBack);
       twa?.MainButton?.hide();
       es.close();
       obs.disconnect();
@@ -207,7 +245,6 @@ export function renderChat(navigate, chatId) {
   });
   obs.observe(document.body, { childList: true, subtree: true });
 
-  // Initial load
   loadChatMeta();
   loadMessages();
   loadDrafts();
