@@ -59,6 +59,37 @@ class ServicePolicyTests(unittest.TestCase):
         self.assertEqual(response.decision, Decision.DRAFT)
         self.assertEqual(response.memory_used, ())
 
+    def test_memory_used_does_not_echo_input_context(self) -> None:
+        """Regression: memory_used must NOT contain assembled prompt context lines.
+
+        The Bug Backlog described a self-poisoning loop where memory_used was set to
+        ``request.memory_context + extracted_facts``, causing the Go backend to
+        re-insert prompt lines such as "[CURRENT DATE:]", "[ФАКТ:]", and conversation
+        history into semantic_facts.  This test asserts that no input context string
+        appears in the response memory_used field.
+        """
+        poisoning_context = (
+            "[CURRENT DATE: 2026-05-27]",
+            "[ФАКТ: contact prefers formal tone]",
+            "[2026-05-20 14:32] OWNER: Hi there",
+            "[2026-05-20 14:33] CONTACT: Hello, how are you?",
+            "[OWNER STYLE] prefers short replies",
+        )
+        response = self.service.process_message(
+            _process_request_with_memory(
+                mode=ChatMode.AUTO,
+                text="Can we meet tomorrow?",
+                memory_context=poisoning_context,
+            )
+        )
+
+        for context_line in poisoning_context:
+            self.assertNotIn(
+                context_line,
+                response.memory_used,
+                f"Context line leaked into memory_used: {context_line!r}",
+            )
+
     def test_critical_risk_asks_owner_without_generation(self) -> None:
         """Critical risk messages should not generate a reply."""
         response = self.service.process_message(
@@ -272,6 +303,78 @@ class LLMGatewayTests(unittest.TestCase):
         self.assertFalse(mock_llm)
         self.assertEqual(configured_service.health(), {"status": "ok"})
 
+    def test_embed_texts_logs_when_upstream_call_fails(self) -> None:
+        """Regression: embed_texts must surface upstream failures via a warning log.
+
+        The previous implementation silently swallowed errors, hiding the fact that
+        `text-embedding-3-small` was unreachable via OpenRouter and `fact_embeddings`
+        stayed empty.  Asserts that a failure path now emits a `warning`-level log
+        with the model name so the deployment can see the cause.
+        """
+        from ai_agent.schemas import EmbedTextsRequest
+
+        svc = AIService(ModelRouter(MockLLMGateway()))
+        with patch.dict(
+            os.environ,
+            {
+                "OPENROUTER_API_KEY": "secret",
+                "OPENROUTER_BASE_URL": "http://127.0.0.1:1/invalid",  # unreachable
+                "OPENAI_API_KEY": "",
+            },
+            clear=False,
+        ), patch.object(service.logger, "warning") as warn:
+            response = svc.embed_texts(
+                EmbedTextsRequest(texts=("hello",), model="qwen/qwen3-embedding-8b")
+            )
+
+        self.assertEqual(response.model_used, "error")
+        self.assertTrue(warn.called, "embed_texts must log when the upstream call fails")
+        args, _kwargs = warn.call_args
+        self.assertIn("embed_texts", args[0])
+
+    def test_embed_texts_prefers_openrouter_base_url(self) -> None:
+        """Regression: when only OpenRouter creds are configured the request must go to
+        the OpenRouter endpoint, not the default OpenAI host.  The previous code fell
+        back to OPENAI_BASE_URL even when OPENROUTER_API_KEY was set, which 401'd."""
+        from ai_agent.schemas import EmbedTextsRequest
+
+        captured: dict[str, str] = {}
+
+        def fake_urlopen(req, timeout: int):  # noqa: ARG001 - timeout unused in stub
+            captured["url"] = req.full_url
+            captured["auth"] = req.get_header("Authorization") or ""
+
+            class _Resp:
+                def read(self):
+                    return b'{"data":[{"index":0,"embedding":[0.1,0.2,0.3]}]}'
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    return False
+
+            return _Resp()
+
+        svc = AIService(ModelRouter(MockLLMGateway()))
+        with patch.dict(
+            os.environ,
+            {
+                "OPENROUTER_API_KEY": "secret-or",
+                "OPENROUTER_BASE_URL": "https://openrouter.example/api/v1",
+                "OPENAI_API_KEY": "",
+                "OPENAI_BASE_URL": "https://wrong.example/v1",
+            },
+            clear=False,
+        ), patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            response = svc.embed_texts(
+                EmbedTextsRequest(texts=("hello",), model="qwen/qwen3-embedding-8b")
+            )
+
+        self.assertEqual(response.model_used, "qwen/qwen3-embedding-8b")
+        self.assertTrue(captured["url"].startswith("https://openrouter.example/api/v1"))
+        self.assertEqual(captured["auth"], "Bearer secret-or")
+
 
 def _process_request(
     mode: ChatMode,
@@ -299,6 +402,37 @@ def _process_request(
             privacy_flags=privacy_flags,
         ),
         memory_context=("Customer prefers short replies.",),
+    )
+
+
+def _process_request_with_memory(
+    mode: ChatMode,
+    text: str,
+    memory_context: tuple[str, ...],
+    privacy_flags: tuple[PrivacyFlag, ...] = (),
+) -> AIProcessMessageRequest:
+    """Build a process-message request with an explicit memory context."""
+    return AIProcessMessageRequest(
+        request_id="req-1",
+        event=NormalizedTelegramEvent(
+            event_id="evt-1",
+            tenant_id="tenant-1",
+            chat_id="chat-1",
+            telegram_update_id=100,
+            business_connection_id="bc-1",
+            source_message_id="msg-1",
+            sender_id="sender-1",
+            message_text=text,
+            message_type="text",
+            created_at="2026-05-27T10:00:00Z",
+        ),
+        chat_settings=ChatSettings(
+            tenant_id="tenant-1",
+            chat_id="chat-1",
+            mode=mode,
+            privacy_flags=privacy_flags,
+        ),
+        memory_context=memory_context,
     )
 
 

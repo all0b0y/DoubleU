@@ -2,7 +2,6 @@ package httpapi
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -29,6 +28,7 @@ func TestHealthEndpoints(t *testing.T) {
 func TestTelegramWebhookRoute(t *testing.T) {
 	repository := store.NewRepository()
 	repository.SaveChatSettings(contracts.ChatSettings{TenantID: "tenant-1", ChatID: "42", Mode: contracts.ChatModeManual})
+	repository.SaveChat(store.ChatRecord{TenantID: "tenant-1", ChatID: "42"})
 	server := NewServer(core.NewService(repository, routeAI{}, nil))
 	body := `{"update_id":1,"business_message":{"message_id":2,"business_connection_id":"bc","chat":{"id":42},"from":{"id":7},"text":"hi","date":1700000000}}`
 	req := httptest.NewRequest(http.MethodPost, "/telegram/webhook", strings.NewReader(body))
@@ -36,15 +36,9 @@ func TestTelegramWebhookRoute(t *testing.T) {
 	res := httptest.NewRecorder()
 
 	server.ServeHTTP(res, req)
+	// Webhook ACKs immediately with 200 and processes in a background goroutine.
 	if res.Code != http.StatusOK {
 		t.Fatalf("status = %d body=%s", res.Code, res.Body.String())
-	}
-	var result core.InboundResult
-	if err := json.NewDecoder(res.Body).Decode(&result); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if result.Decision != contracts.DecisionDraft || result.DraftID == "" {
-		t.Fatalf("result = %+v", result)
 	}
 }
 

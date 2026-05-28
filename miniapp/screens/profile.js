@@ -8,6 +8,9 @@ const TABS = [
   { id: 'chat',    label: 'Чат' },
 ];
 
+// Minimum character requirement for "Я" and "Чат" message fields before saving.
+const MIN_MESSAGE_LENGTH = 20;
+
 function parseNotes(raw) {
   try { return JSON.parse(raw || '{}'); } catch (_) { return {}; }
 }
@@ -41,29 +44,41 @@ export function renderProfile(navigate, chatId) {
     </div>
   `;
 
-  // Tab clicks
-  el.querySelector('#tab-bar').addEventListener('click', (e) => {
-    const btn = e.target.closest('[data-tab]');
-    if (!btn) return;
-    twa?.HapticFeedback?.selectionChanged();
-    activeTab = btn.dataset.tab;
-    el.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === activeTab));
-    renderTab();
-  });
-
-  function getFormValues() {
+  function captureCurrentTab() {
     const notes = parseNotes(profile.notes);
-    return {
-      name:              el.querySelector('#f-name')?.value     ?? profile.name,
-      gender:            el.querySelector('#f-gender')?.value   ?? profile.gender,
-      role:              el.querySelector('#f-role')?.value      ?? profile.role,
-      relationship_type: el.querySelector('#f-reltype')?.value  ?? profile.relationship_type,
+    profile = {
+      ...profile,
+      name:              el.querySelector('#f-name')?.value              ?? profile.name,
+      gender:            el.querySelector('#f-gender')?.value            ?? profile.gender,
+      role:              el.querySelector('#f-role')?.value              ?? profile.role,
+      relationship_type: el.querySelector('#f-reltype')?.value           ?? profile.relationship_type,
       notes: serializeNotes({
         ...notes,
         me_style:     el.querySelector('#f-me-style')?.value    ?? notes.me_style    ?? '',
         chat_context: el.querySelector('#f-chat-ctx')?.value    ?? notes.chat_context ?? '',
       }),
     };
+  }
+
+  // Tab clicks — capture current values before switching so nothing is lost (issue 6)
+  el.querySelector('#tab-bar').addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-tab]');
+    if (!btn || btn.dataset.tab === activeTab) return;
+    twa?.HapticFeedback?.selectionChanged();
+    captureCurrentTab();
+    activeTab = btn.dataset.tab;
+    el.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === activeTab));
+    renderTab();
+  });
+
+  function getFormValues() {
+    captureCurrentTab();
+    return profile;
+  }
+
+  function msgCounter(len) {
+    const color = len > 0 && len < MIN_MESSAGE_LENGTH ? 'var(--error, #f44)' : 'var(--muted)';
+    return `<span style="font-size:11px;color:${color};">${len}/${MIN_MESSAGE_LENGTH}</span>`;
   }
 
   function renderTab() {
@@ -102,36 +117,64 @@ export function renderProfile(navigate, chatId) {
         </div>
       `;
     } else if (activeTab === 'me') {
+      const meStyle = notes.me_style || '';
       content.innerHTML = `
         <div style="font-size:13px;color:var(--hint);line-height:1.5;">
           Как ты общаешься с этим человеком: тон, стиль, привычки.
         </div>
         <div class="field-group">
-          <div class="field-label">Мой стиль</div>
+          <div class="field-label" style="display:flex;justify-content:space-between;align-items:center;">
+            <span>Мой стиль</span>
+            <span id="counter-me-style" style="font-size:11px;color:var(--muted);">${msgCounter(meStyle.length)}</span>
+          </div>
           <textarea class="field-input field-textarea" id="f-me-style"
-            placeholder="Неформально, с уменьшительными, часто шучу…"
-          >${esc(notes.me_style || '')}</textarea>
+            placeholder="Неформально, шучу…"
+          >${esc(meStyle)}</textarea>
         </div>
       `;
+      el.querySelector('#f-me-style').addEventListener('input', (e) => {
+        const counter = el.querySelector('#counter-me-style');
+        if (counter) counter.innerHTML = msgCounter(e.target.value.length);
+      });
     } else {
+      const chatCtx = notes.chat_context || '';
       content.innerHTML = `
         <div style="font-size:13px;color:var(--hint);line-height:1.5;">
           О чём вы разговариваете, важные темы.
         </div>
         <div class="field-group">
-          <div class="field-label">Контекст чата</div>
+          <div class="field-label" style="display:flex;justify-content:space-between;align-items:center;">
+            <span>Контекст чата</span>
+            <span id="counter-chat-ctx" style="font-size:11px;color:var(--muted);">${msgCounter(chatCtx.length)}</span>
+          </div>
           <textarea class="field-input field-textarea" id="f-chat-ctx"
-            placeholder="Переписка с менеджером по проекту X…"
-          >${esc(notes.chat_context || '')}</textarea>
+            placeholder="Проект X, менеджер…"
+          >${esc(chatCtx)}</textarea>
         </div>
       `;
+      el.querySelector('#f-chat-ctx').addEventListener('input', (e) => {
+        const counter = el.querySelector('#counter-chat-ctx');
+        if (counter) counter.innerHTML = msgCounter(e.target.value.length);
+      });
     }
   }
 
-  // Save
   el.querySelector('#btn-save').addEventListener('click', async () => {
     twa?.HapticFeedback?.impactOccurred('medium');
     const data = getFormValues();
+    const notes = parseNotes(data.notes);
+    const meStyle = (notes.me_style || '').trim();
+    const chatCtx = (notes.chat_context || '').trim();
+    if (meStyle && meStyle.length < MIN_MESSAGE_LENGTH) {
+      twa?.HapticFeedback?.notificationOccurred('error');
+      twa?.showAlert(`Поле "Мой стиль" должно содержать не менее ${MIN_MESSAGE_LENGTH} символов.`);
+      return;
+    }
+    if (chatCtx && chatCtx.length < MIN_MESSAGE_LENGTH) {
+      twa?.HapticFeedback?.notificationOccurred('error');
+      twa?.showAlert(`Поле "Контекст чата" должно содержать не менее ${MIN_MESSAGE_LENGTH} символов.`);
+      return;
+    }
     const btn = el.querySelector('#btn-save');
     btn.textContent = '…'; btn.disabled = true;
     try {

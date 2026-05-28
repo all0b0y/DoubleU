@@ -207,6 +207,9 @@ const (
 	ApprovalEditRequest ApprovalAction = "edit_request"
 	// ApprovalAIRefine puts the bot into "waiting for AI refinement instruction" state.
 	ApprovalAIRefine ApprovalAction = "ai_refine"
+	// ApprovalChooseOption selects one of the AI-suggested options from a question card.
+	// The chosen option is used as a hint so the AI can craft a full reply.
+	ApprovalChooseOption ApprovalAction = "choose_option"
 )
 
 // IsValid reports whether the approval action is part of the frozen contract.
@@ -214,7 +217,8 @@ func (a ApprovalAction) IsValid() bool {
 	switch a {
 	case ApprovalApprove, ApprovalReject, ApprovalRegenerate, ApprovalEdit,
 		ApprovalMakeShorter, ApprovalMakeMoreFormal, ApprovalNoMemory,
-		ApprovalThumbUp, ApprovalThumbDown, ApprovalEditRequest, ApprovalAIRefine:
+		ApprovalThumbUp, ApprovalThumbDown, ApprovalEditRequest, ApprovalAIRefine,
+		ApprovalChooseOption:
 		return true
 	default:
 		return false
@@ -255,6 +259,7 @@ func CallbackDataEncode(action ApprovalAction, draftID string) string {
 }
 
 // CallbackDataDecode parses a Telegram callback_data string back into action + draftID + idempotencyKey.
+// For ApprovalChooseOption callbacks use CallbackDataDecodeChoice instead.
 func CallbackDataDecode(data string) (action ApprovalAction, draftID string, idempotencyKey string, ok bool) {
 	idx := strings.Index(data, ":")
 	if idx < 0 {
@@ -271,15 +276,200 @@ func CallbackDataDecode(data string) (action ApprovalAction, draftID string, ide
 	return action, draftID, idempotencyKey, true
 }
 
+// CallbackDataEncodeChoice encodes a question-option selection into a callback_data string (≤64 bytes).
+// Format: "co:{N}:{bareID}" where N is the single-digit option index (0–9).
+func CallbackDataEncodeChoice(draftID string, optionIdx int) string {
+	bare := strings.TrimPrefix(draftID, "draft:")
+	return fmt.Sprintf("co:%d:%s", optionIdx, bare)
+}
+
+// CallbackDataDecodeChoice parses a choice callback_data string ("co:{N}:{bareID}").
+// Returns false if the data is not in choice format.
+func CallbackDataDecodeChoice(data string) (optionIdx int, draftID string, idempotencyKey string, ok bool) {
+	if !strings.HasPrefix(data, "co:") {
+		return 0, "", "", false
+	}
+	rest := data[3:] // strip "co:"
+	sep := strings.Index(rest, ":")
+	if sep < 0 {
+		return 0, "", "", false
+	}
+	n, err := strconv.Atoi(rest[:sep])
+	if err != nil || n < 0 || n > 9 {
+		return 0, "", "", false
+	}
+	bare := rest[sep+1:]
+	draftID = "draft:" + bare
+	idempotencyKey = draftID + ":choose_option:" + strconv.Itoa(n)
+	return n, draftID, idempotencyKey, true
+}
+
 // ContactProfile is the owner-supplied description of a contact in a specific chat.
+// It maps to the contact_profiles table and covers three concerns:
+//  1. Собеседник — objective facts about the contact.
+//  2. Я с ним — how the owner communicates with this contact (style).
+//  3. Чат — what this conversation is about.
+//
+// Backwards-compat fields (Name, Notes) are preserved so existing UI code and
+// API clients continue to work without changes.
 type ContactProfile struct {
-	TenantID         string `json:"tenant_id"`
-	ChatID           string `json:"chat_id"`
-	Name             string `json:"name,omitempty"`
-	Gender           string `json:"gender,omitempty"`           // "male", "female", "other", ""
-	Role             string `json:"role,omitempty"`             // "friend", "colleague", "client", "partner", "family"
-	RelationshipType string `json:"relationship_type,omitempty"` // "formal", "informal", "business"
-	Notes            string `json:"notes,omitempty"`
+	TenantID string `json:"tenant_id"`
+	ChatID   string `json:"chat_id"`
+
+	// --- Собеседник (contact identity) ---
+	// DisplayNames holds all known names/aliases for the contact.
+	// DisplayNames[0] is the primary name; kept in sync with the Name field.
+	DisplayNames     []string `json:"display_names,omitempty"`
+	PreferredAddress string   `json:"preferred_address,omitempty"`
+	// Gender: male, female, non_binary, unknown (or legacy: other, "").
+	Gender string `json:"gender,omitempty"`
+	// Role is a free-text descriptor (client, colleague, partner, …).
+	Role string `json:"role,omitempty"`
+	// RelationshipType: family, romantic, friendship, professional, acquaintance, unknown.
+	// Legacy values (personal, business) are accepted at the API layer.
+	RelationshipType string `json:"relationship_type,omitempty"`
+	Language         string `json:"language,omitempty"`
+	ContactTimezone  string `json:"contact_timezone,omitempty"`
+
+	// --- Я с ним (communication style for this chat) ---
+	// Tone: formal, neutral, casual. NULL means cold-start default by relationship_type.
+	Tone string `json:"tone,omitempty"`
+	// EmojiUsage: none, rare, frequent.
+	EmojiUsage string `json:"emoji_usage,omitempty"`
+	// AddressForm: ty (informal), vy (formal).
+	AddressForm string `json:"address_form,omitempty"`
+	// StyleNotes is a free-text complement to structured style fields.
+	StyleNotes string `json:"style_notes,omitempty"`
+
+	// --- Чат (conversation context) ---
+	Topics       []string `json:"topics,omitempty"`
+	ChatContext  string   `json:"chat_context,omitempty"`
+	DoNotDiscuss []string `json:"do_not_discuss,omitempty"`
+
+	// --- Backwards-compat fields ---
+	// Name mirrors DisplayNames[0]; kept for existing UI and API consumers.
+	Name string `json:"name,omitempty"`
+	// Notes is a JSON string "{me_style, chat_context}" used by the current
+	// Mini App profile screen. Derived from StyleNotes / ChatContext on read;
+	// parsed into those fields on write.
+	Notes string `json:"notes,omitempty"`
+}
+
+// DisplayName returns the primary display name for the contact.
+// It checks DisplayNames first, then falls back to the legacy Name field.
+func (p ContactProfile) DisplayName() string {
+	if len(p.DisplayNames) > 0 {
+		return p.DisplayNames[0]
+	}
+	return p.Name
+}
+
+// ColdStartTone returns the default tone for a contact whose Tone field is empty,
+// derived from the relationship type (§4.6 of architecture doc).
+func (p ContactProfile) ColdStartTone() string {
+	if p.Tone != "" {
+		return p.Tone
+	}
+	switch p.RelationshipType {
+	case "family", "romantic", "friendship", "personal":
+		return "casual"
+	case "professional", "business":
+		return "formal"
+	default:
+		return "neutral"
+	}
+}
+
+// ColdStartEmojiUsage returns the default emoji-usage level when EmojiUsage is empty.
+func (p ContactProfile) ColdStartEmojiUsage() string {
+	if p.EmojiUsage != "" {
+		return p.EmojiUsage
+	}
+	switch p.RelationshipType {
+	case "romantic", "friendship", "personal":
+		return "frequent"
+	case "professional", "business":
+		return "none"
+	default:
+		return "rare"
+	}
+}
+
+// ColdStartAddressForm returns the default address form when AddressForm is empty.
+func (p ContactProfile) ColdStartAddressForm() string {
+	if p.AddressForm != "" {
+		return p.AddressForm
+	}
+	switch p.RelationshipType {
+	case "family", "romantic", "friendship", "personal":
+		return "ty"
+	default:
+		return "vy"
+	}
+}
+
+// UserSettings stores per-owner identity and behaviour preferences (User Layer).
+type UserSettings struct {
+	UserID             string   `json:"user_id"`
+	TenantID           string   `json:"tenant_id"`
+	DisplayName        string   `json:"display_name,omitempty"`
+	Bio                string   `json:"bio,omitempty"`
+	Timezone           string   `json:"timezone,omitempty"`
+	PrimaryLanguage    string   `json:"primary_language"`
+	SecondaryLanguages []string `json:"secondary_languages"`
+	// DefaultModeForNewChats: off, observe, manual, semi_auto, auto.
+	DefaultModeForNewChats string `json:"default_mode_for_new_chats"`
+	LearningEnabled        bool   `json:"learning_enabled"`
+	// LanguageForDrafts: auto (detect from contact) or primary (always use PrimaryLanguage).
+	LanguageForDrafts string `json:"language_for_drafts"`
+}
+
+// SemanticFact is a typed, atomic piece of knowledge about the conversation
+// or the owner, stored in the Semantic Layer (semantic_facts table).
+type SemanticFact struct {
+	ID   int64  `json:"id"`
+	// ScopeKind: "chat" (visible in one chat) or "owner_global" (visible in all chats).
+	ScopeKind string `json:"scope_kind"`
+	TenantID  string `json:"tenant_id"`
+	ChatID    string `json:"chat_id,omitempty"`
+	FactText  string `json:"fact_text"`
+	// FactType: preference, biographical, commitment, event, relationship, health, taboo.
+	FactType string `json:"fact_type"`
+	// Subject: contact, owner, relationship, third_party.
+	Subject         string   `json:"subject"`
+	Confidence      float64  `json:"confidence"`
+	// Source: llm_extracted, owner_confirmed, owner_authored.
+	Source          string     `json:"source"`
+	SourceMessageID string     `json:"source_message_id,omitempty"`
+	ExpiresAt       *time.Time `json:"expires_at,omitempty"`
+	CreatedAt       time.Time  `json:"created_at"`
+}
+
+// ActiveEpisode represents the open (not yet summarised) episode for a chat
+// (Runtime State Layer, active_episodes table).
+type ActiveEpisode struct {
+	TenantID           string    `json:"tenant_id"`
+	ChatID             string    `json:"chat_id"`
+	StartedAt          time.Time `json:"started_at"`
+	LastMessageAt      time.Time `json:"last_message_at"`
+	MessageCount       int       `json:"message_count"`
+	CurrentTopic       string    `json:"current_topic,omitempty"`
+	OpenQuestionMsgID  string    `json:"open_question_message_id,omitempty"`
+	PendingOwnerAction string    `json:"pending_owner_action,omitempty"`
+}
+
+// EpisodeSummary is a compressed record of a closed conversation episode
+// (Episodic Layer, episode_summaries table).
+type EpisodeSummary struct {
+	ID            int64     `json:"id"`
+	TenantID      string    `json:"tenant_id"`
+	ChatID        string    `json:"chat_id"`
+	PeriodStart   time.Time `json:"period_start"`
+	PeriodEnd     time.Time `json:"period_end"`
+	Content       string    `json:"content"`
+	ClosureReason string    `json:"closure_reason"`
+	MessageCount  int       `json:"message_count"`
+	CreatedAt     time.Time `json:"created_at"`
 }
 
 // DraftFeedback stores owner feedback on a generated draft.
@@ -367,9 +557,14 @@ type AIProcessMessageRequest struct {
 	RequestID       string                  `json:"request_id"`
 	Event           NormalizedTelegramEvent `json:"event"`
 	ChatSettings    ChatSettings            `json:"chat_settings"`
+	// MemoryContext is the assembled prompt context (Working + Episodic + Semantic layers).
 	MemoryContext   []string                `json:"memory_context"`
 	FeedbackContext []FeedbackItem          `json:"feedback_context,omitempty"`
 	ContactProfile  *ContactProfile         `json:"contact_profile,omitempty"`
+	// UserSettings provides the owner's identity and preferences to the AI.
+	UserSettings    *UserSettings           `json:"user_settings,omitempty"`
+	// ActiveEpisode gives the AI awareness of the current open conversation episode.
+	ActiveEpisode   *ActiveEpisode          `json:"active_episode,omitempty"`
 }
 
 // TokenUsage contains model input and output token counts.
@@ -423,6 +618,9 @@ type ChatSummaryRequest struct {
 type ChatSummaryResponse struct {
 	Summary          string     `json:"summary"`
 	ActionItems      []string   `json:"action_items"`
+	// Recommendations are proactive suggestions for the owner based on the contact's interests
+	// and conversation history. Populated by the Python AI service when relevant.
+	Recommendations  []string   `json:"recommendations,omitempty"`
 	ModelUsed        string     `json:"model_used"`
 	Usage            TokenUsage `json:"usage"`
 	BlockedByPrivacy bool       `json:"blocked_by_privacy"`
@@ -430,18 +628,23 @@ type ChatSummaryResponse struct {
 
 // ContextScore computes a 0–100 richness score for a chat based on available knowledge.
 // It is used to determine which autonomy modes are unlocked for this chat.
+// Scoring accounts for the richer ContactProfile schema: style fields add additional weight.
 func ContextScore[F any, FB any](profile ContactProfile, facts []F, feedback []FB) int {
 	score := 0
 	if profile.Gender != "" {
-		score += 15
+		score += 10
 	}
 	if profile.Role != "" {
-		score += 20
+		score += 15
 	}
 	if profile.RelationshipType != "" {
 		score += 15
 	}
-	if profile.Name != "" {
+	if profile.DisplayName() != "" {
+		score += 10
+	}
+	// Style fields signal the owner has personalised this contact's profile.
+	if profile.Tone != "" || profile.EmojiUsage != "" || profile.AddressForm != "" {
 		score += 10
 	}
 	if len(facts) >= 3 {
@@ -456,9 +659,9 @@ func ContextScore[F any, FB any](profile ContactProfile, facts []F, feedback []F
 }
 
 // UnlockedModesForScore returns the chat modes available at a given context score.
-// silent and manual are always available; semi_auto requires ≥50; auto requires ≥80.
+// disabled, silent, and manual are always available; semi_auto requires ≥50; auto requires ≥80.
 func UnlockedModesForScore(score int) []ChatMode {
-	modes := []ChatMode{ChatModeSilent, ChatModeManual}
+	modes := []ChatMode{ChatModeDisabled, ChatModeSilent, ChatModeManual}
 	if score >= 50 {
 		modes = append(modes, ChatModeSemiAuto)
 	}

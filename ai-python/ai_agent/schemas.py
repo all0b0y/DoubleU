@@ -224,6 +224,66 @@ class MemoryExtractionResponse(JsonDataclass):
 
 
 @dataclass(frozen=True)
+class TypedFact(JsonDataclass):
+    """A single typed, atomic fact extracted from a message.
+
+    Mirrors the SemanticFact contract (§5.4): fact_type and subject determine
+    the scope routing on the Go side.  scope_kind is a hint; Go applies the
+    deterministic routing rules from the design document.
+    """
+
+    fact_text: str
+    # One of: preference, biographical, commitment, event, relationship, health, taboo.
+    fact_type: str
+    # One of: contact, owner, relationship, third_party.
+    subject: str
+    # Routing hint: "chat" or "owner_global".  Go enforces deterministic routing.
+    scope_kind: str = "chat"
+    confidence: float = 0.75
+
+
+@dataclass(frozen=True)
+class TypedExtractionRequest(JsonDataclass):
+    """Request body for `/ai/extract-facts-typed`."""
+
+    message_text: str
+    tenant_id: str = ""
+    chat_id: str = ""
+    privacy_flags: tuple[PrivacyFlag, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
+class TypedExtractionResponse(JsonDataclass):
+    """Response body for `/ai/extract-facts-typed`."""
+
+    facts: tuple[TypedFact, ...]
+    blocked_by_privacy: bool
+
+
+@dataclass(frozen=True)
+class EmbedTextsRequest(JsonDataclass):
+    """Request body for `/ai/embed-texts`.
+
+    The Go backend sends batches of fact/episode texts to embed.
+    Returns float vectors (4096-dim for qwen/qwen3-embedding-8b) per input text.
+    """
+
+    texts: tuple[str, ...]
+    model: str = "qwen/qwen3-embedding-8b"
+
+
+@dataclass(frozen=True)
+class EmbedTextsResponse(JsonDataclass):
+    """Response body for `/ai/embed-texts`.
+
+    embeddings[i] corresponds to texts[i]; vectors are 4096-dim float lists.
+    """
+
+    embeddings: tuple[tuple[float, ...], ...]
+    model_used: str
+
+
+@dataclass(frozen=True)
 class ChatSummaryRequest(JsonDataclass):
     """Request body for `/ai/summarize-chat`."""
 
@@ -317,6 +377,25 @@ def parse_intent_request(payload: dict[str, Any]) -> IntentRequest:
 def parse_memory_request(payload: dict[str, Any]) -> MemoryExtractionRequest:
     """Parse an extract-memory JSON object into a typed request."""
     return MemoryExtractionRequest(
+        message_text=str(payload["message_text"]),
+        tenant_id=str(payload.get("tenant_id", "")),
+        chat_id=str(payload.get("chat_id", "")),
+        privacy_flags=_parse_privacy_flags(payload.get("privacy_flags", [])),
+    )
+
+
+def parse_embed_texts_request(payload: dict[str, Any]) -> EmbedTextsRequest:
+    """Parse an embed-texts JSON object into a typed request."""
+    texts = payload.get("texts") or []
+    return EmbedTextsRequest(
+        texts=tuple(str(t) for t in texts),
+        model=str(payload.get("model", "qwen/qwen3-embedding-8b")),
+    )
+
+
+def parse_typed_extraction_request(payload: dict[str, Any]) -> TypedExtractionRequest:
+    """Parse an extract-facts-typed JSON object into a typed request."""
+    return TypedExtractionRequest(
         message_text=str(payload["message_text"]),
         tenant_id=str(payload.get("tenant_id", "")),
         chat_id=str(payload.get("chat_id", "")),

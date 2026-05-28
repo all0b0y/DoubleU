@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from uuid import uuid5, NAMESPACE_URL
 
-from .classifiers import IntentClassifier, MemoryExtractor, RiskClassifier
+logger = logging.getLogger(__name__)
+
+from .classifiers import IntentClassifier, MemoryExtractor, RiskClassifier, TypedMemoryExtractor
 from .llm import ModelRouter
 from .schemas import (
     AIProcessMessageRequest,
@@ -18,6 +21,8 @@ from .schemas import (
     Decision,
     DraftRequest,
     DraftResponse,
+    EmbedTextsRequest,
+    EmbedTextsResponse,
     IntentRequest,
     IntentResponse,
     MemoryExtractionRequest,
@@ -27,6 +32,9 @@ from .schemas import (
     RiskLevel,
     RiskRequest,
     RiskResponse,
+    TypedExtractionRequest,
+    TypedExtractionResponse,
+    TypedFact,
     Usage,
 )
 from .security import PromptBuilder
@@ -61,6 +69,7 @@ class AIService:
         risk_classifier: RiskClassifier | None = None,
         intent_classifier: IntentClassifier | None = None,
         memory_extractor: MemoryExtractor | None = None,
+        typed_extractor: TypedMemoryExtractor | None = None,
         prompt_builder: PromptBuilder | None = None,
         audit_sink: InMemoryAuditSink | None = None,
     ) -> None:
@@ -69,6 +78,7 @@ class AIService:
         self._risk_classifier = risk_classifier or RiskClassifier()
         self._intent_classifier = intent_classifier or IntentClassifier()
         self._memory_extractor = memory_extractor or MemoryExtractor()
+        self._typed_extractor = typed_extractor or TypedMemoryExtractor()
         self._prompt_builder = prompt_builder or PromptBuilder()
         self._audit_sink = audit_sink or InMemoryAuditSink()
 
@@ -95,6 +105,99 @@ class AIService:
     def extract_memory(self, request: MemoryExtractionRequest) -> MemoryExtractionResponse:
         """Extract memory candidates while honoring privacy flags."""
         return self._memory_extractor.extract(request.message_text, request.privacy_flags)
+
+    def extract_facts_typed(self, request: TypedExtractionRequest) -> TypedExtractionResponse:
+        """Extract typed, scoped facts from a message using deterministic rules + optional LLM.
+
+        Returns a TypedExtractionResponse where each TypedFact carries fact_type, subject,
+        scope_kind, and confidence so the Go backend can route facts without hard-coded defaults.
+        Called asynchronously by the Go backend after the draft is dispatched.
+        """
+        if PrivacyFlag.NO_MEMORY in request.privacy_flags:
+            return TypedExtractionResponse(facts=(), blocked_by_privacy=True)
+
+        # Deterministic rule-based extraction (fast, always runs).
+        deterministic = self._typed_extractor.extract(request.message_text, request.privacy_flags)
+
+        # LLM-powered extraction for richer coverage; falls back gracefully on failure.
+        llm_facts = self._extract_facts_llm_typed(request.message_text, request.privacy_flags)
+
+        # Merge: prefer LLM facts, add deterministic facts not already covered.
+        merged = list(llm_facts)
+        llm_texts = {f.fact_text.lower().strip() for f in llm_facts}
+        for f in deterministic.facts:
+            if f.fact_text.lower().strip() not in llm_texts:
+                merged.append(f)
+
+        return TypedExtractionResponse(facts=tuple(merged), blocked_by_privacy=False)
+
+    def _extract_facts_llm_typed(
+        self,
+        message_text: str,
+        privacy_flags: tuple[PrivacyFlag, ...],
+    ) -> tuple[TypedFact, ...]:
+        """Use LLM to extract typed facts; returns empty tuple on failure or when memory disabled."""
+        if PrivacyFlag.NO_MEMORY in privacy_flags or not message_text.strip():
+            return ()
+        system_prompt, user_payload = self._prompt_builder.build(
+            (
+                "Extract durable facts from the message below. "
+                "Output a JSON array of objects, each with keys: "
+                "fact_text (string, ≤120 chars), "
+                "fact_type (one of: preference, biographical, commitment, event, relationship, health, taboo), "
+                "subject (one of: contact, owner, relationship, third_party), "
+                "scope_kind (one of: chat, owner_global), "
+                "confidence (float 0–1). "
+                "health and biographical facts about the owner should use scope_kind=owner_global. "
+                "Return [] if there are no durable facts. "
+                "Output only the JSON array, no prose."
+            ),
+            message_text,
+            (),
+        )
+        try:
+            response = self._router.complete(ModelTask.EXTRACT_FACTS, system_prompt, user_payload)
+            raw = response.text.strip()
+            if not raw:
+                return ()
+            import json
+            items = json.loads(raw)
+            if not isinstance(items, list):
+                return ()
+            facts: list[TypedFact] = []
+            valid_fact_types = {"preference", "biographical", "commitment", "event",
+                                "relationship", "health", "taboo"}
+            valid_subjects = {"contact", "owner", "relationship", "third_party"}
+            valid_scopes = {"chat", "owner_global"}
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                text = str(item.get("fact_text", "")).strip()
+                fact_type = str(item.get("fact_type", "preference"))
+                subject = str(item.get("subject", "contact"))
+                scope = str(item.get("scope_kind", "chat"))
+                confidence = float(item.get("confidence", 0.75))
+                if not text or len(text) < 5 or len(text) > 120:
+                    continue
+                if fact_type not in valid_fact_types:
+                    fact_type = "preference"
+                if subject not in valid_subjects:
+                    subject = "contact"
+                if scope not in valid_scopes:
+                    scope = "chat"
+                # Deterministic scope override: owner health/biographical always global.
+                if subject == "owner" and fact_type in ("health", "biographical"):
+                    scope = "owner_global"
+                facts.append(TypedFact(
+                    fact_text=text,
+                    fact_type=fact_type,
+                    subject=subject,
+                    scope_kind=scope,
+                    confidence=min(max(confidence, 0.0), 1.0),
+                ))
+            return tuple(facts)
+        except (RuntimeError, Exception):
+            return ()
 
     def generate_draft(self, request: DraftRequest) -> DraftResponse:
         """Generate a draft reply through the model router and gateway."""
@@ -149,13 +252,17 @@ class AIService:
         confidence = _confidence_for(risk.risk_level, intent.confidence)
         no_memory = PrivacyFlag.NO_MEMORY in request.chat_settings.privacy_flags
 
-        # Extract durable facts from this message via LLM; fall back to regex extractor.
-        extracted_facts = self._extract_facts_llm(request.event.message_text, request.chat_settings.privacy_flags)
-        if not extracted_facts:
-            extracted_facts = self._memory_extractor.extract(
-                request.event.message_text, request.chat_settings.privacy_flags
-            ).memories
-        memory_used = () if no_memory else (request.memory_context + extracted_facts)
+        # Synchronous memory extraction in the hot reply path is intentionally limited to the
+        # fast regex extractor.  LLM-based extraction is expensive and blocks reply latency;
+        # per the design (§7.1) it must run asynchronously after the draft is returned.
+        # The Go backend fires an /ai/extract-memory call in a goroutine after dispatch.
+        # memory_used contains only the regex-extracted facts (fast, no LLM round-trip).
+        # IMPORTANT: never include request.memory_context here — that causes self-poisoning.
+        extracted_facts = self._memory_extractor.extract(
+            request.event.message_text, request.chat_settings.privacy_flags
+        ).memories
+        # memory_used = only facts extracted from THIS message, not the assembled input context.
+        memory_used = () if no_memory else extracted_facts
 
         try:
             response_text, model_used, usage = self._maybe_generate_response(request, risk.risk_level, risk.reasons)
@@ -306,6 +413,72 @@ class AIService:
                 created_at=datetime.now(timezone.utc).isoformat(),
             )
         )
+
+
+    def embed_texts(self, request: EmbedTextsRequest) -> EmbedTextsResponse:
+        """Generate embeddings for a batch of texts using the configured embedding provider.
+
+        Prefers OpenRouter credentials when available (the production deployment
+        only sets OPENROUTER_* envs), falling back to OPENAI_* envs for local
+        dev.  Failures are logged with the upstream error so silent embed misses
+        no longer go undetected.
+
+        Returns zero-length vectors when no embedding API is reachable so callers
+        can proceed without crashing; the DB stores an empty array and semantic
+        similarity falls back to exact-hash dedup until embeddings are populated.
+        """
+        import os
+        openrouter_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+        openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+        api_key = openrouter_key or openai_key
+        if not api_key or not request.texts:
+            empty: tuple[tuple[float, ...], ...] = tuple(() for _ in request.texts)
+            return EmbedTextsResponse(embeddings=empty, model_used="none")
+
+        import urllib.request
+        import json
+        if openrouter_key:
+            base_url = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+        else:
+            base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+        model = request.model
+        body = json.dumps({"input": list(request.texts), "model": model}).encode("utf-8")
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        }
+        if openrouter_key:
+            app_name = os.getenv("OPENROUTER_APP_NAME", "").strip()
+            app_url = os.getenv("OPENROUTER_APP_URL", "").strip()
+            if app_url:
+                headers["HTTP-Referer"] = app_url
+            if app_name:
+                headers["X-Title"] = app_name
+        req = urllib.request.Request(
+            f"{base_url.rstrip('/')}/embeddings",
+            data=body,
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read())
+            embeddings = tuple(
+                tuple(item["embedding"])
+                for item in sorted(data["data"], key=lambda x: x["index"])
+            )
+            return EmbedTextsResponse(embeddings=embeddings, model_used=model)
+        except Exception as e:
+            # Surface the upstream failure: silent swallows previously masked
+            # a 404 from OpenRouter for `text-embedding-3-small`, leaving
+            # `fact_embeddings` permanently empty.  Logged at warning so it
+            # appears in production logs without being noisy at debug.
+            logger.warning(
+                "embed_texts failed",
+                extra={"model": model, "base_url": base_url, "error": str(e)},
+            )
+            empty = tuple(() for _ in request.texts)
+            return EmbedTextsResponse(embeddings=empty, model_used="error")
 
 
 def build_service(router: ModelRouter, audit_sink: InMemoryAuditSink | None = None) -> AIService:

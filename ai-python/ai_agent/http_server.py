@@ -11,11 +11,13 @@ from typing import Callable, Any
 from .llm import MockLLMGateway, ModelRouter, OpenRouterLLMGateway, UnconfiguredLLMGateway
 from .schemas import (
     parse_draft_request,
+    parse_embed_texts_request,
     parse_intent_request,
     parse_memory_request,
     parse_process_message_request,
     parse_risk_request,
     parse_summary_request,
+    parse_typed_extraction_request,
 )
 from .service import AIService, build_service
 
@@ -44,6 +46,8 @@ class AIHTTPHandler(BaseHTTPRequestHandler):
             "/ai/classify-risk": self._classify_risk,
             "/ai/classify-intent": self._classify_intent,
             "/ai/extract-memory": self._extract_memory,
+            "/ai/extract-facts-typed": self._extract_facts_typed,
+            "/ai/embed-texts": self._embed_texts,
             "/ai/summarize-chat": self._summarize_chat,
         }
         route = routes.get(self.path)
@@ -88,6 +92,12 @@ class AIHTTPHandler(BaseHTTPRequestHandler):
 
     def _extract_memory(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self.service.extract_memory(parse_memory_request(payload)).to_dict()
+
+    def _extract_facts_typed(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self.service.extract_facts_typed(parse_typed_extraction_request(payload)).to_dict()
+
+    def _embed_texts(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self.service.embed_texts(parse_embed_texts_request(payload)).to_dict()
 
     def _summarize_chat(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self.service.summarize_chat(parse_summary_request(payload)).to_dict()

@@ -63,6 +63,47 @@ func (c *HTTPClient) SummarizeChat(ctx context.Context, request contracts.ChatSu
 	return response, nil
 }
 
+// ExtractMemory calls the Python AI /ai/extract-memory endpoint to extract facts from a message.
+// This is designed for async use: callers should fire-and-forget via a goroutine.
+func (c *HTTPClient) ExtractMemory(ctx context.Context, request MemoryExtractionRequest) (MemoryExtractionResponse, error) {
+	var response MemoryExtractionResponse
+	if c.baseURL == "" {
+		return response, fmt.Errorf("ai base url is empty")
+	}
+	if err := c.postJSON(ctx, "/ai/extract-memory", request, &response); err != nil {
+		return response, err
+	}
+	return response, nil
+}
+
+// ExtractFactsTyped calls the Python AI /ai/extract-facts-typed endpoint.
+// Returns structured TypedFact objects with fact_type, subject, and scope_kind
+// so the Go backend can route facts without hard-coded defaults.
+// Designed for async use; callers should fire-and-forget via a goroutine.
+func (c *HTTPClient) ExtractFactsTyped(ctx context.Context, request TypedExtractionRequest) (TypedExtractionResponse, error) {
+	var response TypedExtractionResponse
+	if c.baseURL == "" {
+		return response, fmt.Errorf("ai base url is empty")
+	}
+	if err := c.postJSON(ctx, "/ai/extract-facts-typed", request, &response); err != nil {
+		return response, err
+	}
+	return response, nil
+}
+
+// EmbedTexts calls the Python AI /ai/embed-texts endpoint to generate embeddings.
+// The Go embedding worker calls this in batches for facts without embeddings.
+func (c *HTTPClient) EmbedTexts(ctx context.Context, request EmbedTextsRequest) (EmbedTextsResponse, error) {
+	var response EmbedTextsResponse
+	if c.baseURL == "" {
+		return response, fmt.Errorf("ai base url is empty")
+	}
+	if err := c.postJSON(ctx, "/ai/embed-texts", request, &response); err != nil {
+		return response, err
+	}
+	return response, nil
+}
+
 func (c *HTTPClient) postJSON(ctx context.Context, path string, input any, output any) error {
 	body, err := json.Marshal(input)
 	if err != nil {

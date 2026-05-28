@@ -303,10 +303,7 @@ func modeIsAvailable(mode contracts.ChatMode, available []contracts.ChatMode) bo
 }
 
 func contextScoreForChat(repository *store.Repository, tenantID, chatID string) int {
-	profile, _ := repository.ContactProfile(tenantID, chatID)
-	facts := repository.MemoryFacts(tenantID, chatID, 20)
-	feedback := repository.RecentFeedback(tenantID, chatID, 10)
-	return contracts.ContextScore(profile, facts, feedback)
+	return repository.ContextScoreForChat(tenantID, chatID)
 }
 
 func valueOrDash(s string) string {
@@ -445,4 +442,40 @@ func chatMenuKeyboard(chats []store.ChatRecord, tenantID string) telegram.ReplyK
 	// tenantID reserved for future per-chat unlock display.
 	_ = tenantID
 	return telegram.ReplyKeyboardMarkup{ResizeKeyboard: true, Keyboard: rows}
+}
+
+// QuestionCardText formats the owner notification for an incoming choice question.
+// Unlike DraftCardText it does not include a pre-written reply — the owner picks from options.
+func QuestionCardText(contactMsg, chatName string) string {
+	lines := []string{
+		fmt.Sprintf("❓ Вас спрашивают (%s):", chatName),
+		"",
+		contactMsg,
+		"",
+		"👇 Выберите ответ или напишите свой:",
+	}
+	return strings.Join(lines, "\n")
+}
+
+// QuestionOptionsKeyboard builds an inline keyboard with one button per option plus a
+// "Напишу сам" button that activates the owner text-edit flow.
+// Up to 9 options are supported (single-digit index in callback_data).
+func QuestionOptionsKeyboard(draftID string, options []string) telegram.InlineKeyboardMarkup {
+	rows := make([][]telegram.InlineKeyboardButton, 0, len(options)+1)
+	for i, opt := range options {
+		if i > 8 {
+			break // enforce single-digit index limit
+		}
+		label := opt
+		if len(label) > 30 {
+			label = label[:27] + "..."
+		}
+		rows = append(rows, []telegram.InlineKeyboardButton{
+			{Text: label, CallbackData: contracts.CallbackDataEncodeChoice(draftID, i)},
+		})
+	}
+	rows = append(rows, []telegram.InlineKeyboardButton{
+		{Text: "✏️ Напишу сам", CallbackData: contracts.CallbackDataEncode(contracts.ApprovalEditRequest, draftID)},
+	})
+	return telegram.InlineKeyboardMarkup{InlineKeyboard: rows}
 }

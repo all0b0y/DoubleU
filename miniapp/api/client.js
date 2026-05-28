@@ -39,6 +39,7 @@ export const api = {
   contacts:       ()              => request('GET',   '/api/v1/contacts'),
   getProfile:     (chatId)        => request('GET',   `/api/v1/chats/${chatId}/profile`),
   saveProfile:    (chatId, data)  => request('PUT',   `/api/v1/chats/${chatId}/profile`, data),
+  avatarURL:      (chatId)        => `/api/v1/chats/${chatId}/avatar`,
 };
 
 /** Open an SSE stream; returns the EventSource. Caller owns closing it. */

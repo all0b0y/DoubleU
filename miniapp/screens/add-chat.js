@@ -84,8 +84,9 @@ export function renderAddChat(navigate) {
 
   async function loadContacts() {
     try {
-      const data = await api.contacts();
-      allContacts = data.contacts || [];
+      const [contactsData, chatsData] = await Promise.all([api.contacts(), api.chats()]);
+      const addedIds = new Set((chatsData.chats || []).map(c => c.chat_id));
+      allContacts = (contactsData.contacts || []).filter(c => !addedIds.has(c.chat_id));
       renderContacts();
     } catch (err) {
       el.querySelector('#contact-list').innerHTML = `

@@ -89,6 +89,7 @@ func TestDecisionEngineContractCombinations(t *testing.T) {
 func TestHandleTelegramWebhookAutoReplyAndDuplicateAudit(t *testing.T) {
 	repository := store.NewRepository()
 	repository.SaveChatSettings(contracts.ChatSettings{TenantID: "tenant-1", ChatID: "42", Mode: contracts.ChatModeAuto})
+	repository.SaveChat(store.ChatRecord{TenantID: "tenant-1", ChatID: "42"})
 	ai := &fakeAI{response: contracts.AIProcessMessageResponse{
 		Decision:     contracts.DecisionAutoReply,
 		ResponseText: "hello",
@@ -131,6 +132,7 @@ func TestHandleTelegramWebhookAutoReplyAndDuplicateAudit(t *testing.T) {
 func TestHandleTelegramWebhookDisabledAuditsWithoutAI(t *testing.T) {
 	repository := store.NewRepository()
 	repository.SaveChatSettings(contracts.ChatSettings{TenantID: "tenant-1", ChatID: "42", Mode: contracts.ChatModeDisabled})
+	repository.SaveChat(store.ChatRecord{TenantID: "tenant-1", ChatID: "42"})
 	ai := &fakeAI{}
 	service := newTestService(repository, ai, &fakeSender{})
 
@@ -158,6 +160,7 @@ func TestHandleTelegramWebhookNoMemoryDoesNotRetainMessage(t *testing.T) {
 		Mode:         contracts.ChatModeManual,
 		PrivacyFlags: contracts.PrivacyFlags{contracts.PrivacyNoMemory},
 	})
+	repository.SaveChat(store.ChatRecord{TenantID: "tenant-1", ChatID: "42"})
 	ai := &fakeAI{response: contracts.AIProcessMessageResponse{
 		Decision:     contracts.DecisionDraft,
 		ResponseText: "draft",
@@ -181,6 +184,7 @@ func TestHandleTelegramWebhookNoMemoryDoesNotRetainMessage(t *testing.T) {
 func TestHandleTelegramWebhookAIErrorAuditsFallback(t *testing.T) {
 	repository := store.NewRepository()
 	repository.SaveChatSettings(contracts.ChatSettings{TenantID: "tenant-1", ChatID: "42", Mode: contracts.ChatModeManual})
+	repository.SaveChat(store.ChatRecord{TenantID: "tenant-1", ChatID: "42"})
 	service := newTestService(repository, &fakeAI{err: errors.New("boom")}, &fakeSender{})
 
 	result, err := service.HandleTelegramWebhook(context.Background(), telegramPayload(1004, "bc-1", 42, 7, "hi"), "tenant-1")
@@ -199,6 +203,7 @@ func TestHandleTelegramWebhookAIErrorAuditsFallback(t *testing.T) {
 func TestApprovalApproveIsIdempotent(t *testing.T) {
 	repository := store.NewRepository()
 	repository.SaveChatSettings(contracts.ChatSettings{TenantID: "tenant-1", ChatID: "42", Mode: contracts.ChatModeManual})
+	repository.SaveChat(store.ChatRecord{TenantID: "tenant-1", ChatID: "42"})
 	ai := &fakeAI{response: contracts.AIProcessMessageResponse{
 		Decision:     contracts.DecisionDraft,
 		ResponseText: "draft",
@@ -324,6 +329,7 @@ func TestBusinessMessageUsesSavedConnectionTenant(t *testing.T) {
 		IsEnabled:    true,
 	})
 	repository.SaveChatSettings(contracts.ChatSettings{TenantID: "tenant:user:77", ChatID: "42", Mode: contracts.ChatModeAuto})
+	repository.SaveChat(store.ChatRecord{TenantID: "tenant:user:77", ChatID: "42"})
 	ai := &fakeAI{response: contracts.AIProcessMessageResponse{
 		Decision:     contracts.DecisionAutoReply,
 		ResponseText: "hello",
@@ -400,12 +406,13 @@ func TestChatsCommandListsObservedChats(t *testing.T) {
 
 func TestChatsCommandListsUnboundBusinessChatFromRealWebhookFlow(t *testing.T) {
 	repository := store.NewRepository()
-	repository.SaveChat(store.ChatRecord{
-		TenantID:             "tenant:bc-1",
+	repository.SaveUnclaimedChat(store.UnclaimedChatRecord{
+		BusinessConnectionID: "bc-1",
 		ChatID:               "42",
 		DisplayName:          "Customer Alice",
-		BusinessConnectionID: "bc-1",
-		LastSeenAt:           time.Unix(1700000000, 0).UTC(),
+		ChatType:             "private",
+		LastMessageAt:        time.Unix(1700000000, 0).UTC(),
+		Status:               "pending",
 	})
 	sender := &fakeSender{}
 	service := newTestService(repository, &fakeAI{}, sender)
@@ -427,22 +434,30 @@ func TestChatsCommandListsUnboundBusinessChatFromRealWebhookFlow(t *testing.T) {
 
 func TestModeCommandBindsBusinessConnectionTenantForFutureMessages(t *testing.T) {
 	repository := store.NewRepository()
-	repository.SaveChat(store.ChatRecord{
-		TenantID:             "tenant:bc-1",
+	repository.SaveUnclaimedChat(store.UnclaimedChatRecord{
+		BusinessConnectionID: "bc-1",
 		ChatID:               "42",
 		DisplayName:          "Customer Alice",
-		BusinessConnectionID: "bc-1",
-		LastSeenAt:           time.Unix(1700000000, 0).UTC(),
+		ChatType:             "private",
+		LastMessageAt:        time.Unix(1700000000, 0).UTC(),
+		Status:               "pending",
 	})
 	// Populate enough context to unlock auto mode (score >= 80).
 	repository.SaveContactProfile(contracts.ContactProfile{
 		TenantID: "tenant:user:77", ChatID: "42",
 		Name: "Alice", Gender: "female", Role: "client", RelationshipType: "formal",
+		Tone: "formal",
 	})
 	for i := 0; i < 3; i++ {
-		repository.SaveMemoryFact(store.MemoryFactRecord{
-			TenantID: "tenant:user:77", ChatID: "42",
-			FactType: "extracted", FactText: fmt.Sprintf("fact %d", i), Confidence: 0.8,
+		repository.SaveSemanticFact(store.SemanticFactRecord{
+			TenantID:   "tenant:user:77",
+			ChatID:     "42",
+			ScopeKind:  "chat",
+			FactType:   "preference",
+			Subject:    "contact",
+			FactText:   fmt.Sprintf("fact %d about contact", i),
+			Confidence: 0.8,
+			Source:     "llm_extracted",
 		})
 	}
 	sender := &fakeSender{}
@@ -485,8 +500,8 @@ func TestBusinessMessageRegistersChatForOwnerSelection(t *testing.T) {
 		"business_message": {
 			"message_id": 7,
 			"business_connection_id": "bc-1",
-			"chat": {"id": 42, "type": "private", "username": "customer_a"},
-			"from": {"id": 99, "first_name": "Alice"},
+			"chat": {"id": 42, "type": "private"},
+			"from": {"id": 99},
 			"text": "hi",
 			"date": 1700000000
 		}
@@ -512,6 +527,7 @@ func TestOwnerBusinessMessageIsStoredWithoutAIReply(t *testing.T) {
 		CanReply:     true,
 		IsEnabled:    true,
 	})
+	repository.SaveChat(store.ChatRecord{TenantID: "tenant:user:77", ChatID: "42"})
 	ai := &fakeAI{}
 	service := newTestService(repository, ai, &fakeSender{})
 
@@ -548,6 +564,7 @@ func TestBusinessConnectionCannotReplyBlocksAutoReply(t *testing.T) {
 		IsEnabled:    true,
 	})
 	repository.SaveChatSettings(contracts.ChatSettings{TenantID: "tenant:user:77", ChatID: "42", Mode: contracts.ChatModeAuto})
+	repository.SaveChat(store.ChatRecord{TenantID: "tenant:user:77", ChatID: "42"})
 	ai := &fakeAI{response: contracts.AIProcessMessageResponse{
 		Decision:     contracts.DecisionAutoReply,
 		ResponseText: "hello",
@@ -562,6 +579,126 @@ func TestBusinessConnectionCannotReplyBlocksAutoReply(t *testing.T) {
 	}
 	if result.Decision != contracts.DecisionAskOwner || ai.calls != 0 {
 		t.Fatalf("result = %+v ai calls=%d", result, ai.calls)
+	}
+}
+
+// TestEndToEndSmokePipeline drives the full inbound pipeline in a single test:
+//
+//  1. business_connection webhook → tenant + connection registered.
+//  2. business_message from unclaimed chat → unclaimed_chats + chats(status=unclaimed) +
+//     messages stored; IsChatClaimed returns false.
+//  3. UI claim → chats(status=managed) + chat_settings bootstrapped; IsChatClaimed returns true.
+//  4. business_message in claimed chat → message + active_episode + AI draft created.
+//  5. Read path → draft is pending in repository; semantic fact extracted from AI response.
+func TestEndToEndSmokePipeline(t *testing.T) {
+	repository := store.NewRepository()
+	ai := &fakeAI{}
+	sender := &fakeSender{}
+	service := newTestService(repository, ai, sender)
+	ctx := context.Background()
+
+	// ── Step 1: business_connection webhook ──────────────────────────────────
+	// Owner connects the bot in Telegram Settings → Chat Automation.
+	step1, err := service.HandleTelegramWebhook(ctx, []byte(`{
+		"update_id": 3001,
+		"business_connection": {
+			"id": "bc-smoke",
+			"user": {"id": 77},
+			"user_chat_id": 77,
+			"date": 1700000000,
+			"can_reply": true,
+			"is_enabled": true
+		}
+	}`), "")
+	if err != nil {
+		t.Fatalf("step 1 business_connection: %v", err)
+	}
+	if step1.Decision != contracts.DecisionObserve {
+		t.Fatalf("step 1: expected observe, got %+v", step1)
+	}
+	conn, ok := repository.BusinessConnection("bc-smoke")
+	if !ok || conn.TenantID != "tenant:user:77" || !conn.CanReply {
+		t.Fatalf("step 1: connection not registered: %+v ok=%v", conn, ok)
+	}
+
+	// ── Step 2: first business_message from unclaimed chat ───────────────────
+	// Tenant is resolved from the saved connection (tenantHint left empty).
+	// Expected: staged in unclaimed_chats, chat row stored with status='unclaimed',
+	// message body persisted for post-claim history, decision=ignore.
+	step2, err := service.HandleTelegramWebhook(ctx, telegramPayload(3002, "bc-smoke", 42, 7, "Привет"), "")
+	if err != nil {
+		t.Fatalf("step 2 unclaimed message: %v", err)
+	}
+	if step2.Decision != contracts.DecisionIgnore || step2.Reason != "chat_not_claimed" {
+		t.Fatalf("step 2: expected chat_not_claimed, got %+v", step2)
+	}
+	if repository.IsChatClaimed("tenant:user:77", "42") {
+		t.Fatalf("step 2: chat must be unclaimed after first message")
+	}
+	// Chat should appear in the owner's chat list via the unclaimed fallback.
+	chats2 := repository.ChatsForTenant("tenant:user:77")
+	if len(chats2) == 0 {
+		t.Fatalf("step 2: chat should appear in ChatsForTenant via unclaimed fallback")
+	}
+	// Message body must be persisted so history is available after the owner claims the chat.
+	if _, ok := repository.Message("tenant:user:77", "42", "7"); !ok {
+		t.Fatalf("step 2: message must be stored for unclaimed chat with known owner tenant")
+	}
+
+	// ── Step 3: UI claim ─────────────────────────────────────────────────────
+	// Owner picks chat "1" from /chats list.  ClaimChatForTenant transitions
+	// status to 'managed', bootstraps chat_settings(mode=manual), and records
+	// the business connection → tenant binding for future webhook routing.
+	chatToClaim, ok := repository.ChatBySelector("tenant:user:77", "1")
+	if !ok {
+		t.Fatalf("step 3: cannot select chat by index 1")
+	}
+	repository.ClaimChatForTenant("tenant:user:77", chatToClaim)
+	if !repository.IsChatClaimed("tenant:user:77", "42") {
+		t.Fatalf("step 3: IsChatClaimed must return true after claim")
+	}
+	settings3 := repository.ChatSettings("tenant:user:77", "42")
+	if settings3.Mode != contracts.ChatModeManual {
+		t.Fatalf("step 3: expected manual mode after claim, got %s", settings3.Mode)
+	}
+
+	// ── Step 4: second business_message in claimed chat ──────────────────────
+	// AI returns a draft; MemoryUsed carries a fact to extract.
+	ai.response = contracts.AIProcessMessageResponse{
+		Decision:     contracts.DecisionDraft,
+		ResponseText: "Добрый день! Чем могу помочь?",
+		Confidence:   0.85,
+		RiskLevel:    contracts.RiskLow,
+		MemoryUsed:   []string{"предпочитает формальный стиль общения"},
+	}
+	step4, err := service.HandleTelegramWebhook(ctx, telegramPayload(3003, "bc-smoke", 42, 8, "Нужна консультация"), "")
+	if err != nil {
+		t.Fatalf("step 4 claimed message: %v", err)
+	}
+	if step4.Decision != contracts.DecisionDraft {
+		t.Fatalf("step 4: expected draft decision, got %+v", step4)
+	}
+	if step4.DraftID == "" {
+		t.Fatalf("step 4: draft_id missing from result")
+	}
+	// Runtime state: active episode must be open for this chat.
+	if _, ok := repository.ActiveEpisodeByChat("tenant:user:77", "42"); !ok {
+		t.Fatalf("step 4: active_episode must exist after claimed message processed")
+	}
+
+	// ── Step 5: read path ────────────────────────────────────────────────────
+	// Draft is pending in the repository; the AI-extracted fact is stored
+	// in the Semantic Layer and available to the next conversation context build.
+	draft5, ok := repository.Draft(step4.DraftID)
+	if !ok || draft5.Status != store.DraftPending {
+		t.Fatalf("step 5: draft not found or wrong status: %+v ok=%v", draft5, ok)
+	}
+	if draft5.ResponseText != "Добрый день! Чем могу помочь?" {
+		t.Fatalf("step 5: draft response text = %q", draft5.ResponseText)
+	}
+	facts5 := repository.SemanticFacts("tenant:user:77", "42", 10)
+	if len(facts5) == 0 || !strings.Contains(facts5[0].FactText, "формальный") {
+		t.Fatalf("step 5: expected extracted semantic fact, got %+v", facts5)
 	}
 }
 

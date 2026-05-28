@@ -3,8 +3,17 @@
 from __future__ import annotations
 
 import re
+from typing import TYPE_CHECKING
 
-from .schemas import IntentResponse, MemoryExtractionResponse, PrivacyFlag, RiskLevel, RiskResponse
+from .schemas import (
+    IntentResponse,
+    MemoryExtractionResponse,
+    PrivacyFlag,
+    RiskLevel,
+    RiskResponse,
+    TypedExtractionResponse,
+    TypedFact,
+)
 from .security import contains_prompt_injection
 
 
@@ -106,6 +115,120 @@ class MemoryExtractor:
                 candidates.append(match.group(0).strip())
 
         return MemoryExtractionResponse(memories=tuple(dict.fromkeys(candidates)), blocked_by_privacy=False)
+
+
+class TypedMemoryExtractor:
+    """Extract typed, scoped facts from a message using deterministic rules.
+
+    Each candidate is classified into a fact_type, subject, and scope_kind per
+    the design §5.4 routing rules so the Go backend can persist them without
+    hard-coded defaults.
+
+    This extractor is intentionally deterministic and fast (no LLM round-trip).
+    LLM-powered extraction is handled by the service._extract_facts_llm_typed
+    method which is called asynchronously via /ai/extract-facts-typed.
+    """
+
+    # Patterns that hint at health/biographical/preference facts about the contact.
+    _HEALTH_PATTERNS = re.compile(
+        r"\b(аллергия|диабет|гипертония|астма|инсульт|инфаркт|рак|"
+        r"allerg|diabet|asthma|cancer|heart disease|chronic)\b",
+        re.IGNORECASE,
+    )
+    _BIOGRAPHICAL_PATTERNS = re.compile(
+        r"\b(my name is|меня зовут|зовут меня|my birthday|день рождения|"
+        r"я живу в|i live in|i am from|я из|born in|родился|родилась)\b",
+        re.IGNORECASE,
+    )
+    _PREFERENCE_PATTERNS = re.compile(
+        r"\b(i prefer|предпочитаю|prefer|нравится|не нравится|"
+        r"like|dislike|люблю|не люблю)\b",
+        re.IGNORECASE,
+    )
+    _COMMITMENT_PATTERNS = re.compile(
+        r"\b(i will|я сделаю|я пришлю|i'll send|i'll do|пришлю|отправлю|"
+        r"обещаю|promise|deadline|дедлайн|к|by)\b",
+        re.IGNORECASE,
+    )
+
+    def extract(
+        self,
+        message_text: str,
+        privacy_flags: tuple[PrivacyFlag, ...],
+    ) -> TypedExtractionResponse:
+        """Return typed fact candidates unless `no_memory` blocks extraction."""
+        if PrivacyFlag.NO_MEMORY in privacy_flags:
+            return TypedExtractionResponse(facts=(), blocked_by_privacy=True)
+
+        facts: list[TypedFact] = []
+
+        # Health facts about the owner are global-scope and need confirmation.
+        for match in self._HEALTH_PATTERNS.finditer(message_text):
+            sentence = _surrounding_sentence(message_text, match.start())
+            facts.append(TypedFact(
+                fact_text=sentence,
+                fact_type="health",
+                subject="owner",
+                scope_kind="owner_global",
+                confidence=0.70,
+            ))
+
+        # Biographical facts about the contact.
+        for match in self._BIOGRAPHICAL_PATTERNS.finditer(message_text):
+            sentence = _surrounding_sentence(message_text, match.start())
+            facts.append(TypedFact(
+                fact_text=sentence,
+                fact_type="biographical",
+                subject="contact",
+                scope_kind="chat",
+                confidence=0.80,
+            ))
+
+        # Preferences of the contact.
+        for match in self._PREFERENCE_PATTERNS.finditer(message_text):
+            sentence = _surrounding_sentence(message_text, match.start())
+            facts.append(TypedFact(
+                fact_text=sentence,
+                fact_type="preference",
+                subject="contact",
+                scope_kind="chat",
+                confidence=0.75,
+            ))
+
+        # Commitments made by the owner.
+        for match in self._COMMITMENT_PATTERNS.finditer(message_text):
+            sentence = _surrounding_sentence(message_text, match.start())
+            facts.append(TypedFact(
+                fact_text=sentence,
+                fact_type="commitment",
+                subject="owner",
+                scope_kind="chat",
+                confidence=0.72,
+            ))
+
+        # Deduplicate by fact_text before returning.
+        seen: set[str] = set()
+        unique: list[TypedFact] = []
+        for f in facts:
+            key = f.fact_text.lower().strip()
+            if key not in seen:
+                seen.add(key)
+                unique.append(f)
+
+        return TypedExtractionResponse(facts=tuple(unique), blocked_by_privacy=False)
+
+
+def _surrounding_sentence(text: str, match_start: int, max_len: int = 120) -> str:
+    """Return the sentence containing the match position, trimmed to max_len."""
+    # Find sentence boundaries.
+    start = max(0, text.rfind(".", 0, match_start) + 1)
+    end = text.find(".", match_start)
+    if end == -1:
+        end = len(text)
+    sentence = text[start:end].strip()
+    if len(sentence) > max_len:
+        sentence = sentence[:max_len].rstrip()
+    return sentence if sentence else text[match_start:match_start + max_len].strip()
 
 
 def _contains_any(text: str, needles: tuple[str, ...]) -> bool:

@@ -190,7 +190,8 @@ export function renderChats(navigate) {
     try {
       const [chatsData, contactsData] = await Promise.all([api.chats(), api.contacts()]);
       myChats = chatsData.chats || [];
-      suggestedChats = contactsData.contacts || [];
+      const addedIds = new Set(myChats.map(c => c.chat_id));
+      suggestedChats = (contactsData.contacts || []).filter(c => !addedIds.has(c.chat_id));
       renderList(el.querySelector('#search-input').value);
     } catch (err) {
       el.querySelector('#chat-list').innerHTML = `

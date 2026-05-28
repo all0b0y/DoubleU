@@ -34,10 +34,12 @@ func main() {
 	storage := "memory"
 	if cfg.DatabaseURL != "" {
 		postgresRepository, err := store.NewPostgresRepository(cfg.DatabaseURL,
-			"/migrations/001_core_schema.sql",
-			"../infra/migrations/001_core_schema.sql",
-			"/migrations/002_drop_audit_fks.sql",
-			"../infra/migrations/002_drop_audit_fks.sql",
+			"/migrations/001_clean_schema.sql",
+			"../infra/migrations/001_clean_schema.sql",
+			"/migrations/002_fix_upsert_semantic_fact.sql",
+			"../infra/migrations/002_fix_upsert_semantic_fact.sql",
+			"/migrations/003_embeddings_qwen_4096.sql",
+			"../infra/migrations/003_embeddings_qwen_4096.sql",
 		)
 		if err != nil {
 			logger.Error("postgres connection failed — DATABASE_URL is set but database is unreachable", "error", err)
@@ -64,6 +66,10 @@ func main() {
 		httpapi.WithBotToken(cfg.TelegramBotToken),
 		httpapi.WithMiniAppDir(cfg.MiniAppDir),
 	)
+	serverCtx, serverCancel := context.WithCancel(context.Background())
+	defer serverCancel()
+	server.Start(serverCtx)
+	go service.StartEmbeddingWorker(serverCtx)
 	logger.Info("backend storage configured", "storage", storage, "database_url_configured", cfg.DatabaseURL != "")
 	logger.Info("backend listening", "addr", cfg.HTTPAddr, "ai_base_url", cfg.AIBaseURL)
 	if err := http.ListenAndServe(cfg.HTTPAddr, server); err != nil {

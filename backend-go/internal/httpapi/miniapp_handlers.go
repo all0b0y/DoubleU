@@ -2,7 +2,7 @@ package httpapi
 
 import (
 	"encoding/json"
-	"fmt"
+	"io"
 	"net/http"
 	"strings"
 
@@ -129,13 +129,14 @@ func (s *Server) apiMessages(w http.ResponseWriter, r *http.Request) {
 
 	msgs := s.service.Repository().RecentMessages(tenantID, chatID, 50)
 	type msgItem struct {
-		ID         string `json:"id"`
-		Text       string `json:"text"`
-		SenderID   string `json:"sender_id"`
-		SenderName string `json:"sender_name"`
-		Direction  string `json:"direction"`
-		Label      string `json:"label,omitempty"` // set only for DoubleU-sent messages
-		CreatedAt  string `json:"created_at"`
+		ID          string `json:"id"`
+		Text        string `json:"text"`
+		MessageType string `json:"message_type"`
+		SenderID    string `json:"sender_id"`
+		SenderName  string `json:"sender_name"`
+		Direction   string `json:"direction"`
+		Label       string `json:"label,omitempty"` // set only for DoubleU-sent messages
+		CreatedAt   string `json:"created_at"`
 	}
 	items := make([]msgItem, 0, len(msgs))
 	for _, m := range msgs {
@@ -151,13 +152,14 @@ func (s *Server) apiMessages(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		items = append(items, msgItem{
-			ID:         m.Event.SourceMessageID,
-			Text:       m.Event.MessageText,
-			SenderID:   m.Event.SenderID,
-			SenderName: senderName,
-			Direction:  direction,
-			Label:      label,
-			CreatedAt:  m.Event.CreatedAt.UTC().Format("2006-01-02T15:04:05Z"),
+			ID:          m.Event.SourceMessageID,
+			Text:        m.Event.MessageText,
+			MessageType: m.Event.MessageType,
+			SenderID:    m.Event.SenderID,
+			SenderName:  senderName,
+			Direction:   direction,
+			Label:       label,
+			CreatedAt:   m.Event.CreatedAt.UTC().Format("2006-01-02T15:04:05Z"),
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"messages": items})
@@ -256,6 +258,7 @@ func (s *Server) apiGetChatSettings(w http.ResponseWriter, r *http.Request) {
 		"mode":            string(settings.Mode),
 		"privacy_flags":   privacyFlagsToStrings(settings.PrivacyFlags),
 		"available_modes": modeStrs,
+		"context_score":   s.service.Repository().ContextScoreForChat(tenantID, chatID),
 	})
 }
 
@@ -384,32 +387,9 @@ func (s *Server) apiSaveProfile(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "saved"})
 }
 
-// doubleULabel builds a human-readable label for a DoubleU-sent message
-// based on the sequence of actions the owner took before approving the draft.
-func doubleULabel(history []string) string {
-	hasEdit := false
-	hasRefine := false
-	for _, a := range history {
-		switch a {
-		case "edit", "shorter", "formal":
-			hasEdit = true
-		case "ai_refine":
-			hasRefine = true
-		}
-	}
-	label := "DoubleU"
-	switch {
-	case hasEdit && hasRefine:
-		label = "поправленный DoubleU с уточнением"
-	case hasEdit:
-		label = "поправленный DoubleU"
-	case hasRefine:
-		label = "DoubleU с уточнением"
-	}
-	if n := len(history); n > 1 {
-		label += fmt.Sprintf(" ×%d", n)
-	}
-	return label
+// doubleULabel returns the label shown on DoubleU-sent messages.
+func doubleULabel(_ []string) string {
+	return "DoubleU"
 }
 
 func privacyFlagsToStrings(flags contracts.PrivacyFlags) []string {
@@ -426,4 +406,79 @@ func truncateText(s string, max int) string {
 		return s
 	}
 	return string(runes[:max]) + "…"
+}
+
+// apiGetChatAvatar proxies the contact's Telegram profile photo.
+// Fetches the smallest available photo via getUserProfilePhotos + getFile and streams it back.
+// Returns 204 No Content when the bot token is absent or the user has no photo.
+func (s *Server) apiGetChatAvatar(w http.ResponseWriter, r *http.Request) {
+	if s.botToken == "" {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	chatID := r.PathValue("chat_id")
+	if chatID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing chat_id"})
+		return
+	}
+
+	// Step 1: get profile photos (limit=1, smallest size is index 0 of first set).
+	photosURL := "https://api.telegram.org/bot" + s.botToken +
+		"/getUserProfilePhotos?user_id=" + chatID + "&limit=1"
+	resp, err := http.Get(photosURL) //nolint:noctx // avatar fetch is best-effort
+	if err != nil || resp.StatusCode != http.StatusOK {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	defer resp.Body.Close()
+
+	var photosResult struct {
+		OK     bool `json:"ok"`
+		Result struct {
+			Photos [][]struct {
+				FileID string `json:"file_id"`
+			} `json:"photos"`
+		} `json:"result"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&photosResult); err != nil ||
+		!photosResult.OK || len(photosResult.Result.Photos) == 0 || len(photosResult.Result.Photos[0]) == 0 {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	fileID := photosResult.Result.Photos[0][0].FileID
+
+	// Step 2: resolve file_id → file_path.
+	fileURL := "https://api.telegram.org/bot" + s.botToken + "/getFile?file_id=" + fileID
+	resp2, err := http.Get(fileURL) //nolint:noctx
+	if err != nil || resp2.StatusCode != http.StatusOK {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	defer resp2.Body.Close()
+
+	var fileResult struct {
+		OK     bool `json:"ok"`
+		Result struct {
+			FilePath string `json:"file_path"`
+		} `json:"result"`
+	}
+	if err := json.NewDecoder(resp2.Body).Decode(&fileResult); err != nil ||
+		!fileResult.OK || fileResult.Result.FilePath == "" {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	// Step 3: proxy the image bytes — never expose the bot token to the client.
+	imgURL := "https://api.telegram.org/file/bot" + s.botToken + "/" + fileResult.Result.FilePath
+	resp3, err := http.Get(imgURL) //nolint:noctx
+	if err != nil || resp3.StatusCode != http.StatusOK {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	defer resp3.Body.Close()
+
+	w.Header().Set("Content-Type", resp3.Header.Get("Content-Type"))
+	w.Header().Set("Cache-Control", "public, max-age=3600")
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.Copy(w, resp3.Body)
 }

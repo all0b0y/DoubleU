@@ -33,6 +33,7 @@ export function renderSettings(navigate, chatId) {
   let currentMode = 'manual';
   let currentFlags = [];
   let availableModes = new Set(['disabled', 'silent', 'manual']);
+  let contextScore = 0;
 
   function modeRowHTML(mode) {
     const info = MODE_INFO[mode] || { label: mode, desc: '' };
@@ -40,7 +41,7 @@ export function renderSettings(navigate, chatId) {
     const isLocked  = !availableModes.has(mode);
 
     if (isLocked) {
-      const threshold = mode === 'auto' ? 50 : 30;
+      const threshold = mode === 'auto' ? 80 : 50;
       return `
         <div class="st-mode-row st-mode-locked">
           <span class="st-mode-icon">🔒</span>
@@ -48,7 +49,7 @@ export function renderSettings(navigate, chatId) {
             <p class="st-mode-name st-mode-name-locked">${info.label}</p>
             <p class="st-mode-desc">${info.desc}</p>
           </div>
-          <span class="st-mode-lock-badge">0 / ${threshold}</span>
+          <span class="st-mode-lock-badge">${contextScore} / ${threshold}</span>
         </div>`;
     }
     return `
@@ -65,6 +66,7 @@ export function renderSettings(navigate, chatId) {
     currentMode  = settings.mode || 'manual';
     currentFlags = settings.privacy_flags || [];
     availableModes = new Set(settings.available_modes || ['disabled', 'silent', 'manual']);
+    contextScore = settings.context_score ?? 0;
 
     const memoryOn  = !currentFlags.includes('no_memory');
 

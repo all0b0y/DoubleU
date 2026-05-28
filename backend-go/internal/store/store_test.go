@@ -130,12 +130,13 @@ func TestRepositoryObservedChatsResolveByIDAndListIndex(t *testing.T) {
 
 func TestRepositoryOwnerCanClaimUnboundBusinessChat(t *testing.T) {
 	repository := NewRepository()
-	repository.SaveChat(ChatRecord{
-		TenantID:             "tenant:bc-1",
+	repository.SaveUnclaimedChat(UnclaimedChatRecord{
+		BusinessConnectionID: "bc-1",
 		ChatID:               "42",
 		DisplayName:          "Customer Alice",
-		BusinessConnectionID: "bc-1",
-		LastSeenAt:           time.Unix(2, 0).UTC(),
+		ChatType:             "private",
+		LastMessageAt:        time.Unix(2, 0).UTC(),
+		Status:               "pending",
 	})
 
 	chats := repository.ChatsForTenant("tenant:user:77")

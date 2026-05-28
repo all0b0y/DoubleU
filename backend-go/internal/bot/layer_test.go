@@ -66,12 +66,13 @@ func TestHandleModeCommandUsesListIndex(t *testing.T) {
 
 func TestHandleModeCommandClaimsUnboundBusinessChat(t *testing.T) {
 	repository := store.NewRepository()
-	repository.SaveChat(store.ChatRecord{
-		TenantID:             "tenant:bc-1",
+	repository.SaveUnclaimedChat(store.UnclaimedChatRecord{
+		BusinessConnectionID: "bc-1",
 		ChatID:               "42",
 		DisplayName:          "Customer Alice",
-		BusinessConnectionID: "bc-1",
-		LastSeenAt:           time.Unix(2, 0).UTC(),
+		ChatType:             "private",
+		LastMessageAt:        time.Unix(2, 0).UTC(),
+		Status:               "pending",
 	})
 	layer := NewLayer(repository)
 

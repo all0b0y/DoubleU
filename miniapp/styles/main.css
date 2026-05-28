@@ -205,6 +205,13 @@ html, body {
   align-self: flex-end;
   color: #fff;
 }
+
+/* Inline pending draft — right-aligned like outgoing, but visually distinct */
+.msg-draft {
+  background: var(--bg2);
+  border: 1.5px dashed var(--accent);
+  color: var(--text);
+}
 .msg-footer-out {
   display: flex; align-items: center; justify-content: flex-end;
   gap: 4px; margin-top: 3px;
@@ -277,6 +284,41 @@ html, body {
   transition: opacity 120ms;
 }
 .draft-send-btn:active { opacity: 0.8; }
+
+/* Back/cancel button in draft panel editing & refining modes */
+.draft-back-btn {
+  height: 38px; padding: 0 14px; flex-shrink: 0;
+  background: var(--bg2); border: 1px solid var(--border-color); border-radius: 12px;
+  color: var(--hint); font-size: 13px; cursor: pointer;
+  display: flex; align-items: center; gap: 4px;
+  transition: background 120ms;
+}
+.draft-back-btn:active { background: var(--surface-active); color: var(--text); }
+
+/* Label inside refining bubble */
+.draft-refine-label {
+  font-size: 11px; color: var(--muted); text-transform: uppercase;
+  letter-spacing: 0.4px; margin-bottom: 6px;
+}
+
+/* Draft source message (issue 4) */
+.draft-source-msg {
+  display: flex; flex-direction: column; gap: 2px;
+  padding: 6px 10px; margin-bottom: 6px;
+  background: var(--surface-active); border-radius: 10px;
+  border-left: 3px solid var(--hint);
+}
+.draft-source-label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.3px; }
+.draft-source-text { font-size: 12px; color: var(--hint); line-height: 1.4;
+  overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+
+/* Draft inline edit textarea (issue 2) */
+.draft-edit-textarea {
+  width: 100%; min-height: 72px;
+  background: transparent; border: none; outline: none; resize: none;
+  font-size: 13px; color: var(--text); line-height: 1.45;
+  font-family: inherit;
+}
 
 /* ── Draft card ── */
 .draft-card {

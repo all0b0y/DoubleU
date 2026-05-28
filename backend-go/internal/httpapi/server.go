@@ -2,6 +2,7 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 
@@ -46,6 +47,13 @@ func NewServer(service *core.Service, opts ...ServerOption) *Server {
 	return server
 }
 
+// Start launches background goroutines bound to the given context.
+// Call this once after NewServer, before accepting requests.
+func (s *Server) Start(ctx context.Context) {
+	go s.service.StartDailySummaryScheduler(ctx)
+	go s.service.StartEpisodeCloser(ctx)
+}
+
 // ServeHTTP dispatches HTTP requests to API handlers.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mux.ServeHTTP(w, r)
@@ -75,6 +83,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/v1/contacts", s.tmaAuth(s.apiContacts))
 	s.mux.HandleFunc("GET /api/v1/chats/{chat_id}/profile", s.tmaAuth(s.apiGetProfile))
 	s.mux.HandleFunc("PUT /api/v1/chats/{chat_id}/profile", s.tmaAuth(s.apiSaveProfile))
+	s.mux.HandleFunc("GET /api/v1/chats/{chat_id}/avatar", s.tmaAuth(s.apiGetChatAvatar))
 
 	// Mini App static files
 	if s.miniappDir != "" {
@@ -142,12 +151,14 @@ func (s *Server) telegramWebhook(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	result, err := s.service.HandleTelegramWebhook(r.Context(), raw, r.Header.Get("X-Tenant-ID"))
-	if err != nil {
-		writeJSON(w, http.StatusAccepted, result)
-		return
-	}
-	writeJSON(w, http.StatusOK, result)
+	tenantHint := r.Header.Get("X-Tenant-ID")
+	// Ack immediately so Telegram does not retry within the 60s window.
+	// The duplicate-receive gate in HandleTelegramWebhook ensures any concurrent
+	// re-delivery is dropped once processing has started.
+	w.WriteHeader(http.StatusOK)
+	go func() {
+		_, _ = s.service.HandleTelegramWebhook(context.Background(), raw, tenantHint)
+	}()
 }
 
 func (s *Server) approvalCallback(w http.ResponseWriter, r *http.Request) {

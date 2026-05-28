@@ -21,6 +21,7 @@ type OutboundMessage struct {
 	ChatID               string
 	BusinessConnectionID string
 	SourceMessageID      string
+	ReplyToMessageID     string // when set, sends as a Telegram reply to this message_id
 	DecisionID           string
 	Text                 string
 	ReplyMarkup          ReplyMarkup
@@ -117,11 +118,9 @@ func NewBotSender(token string, client *http.Client) *BotSender {
 	return &BotSender{token: token, client: client}
 }
 
-// SendMessage sends a message to Telegram.
-func (s *BotSender) SendMessage(ctx context.Context, message OutboundMessage) error {
-	if s.token == "" {
-		return fmt.Errorf("telegram bot token is empty")
-	}
+// sendMessageBody builds the sendMessage JSON body from an OutboundMessage.
+// Extracted so both SendMessage and SendMessageGetID share the same body construction.
+func (s *BotSender) sendMessageBody(message OutboundMessage) map[string]any {
 	body := map[string]any{
 		"chat_id": message.ChatID,
 		"text":    message.Text,
@@ -132,7 +131,44 @@ func (s *BotSender) SendMessage(ctx context.Context, message OutboundMessage) er
 	if message.ReplyMarkup != nil {
 		body["reply_markup"] = message.ReplyMarkup
 	}
-	return s.post(ctx, "sendMessage", body)
+	if replyID, ok := parseMessageID(message.ReplyToMessageID); ok {
+		body["reply_parameters"] = map[string]any{"message_id": replyID}
+	}
+	return body
+}
+
+// sendMessageRaw posts a sendMessage request and returns the raw response body.
+// It is the shared transport layer for SendMessage and SendMessageGetID.
+func (s *BotSender) sendMessageRaw(ctx context.Context, body map[string]any) ([]byte, error) {
+	data, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	url := "https://api.telegram.org/bot" + s.token + "/sendMessage"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	res, err := s.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(res.Body, 8192))
+	if res.StatusCode < 200 || res.StatusCode > 299 {
+		return nil, fmt.Errorf("telegram sendMessage status %d: %s", res.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	return raw, nil
+}
+
+// SendMessage sends a message to Telegram.
+func (s *BotSender) SendMessage(ctx context.Context, message OutboundMessage) error {
+	if s.token == "" {
+		return fmt.Errorf("telegram bot token is empty")
+	}
+	_, err := s.sendMessageRaw(ctx, s.sendMessageBody(message))
+	return err
 }
 
 // AnswerCallbackQuery dismisses the loading spinner on an inline button click.
@@ -172,34 +208,9 @@ func (s *BotSender) SendMessageGetID(ctx context.Context, message OutboundMessag
 	if s.token == "" {
 		return "", fmt.Errorf("telegram bot token is empty")
 	}
-	body := map[string]any{
-		"chat_id": message.ChatID,
-		"text":    message.Text,
-	}
-	if message.BusinessConnectionID != "" {
-		body["business_connection_id"] = message.BusinessConnectionID
-	}
-	if message.ReplyMarkup != nil {
-		body["reply_markup"] = message.ReplyMarkup
-	}
-	data, err := json.Marshal(body)
+	raw, err := s.sendMessageRaw(ctx, s.sendMessageBody(message))
 	if err != nil {
 		return "", err
-	}
-	url := "https://api.telegram.org/bot" + s.token + "/sendMessage"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(data))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	res, err := s.client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer res.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(res.Body, 8192))
-	if res.StatusCode < 200 || res.StatusCode > 299 {
-		return "", fmt.Errorf("telegram sendMessage status %d: %s", res.StatusCode, strings.TrimSpace(string(raw)))
 	}
 	var result struct {
 		OK     bool `json:"ok"`
@@ -449,13 +460,7 @@ func NormalizeUpdate(payload []byte, tenantHint string, now time.Time) (contract
 		createdAt = time.Unix(message.Date, 0).UTC()
 	}
 	text := firstNonEmpty(message.Text, message.Caption)
-	messageType := "text"
-	if text == "" && message.Caption != "" {
-		messageType = "caption"
-	}
-	if text == "" {
-		messageType = "unknown"
-	}
+	messageType := detectMessageType(message)
 	sourceMessageID := strconv.FormatInt(message.MessageID, 10)
 	chatID := strconv.FormatInt(message.Chat.ID, 10)
 	senderID := strconv.FormatInt(message.From.ID, 10)
@@ -505,13 +510,21 @@ type telegramBusinessConn struct {
 }
 
 type telegramMessage struct {
-	MessageID            int64        `json:"message_id"`
-	BusinessConnectionID string       `json:"business_connection_id"`
-	Chat                 telegramChat `json:"chat"`
-	From                 telegramUser `json:"from"`
-	Text                 string       `json:"text"`
-	Caption              string       `json:"caption"`
-	Date                 int64        `json:"date"`
+	MessageID            int64             `json:"message_id"`
+	BusinessConnectionID string            `json:"business_connection_id"`
+	Chat                 telegramChat      `json:"chat"`
+	From                 telegramUser      `json:"from"`
+	Text                 string            `json:"text"`
+	Caption              string            `json:"caption"`
+	Date                 int64             `json:"date"`
+	Photo                []json.RawMessage `json:"photo"`
+	Video                *json.RawMessage  `json:"video"`
+	Voice                *json.RawMessage  `json:"voice"`
+	Document             *json.RawMessage  `json:"document"`
+	Sticker              *json.RawMessage  `json:"sticker"`
+	Audio                *json.RawMessage  `json:"audio"`
+	VideoNote            *json.RawMessage  `json:"video_note"`
+	Animation            *json.RawMessage  `json:"animation"`
 }
 
 type telegramChat struct {
@@ -528,6 +541,48 @@ type telegramUser struct {
 	Username  string `json:"username"`
 	FirstName string `json:"first_name"`
 	LastName  string `json:"last_name"`
+}
+
+// detectMessageType derives a human-readable message type from a Telegram message.
+func detectMessageType(m *telegramMessage) string {
+	if m.Text != "" {
+		return "text"
+	}
+	switch {
+	case len(m.Photo) > 0:
+		return "photo"
+	case m.Video != nil:
+		return "video"
+	case m.Voice != nil:
+		return "voice"
+	case m.Document != nil:
+		return "document"
+	case m.Sticker != nil:
+		return "sticker"
+	case m.Audio != nil:
+		return "audio"
+	case m.VideoNote != nil:
+		return "video_note"
+	case m.Animation != nil:
+		return "animation"
+	case m.Caption != "":
+		return "caption"
+	default:
+		return "unknown"
+	}
+}
+
+// parseMessageID converts a stringified Telegram message_id to int64.
+// Returns (0, false) when the string is empty or not a valid integer.
+func parseMessageID(s string) (int64, bool) {
+	if s == "" {
+		return 0, false
+	}
+	id, err := strconv.ParseInt(s, 10, 64)
+	if err != nil || id <= 0 {
+		return 0, false
+	}
+	return id, true
 }
 
 func firstNonEmpty(values ...string) string {
