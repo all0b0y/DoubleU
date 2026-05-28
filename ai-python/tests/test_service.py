@@ -10,6 +10,16 @@ from unittest.mock import patch
 from ai_agent import classifiers, http_server, llm, schemas, security, service
 from ai_agent.classifiers import IntentClassifier, MemoryExtractor, RiskClassifier
 from ai_agent.llm import MockLLMGateway, ModelRouter, OpenRouterLLMGateway
+from ai_agent.pipelines import (
+    decisions as decisions_pipeline,
+    draft as draft_pipeline,
+    embedding as embedding_pipeline,
+    extraction as extraction_pipeline,
+    intent as intent_pipeline,
+    memory as memory_pipeline,
+    risk as risk_pipeline,
+    summarization as summarization_pipeline,
+)
 from ai_agent.schemas import (
     AIProcessMessageRequest,
     ChatMode,
@@ -129,7 +139,22 @@ class ServicePolicyTests(unittest.TestCase):
 
     def test_public_functions_and_methods_have_docstrings(self) -> None:
         """Public service modules should document public functions and methods."""
-        modules = (classifiers, http_server, llm, schemas, security, service)
+        modules = (
+            classifiers,
+            http_server,
+            llm,
+            schemas,
+            security,
+            service,
+            decisions_pipeline,
+            draft_pipeline,
+            embedding_pipeline,
+            extraction_pipeline,
+            intent_pipeline,
+            memory_pipeline,
+            risk_pipeline,
+            summarization_pipeline,
+        )
         missing: list[str] = []
         for module in modules:
             for name, obj in inspect.getmembers(module):
@@ -322,7 +347,7 @@ class LLMGatewayTests(unittest.TestCase):
                 "OPENAI_API_KEY": "",
             },
             clear=False,
-        ), patch.object(service.logger, "warning") as warn:
+        ), patch.object(embedding_pipeline.logger, "warning") as warn:
             response = svc.embed_texts(
                 EmbedTextsRequest(texts=("hello",), model="qwen/qwen3-embedding-8b")
             )

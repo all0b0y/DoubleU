@@ -224,6 +224,13 @@ func (s *Service) HandleTelegramWebhook(ctx context.Context, payload []byte, ten
 		} else if tenantID, ok := s.repository.TenantForBusinessConnection(event.BusinessConnectionID); ok {
 			event.TenantID = tenantID
 		}
+		// Auto-derived tenants must look like a real user tenant; otherwise drop
+		// to avoid poisoning unclaimed_chats.owner_tenant_id with a fallback value
+		// such as the business connection ID.  An explicit tenantHint from the
+		// webhook URL is trusted as-is and bypasses this check.
+		if !strings.HasPrefix(event.TenantID, "tenant:user:") {
+			event.TenantID = ""
+		}
 	}
 	connection, hasConnection := s.repository.BusinessConnection(event.BusinessConnectionID)
 	ownerID := ""
@@ -240,7 +247,8 @@ func (s *Service) HandleTelegramWebhook(ctx context.Context, payload []byte, ten
 
 	// Gate: only process chats the owner has explicitly added.
 	// New contacts are staged in unclaimed_chats for owner decision.
-	// When the owner tenant is known, messages are persisted so history is available after claim.
+	// When the owner tenant is known, messages are persisted and facts are extracted in the
+	// background so history and memory are available immediately after the owner claims the chat.
 	if event.BusinessConnectionID != "" && !s.repository.IsChatClaimed(event.TenantID, event.ChatID) {
 		s.repository.SaveUnclaimedChat(store.UnclaimedChatRecord{
 			OwnerTenantID:        event.TenantID,
@@ -264,13 +272,14 @@ func (s *Service) HandleTelegramWebhook(ctx context.Context, payload []byte, ten
 				Status:               "unclaimed",
 			})
 			s.repository.SaveMessage(event)
+			s.processPassive(ctx, event)
 		}
-		s.logger.Info("unclaimed business chat registered for owner review",
+		s.logger.Info("unclaimed business chat — passive RAG processing",
 			"chat_id", event.ChatID,
 			"business_connection_id", event.BusinessConnectionID,
 			"owner_tenant_id", event.TenantID,
 		)
-		return InboundResult{Event: event, Decision: contracts.DecisionIgnore, Reason: "chat_not_claimed"}, nil
+		return InboundResult{Event: event, Decision: contracts.DecisionIgnore, Reason: "passive_processing"}, nil
 	}
 
 	s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateReceived)
@@ -822,6 +831,65 @@ func (s *Service) saveExtractedFacts(event contracts.NormalizedTelegramEvent, fa
 			Source:          "llm_extracted",
 			SourceMessageID: event.SourceMessageID,
 		})
+	}
+}
+
+// processPassive runs asynchronous fact extraction for unclaimed chats.
+// It opens/updates the active episode and fires the extractor in a goroutine so it never
+// blocks the webhook path. No response is generated and no draft is created.
+func (s *Service) processPassive(ctx context.Context, event contracts.NormalizedTelegramEvent) {
+	// Maintain an active episode so episode-based context works after claim.
+	now := s.now()
+	ep := store.ActiveEpisodeRecord{
+		TenantID:      event.TenantID,
+		ChatID:        event.ChatID,
+		StartedAt:     now,
+		LastMessageAt: now,
+		MessageCount:  1,
+	}
+	if existing, ok := s.repository.ActiveEpisodeByChat(event.TenantID, event.ChatID); ok {
+		ep.StartedAt = existing.StartedAt
+		ep.MessageCount = existing.MessageCount + 1
+	}
+	s.repository.UpsertActiveEpisode(ep)
+
+	// Fire lightweight extraction in the background — no response generation.
+	if typedExtractor, ok := s.ai.(aiclient.TypedMemoryExtractor); ok {
+		go func() {
+			extractCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			resp, err := typedExtractor.ExtractFactsTyped(extractCtx, aiclient.TypedExtractionRequest{
+				MessageText: event.MessageText,
+				TenantID:    event.TenantID,
+				ChatID:      event.ChatID,
+			})
+			if err != nil {
+				s.logger.Warn("passive typed extraction failed",
+					"tenant_id", event.TenantID, "chat_id", event.ChatID, "error", err)
+				return
+			}
+			if !resp.BlockedByPrivacy {
+				s.saveTypedFacts(event, resp.Facts)
+			}
+		}()
+	} else if extractor, ok := s.ai.(aiclient.MemoryExtractor); ok {
+		go func() {
+			extractCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			resp, err := extractor.ExtractMemory(extractCtx, aiclient.MemoryExtractionRequest{
+				MessageText: event.MessageText,
+				TenantID:    event.TenantID,
+				ChatID:      event.ChatID,
+			})
+			if err != nil {
+				s.logger.Warn("passive memory extraction failed",
+					"tenant_id", event.TenantID, "chat_id", event.ChatID, "error", err)
+				return
+			}
+			if !resp.BlockedByPrivacy {
+				s.saveExtractedFacts(event, resp.Memories)
+			}
+		}()
 	}
 }
 

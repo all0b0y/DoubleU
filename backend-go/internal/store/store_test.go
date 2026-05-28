@@ -139,15 +139,23 @@ func TestRepositoryOwnerCanClaimUnboundBusinessChat(t *testing.T) {
 		Status:               "pending",
 	})
 
-	chats := repository.ChatsForTenant("tenant:user:77")
-	if len(chats) != 1 || chats[0].ChatID != "42" {
-		t.Fatalf("fallback chats = %+v", chats)
+	// Before claim the chat is surfaced as unclaimed in ChatsForTenant so /chats
+	// and /mode_* can act on it; it must not yet be marked as claimed.
+	if repository.IsChatClaimed("tenant:user:77", "42") {
+		t.Fatalf("unclaimed chat must not be marked claimed before ClaimChatForTenant")
 	}
-	chat, ok := repository.ChatBySelector("tenant:user:77", "1")
-	if !ok || chat.BusinessConnectionID != "bc-1" {
-		t.Fatalf("selected chat = %+v ok=%v", chat, ok)
+	// The chat is visible via UnclaimedChatByConnection (the path used by apiAddChats).
+	uc, ok := repository.UnclaimedChatByConnection("bc-1", "42")
+	if !ok || uc.BusinessConnectionID != "bc-1" {
+		t.Fatalf("UnclaimedChatByConnection = %+v ok=%v", uc, ok)
 	}
-	claimed := repository.ClaimChatForTenant("tenant:user:77", chat)
+	chatToAdd := ChatRecord{
+		ChatID:               uc.ChatID,
+		DisplayName:          uc.DisplayName,
+		ChatType:             uc.ChatType,
+		BusinessConnectionID: uc.BusinessConnectionID,
+	}
+	claimed := repository.ClaimChatForTenant("tenant:user:77", chatToAdd)
 	if claimed.TenantID != "tenant:user:77" {
 		t.Fatalf("claimed chat = %+v", claimed)
 	}

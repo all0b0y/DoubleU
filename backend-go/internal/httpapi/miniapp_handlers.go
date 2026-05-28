@@ -93,21 +93,29 @@ func (s *Server) apiAddChats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	userID := strings.TrimPrefix(tenantID, "tenant:user:")
-	conn, _ := s.service.Repository().BusinessConnectionByUser(userID)
-	stagingTenant := "staging:" + conn.ConnectionID
+	conn, ok := s.service.Repository().BusinessConnectionByUser(userID)
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "no business connection found for this account"})
+		return
+	}
 
 	claimed := make([]string, 0, len(req.ChatIDs))
 	for _, chatID := range req.ChatIDs {
-		// Look for the chat in the staging tenant first, then fall back to global lookup.
-		chat, ok := s.service.Repository().ChatBySelector(stagingTenant, chatID)
-		if !ok {
-			chat, ok = s.service.Repository().ChatBySelector("", chatID)
-		}
-		if !ok {
+		uc, found := s.service.Repository().UnclaimedChatByConnection(conn.ConnectionID, chatID)
+		if !found {
 			continue
+		}
+		chat := store.ChatRecord{
+			ChatID:               uc.ChatID,
+			DisplayName:          uc.DisplayName,
+			ChatType:             uc.ChatType,
+			BusinessConnectionID: uc.BusinessConnectionID,
 		}
 		s.service.Repository().ClaimChatForTenant(tenantID, chat)
 		claimed = append(claimed, chatID)
+	}
+	if len(claimed) > 0 && s.hub != nil {
+		s.hub.Broadcast(tenantID, "chats_updated", map[string]any{"claimed": claimed})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"claimed": claimed})
 }
@@ -313,7 +321,6 @@ func (s *Server) apiContacts(w http.ResponseWriter, r *http.Request) {
 	tenantID := tenantFromContext(r.Context())
 	userID := strings.TrimPrefix(tenantID, "tenant:user:")
 
-	// Staging chats are stored under "staging:<connectionID>" by the webhook handler.
 	conn, ok := s.service.Repository().BusinessConnectionByUser(userID)
 	type contactItem struct {
 		ChatID      string `json:"chat_id"`

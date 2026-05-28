@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Any
 
@@ -57,8 +58,10 @@ class AIHTTPHandler(BaseHTTPRequestHandler):
         try:
             payload = self._read_json()
             self._log_json("ai request received", _request_summary(self.path, payload))
+            t0 = time.perf_counter()
             response = route(payload)
-            self._log_json("ai response ready", _response_summary(self.path, payload, response))
+            latency_ms = (time.perf_counter() - t0) * 1000
+            self._log_json("ai response ready", _response_summary(self.path, payload, response, latency_ms))
             self._write_json(200, response)
         except (KeyError, TypeError, ValueError) as exc:
             self._log_json("ai request rejected", {"path": self.path, "error": str(exc)})
@@ -158,32 +161,59 @@ def make_handler(service: AIService, mock_llm: bool) -> type[AIHTTPHandler]:
     return BoundAIHTTPHandler
 
 
+def _extract_context(path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Extract per-endpoint context fields from the payload.
+
+    process-message uses a nested event/chat_settings envelope.
+    All other endpoints use a flat schema — fields live at the top level.
+    embed-texts has no message_text; reports texts_count instead.
+    """
+    event = payload.get("event") if isinstance(payload.get("event"), dict) else None
+    settings = payload.get("chat_settings") if isinstance(payload.get("chat_settings"), dict) else None
+
+    if event is not None:
+        source: dict[str, Any] = event
+        mode = settings.get("mode", "") if settings else ""
+        privacy_flags = settings.get("privacy_flags", []) if settings else []
+    else:
+        source = payload
+        mode = payload.get("mode", "")
+        privacy_flags = payload.get("privacy_flags", [])
+
+    ctx: dict[str, Any] = {
+        "tenant_id": source.get("tenant_id", ""),
+        "chat_id": source.get("chat_id", ""),
+        "source_message_id": source.get("source_message_id", ""),
+        "message_type": source.get("message_type", ""),
+        "mode": mode,
+        "privacy_flags": privacy_flags,
+        "memory_context_count": len(payload.get("memory_context", []) or []),
+    }
+    if path == "/ai/embed-texts":
+        ctx["texts_count"] = len(payload.get("texts", []))
+    else:
+        ctx["message_text"] = _truncate(str(source.get("message_text", "")), 1000)
+    return ctx
+
+
 def _request_summary(path: str, payload: dict[str, Any]) -> dict[str, Any]:
-    event = payload.get("event") if isinstance(payload.get("event"), dict) else {}
-    settings = payload.get("chat_settings") if isinstance(payload.get("chat_settings"), dict) else {}
     return {
         "path": path,
         "request_id": payload.get("request_id", ""),
-        "tenant_id": event.get("tenant_id", ""),
-        "chat_id": event.get("chat_id", ""),
-        "source_message_id": event.get("source_message_id", ""),
-        "message_type": event.get("message_type", ""),
-        "message_text": _truncate(str(event.get("message_text", "")), 1000),
-        "mode": settings.get("mode", ""),
-        "privacy_flags": settings.get("privacy_flags", []),
-        "memory_context_count": len(payload.get("memory_context", []) or []),
+        **_extract_context(path, payload),
+        "request_body_preview": _truncate(json.dumps(payload, ensure_ascii=False), 2000),
     }
 
 
-def _response_summary(path: str, payload: dict[str, Any], response: dict[str, Any]) -> dict[str, Any]:
-    event = payload.get("event") if isinstance(payload.get("event"), dict) else {}
+def _response_summary(path: str, payload: dict[str, Any], response: dict[str, Any], latency_ms: float) -> dict[str, Any]:
+    ctx = _extract_context(path, payload)
     usage = response.get("usage") if isinstance(response.get("usage"), dict) else {}
     return {
         "path": path,
         "request_id": payload.get("request_id", ""),
-        "tenant_id": event.get("tenant_id", ""),
-        "chat_id": event.get("chat_id", ""),
-        "source_message_id": event.get("source_message_id", ""),
+        "tenant_id": ctx["tenant_id"],
+        "chat_id": ctx["chat_id"],
+        "source_message_id": ctx["source_message_id"],
         "decision": response.get("decision", ""),
         "risk_level": response.get("risk_level", ""),
         "intent": response.get("intent", ""),
@@ -193,6 +223,8 @@ def _response_summary(path: str, payload: dict[str, Any], response: dict[str, An
         "usage_input_tokens": usage.get("input_tokens", 0),
         "usage_output_tokens": usage.get("output_tokens", 0),
         "memory_used_count": len(response.get("memory_used", []) or []),
+        "latency_ms": round(latency_ms, 1),
+        "response_body_preview": _truncate(json.dumps(response, ensure_ascii=False), 2000),
     }
 
 

@@ -629,16 +629,16 @@ func TestEndToEndSmokePipeline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("step 2 unclaimed message: %v", err)
 	}
-	if step2.Decision != contracts.DecisionIgnore || step2.Reason != "chat_not_claimed" {
-		t.Fatalf("step 2: expected chat_not_claimed, got %+v", step2)
+	if step2.Decision != contracts.DecisionIgnore || step2.Reason != "passive_processing" {
+		t.Fatalf("step 2: expected passive_processing, got %+v", step2)
 	}
 	if repository.IsChatClaimed("tenant:user:77", "42") {
 		t.Fatalf("step 2: chat must be unclaimed after first message")
 	}
-	// Chat should appear in the owner's chat list via the unclaimed fallback.
-	chats2 := repository.ChatsForTenant("tenant:user:77")
-	if len(chats2) == 0 {
-		t.Fatalf("step 2: chat should appear in ChatsForTenant via unclaimed fallback")
+	// The chat must appear as a pending suggestion via UnclaimedChatsForOwner.
+	suggested2 := repository.UnclaimedChatsForOwner("tenant:user:77")
+	if len(suggested2) == 0 {
+		t.Fatalf("step 2: unclaimed chat must appear in UnclaimedChatsForOwner")
 	}
 	// Message body must be persisted so history is available after the owner claims the chat.
 	if _, ok := repository.Message("tenant:user:77", "42", "7"); !ok {
@@ -646,12 +646,17 @@ func TestEndToEndSmokePipeline(t *testing.T) {
 	}
 
 	// ── Step 3: UI claim ─────────────────────────────────────────────────────
-	// Owner picks chat "1" from /chats list.  ClaimChatForTenant transitions
-	// status to 'managed', bootstraps chat_settings(mode=manual), and records
-	// the business connection → tenant binding for future webhook routing.
-	chatToClaim, ok := repository.ChatBySelector("tenant:user:77", "1")
+	// Owner picks the chat from the suggestions list and claims it.
+	// apiAddChats uses UnclaimedChatByConnection; here we simulate the same path.
+	ucRecord, ok := repository.UnclaimedChatByConnection("bc-smoke", "42")
 	if !ok {
-		t.Fatalf("step 3: cannot select chat by index 1")
+		t.Fatalf("step 3: UnclaimedChatByConnection must find the pending chat")
+	}
+	chatToClaim := store.ChatRecord{
+		ChatID:               ucRecord.ChatID,
+		DisplayName:          ucRecord.DisplayName,
+		ChatType:             ucRecord.ChatType,
+		BusinessConnectionID: ucRecord.BusinessConnectionID,
 	}
 	repository.ClaimChatForTenant("tenant:user:77", chatToClaim)
 	if !repository.IsChatClaimed("tenant:user:77", "42") {

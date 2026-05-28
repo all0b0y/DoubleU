@@ -135,6 +135,13 @@ export function renderChats(navigate) {
       html += `<div style="display:flex;flex-direction:column;gap:2px;padding:4px 0;">
         ${mine.map(c => chatItemHTML(c)).join('')}
       </div>`;
+    } else {
+      html += `
+        <div class="empty-state">
+          <div class="empty-icon">💬</div>
+          <div class="empty-title">Нет добавленных чатов</div>
+          <div class="empty-subtitle">Добавь чат из предложений ниже или нажми +</div>
+        </div>`;
     }
 
     if (sug.length) {
@@ -145,15 +152,6 @@ export function renderChats(navigate) {
         </div>
         <div style="display:flex;flex-direction:column;gap:2px;padding:4px 0;">
           ${sug.map(c => suggestedItemHTML(c)).join('')}
-        </div>`;
-    }
-
-    if (!mine.length && !sug.length) {
-      html = `
-        <div class="empty-state">
-          <div class="empty-icon">💬</div>
-          <div class="empty-title">Нет чатов</div>
-          <div class="empty-subtitle">Нажми + чтобы добавить или получи первое бизнес-сообщение в Telegram</div>
         </div>`;
     }
 
@@ -214,6 +212,7 @@ export function renderChats(navigate) {
   const es = openEvents({
     new_draft: () => loadChats(),
     chat_mode_changed: () => loadChats(),
+    chats_updated: () => loadChats(),
   });
   const obs = new MutationObserver(() => {
     if (!document.body.contains(el)) { es.close(); obs.disconnect(); }

@@ -785,6 +785,38 @@ func (r *Repository) StagingChatsForConnection(connectionID string) []ChatRecord
 	return chats
 }
 
+// UnclaimedChatByConnection returns the pending unclaimed record for a (connectionID, chatID) pair.
+func (r *Repository) UnclaimedChatByConnection(connectionID, chatID string) (UnclaimedChatRecord, bool) {
+	key := connectionID + "::" + chatID
+	if r.db != nil {
+		var uc UnclaimedChatRecord
+		var ownerTenantID sql.NullString
+		err := r.db.QueryRow(
+			`SELECT staging_id, owner_tenant_id, business_connection_id, chat_id,
+			        display_name, chat_type, first_message_at, last_message_at, message_count, status
+			   FROM unclaimed_chats
+			  WHERE business_connection_id = $1 AND chat_id = $2 AND status = 'pending'`,
+			connectionID, chatID,
+		).Scan(
+			&uc.StagingID, &ownerTenantID, &uc.BusinessConnectionID, &uc.ChatID,
+			&uc.DisplayName, &uc.ChatType, &uc.FirstMessageAt, &uc.LastMessageAt,
+			&uc.MessageCount, &uc.Status,
+		)
+		if err != nil {
+			return UnclaimedChatRecord{}, false
+		}
+		uc.OwnerTenantID = ownerTenantID.String
+		return uc, true
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	uc, ok := r.unclaimedChats[key]
+	if !ok || uc.Status != "pending" {
+		return UnclaimedChatRecord{}, false
+	}
+	return uc, true
+}
+
 // DraftsForChat returns all drafts for a tenant/chat pair, newest first.
 func (r *Repository) DraftsForChat(tenantID, chatID string) []DraftRecord {
 	r.mu.Lock()
@@ -1013,13 +1045,23 @@ func (r *Repository) SaveChat(record ChatRecord) {
 	}
 }
 
-// ChatsForTenant returns claimed chats for a tenant; when none exist, returns pending
-// unclaimed chats visible to that owner (for the initial setup flow).
+// ChatsForTenant returns chats visible to a tenant: managed claims plus pending
+// unclaimed chats whose ownership has not been decided yet. Managed entries win
+// when both exist for the same chat_id so a claimed chat is never duplicated by
+// its prior unclaimed row.
 func (r *Repository) ChatsForTenant(tenantID string) []ChatRecord {
 	if r.db != nil {
 		chats := r.dbChatsForTenant(tenantID)
-		if len(chats) == 0 {
-			chats = r.dbUnclaimedChatsForOwner(tenantID)
+		seen := make(map[string]struct{}, len(chats))
+		for _, c := range chats {
+			seen[c.ChatID] = struct{}{}
+		}
+		for _, uc := range r.dbUnclaimedChatsForOwner(tenantID) {
+			if _, ok := seen[uc.ChatID]; ok {
+				continue
+			}
+			seen[uc.ChatID] = struct{}{}
+			chats = append(chats, uc)
 		}
 		sortChats(chats)
 		return chats
@@ -1027,9 +1069,6 @@ func (r *Repository) ChatsForTenant(tenantID string) []ChatRecord {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	chats := r.chatsForTenantLocked(tenantID)
-	if len(chats) == 0 {
-		chats = r.unclaimedChatsForOwnerLocked(tenantID)
-	}
 	sortChats(chats)
 	return chats
 }
@@ -1104,10 +1143,22 @@ func (r *Repository) ClaimChatForTenant(tenantID string, chat ChatRecord) ChatRe
 
 func (r *Repository) chatsForTenantLocked(tenantID string) []ChatRecord {
 	chats := make([]ChatRecord, 0)
+	seen := make(map[string]struct{})
 	for _, chat := range r.chats {
 		if chat.TenantID == tenantID && (chat.Status == "" || chat.Status == "managed") {
 			chats = append(chats, chat)
+			seen[chat.ChatID] = struct{}{}
 		}
+	}
+	// Pending unclaimed chats visible to this tenant are surfaced alongside
+	// managed claims so /chats and /mode_* can act on a chat before the owner
+	// has explicitly claimed it. Managed entries (above) take precedence.
+	for _, uc := range r.unclaimedChatsForOwnerLocked(tenantID) {
+		if _, ok := seen[uc.ChatID]; ok {
+			continue
+		}
+		seen[uc.ChatID] = struct{}{}
+		chats = append(chats, uc)
 	}
 	return chats
 }
@@ -1138,9 +1189,6 @@ func (r *Repository) ChatBySelector(tenantID string, selector string) (ChatRecor
 		return ChatRecord{}, false
 	}
 	chats := r.chatsForTenantLocked(tenantID)
-	if len(chats) == 0 {
-		chats = r.unclaimedChatsForOwnerLocked(tenantID)
-	}
 	sortChats(chats)
 	if index > len(chats) {
 		return ChatRecord{}, false
