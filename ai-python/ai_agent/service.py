@@ -186,6 +186,10 @@ class AIService:
             decision = Decision.ERROR_FALLBACK
             confidence = 0.0
 
+        # Output-safety findings (e.g. toxicity in draft) propagate as a
+        # non-blocking ``flagged`` signal so the bot UI annotates the draft.
+        from .observability.context import current_context
+        flagged = current_context().output_flagged
         result = AIProcessMessageResponse(
             decision=decision,
             response_text=response_text if decision in (Decision.DRAFT, Decision.AUTO_REPLY) else "",
@@ -195,6 +199,7 @@ class AIService:
             model_used=model_used,
             usage=usage,
             memory_used=memory_used,
+            flagged=flagged,
         )
         self._record_audit(request, result, ",".join(risk_response.reasons))
         return result
@@ -206,6 +211,17 @@ class AIService:
         reason: str,
     ) -> None:
         audit_id = str(uuid5(NAMESPACE_URL, f"{request.request_id}:{request.event.source_message_id}"))
+        # Prefer the trace_id propagated on the request, fall back to the
+        # ContextVar set by the HTTP handler, then derive from event.event_id
+        # so direct AIService callers (tests, sync orchestrators) still get a
+        # stable trace identifier on every audit row.
+        trace_id = request.trace_id
+        if not trace_id:
+            from .observability.context import current_context
+            trace_id = current_context().trace_id
+        if not trace_id and request.event.event_id:
+            from .observability.trace import derive_trace_id
+            trace_id = derive_trace_id(request.event.event_id)
         self._audit_sink.record(
             AuditEvent(
                 audit_id=audit_id,
@@ -215,6 +231,7 @@ class AIService:
                 decision=response.decision,
                 reason=reason,
                 created_at=datetime.now(timezone.utc).isoformat(),
+                trace_id=trace_id,
             )
         )
 

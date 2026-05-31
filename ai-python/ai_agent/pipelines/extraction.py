@@ -50,7 +50,7 @@ def extract_facts_typed(
         return TypedExtractionResponse(facts=(), blocked_by_privacy=True)
 
     deterministic = typed_extractor.extract(request.message_text, request.privacy_flags)
-    llm_facts = _extract_facts_llm_typed(
+    llm_facts, raw_output, model_used = _extract_facts_llm_typed(
         prompt_builder, router, request.message_text, request.privacy_flags
     )
 
@@ -60,7 +60,14 @@ def extract_facts_typed(
         if f.fact_text.lower().strip() not in llm_texts:
             merged.append(f)
 
-    return TypedExtractionResponse(facts=tuple(merged), blocked_by_privacy=False)
+    return TypedExtractionResponse(
+        facts=tuple(merged),
+        blocked_by_privacy=False,
+        model_used=model_used,
+        raw_output=raw_output[:2000],
+        llm_facts_count=len(llm_facts),
+        deterministic_facts_count=len(deterministic.facts),
+    )
 
 
 def _extract_facts_llm_typed(
@@ -68,19 +75,33 @@ def _extract_facts_llm_typed(
     router: ModelRouter,
     message_text: str,
     privacy_flags: tuple[PrivacyFlag, ...],
-) -> tuple[TypedFact, ...]:
-    """Ask the LLM for typed facts; returns ``()`` on failure or when memory is off."""
+) -> tuple[tuple[TypedFact, ...], str, str]:
+    """Ask the LLM for typed facts.
+
+    Returns ``(facts, raw_output, model_used)``.  ``facts`` is empty on failure
+    or when memory is off; ``raw_output``/``model_used`` are surfaced for the
+    extraction-log diagnostics so a returned ``[]`` is distinguishable from a
+    silent error.
+    """
     if PrivacyFlag.NO_MEMORY in privacy_flags or not message_text.strip():
-        return ()
+        return (), "", ""
     system_prompt, user_payload = prompt_builder.build(
         (
-            "Extract durable facts from the message below. "
+            "Extract ONLY durable, long-lived facts from the message below — stable "
+            "traits that will still be true weeks from now (profession, place of "
+            "residence/study, family, long-standing preferences, commitments with a "
+            "clear deadline). "
+            "Do NOT extract transient or in-the-moment statements (what someone is "
+            "doing right now, today, this moment, current mood, one-off small talk). "
+            "For example 'sitting in class right now' is transient — skip it; "
+            "'studies medicine at university X' is durable — keep it. "
             "Output a JSON array of objects, each with keys: "
             "fact_text (string, ≤120 chars), "
             "fact_type (one of: preference, biographical, commitment, event, relationship, health, taboo), "
             "subject (one of: contact, owner, relationship, third_party), "
             "scope_kind (one of: chat, owner_global), "
-            "confidence (float 0–1). "
+            "confidence (float 0–1; use ≥0.8 only when the message states the fact "
+            "explicitly and unambiguously). "
             "health and biographical facts about the owner should use scope_kind=owner_global. "
             "Return [] if there are no durable facts. "
             "Output only the JSON array, no prose."
@@ -89,26 +110,29 @@ def _extract_facts_llm_typed(
         (),
     )
     raw = ""
+    model_used = ""
     try:
         response = router.complete(ModelTask.EXTRACT_FACTS, system_prompt, user_payload)
+        model_used = response.model_used
         raw = response.text.strip()
         if not raw:
-            return ()
+            return (), raw, model_used
         items = json.loads(raw)
         if not isinstance(items, list):
-            return ()
+            return (), raw, model_used
         facts: list[TypedFact] = []
         for item in items:
             normalized = _normalize_typed_fact(item)
             if normalized is not None:
                 facts.append(normalized)
-        return tuple(facts)
+        return tuple(facts), raw, model_used
     except Exception as exc:
         logger.warning(
             "typed extraction LLM failed",
             extra={"error": str(exc), "raw_preview": raw[:500]},
         )
-        return ()
+        # Surface the error text as raw_output so the extraction_log captures it.
+        return (), f"ERROR: {exc}", model_used
 
 
 def _normalize_typed_fact(item: object) -> TypedFact | None:

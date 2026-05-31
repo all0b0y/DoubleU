@@ -200,6 +200,26 @@ class LLMGatewayTests(unittest.TestCase):
 
         self.assertEqual(selected, "openrouter/test-model")
 
+    def test_model_router_litellm_path_uses_semantic_aliases(self) -> None:
+        """When LLM_GATEWAY=litellm, route() must return the LiteLLM config.yaml aliases."""
+        from ai_agent.config.flags import FeatureFlags
+
+        flags = FeatureFlags(llm_gateway="litellm")
+        router = ModelRouter(MockLLMGateway(), flags=flags)
+
+        self.assertEqual(router.route(ModelTask.DRAFT_REPLY), "draft-primary")
+        self.assertEqual(router.route(ModelTask.DRAFT_REPLY, risk_level=RiskLevel.CRITICAL), "draft-primary")
+        self.assertEqual(router.route(ModelTask.SUMMARIZE_CHAT), "summarize-cheap")
+        self.assertEqual(router.route(ModelTask.EXTRACT_FACTS), "extract-cheap")
+
+    def test_model_router_non_litellm_path_keeps_tier_names(self) -> None:
+        """Without LiteLLM gateway, route() must still emit legacy mock tier names."""
+        router = ModelRouter(MockLLMGateway())
+
+        self.assertEqual(router.route(ModelTask.DRAFT_REPLY), "mock-fast-v1")
+        self.assertEqual(router.route(ModelTask.DRAFT_REPLY, risk_level=RiskLevel.HIGH), "mock-strong-v1")
+        self.assertEqual(router.route(ModelTask.SUMMARIZE_CHAT), "mock-fast-summary-v1")
+
     def test_openrouter_gateway_sends_chat_completion_request(self) -> None:
         """OpenRouter gateway should normalize provider response without leaking transport details."""
         captured: dict[str, object] = {}
@@ -323,7 +343,7 @@ class LLMGatewayTests(unittest.TestCase):
                 "OPENROUTER_APP_URL": "https://doubleu.example",
             },
         ):
-            configured_service, mock_llm = http_server.create_service_from_env()
+            configured_service, mock_llm, _flags = http_server.create_service_from_env()
 
         self.assertFalse(mock_llm)
         self.assertEqual(configured_service.health(), {"status": "ok"})

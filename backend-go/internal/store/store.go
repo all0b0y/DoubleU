@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -15,6 +14,7 @@ import (
 	"github.com/lib/pq"
 
 	"doubleu/backend-go/internal/contracts"
+	tracepkg "doubleu/backend-go/internal/trace"
 )
 
 // MessageRecord stores operational state for a normalized message.
@@ -45,35 +45,38 @@ type DraftRecord struct {
 	ChatID               string
 	BusinessConnectionID string
 	SourceMessageID      string
-	SourceMessageText    string   // original contact message text; stored so regen works even with no_memory
+	SourceMessageText    string // original contact message text; stored so regen works even with no_memory
 	ResponseText         string
 	// DraftType distinguishes regular reply drafts ("reply") from interactive question
 	// cards ("question") where the owner picks one of several AI-suggested options.
 	DraftType        string
 	SuggestedOptions []string // non-empty when DraftType == "question"
-	Status               DraftStatus
-	OwnerChatID          string   // owner's bot chat ID (for editing the draft card)
-	OwnerMessageID       string   // Telegram message_id of the draft card in owner's chat
-	SentMessageID        string   // Telegram message_id of the reply sent to the contact
-	ActionHistory        []string // sequence of modification actions taken before final approve
-	CreatedAt            time.Time
-	UpdatedAt            time.Time
+	Status           DraftStatus
+	OwnerChatID      string   // owner's bot chat ID (for editing the draft card)
+	OwnerMessageID   string   // Telegram message_id of the draft card in owner's chat
+	SentMessageID    string   // Telegram message_id of the reply sent to the contact
+	ActionHistory    []string // sequence of modification actions taken before final approve
+	// TraceID is the W3C trace-id under which this draft was generated.
+	// Owner feedback (approve/reject/thumb) attaches a Langfuse score to it.
+	TraceID   string
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 // SemanticFactRecord stores a typed, atomic fact in the Semantic Layer.
 // It maps to the semantic_facts table and replaces the deprecated MemoryFactRecord.
 type SemanticFactRecord struct {
-	ID              int64
-	TenantID        string
+	ID       int64
+	TenantID string
 	// ScopeKind: "chat" or "owner_global".
-	ScopeKind       string
-	ChatID          string
-	FactText        string
+	ScopeKind string
+	ChatID    string
+	FactText  string
 	// FactType: preference, biographical, commitment, event, relationship, health, taboo.
-	FactType        string
+	FactType string
 	// Subject: contact, owner, relationship, third_party.
-	Subject         string
-	Confidence      float64
+	Subject    string
+	Confidence float64
 	// Source: llm_extracted, owner_confirmed, owner_authored.
 	Source          string
 	SourceMessageID string
@@ -106,6 +109,22 @@ type EpisodeSummaryRecord struct {
 	ClosureReason string
 	MessageCount  int
 	CreatedAt     time.Time
+}
+
+// ExtractionLogRecord captures one async fact-extraction attempt for observability.
+// It maps to the extraction_log table so a returned empty fact set is distinguishable
+// from a silent failure (model used, verbatim LLM output, created IDs, skip count, errors).
+type ExtractionLogRecord struct {
+	TenantID        string
+	ChatID          string
+	InputMessageIDs []string
+	ModelUsed       string
+	RawOutput       string
+	FactsCreated    []int64
+	FactsSkipped    int
+	FactsMerged     int
+	Error           string
+	DurationMS      int
 }
 
 // SendRecord stores an outbound send idempotency record.
@@ -262,49 +281,6 @@ func (r *Repository) Close() error {
 	return r.db.Close()
 }
 
-// applyMigrations runs migration files that have not been applied yet.
-// Applied migrations are tracked in a schema_migrations table (filename → applied_at).
-// Each file is executed exactly once per DB; re-running the binary is safe.
-func (r *Repository) applyMigrations(paths ...string) error {
-	if r.db == nil {
-		return nil
-	}
-	// Bootstrap the migration tracking table on first run.
-	if _, err := r.db.Exec(`
-		CREATE TABLE IF NOT EXISTS schema_migrations (
-		  filename   TEXT PRIMARY KEY,
-		  applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
-		)`); err != nil {
-		return fmt.Errorf("schema_migrations bootstrap: %w", err)
-	}
-	for _, path := range paths {
-		data, err := os.ReadFile(path)
-		if err != nil {
-			continue // file not present in this environment; skip
-		}
-		filename := path[strings.LastIndex(path, "/")+1:]
-		var already bool
-		_ = r.db.QueryRow(
-			`SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE filename = $1)`,
-			filename,
-		).Scan(&already)
-		if already {
-			continue // already applied; idempotent skip
-		}
-		if _, err = r.db.Exec(string(data)); err != nil {
-			return fmt.Errorf("migration %s: %w", path, err)
-		}
-		if _, err = r.db.Exec(
-			`INSERT INTO schema_migrations (filename) VALUES ($1) ON CONFLICT DO NOTHING`,
-			filename,
-		); err != nil {
-			// Non-fatal: migration was applied; tracking insert failure is cosmetic.
-			_ = err
-		}
-	}
-	return nil
-}
-
 // ChatSettings returns settings for a tenant/chat pair.
 func (r *Repository) ChatSettings(tenantID, chatID string) contracts.ChatSettings {
 	if r.db != nil {
@@ -434,8 +410,9 @@ func (r *Repository) SaveMessage(event contracts.NormalizedTelegramEvent) {
 			event.MessageType,
 			event.CreatedAt,
 		)
+		traceID := tracepkg.DeriveTraceID(event.EventID)
 		for _, state := range record.States {
-			r.insertState(event.TenantID, event.ChatID, event.SourceMessageID, state)
+			r.insertState(event.TenantID, event.ChatID, event.SourceMessageID, state, traceID)
 		}
 		// Raw messages are NOT stored in memory tables — they live in `messages` only (Working Layer).
 	}
@@ -486,38 +463,56 @@ func (r *Repository) AppendState(tenantID, chatID, sourceMessageID string, state
 	record := r.messages[key]
 	record.States = append(record.States, state)
 	r.messages[key] = record
-	// Only write to DB if the message row exists (EventID is set by SaveMessage).
-	// AppendState may be called before SaveMessage for early lifecycle states; those
-	// are tracked in-memory only to avoid FK violations on message_states → messages.
+	// Production callers in HandleTelegramWebhook now run SaveMessage before any
+	// AppendState, so this fallback only fires for no_memory chats (intentional —
+	// the messages row is never persisted) and for the synthetic event constructed
+	// on normalization failure (no usable tenant/chat/source_message_id triple).
+	// In both cases skipping the DB write avoids an FK violation against messages.
+	//
+	// trace_id is derived from the stored event_id rather than threaded through
+	// the call site: every webhook produces the same UUIDv5-derived trace_id so
+	// state/audit rows for one event automatically share a trace.
 	if r.db != nil && record.Event.EventID != "" {
-		r.insertState(tenantID, chatID, sourceMessageID, state)
+		r.insertState(tenantID, chatID, sourceMessageID, state, tracepkg.DeriveTraceID(record.Event.EventID))
 	}
 }
 
 // AppendAudit stores an audit event.
+//
+// When event.TraceID is empty but the parent message_states rows already carry
+// a derived trace_id, we fill it from the stored event_id so audit and state
+// rows for the same webhook always share a trace.
 func (r *Repository) AppendAudit(event contracts.AuditEvent) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	// See AppendState — production callers persist the message row before any
+	// audit write.  The skip below only triggers for no_memory chats (intentional)
+	// and the synthetic normalization-error audit (no parent message row exists).
+	msgRecord := r.messages[messageKey(event.TenantID, event.ChatID, event.SourceMessageID)]
+	if event.TraceID == "" && msgRecord.Event.EventID != "" {
+		event.TraceID = tracepkg.DeriveTraceID(msgRecord.Event.EventID)
+	}
 	r.audits = append(r.audits, event)
 	if r.db == nil {
 		return
 	}
-	// Only write to DB if the parent message row exists (EventID is set by SaveMessage).
-	// Audit events for early lifecycle states (before SaveMessage) are tracked in-memory only
-	// to avoid FK violations on audit_events → messages.
-	msgRecord := r.messages[messageKey(event.TenantID, event.ChatID, event.SourceMessageID)]
 	if msgRecord.Event.EventID == "" {
 		return
 	}
+	var traceArg any = nil
+	if event.TraceID != "" {
+		traceArg = event.TraceID
+	}
 	_, _ = r.db.Exec(
-		`INSERT INTO audit_events (tenant_id, chat_id, source_message_id, decision, reason)
-		 VALUES ($1, $2, $3, $4::decision, $5)
+		`INSERT INTO audit_events (tenant_id, chat_id, source_message_id, decision, reason, trace_id)
+		 VALUES ($1, $2, $3, $4::decision, $5, $6)
 		 ON CONFLICT (tenant_id, chat_id, source_message_id, decision, reason) DO NOTHING`,
 		event.TenantID,
 		event.ChatID,
 		event.SourceMessageID,
 		string(event.Decision),
 		event.Reason,
+		traceArg,
 	)
 }
 
@@ -536,21 +531,25 @@ func (r *Repository) SaveDraft(draft DraftRecord) {
 	r.draftsByMsg[messageKey(draft.TenantID, draft.ChatID, draft.SourceMessageID)] = draft.DraftID
 	r.mu.Unlock()
 	if r.db != nil {
+		var traceArg any = nil
+		if draft.TraceID != "" {
+			traceArg = draft.TraceID
+		}
 		_, _ = r.db.Exec(
 			`INSERT INTO drafts (
 			   draft_id, decision_id, tenant_id, chat_id, business_connection_id,
 			   source_message_id, source_message_text, response_text,
 			   draft_type, suggested_options, status,
 			   owner_chat_id, owner_message_id, sent_message_id, action_history,
-			   created_at, updated_at
-			 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$16)
+			   trace_id, created_at, updated_at
+			 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$17)
 			 ON CONFLICT (draft_id) DO NOTHING`,
 			draft.DraftID, draft.DecisionID, draft.TenantID, draft.ChatID,
 			draft.BusinessConnectionID, draft.SourceMessageID, draft.SourceMessageText,
 			draft.ResponseText, valueOrDefault(draft.DraftType, "reply"),
 			pq.Array(nilToEmpty(draft.SuggestedOptions)), string(valueOrDefault(string(draft.Status), "pending")),
 			draft.OwnerChatID, draft.OwnerMessageID, draft.SentMessageID,
-			pq.Array(nilToEmpty(draft.ActionHistory)), draft.CreatedAt,
+			pq.Array(nilToEmpty(draft.ActionHistory)), traceArg, draft.CreatedAt,
 		)
 	}
 }
@@ -616,7 +615,8 @@ func (r *Repository) dbDraft(draftID string) (DraftRecord, bool) {
 		        COALESCE(source_message_text,''), COALESCE(response_text,''),
 		        draft_type, suggested_options, status,
 		        COALESCE(owner_chat_id,''), COALESCE(owner_message_id,''),
-		        COALESCE(sent_message_id,''), action_history, created_at, updated_at
+		        COALESCE(sent_message_id,''), action_history,
+		        COALESCE(trace_id,''), created_at, updated_at
 		   FROM drafts WHERE draft_id = $1`,
 		draftID,
 	).Scan(
@@ -625,7 +625,7 @@ func (r *Repository) dbDraft(draftID string) (DraftRecord, bool) {
 		&d.SourceMessageText, &d.ResponseText,
 		&draftType, &opts, &status,
 		&d.OwnerChatID, &d.OwnerMessageID,
-		&d.SentMessageID, &history, &d.CreatedAt, &d.UpdatedAt,
+		&d.SentMessageID, &history, &d.TraceID, &d.CreatedAt, &d.UpdatedAt,
 	)
 	if err != nil {
 		return DraftRecord{}, false
@@ -1349,15 +1349,20 @@ func (r *Repository) markIdempotency(key string, operation string, record SendRe
 	return err == nil && affected == 0
 }
 
-func (r *Repository) insertState(tenantID, chatID, sourceMessageID string, state contracts.MessageState) {
+func (r *Repository) insertState(tenantID, chatID, sourceMessageID string, state contracts.MessageState, traceID string) {
+	var traceArg any = nil
+	if traceID != "" {
+		traceArg = traceID
+	}
 	_, _ = r.db.Exec(
-		`INSERT INTO message_states (tenant_id, chat_id, source_message_id, state)
-		 VALUES ($1, $2, $3, $4::message_state)
+		`INSERT INTO message_states (tenant_id, chat_id, source_message_id, state, trace_id)
+		 VALUES ($1, $2, $3, $4::message_state, $5)
 		 ON CONFLICT (tenant_id, chat_id, source_message_id, state, actor) DO NOTHING`,
 		tenantID,
 		chatID,
 		sourceMessageID,
 		string(state),
+		traceArg,
 	)
 }
 
@@ -1415,7 +1420,6 @@ func (r *Repository) dbChatsForTenant(tenantID string) []ChatRecord {
 	defer rows.Close()
 	return scanChats(rows)
 }
-
 
 // Chat returns the ChatRecord for a specific tenant/chat pair.
 func (r *Repository) Chat(tenantID, chatID string) (ChatRecord, bool) {
@@ -1586,8 +1590,8 @@ func (r *Repository) SaveContactProfile(profile contracts.ContactProfile) {
 	// Parse the legacy notes JSON field into the new dedicated columns.
 	if profile.Notes != "" {
 		var notes struct {
-			MeStyle    string `json:"me_style"`
-			ChatCtx    string `json:"chat_context"`
+			MeStyle string `json:"me_style"`
+			ChatCtx string `json:"chat_context"`
 		}
 		if err := json.Unmarshal([]byte(profile.Notes), &notes); err == nil {
 			if notes.MeStyle != "" && profile.StyleNotes == "" {
@@ -1652,8 +1656,8 @@ func (r *Repository) SaveContactProfile(profile contracts.ContactProfile) {
 // to work without changes.
 func buildLegacyNotes(p contracts.ContactProfile) string {
 	type notesPayload struct {
-		MeStyle    string `json:"me_style,omitempty"`
-		ChatCtx    string `json:"chat_context,omitempty"`
+		MeStyle string `json:"me_style,omitempty"`
+		ChatCtx string `json:"chat_context,omitempty"`
 	}
 	payload := notesPayload{MeStyle: p.StyleNotes, ChatCtx: p.ChatContext}
 	b, err := json.Marshal(payload)
@@ -2133,6 +2137,45 @@ func (r *Repository) CloseActiveEpisode(tenantID, chatID string) {
 		`DELETE FROM active_episodes WHERE tenant_id = $1 AND chat_id = $2`,
 		tenantID, chatID,
 	)
+}
+
+// LogExtraction records one async fact-extraction attempt to the extraction_log table.
+// Best-effort: failures are swallowed because logging must never break the extraction
+// path. No-op when running without a DB (unit tests use the in-memory repository).
+func (r *Repository) LogExtraction(rec ExtractionLogRecord) {
+	if r.db == nil {
+		return
+	}
+	rawOutput := rec.RawOutput
+	if len(rawOutput) > 4000 {
+		rawOutput = rawOutput[:4000]
+	}
+	_, _ = r.db.Exec(
+		`INSERT INTO extraction_log (
+		   tenant_id, chat_id, input_message_ids, model_used, raw_output,
+		   facts_created, facts_skipped, facts_merged, error, duration_ms
+		 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+		rec.TenantID, rec.ChatID,
+		pq.Array(nilToEmpty(rec.InputMessageIDs)),
+		rec.ModelUsed,
+		// raw_output is JSONB; store the verbatim text as a JSON string value.
+		rawOutputJSON(rawOutput),
+		pq.Array(rec.FactsCreated),
+		rec.FactsSkipped, rec.FactsMerged,
+		nullableString(rec.Error),
+		rec.DurationMS,
+	)
+}
+
+// rawOutputJSON wraps arbitrary extractor text as a valid JSON value for the
+// JSONB raw_output column. The LLM output is usually a JSON array already, but it
+// can be an error string or malformed; encoding as a JSON string is always valid.
+func rawOutputJSON(s string) string {
+	b, err := json.Marshal(s)
+	if err != nil {
+		return "\"\""
+	}
+	return string(b)
 }
 
 // ============================================================

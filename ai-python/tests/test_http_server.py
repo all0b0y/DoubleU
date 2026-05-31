@@ -6,6 +6,7 @@ import unittest
 
 from ai_agent.http_server import make_handler
 from ai_agent.llm import MockLLMGateway, ModelRouter
+from ai_agent.observability.trace import derive_trace_id
 from ai_agent.service import AIService
 
 
@@ -57,11 +58,55 @@ class HTTPServerTests(unittest.TestCase):
             },
         )
 
+        # Phase 3 added an optional "flagged" boolean to the contract.
         self.assertEqual(
             set(response),
-            {"decision", "response_text", "confidence", "risk_level", "intent", "model_used", "usage", "memory_used"},
+            {
+                "decision", "response_text", "confidence", "risk_level", "intent",
+                "model_used", "usage", "memory_used", "flagged",
+            },
         )
         self.assertEqual(response["decision"], "auto_reply")
+        self.assertFalse(response["flagged"])
+
+
+class TraceIDPropagationTests(unittest.TestCase):
+    """Phase 0: trace_id is derived from event_id and stamped on audit rows."""
+
+    def setUp(self) -> None:
+        handler_class = make_handler(AIService(ModelRouter(MockLLMGateway())), True)
+        self.handler = object.__new__(handler_class)
+
+    def test_audit_row_carries_derived_trace_id(self) -> None:
+        """An /ai/process-message call must stamp the derived trace_id on the audit row."""
+        event_id = "evt-phase0-1"
+        self.handler._process_message(
+            {
+                "request_id": "req-phase0-1",
+                "event": {
+                    "event_id": event_id,
+                    "tenant_id": "tenant-1",
+                    "chat_id": "chat-1",
+                    "telegram_update_id": 1,
+                    "business_connection_id": "bc-1",
+                    "source_message_id": "msg-1",
+                    "sender_id": "sender-1",
+                    "message_text": "Hello there",
+                    "message_type": "text",
+                    "created_at": "2026-05-13T10:00:00Z",
+                },
+                "chat_settings": {
+                    "tenant_id": "tenant-1",
+                    "chat_id": "chat-1",
+                    "mode": "semi_auto",
+                    "privacy_flags": [],
+                },
+                "memory_context": [],
+            },
+        )
+        audits = self.handler.service.audit_events()
+        self.assertTrue(audits, "expected at least one audit event")
+        self.assertEqual(audits[-1].trace_id, derive_trace_id(event_id))
 
 
 if __name__ == "__main__":

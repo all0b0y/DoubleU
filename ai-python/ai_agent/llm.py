@@ -5,11 +5,19 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 import json
 import socket
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 import urllib.error
 import urllib.request
 
+from .observability.context import current_context
+from .observability.results import SafetyBlocked
 from .schemas import GatewayRequest, GatewayResponse, ModelTask, RiskLevel, Usage
+
+if TYPE_CHECKING:  # pragma: no cover - import only for type hints
+    from .config.flags import FeatureFlags
+    from .observability.langfuse_sink import LangfuseSink
+    from .safety.input import InputSafetyScanner
+    from .safety.output import OutputSafetyScanner
 
 
 class LLMGateway(ABC):
@@ -134,17 +142,60 @@ class OpenRouterLLMGateway(LLMGateway):
 
 
 class ModelRouter:
-    """Select model tiers and delegate all generation to the configured gateway."""
+    """Select model tiers and delegate all generation to the configured gateway.
 
-    def __init__(self, gateway: LLMGateway, fixed_model: str = "") -> None:
+    The router is the single chokepoint for Phase 1 input safety and Phase 3
+    output safety: both scanners attach here so concrete gateways
+    (Mock/OpenRouter/LiteLLM) never see raw user payloads or unfiltered
+    responses.  When both scanners are ``None`` the router behaves exactly as
+    before.
+    """
+
+    # Semantic aliases that map purpose/task to LiteLLM proxy model names.
+    # When LLM_GATEWAY=litellm these are used instead of the mock tier names
+    # so the proxy resolves them against its own config.yaml model_list.
+    # Risk-tier differentiation moves inside the proxy (fallback chains).
+    _LITELLM_TASK_ALIASES: dict[ModelTask, str] = {
+        ModelTask.SUMMARIZE_CHAT: "summarize-cheap",
+        ModelTask.EXTRACT_FACTS: "extract-cheap",
+    }
+    _LITELLM_DRAFT_ALIAS = "draft-primary"
+
+    def __init__(
+        self,
+        gateway: LLMGateway,
+        fixed_model: str = "",
+        flags: "FeatureFlags | None" = None,
+        input_safety: "InputSafetyScanner | None" = None,
+        output_safety: "OutputSafetyScanner | None" = None,
+        legacy_gateway: LLMGateway | None = None,
+        sink: "LangfuseSink | None" = None,
+    ) -> None:
         """Create a router backed by a concrete LLM gateway."""
         self._gateway = gateway
         self._fixed_model = fixed_model.strip()
+        self._flags = flags
+        self._input_safety = input_safety
+        self._output_safety = output_safety
+        # legacy_gateway is set during Phase 5 shadow / cutover to drive the
+        # ShadowRunner.  None means there is no parallel legacy path to run.
+        self._legacy_gateway = legacy_gateway
+        self._sink = sink
 
     def route(self, task: ModelTask, risk_level: RiskLevel = RiskLevel.LOW, complexity: str = "normal") -> str:
-        """Return the model name selected for a task and risk profile."""
+        """Return the model name selected for a task and risk profile.
+
+        When ``LLM_GATEWAY=litellm`` the method returns the semantic aliases
+        declared in the LiteLLM ``config.yaml`` model_list so the proxy can
+        apply its own fallback and retry chains.  On the legacy OpenRouter
+        direct path the old mock tier names are kept so existing OpenRouter
+        routing logic is unchanged.
+        """
         if self._fixed_model:
             return self._fixed_model
+        if self._flags is not None and self._flags.llm_gateway == "litellm":
+            return self._LITELLM_TASK_ALIASES.get(task, self._LITELLM_DRAFT_ALIAS)
+        # Legacy / mock tier names for the OpenRouter direct path and mock mode.
         if task in (ModelTask.SUMMARIZE_CHAT, ModelTask.EXTRACT_FACTS):
             return "mock-fast-summary-v1"
         if risk_level in (RiskLevel.HIGH, RiskLevel.CRITICAL) or complexity == "complex":
@@ -161,15 +212,105 @@ class ModelRouter:
         risk_level: RiskLevel = RiskLevel.LOW,
         complexity: str = "normal",
     ) -> GatewayResponse:
-        """Route a task and return the gateway completion."""
-        request = GatewayRequest(
-            task=task,
-            model_name=self.route(task, risk_level=risk_level, complexity=complexity),
-            system_prompt=system_prompt,
-            user_payload=user_payload,
-            metadata={"risk_level": risk_level.value, "complexity": complexity},
-        )
-        return self._gateway.complete(request)
+        """Route a task and return the gateway completion.
+
+        Pipeline:
+          1. (Phase 1) InputSafetyScanner.scan — may rewrite prompts or block.
+          2. Concrete gateway.complete — Mock/OpenRouter/LiteLLM.
+          3. (Phase 3) OutputSafetyScanner.scan — may rewrite or flag.
+
+        Phase 5 shadow mode delegates step 2 to :class:`ShadowRunner` so a
+        legacy gateway and the new LiteLLM gateway run side-by-side.
+        """
+        ctx = current_context()
+        try:
+            scanned_system, scanned_user = system_prompt, user_payload
+            if self._input_safety is not None:
+                scanned_system, scanned_user = self._input_safety.scan(
+                    system_prompt, user_payload, task, ctx,
+                )
+            request = GatewayRequest(
+                task=task,
+                model_name=self.route(task, risk_level=risk_level, complexity=complexity),
+                system_prompt=scanned_system,
+                user_payload=scanned_user,
+                metadata={"risk_level": risk_level.value, "complexity": complexity},
+                trace_id=ctx.trace_id,
+            )
+            response = self._invoke_gateway(request)
+        except SafetyBlocked as exc:
+            return GatewayResponse(
+                text=exc.canned_reply,
+                model_used="blocked",
+                usage=Usage(),
+            )
+        if self._output_safety is not None:
+            text, flagged = self._output_safety.scan(
+                response.text, task, ctx,
+            )
+            if text != response.text or flagged:
+                response = GatewayResponse(
+                    text=text,
+                    model_used=response.model_used,
+                    usage=response.usage,
+                    cost_usd=response.cost_usd,
+                )
+        self._record_to_sink(ctx, request, response)
+        return response
+
+    def _record_to_sink(self, ctx: object, request: GatewayRequest, response: GatewayResponse) -> None:
+        """Fire-and-forget: push trace / safety-span / generation events to the sink.
+
+        Generations are only recorded when the gateway is NOT LiteLLM because
+        the LiteLLM ``success_callback`` already logs the provider call; app-side
+        spans enrich that trace without duplicating the generation entry.
+        """
+        if self._sink is None or not ctx.trace_id:  # type: ignore[union-attr]
+            return
+        # Trace metadata groups all spans for this request under one trace_id.
+        self._sink.record_trace(ctx.trace_id, {  # type: ignore[union-attr]
+            "name": ctx.purpose.value if ctx.purpose else "request",  # type: ignore[union-attr]
+            "tenant_id": ctx.tenant_id or None,  # type: ignore[union-attr]
+            "purpose": ctx.purpose.value if ctx.purpose else None,  # type: ignore[union-attr]
+        })
+        # Input-safety span: attach scanner results when the safety gate ran.
+        if ctx.safety_results:  # type: ignore[union-attr]
+            self._sink.record_span(ctx.trace_id, "input_safety", {  # type: ignore[union-attr]
+                "passed": all(r.passed for r in ctx.safety_results),  # type: ignore[union-attr]
+                "scanner_count": len(ctx.safety_results),  # type: ignore[union-attr]
+            })
+        # Output-safety span: record when the output gate ran and flagged content.
+        if self._output_safety is not None:
+            self._sink.record_span(ctx.trace_id, "output_safety", {  # type: ignore[union-attr]
+                "flagged": ctx.output_flagged,  # type: ignore[union-attr]
+            })
+        # Generation: only on non-LiteLLM paths to avoid duplicate entries
+        # (LiteLLM already records the provider call via success_callback).
+        is_litellm = self._flags is not None and self._flags.llm_gateway == "litellm"
+        if not is_litellm and response.model_used != "blocked":
+            self._sink.record_generation(
+                trace_id=ctx.trace_id,  # type: ignore[union-attr]
+                model=response.model_used,
+                prompt=f"[system]\n{request.system_prompt[:400]}\n[user]\n{request.user_payload[:400]}",
+                completion=response.text,
+                privacy_flags=ctx.privacy_flags,  # type: ignore[union-attr]
+                usage={
+                    "input_tokens": response.usage.input_tokens,
+                    "output_tokens": response.usage.output_tokens,
+                },
+                cost_usd=response.cost_usd,
+            )
+
+    def _invoke_gateway(self, request: GatewayRequest) -> GatewayResponse:
+        """Call the primary gateway, optionally side-by-side with legacy."""
+        if self._legacy_gateway is None:
+            return self._gateway.complete(request)
+        from .shadow.runner import ShadowRunner  # local import avoids cycle
+        return ShadowRunner(
+            primary=self._gateway,
+            legacy=self._legacy_gateway,
+            flags=self._flags,
+        ).complete(request)
 
 
 def _mock_draft(user_payload: str) -> str:

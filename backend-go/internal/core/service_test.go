@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -242,6 +243,55 @@ func TestApprovalApproveIsIdempotent(t *testing.T) {
 	}
 	if sender.calls != 1 || repository.SendCount() != 1 {
 		t.Fatalf("sender calls=%d send count=%d", sender.calls, repository.SendCount())
+	}
+}
+
+func TestApprovalEditRecordsOriginalAsNegativeFeedback(t *testing.T) {
+	repository := store.NewRepository()
+	repository.SaveChatSettings(contracts.ChatSettings{TenantID: "tenant-1", ChatID: "42", Mode: contracts.ChatModeManual})
+	repository.SaveChat(store.ChatRecord{TenantID: "tenant-1", ChatID: "42"})
+	ai := &fakeAI{response: contracts.AIProcessMessageResponse{
+		Decision:     contracts.DecisionDraft,
+		ResponseText: "ai original text",
+		Confidence:   0.9,
+		RiskLevel:    contracts.RiskLow,
+	}}
+	service := newTestService(repository, ai, &fakeSender{})
+
+	inbound, err := service.HandleTelegramWebhook(context.Background(), telegramPayload(2005, "bc-1", 42, 7, "hi"), "tenant-1")
+	if err != nil {
+		t.Fatalf("webhook: %v", err)
+	}
+
+	edit := func(key, text string) {
+		if _, err := service.HandleApprovalCallback(context.Background(), contracts.ApprovalCallbackPayload{
+			Action:         contracts.ApprovalEdit,
+			TenantID:       "tenant-1",
+			ChatID:         "42",
+			DraftID:        inbound.DraftID,
+			EditedText:     text,
+			IdempotencyKey: key,
+		}); err != nil {
+			t.Fatalf("edit %s: %v", key, err)
+		}
+	}
+	edit("edit-1", "owner rewrite v1")
+	edit("edit-2", "owner rewrite v2")
+
+	feedback := repository.RecentFeedback("tenant-1", "42", 10)
+	downs := make([]contracts.DraftFeedback, 0)
+	for _, fb := range feedback {
+		if fb.Rating == "down" {
+			downs = append(downs, fb)
+		}
+	}
+	// Only the FIRST edit captures the original AI text; the second edit rewrites
+	// already-owner text and must not pollute the signal.
+	if len(downs) != 1 {
+		t.Fatalf("expected 1 down feedback, got %d: %+v", len(downs), downs)
+	}
+	if downs[0].ResponseText != "ai original text" {
+		t.Fatalf("down feedback should capture original AI text, got %q", downs[0].ResponseText)
 	}
 }
 
@@ -713,6 +763,75 @@ func newTestService(repository *store.Repository, ai aiclient.Client, sender tel
 	}))
 }
 
+// fakeFeedbackSender records every owner-feedback score emitted by the
+// service so Phase 4 tests can assert that approval/thumb actions attach a
+// Langfuse score to the trace the draft was generated under.
+type fakeFeedbackSender struct {
+	mu    sync.Mutex
+	calls []feedbackCall
+}
+
+type feedbackCall struct {
+	traceID string
+	rating  string
+	comment string
+}
+
+func (f *fakeFeedbackSender) SendOwnerFeedback(_ context.Context, traceID, rating, comment string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, feedbackCall{traceID, rating, comment})
+}
+
+func TestOwnerApprovalSendsLangfuseScore(t *testing.T) {
+	repository := store.NewRepository()
+	repository.SaveChatSettings(contracts.ChatSettings{TenantID: "tenant-1", ChatID: "42", Mode: contracts.ChatModeManual})
+	repository.SaveChat(store.ChatRecord{TenantID: "tenant-1", ChatID: "42"})
+	ai := &fakeAI{response: contracts.AIProcessMessageResponse{
+		Decision:     contracts.DecisionDraft,
+		ResponseText: "draft",
+		Confidence:   0.9,
+		RiskLevel:    contracts.RiskLow,
+	}}
+	feedback := &fakeFeedbackSender{}
+	service := NewService(repository, ai, &fakeSender{},
+		WithClock(func() time.Time { return time.Unix(1700000000, 0).UTC() }),
+		WithOwnerFeedbackSender(feedback),
+	)
+
+	inbound, err := service.HandleTelegramWebhook(context.Background(), telegramPayload(2001, "bc-1", 42, 11, "hi"), "tenant-1")
+	if err != nil {
+		t.Fatalf("webhook: %v", err)
+	}
+	payload := contracts.ApprovalCallbackPayload{
+		Action:          contracts.ApprovalApprove,
+		TenantID:        "tenant-1",
+		ChatID:          "42",
+		SourceMessageID: "11",
+		DraftID:         inbound.DraftID,
+		DecisionID:      inbound.Event.EventID,
+		IdempotencyKey:  "callback-feedback",
+	}
+	if _, err := service.HandleApprovalCallback(context.Background(), payload); err != nil {
+		t.Fatalf("approval: %v", err)
+	}
+
+	if len(feedback.calls) != 1 {
+		t.Fatalf("expected 1 owner feedback call, got %d", len(feedback.calls))
+	}
+	call := feedback.calls[0]
+	if call.rating != "up" {
+		t.Fatalf("expected rating 'up', got %q", call.rating)
+	}
+	draft, ok := repository.Draft(inbound.DraftID)
+	if !ok {
+		t.Fatalf("draft not found")
+	}
+	if call.traceID == "" || call.traceID != draft.TraceID {
+		t.Fatalf("score trace_id %q != draft trace_id %q", call.traceID, draft.TraceID)
+	}
+}
+
 func telegramPayload(updateID int64, businessConnectionID string, chatID, messageID int64, text string) []byte {
 	return []byte(`{
 		"update_id": ` + intString(updateID) + `,
@@ -767,4 +886,67 @@ func (f *fakeSender) EditMessageText(ctx context.Context, chatID, messageID, tex
 
 func (f *fakeSender) DeleteMessage(ctx context.Context, chatID, messageID string) error {
 	return nil
+}
+
+// TestSaveTypedFactsConfidenceGate verifies the owner_global promotion gate:
+// a biographical fact about the owner must not be promoted to owner_global when
+// confidence is below ownerGlobalMinConfidence, and must be promoted when above.
+func TestSaveTypedFactsConfidenceGate(t *testing.T) {
+	event := contracts.NormalizedTelegramEvent{
+		TenantID:        "tenant:user:99",
+		ChatID:          "chat-42",
+		SourceMessageID: "m1",
+	}
+
+	t.Run("low_confidence_stays_chat_scoped", func(t *testing.T) {
+		repo := store.NewRepository()
+		svc := newTestService(repo, &fakeAI{}, &fakeSender{})
+		svc.saveTypedFacts(event, []aiclient.TypedFact{
+			{FactText: "owner-bio-fact", FactType: "biographical", Subject: "owner",
+				ScopeKind: "owner_global", Confidence: 0.7},
+		})
+		global := repo.GlobalSemanticFacts(event.TenantID, 10)
+		chat := repo.SemanticFacts(event.TenantID, event.ChatID, 10)
+		if len(global) != 0 {
+			t.Errorf("expected 0 owner_global facts, got %d", len(global))
+		}
+		if len(chat) == 0 {
+			t.Error("expected fact stored as chat-scoped, got none")
+		}
+	})
+
+	t.Run("high_confidence_promotes_to_owner_global", func(t *testing.T) {
+		repo := store.NewRepository()
+		svc := newTestService(repo, &fakeAI{}, &fakeSender{})
+		svc.saveTypedFacts(event, []aiclient.TypedFact{
+			{FactText: "owner-bio-fact", FactType: "biographical", Subject: "owner",
+				ScopeKind: "owner_global", Confidence: 0.85},
+		})
+		global := repo.GlobalSemanticFacts(event.TenantID, 10)
+		if len(global) == 0 {
+			t.Error("expected fact promoted to owner_global, got none")
+		}
+	})
+}
+
+// TestSaveTypedFactsOutcomeSkipCounting verifies the observability summary:
+// facts rejected for length or context-contamination are counted as skipped so
+// the extraction_log can report them, while valid facts are persisted.
+func TestSaveTypedFactsOutcomeSkipCounting(t *testing.T) {
+	event := contracts.NormalizedTelegramEvent{TenantID: "tenant:user:99", ChatID: "chat-42", SourceMessageID: "m1"}
+	repo := store.NewRepository()
+	svc := newTestService(repo, &fakeAI{}, &fakeSender{})
+
+	outcome := svc.saveTypedFacts(event, []aiclient.TypedFact{
+		{FactText: "хочу кофе по утрам", FactType: "preference", Subject: "contact", Confidence: 0.8},
+		{FactText: "tiny", FactType: "preference", Subject: "contact", Confidence: 0.8},          // too short → skip
+		{FactText: "[ФАКТ] context contamination leak", FactType: "preference", Confidence: 0.8}, // contaminated → skip
+	})
+
+	if outcome.Skipped != 2 {
+		t.Errorf("expected 2 skipped facts, got %d", outcome.Skipped)
+	}
+	if got := len(repo.SemanticFacts(event.TenantID, event.ChatID, 10)); got != 1 {
+		t.Errorf("expected 1 persisted fact, got %d", got)
+	}
 }

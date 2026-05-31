@@ -1,0 +1,57 @@
+# Langfuse self-hosted overlay for the DoubleU stack (Phase 4).
+#
+# Langfuse v2 is Postgres-only (ClickHouse + a separate worker are v3 concepts),
+# so this overlay runs a single container against the existing `postgres`
+# service using a dedicated `langfuse` database.  Prisma migrations run
+# automatically on first boot.
+#
+# Headless init (LANGFUSE_INIT_*) seeds a deterministic org/project, fixed API
+# keys and a login user so the LiteLLM success-callback can authenticate
+# without a manual UI bootstrap.  Override the keys/password via .env in any
+# shared environment.
+#
+# Usage (always alongside the base compose):
+#   docker compose \
+#     -f docker-compose.yml \
+#     -f infra/langfuse/docker-compose.langfuse.yml \
+#     -f infra/litellm/docker-compose.litellm.yml up -d
+#
+# UI: http://localhost:3001  (login with LANGFUSE_INIT_USER_EMAIL / _PASSWORD)
+
+services:
+  langfuse-web:
+    # Latest v2 line: 2.71 predates LANGFUSE_INIT_* headless bootstrap.  We log
+    # via the SDK ingestion API (LiteLLM success-callback), not the OTel
+    # endpoint, so the 2.71 OTel-contract pin no longer applies.
+    image: langfuse/langfuse:2
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: ${LANGFUSE_DATABASE_URL:-postgresql://doubleu:doubleu@postgres:5432/langfuse}
+      NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET:-doubleu-local-nextauth-secret}
+      NEXTAUTH_URL: ${LANGFUSE_NEXTAUTH_URL:-http://localhost:3001}
+      SALT: ${LANGFUSE_SALT:-doubleu-local-salt}
+      TELEMETRY_ENABLED: "false"
+      LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: "false"
+      # Headless bootstrap: deterministic org/project/keys + a login user.
+      LANGFUSE_INIT_ORG_ID: ${LANGFUSE_INIT_ORG_ID:-doubleu}
+      LANGFUSE_INIT_ORG_NAME: ${LANGFUSE_INIT_ORG_NAME:-DoubleU}
+      LANGFUSE_INIT_PROJECT_ID: ${LANGFUSE_INIT_PROJECT_ID:-doubleu}
+      LANGFUSE_INIT_PROJECT_NAME: ${LANGFUSE_INIT_PROJECT_NAME:-DoubleU}
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-pk-lf-doubleu-local}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-sk-lf-doubleu-local}
+      LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_INIT_USER_EMAIL:-admin@doubleu.local}
+      LANGFUSE_INIT_USER_NAME: ${LANGFUSE_INIT_USER_NAME:-DoubleU Admin}
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:-doubleu-local-admin}
+    ports:
+      - "${LANGFUSE_PORT:-3001}:3000"
+    healthcheck:
+      # Langfuse binds to the container's eth0 IP, not localhost — probe via
+      # `hostname -i` so the check hits the interface the app actually listens on.
+      test: ["CMD-SHELL", "wget -qO- http://$(hostname -i):3000/api/public/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s

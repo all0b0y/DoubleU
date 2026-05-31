@@ -1,0 +1,14 @@
+# DEV-ONLY: Arize Phoenix for RAG / retrieval debugging.
+# Not referenced from the production docker-compose.yml.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f infra/phoenix/docker-compose.dev.yml up
+
+services:
+  phoenix:
+    image: arizephoenix/phoenix:latest
+    restart: unless-stopped
+    ports:
+      - "6006:6006"
+    environment:
+      PHOENIX_PORT: "6006"

@@ -1,0 +1,55 @@
+# LiteLLM Proxy overlay for the DoubleU stack (Phase 2).
+#
+# Sits between the AI service and the upstream providers so every
+# chat-completion is centrally routed, retried, budget-checked and — via the
+# Langfuse success callback wired in config.yaml — logged with full
+# prompt/response for inspection.
+#
+# Reuses the main `postgres` (schema `litellm`, provisioned by migration 006)
+# and `redis` (idempotency dedup cache) services.
+#
+# Usage (always alongside the base compose):
+#   docker compose \
+#     -f docker-compose.yml \
+#     -f infra/langfuse/docker-compose.langfuse.yml \
+#     -f infra/litellm/docker-compose.litellm.yml up -d
+
+services:
+  litellm:
+    image: ghcr.io/berriai/litellm-database:main-stable
+    restart: unless-stopped
+    command: ["--config", "/etc/litellm/config.yaml", "--port", "4000"]
+    environment:
+      # Resolved by os.environ/* references in config.yaml.
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-sk-doubleu-local-master}
+      # Prisma manages its bookkeeping tables inside the dedicated `litellm`
+      # schema so they never collide with the DoubleU application tables.
+      LITELLM_DATABASE_URL: ${LITELLM_DATABASE_URL:-postgresql://doubleu:doubleu@postgres:5432/doubleu?schema=litellm}
+      DATABASE_URL: ${LITELLM_DATABASE_URL:-postgresql://doubleu:doubleu@postgres:5432/doubleu?schema=litellm}
+      # Provider credentials referenced by the model_list aliases.
+      # Only OPENROUTER_API_KEY is needed — all models use the openrouter/ prefix.
+      # DEEPSEEK_API_KEY is intentionally absent: passing it would let LiteLLM
+      # auto-route deepseek/ model names directly to api.deepseek.com, bypassing
+      # OpenRouter.  All DeepSeek traffic must go through OpenRouter.
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      # Langfuse success-callback target (full request/response logging).
+      LANGFUSE_HOST: ${LITELLM_LANGFUSE_HOST:-http://langfuse-web:3000}
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-pk-lf-doubleu-local}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-sk-lf-doubleu-local}
+    volumes:
+      - ./infra/litellm/config.yaml:/etc/litellm/config.yaml:ro
+      - ./infra/litellm/budgets.yaml:/etc/litellm/budgets.yaml:ro
+    ports:
+      - "${LITELLM_PORT:-4000}:4000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      # /health/liveliness needs no auth and 200 means the proxy is serving.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4000/health/liveliness')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s

@@ -1,0 +1,10 @@
+# DoubleU AI service runtime dependencies.
+#
+# Phase 0 ships an empty header — the stdlib HTTP server has no external
+# runtime imports.  Subsequent phases pin:
+#   Phase 1/3: llm-guard==0.3.*  (input/output safety scanners)
+#   Phase 4:   langfuse==2.*     (observability sink)
+#
+# Pins live commented-out until the corresponding phase rolls forward.
+# llm-guard==0.3.*
+# langfuse==2.*

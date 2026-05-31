@@ -1,0 +1,100 @@
+# LiteLLM Proxy configuration for the DoubleU LLM Safety & Observability stack.
+#
+# Per-purpose model aliases are defined here; Python sends ``model: <alias>``
+# in the chat-completion body and LiteLLM resolves it to the concrete provider
+# model.  Adding a new alias is a one-line change here plus a one-line addition
+# to ``ai-python/ai_agent/llm.py:ModelRouter.route``.
+#
+# All model names carry the ``openrouter/`` prefix so LiteLLM routes every call
+# through OpenRouter.  WITHOUT this prefix LiteLLM auto-detects the provider
+# from the model name (e.g. deepseek/ → api.deepseek.com) and will fail if that
+# provider's API key is not set.
+
+model_list:
+  - model_name: draft-primary
+    litellm_params:
+      # deepseek/deepseek-v4-flash is a reasoning model on OpenRouter (Baidu).
+      # The openrouter/ prefix is mandatory — without it LiteLLM auto-routes to
+      # api.deepseek.com directly, which fails because DEEPSEEK_API_KEY is unset.
+      model: openrouter/deepseek/deepseek-v4-flash
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: draft-fallback
+    litellm_params:
+      # Larger Qwen model as fallback when DeepSeek is unavailable.
+      model: openrouter/qwen/qwen-2.5-72b-instruct
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: extract-cheap
+    litellm_params:
+      model: openrouter/qwen/qwen-2.5-7b-instruct
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: summarize-cheap
+    litellm_params:
+      model: openrouter/qwen/qwen-2.5-7b-instruct
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: embed-qwen
+    litellm_params:
+      model: openrouter/qwen/qwen3-embedding-8b
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: moderate-local
+    litellm_params:
+      model: openrouter/meta-llama/llama-guard-3-8b
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  # --- Bridge aliases (Phase 2 stop-gap) -----------------------------------
+  # ModelRouter.route() still emits the deterministic mock-* tier names instead
+  # of the semantic aliases above (see Tech Debt in docs/backlog.md).  Until the
+  # app-side routing is gateway-aware these aliases keep live LiteLLM traffic
+  # flowing — and logged to Langfuse — by resolving each tier to a real model.
+  - model_name: mock-fast-v1
+    litellm_params:
+      model: openrouter/deepseek/deepseek-v4-flash
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: mock-base-v1
+    litellm_params:
+      model: openrouter/deepseek/deepseek-v4-flash
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: mock-strong-v1
+    litellm_params:
+      model: openrouter/deepseek/deepseek-v4-flash
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: mock-fast-summary-v1
+    litellm_params:
+      model: openrouter/deepseek/deepseek-v4-flash
+      api_key: os.environ/OPENROUTER_API_KEY
+
+router_settings:
+  routing_strategy: simple-shuffle
+  fallbacks:
+    - draft-primary: ["draft-fallback"]
+    - mock-fast-v1: ["draft-fallback"]
+    - mock-base-v1: ["draft-fallback"]
+    - mock-strong-v1: ["draft-fallback"]
+    - mock-fast-summary-v1: ["draft-fallback"]
+  num_retries: 2
+  timeout: 30
+  context_window_fallbacks: []
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/LITELLM_DATABASE_URL
+  database_schema: litellm
+  # Retain provider call logs for 7 days to keep the Postgres footprint small.
+  retention_days: 7
+
+litellm_settings:
+  # Log every request/response (prompt + completion + token usage + cost) to
+  # Langfuse so operators can inspect exactly what went to the model and came
+  # back.  Credentials come from LANGFUSE_* env injected by the compose file.
+  success_callback: ["langfuse"]
+  failure_callback: ["langfuse"]
+  # Redis-backed dedup cache keyed by X-Idempotency-Key so a webhook replay
+  # hits the cache instead of billing the provider twice.
+  cache: true
+  cache_params:
+    type: redis
+    host: redis
+    port: 6379
+    ttl: 3600
+  drop_params: true
+  set_verbose: false
+  json_logs: true

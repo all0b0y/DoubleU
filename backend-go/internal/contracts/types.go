@@ -9,22 +9,8 @@ import (
 )
 
 // Decision is the final or proposed action for an inbound message.
+// Allowed values are generated from contracts/contracts.json — see contract_enums.gen.go.
 type Decision string
-
-const (
-	// DecisionDraft means a response should be prepared for owner approval.
-	DecisionDraft Decision = "draft"
-	// DecisionAutoReply means the response may be sent to the recipient.
-	DecisionAutoReply Decision = "auto_reply"
-	// DecisionIgnore means no response or owner draft should be produced.
-	DecisionIgnore Decision = "ignore"
-	// DecisionObserve means the message is observed without creating a reply.
-	DecisionObserve Decision = "observe"
-	// DecisionAskOwner means the owner must make the decision manually.
-	DecisionAskOwner Decision = "ask_owner"
-	// DecisionErrorFallback means processing failed and a safe fallback is required.
-	DecisionErrorFallback Decision = "error_fallback"
-)
 
 // IsValid reports whether the decision is part of the frozen contract.
 func (d Decision) IsValid() bool {
@@ -37,20 +23,8 @@ func (d Decision) IsValid() bool {
 }
 
 // ChatMode controls the autonomy level for one tenant/chat pair.
+// Allowed values are generated from contracts/contracts.json — see contract_enums.gen.go.
 type ChatMode string
-
-const (
-	// ChatModeDisabled blocks all AI processing for the chat.
-	ChatModeDisabled ChatMode = "disabled"
-	// ChatModeSilent records and observes without replying.
-	ChatModeSilent ChatMode = "silent"
-	// ChatModeManual always requires owner approval before a reply.
-	ChatModeManual ChatMode = "manual"
-	// ChatModeSemiAuto allows low-risk auto replies above the semi-auto threshold.
-	ChatModeSemiAuto ChatMode = "semi_auto"
-	// ChatModeAuto allows low-risk auto replies above the auto threshold.
-	ChatModeAuto ChatMode = "auto"
-)
 
 // IsValid reports whether the chat mode is part of the frozen contract.
 func (m ChatMode) IsValid() bool {
@@ -63,18 +37,8 @@ func (m ChatMode) IsValid() bool {
 }
 
 // PrivacyFlag is a policy flag attached to chat settings.
+// Allowed values are generated from contracts/contracts.json — see contract_enums.gen.go.
 type PrivacyFlag string
-
-const (
-	// PrivacyNoMemory prevents persisted message memory beyond transient processing.
-	PrivacyNoMemory PrivacyFlag = "no_memory"
-	// PrivacyNoTraining prevents use of chat data for training.
-	PrivacyNoTraining PrivacyFlag = "no_training"
-	// PrivacyPrivate marks the chat private and disables autonomous replies.
-	PrivacyPrivate PrivacyFlag = "private"
-	// PrivacyNoSummary prevents summary generation.
-	PrivacyNoSummary PrivacyFlag = "no_summary"
-)
 
 // IsValid reports whether the privacy flag is part of the frozen contract.
 func (f PrivacyFlag) IsValid() bool {
@@ -130,18 +94,8 @@ func (f PrivacyFlags) IsValid() bool {
 }
 
 // RiskLevel is the AI-classified risk level for a response.
+// Allowed values are generated from contracts/contracts.json — see contract_enums.gen.go.
 type RiskLevel string
-
-const (
-	// RiskLow is safe enough for autonomous handling when mode and privacy allow it.
-	RiskLow RiskLevel = "low"
-	// RiskMedium defaults to a draft.
-	RiskMedium RiskLevel = "medium"
-	// RiskHigh is draft-only.
-	RiskHigh RiskLevel = "high"
-	// RiskCritical must be ignored or escalated to the owner.
-	RiskCritical RiskLevel = "critical"
-)
 
 // IsValid reports whether the risk level is part of the frozen contract.
 func (r RiskLevel) IsValid() bool {
@@ -154,63 +108,28 @@ func (r RiskLevel) IsValid() bool {
 }
 
 // MessageState is an auditable lifecycle state for an inbound message.
+// Allowed values are generated from contracts/contracts.json — see contract_enums.gen.go.
 type MessageState string
 
-const (
-	// StateReceived means the webhook reached the backend.
-	StateReceived MessageState = "received"
-	// StateNormalized means the Telegram update was normalized.
-	StateNormalized MessageState = "normalized"
-	// StatePolicyChecked means chat mode and privacy policy were evaluated.
-	StatePolicyChecked MessageState = "policy_checked"
-	// StateAIRequested means the Python AI client was called.
-	StateAIRequested MessageState = "ai_requested"
-	// StateAIGenerated means the Python AI client returned a proposal.
-	StateAIGenerated MessageState = "ai_generated"
-	// StateDecisionMade means the backend final decision engine completed.
-	StateDecisionMade MessageState = "decision_made"
-	// StateDraftSentToOwner means the owner-facing draft was created.
-	StateDraftSentToOwner MessageState = "draft_sent_to_owner"
-	// StateApprovedByOwner means an approval callback accepted a draft.
-	StateApprovedByOwner MessageState = "approved_by_owner"
-	// StateSentToRecipient means the reply was sent to the recipient.
-	StateSentToRecipient MessageState = "sent_to_recipient"
-	// StateIgnored means the message or draft was intentionally ignored.
-	StateIgnored MessageState = "ignored"
-	// StateFailed means processing failed.
-	StateFailed MessageState = "failed"
-)
+// LLMPurpose tags every LLM call with the pipeline stage it belongs to.
+// Routed to LiteLLM as the X-LiteLLM-Purpose header and used by the
+// InputSafetyScanner / OutputSafetyScanner to pick the right scanner set.
+// Allowed values are generated from contracts/contracts.json — see contract_enums.gen.go.
+type LLMPurpose string
+
+// IsValid reports whether the purpose is part of the frozen contract.
+func (p LLMPurpose) IsValid() bool {
+	switch p {
+	case PurposeDraft, PurposeExtract, PurposeSummarize, PurposeEmbed, PurposeModerate, PurposeClassify:
+		return true
+	default:
+		return false
+	}
+}
 
 // ApprovalAction is the owner callback action.
+// Allowed values are generated from contracts/contracts.json — see contract_enums.gen.go.
 type ApprovalAction string
-
-const (
-	// ApprovalApprove sends the draft to the recipient.
-	ApprovalApprove ApprovalAction = "approve"
-	// ApprovalReject rejects the draft.
-	ApprovalReject ApprovalAction = "reject"
-	// ApprovalRegenerate asks for a new draft.
-	ApprovalRegenerate ApprovalAction = "regenerate"
-	// ApprovalEdit replaces the draft text with owner-edited text.
-	ApprovalEdit ApprovalAction = "edit"
-	// ApprovalMakeShorter revises the draft to be shorter.
-	ApprovalMakeShorter ApprovalAction = "make_shorter"
-	// ApprovalMakeMoreFormal revises the draft to be more formal.
-	ApprovalMakeMoreFormal ApprovalAction = "make_more_formal"
-	// ApprovalNoMemory enables no-memory mode for the chat.
-	ApprovalNoMemory ApprovalAction = "no_memory"
-	// ApprovalThumbUp records positive feedback on a draft.
-	ApprovalThumbUp ApprovalAction = "thumb_up"
-	// ApprovalThumbDown records negative feedback and prompts text feedback.
-	ApprovalThumbDown ApprovalAction = "thumb_down"
-	// ApprovalEditRequest puts the bot into "waiting for direct text replacement" state.
-	ApprovalEditRequest ApprovalAction = "edit_request"
-	// ApprovalAIRefine puts the bot into "waiting for AI refinement instruction" state.
-	ApprovalAIRefine ApprovalAction = "ai_refine"
-	// ApprovalChooseOption selects one of the AI-suggested options from a question card.
-	// The chosen option is used as a hint so the AI can craft a full reply.
-	ApprovalChooseOption ApprovalAction = "choose_option"
-)
 
 // IsValid reports whether the approval action is part of the frozen contract.
 func (a ApprovalAction) IsValid() bool {
@@ -555,6 +474,10 @@ type FeedbackItem struct {
 // AIProcessMessageRequest is sent to the Python AI service.
 type AIProcessMessageRequest struct {
 	RequestID       string                  `json:"request_id"`
+	// TraceID is the deterministic W3C trace-id derived from Event.EventID.
+	// Propagated to Python via the traceparent header and persisted on every
+	// state/audit row produced for this webhook so all spans correlate.
+	TraceID         string                  `json:"trace_id,omitempty"`
 	Event           NormalizedTelegramEvent `json:"event"`
 	ChatSettings    ChatSettings            `json:"chat_settings"`
 	// MemoryContext is the assembled prompt context (Working + Episodic + Semantic layers).
@@ -583,6 +506,10 @@ type AIProcessMessageResponse struct {
 	ModelUsed    string     `json:"model_used"`
 	Usage        TokenUsage `json:"usage"`
 	MemoryUsed   []string   `json:"memory_used"`
+	// Flagged is set by the Phase 3 output-safety layer when a draft contains
+	// toxicity, sensitive content, or schema-invalid output the repair attempt
+	// could not salvage.  Drafts are still returned; the bot UI annotates them.
+	Flagged      bool       `json:"flagged,omitempty"`
 }
 
 // AuditEvent records the policy outcome for an inbound message.
@@ -593,6 +520,9 @@ type AuditEvent struct {
 	SourceMessageID string    `json:"source_message_id"`
 	Decision        Decision  `json:"decision"`
 	Reason          string    `json:"reason"`
+	// TraceID is the W3C trace-id this audit row belongs to.  Joins audit
+	// rows back to Langfuse spans and message_states for the same event.
+	TraceID         string    `json:"trace_id,omitempty"`
 	CreatedAt       time.Time `json:"created_at"`
 }
 
@@ -612,6 +542,7 @@ type ApprovalCallbackPayload struct {
 type ChatSummaryRequest struct {
 	Messages     []string     `json:"messages"`
 	PrivacyFlags PrivacyFlags `json:"privacy_flags"`
+	TraceID      string       `json:"trace_id,omitempty"`
 }
 
 // ChatSummaryResponse is returned by the Python AI service.
@@ -675,12 +606,6 @@ func UnlockedModesForScore(score int) []ChatMode {
 func SendIdempotencyKey(tenantID, chatID, sourceMessageID, decisionID string) string {
 	return tenantID + ":" + chatID + ":" + sourceMessageID + ":" + decisionID
 }
-
-// SemiAutoMinConfidence is the minimum confidence for semi-auto replies.
-const SemiAutoMinConfidence = 0.85
-
-// AutoMinConfidence is the minimum confidence for auto replies.
-const AutoMinConfidence = 0.92
 
 func formatInt64(v int64) string {
 	return strconv.FormatInt(v, 10)

@@ -2,9 +2,24 @@
 
 from __future__ import annotations
 
+import json
+import pathlib
 import unittest
 
-from ai_agent.schemas import ChatMode, Decision, PrivacyFlag, RiskLevel
+from ai_agent import contract_enums
+from ai_agent.schemas import ChatMode, Decision, LLMPurpose, PrivacyFlag, RiskLevel
+
+CONTRACTS_JSON = (
+    pathlib.Path(__file__).resolve().parent.parent.parent / "contracts" / "contracts.json"
+)
+
+
+def _values(enum_cls: type) -> set[str]:
+    return {item.value for item in enum_cls}
+
+
+def _load_contract() -> dict:
+    return json.loads(CONTRACTS_JSON.read_text())
 
 
 class ContractEnumTests(unittest.TestCase):
@@ -36,6 +51,71 @@ class ContractEnumTests(unittest.TestCase):
         self.assertEqual(
             {item.value for item in RiskLevel},
             {"low", "medium", "high", "critical"},
+        )
+
+    def test_llm_purpose_values_match_contract(self) -> None:
+        """LLMPurpose enum values must match contracts.json llm_purposes."""
+        self.assertEqual(
+            {item.value for item in LLMPurpose},
+            {"draft", "extract", "summarize", "embed", "moderate", "classify"},
+        )
+
+    def test_llm_purpose_draft_str_value(self) -> None:
+        """LLMPurpose("draft").value must equal "draft" (header attribute)."""
+        self.assertEqual(LLMPurpose("draft").value, "draft")
+
+
+class GeneratedEnumsMatchContractJSONTests(unittest.TestCase):
+    """Guard against drift between contracts.json and the generated Python file.
+
+    If this test fails, regenerate via ``scripts/generate_contracts.py`` and
+    commit the new ``ai_agent/contract_enums.py``.
+    """
+
+    def setUp(self) -> None:
+        self.contract = _load_contract()
+
+    def test_version_matches(self) -> None:
+        self.assertEqual(contract_enums.CONTRACT_VERSION, self.contract["version"])
+
+    def test_decisions(self) -> None:
+        self.assertEqual(_values(contract_enums.Decision), set(self.contract["decisions"]))
+
+    def test_chat_modes(self) -> None:
+        self.assertEqual(_values(contract_enums.ChatMode), set(self.contract["chat_modes"]))
+
+    def test_privacy_flags(self) -> None:
+        self.assertEqual(_values(contract_enums.PrivacyFlag), set(self.contract["privacy_flags"]))
+
+    def test_risk_levels(self) -> None:
+        self.assertEqual(_values(contract_enums.RiskLevel), set(self.contract["risk_levels"]))
+
+    def test_approval_actions(self) -> None:
+        self.assertEqual(
+            _values(contract_enums.ApprovalAction),
+            set(self.contract["approval_actions"]),
+        )
+
+    def test_message_states(self) -> None:
+        self.assertEqual(
+            _values(contract_enums.MessageState),
+            set(self.contract["message_states"]),
+        )
+
+    def test_llm_purposes(self) -> None:
+        self.assertEqual(
+            _values(contract_enums.LLMPurpose),
+            set(self.contract["llm_purposes"]),
+        )
+
+    def test_confidence_thresholds(self) -> None:
+        self.assertEqual(
+            contract_enums.SEMI_AUTO_MIN_CONFIDENCE,
+            self.contract["confidence_thresholds"]["semi_auto_min"],
+        )
+        self.assertEqual(
+            contract_enums.AUTO_MIN_CONFIDENCE,
+            self.contract["confidence_thresholds"]["auto_min"],
         )
 
 

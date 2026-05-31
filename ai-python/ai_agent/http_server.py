@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import sys
@@ -9,7 +10,15 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Any
 
+from .config.flags import FeatureFlags, load_from_env as load_flags_from_env
+from .contract_enums import LLMPurpose
 from .llm import MockLLMGateway, ModelRouter, OpenRouterLLMGateway, UnconfiguredLLMGateway
+from .llm_litellm import LiteLLMGateway
+from .observability.context import LLMCallContext, with_context
+from .observability.langfuse_sink import HttpUploader, LangfuseSink
+from .observability.trace import derive_trace_id, parse_traceparent
+from .safety.input import InputSafetyScanner
+from .safety.output import OutputSafetyScanner
 from .schemas import (
     parse_draft_request,
     parse_embed_texts_request,
@@ -28,6 +37,7 @@ class AIHTTPHandler(BaseHTTPRequestHandler):
 
     service: AIService
     mock_llm: bool
+    flags: FeatureFlags = FeatureFlags()
 
     def do_GET(self) -> None:
         """Handle liveness and readiness requests."""
@@ -57,11 +67,14 @@ class AIHTTPHandler(BaseHTTPRequestHandler):
             return
         try:
             payload = self._read_json()
-            self._log_json("ai request received", _request_summary(self.path, payload))
+            trace_id, ctx = self._build_call_context(payload)
+            payload.setdefault("trace_id", trace_id)
+            self._log_json("ai request received", {"trace_id": trace_id, **_request_summary(self.path, payload)})
             t0 = time.perf_counter()
-            response = route(payload)
+            with with_context(ctx):
+                response = route(payload)
             latency_ms = (time.perf_counter() - t0) * 1000
-            self._log_json("ai response ready", _response_summary(self.path, payload, response, latency_ms))
+            self._log_json("ai response ready", {"trace_id": trace_id, **_response_summary(self.path, payload, response, latency_ms)})
             self._write_json(200, response)
         except (KeyError, TypeError, ValueError) as exc:
             self._log_json("ai request rejected", {"path": self.path, "error": str(exc)})
@@ -105,6 +118,48 @@ class AIHTTPHandler(BaseHTTPRequestHandler):
     def _summarize_chat(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self.service.summarize_chat(parse_summary_request(payload)).to_dict()
 
+    # _PURPOSE_BY_PATH maps each endpoint to the LLMPurpose tag the safety /
+    # observability layers will see in the call context.
+    _PURPOSE_BY_PATH: dict[str, LLMPurpose] = {
+        "/ai/process-message": LLMPurpose.DRAFT,
+        "/ai/generate-draft": LLMPurpose.DRAFT,
+        "/ai/classify-risk": LLMPurpose.CLASSIFY,
+        "/ai/classify-intent": LLMPurpose.CLASSIFY,
+        "/ai/extract-memory": LLMPurpose.EXTRACT,
+        "/ai/extract-facts-typed": LLMPurpose.EXTRACT,
+        "/ai/embed-texts": LLMPurpose.EMBED,
+        "/ai/summarize-chat": LLMPurpose.SUMMARIZE,
+    }
+
+    def _build_call_context(self, payload: dict[str, Any]) -> tuple[str, LLMCallContext]:
+        """Derive a trace_id and ``LLMCallContext`` for the current request.
+
+        Precedence:
+          1. ``traceparent`` header (W3C standard, preferred).
+          2. ``X-DoubleU-Trace-ID`` (transitional fallback for one release).
+          3. ``derive_trace_id(event.event_id)`` for process-message events.
+          4. ``payload["trace_id"]`` echoed back from the Go backend.
+        """
+        trace_id = parse_traceparent(self.headers.get("traceparent"))
+        if not trace_id:
+            trace_id = (self.headers.get("X-DoubleU-Trace-ID") or "").strip()
+        if not trace_id:
+            event = payload.get("event") if isinstance(payload.get("event"), dict) else None
+            if event is not None:
+                trace_id = derive_trace_id(str(event.get("event_id", "")))
+        if not trace_id:
+            trace_id = str(payload.get("trace_id", "")).strip()
+
+        ctx_payload = payload.get("event") if isinstance(payload.get("event"), dict) else payload
+        ctx = LLMCallContext(
+            trace_id=trace_id,
+            tenant_id=str(ctx_payload.get("tenant_id", "")),
+            chat_id=str(ctx_payload.get("chat_id", "")),
+            event_id=str(ctx_payload.get("event_id", "")),
+            purpose=self._PURPOSE_BY_PATH.get(self.path),
+        )
+        return trace_id, ctx
+
     def _read_json(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(length)
@@ -126,13 +181,28 @@ class AIHTTPHandler(BaseHTTPRequestHandler):
         print(json.dumps(record, ensure_ascii=False, separators=(",", ":")), file=sys.stdout, flush=True)
 
 
-def create_service_from_env() -> tuple[AIService, bool]:
-    """Create the service and report whether deterministic mock mode is active."""
+def create_service_from_env() -> tuple[AIService, bool, FeatureFlags]:
+    """Create the service and report whether deterministic mock mode is active.
+
+    Returns a ``(service, mock_llm, flags)`` tuple so callers can mount the
+    flags on the request handler for Phase 1+ safety gates.
+    """
+    flags = load_flags_from_env()
     mock_llm = os.getenv("MOCK_LLM", "true").lower() in ("1", "true", "yes", "on")
     model = os.getenv("OPENROUTER_MODEL", "").strip()
+    input_safety = InputSafetyScanner(flags=flags) if flags.safety_input_enabled else None
+    output_safety = OutputSafetyScanner(flags=flags) if flags.safety_output_enabled else None
+    sink = _build_langfuse_sink(flags)
     if mock_llm:
         gateway = MockLLMGateway()
-        router = ModelRouter(gateway)
+        router = ModelRouter(gateway, flags=flags, input_safety=input_safety, output_safety=output_safety, sink=sink)
+    elif flags.llm_gateway == "litellm":
+        gateway = LiteLLMGateway(
+            master_key=os.getenv("LITELLM_MASTER_KEY", ""),
+            base_url=os.getenv("LITELLM_BASE_URL", "http://litellm:4000"),
+            timeout_seconds=float(os.getenv("LITELLM_TIMEOUT_SECONDS", "30")),
+        )
+        router = ModelRouter(gateway, flags=flags, input_safety=input_safety, output_safety=output_safety, sink=sink)
     elif os.getenv("OPENROUTER_API_KEY", "").strip() and model:
         gateway = OpenRouterLLMGateway(
             api_key=os.getenv("OPENROUTER_API_KEY", ""),
@@ -143,14 +213,33 @@ def create_service_from_env() -> tuple[AIService, bool]:
             app_url=os.getenv("OPENROUTER_APP_URL", ""),
             timeout_seconds=float(os.getenv("OPENROUTER_TIMEOUT_SECONDS", "30")),
         )
-        router = ModelRouter(gateway, fixed_model=model)
+        router = ModelRouter(gateway, fixed_model=model, flags=flags, input_safety=input_safety, output_safety=output_safety, sink=sink)
     else:
         gateway = UnconfiguredLLMGateway()
-        router = ModelRouter(gateway)
-    return build_service(router), mock_llm
+        router = ModelRouter(gateway, flags=flags, input_safety=input_safety, output_safety=output_safety, sink=sink)
+    return build_service(router), mock_llm, flags
 
 
-def make_handler(service: AIService, mock_llm: bool) -> type[AIHTTPHandler]:
+def _build_langfuse_sink(flags: FeatureFlags) -> LangfuseSink | None:
+    """Instantiate a LangfuseSink with a live HTTP uploader when OBSERVABILITY_SINK=langfuse.
+
+    Returns ``None`` when the sink is disabled or credentials are missing so
+    ModelRouter degrades to noop observability without changing call sites.
+    """
+    if flags.observability_sink != "langfuse":
+        return None
+    host = os.getenv("LANGFUSE_HOST", "").strip()
+    public_key = os.getenv("LANGFUSE_PUBLIC_KEY", "").strip()
+    secret_key = os.getenv("LANGFUSE_SECRET_KEY", "").strip()
+    if not (host and public_key and secret_key):
+        return None
+    uploader = HttpUploader(host=host, public_key=public_key, secret_key=secret_key)
+    sink = LangfuseSink(host=host, public_key=public_key, secret_key=secret_key, uploader=uploader)
+    atexit.register(sink.flush)
+    return sink
+
+
+def make_handler(service: AIService, mock_llm: bool, flags: FeatureFlags | None = None) -> type[AIHTTPHandler]:
     """Create a request handler class bound to a service instance."""
 
     class BoundAIHTTPHandler(AIHTTPHandler):
@@ -158,6 +247,7 @@ def make_handler(service: AIService, mock_llm: bool) -> type[AIHTTPHandler]:
 
     BoundAIHTTPHandler.service = service
     BoundAIHTTPHandler.mock_llm = mock_llm
+    BoundAIHTTPHandler.flags = flags or FeatureFlags()
     return BoundAIHTTPHandler
 
 
@@ -237,6 +327,6 @@ def _truncate(value: str, limit: int) -> str:
 
 def run(host: str = "0.0.0.0", port: int = 8081) -> None:
     """Run the stdlib HTTP service until interrupted."""
-    service, mock_llm = create_service_from_env()
-    server = ThreadingHTTPServer((host, port), make_handler(service, mock_llm))
+    service, mock_llm, flags = create_service_from_env()
+    server = ThreadingHTTPServer((host, port), make_handler(service, mock_llm, flags))
     server.serve_forever()

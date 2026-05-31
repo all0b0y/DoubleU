@@ -39,6 +39,7 @@ type MemoryExtractionRequest struct {
 	TenantID     string   `json:"tenant_id"`
 	ChatID       string   `json:"chat_id"`
 	PrivacyFlags []string `json:"privacy_flags"`
+	TraceID      string   `json:"trace_id,omitempty"`
 }
 
 // MemoryExtractionResponse is returned by the Python AI service for async fact extraction.
@@ -59,6 +60,7 @@ type TypedExtractionRequest struct {
 	TenantID     string   `json:"tenant_id"`
 	ChatID       string   `json:"chat_id"`
 	PrivacyFlags []string `json:"privacy_flags"`
+	TraceID      string   `json:"trace_id,omitempty"`
 }
 
 // TypedFact is a single typed, atomic fact extracted from a message.
@@ -72,9 +74,15 @@ type TypedFact struct {
 }
 
 // TypedExtractionResponse is returned by the Python AI service for typed fact extraction.
+// The diagnostic fields back the extraction_log row so a returned empty Facts slice is
+// distinguishable from a silent failure (design: extraction observability).
 type TypedExtractionResponse struct {
-	Facts            []TypedFact `json:"facts"`
-	BlockedByPrivacy bool        `json:"blocked_by_privacy"`
+	Facts                   []TypedFact `json:"facts"`
+	BlockedByPrivacy        bool        `json:"blocked_by_privacy"`
+	ModelUsed               string      `json:"model_used"`
+	RawOutput               string      `json:"raw_output"`
+	LLMFactsCount           int         `json:"llm_facts_count"`
+	DeterministicFactsCount int         `json:"deterministic_facts_count"`
 }
 
 // TypedMemoryExtractor is optionally implemented by AI clients that support typed extraction.
@@ -85,8 +93,9 @@ type TypedMemoryExtractor interface {
 
 // EmbedTextsRequest is sent to the Python AI service to generate text embeddings.
 type EmbedTextsRequest struct {
-	Texts []string `json:"texts"`
-	Model string   `json:"model,omitempty"`
+	Texts   []string `json:"texts"`
+	Model   string   `json:"model,omitempty"`
+	TraceID string   `json:"trace_id,omitempty"`
 }
 
 // EmbedTextsResponse contains one embedding vector per input text.

@@ -156,6 +156,10 @@ export function renderChat(navigate, chatId) {
             <button class="draft-text-btn" data-action="regenerate"   data-id="${d.draft_id}">🔄 ещё</button>
           </div>
         </div>
+        <div class="draft-rate-row" style="display:flex;gap:6px;margin-top:6px;justify-content:flex-end">
+          <button class="draft-text-btn" data-action="thumb_up"   data-id="${d.draft_id}" title="Нравится">👍</button>
+          <button class="draft-text-btn" data-action="thumb_down" data-id="${d.draft_id}" title="Не нравится">👎</button>
+        </div>
         <div class="draft-send-row" style="margin-top:6px">
           <button class="draft-trash-btn" data-action="reject"  data-id="${d.draft_id}" title="Отклонить">🗑</button>
           <button class="draft-send-btn"  data-action="approve" data-id="${d.draft_id}">↑ отправить</button>

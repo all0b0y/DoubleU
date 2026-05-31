@@ -1,5 +1,13 @@
 {
-  "version": "0.1.0",
+  "version": "0.3.0",
+  "llm_purposes": [
+    "draft",
+    "extract",
+    "summarize",
+    "embed",
+    "moderate",
+    "classify"
+  ],
   "decisions": [
     "draft",
     "auto_reply",
@@ -38,7 +46,12 @@
     "edit",
     "make_shorter",
     "make_more_formal",
-    "no_memory"
+    "no_memory",
+    "thumb_up",
+    "thumb_down",
+    "edit_request",
+    "ai_refine",
+    "choose_option"
   ],
   "message_states": [
     "received",

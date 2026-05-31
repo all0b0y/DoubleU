@@ -1,49 +1,26 @@
-"""Typed schemas and contract enums for the Python AI service."""
+"""Typed schemas and contract enums for the Python AI service.
+
+Enum values (Decision, ChatMode, PrivacyFlag, RiskLevel) are re-exported from
+``contract_enums`` which is generated from ``contracts/contracts.json``.
+Regenerate via ``scripts/generate_contracts.py`` — do not redefine them here.
+"""
 
 from __future__ import annotations
 
+import json
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any
 
+from ai_agent.contract_enums import (
+    ChatMode,
+    Decision,
+    LLMPurpose,
+    PrivacyFlag,
+    RiskLevel,
+)
 
-class Decision(str, Enum):
-    """AI decision values shared by the service contract."""
-
-    DRAFT = "draft"
-    AUTO_REPLY = "auto_reply"
-    IGNORE = "ignore"
-    OBSERVE = "observe"
-    ASK_OWNER = "ask_owner"
-    ERROR_FALLBACK = "error_fallback"
-
-
-class ChatMode(str, Enum):
-    """Chat autonomy modes shared by the service contract."""
-
-    DISABLED = "disabled"
-    SILENT = "silent"
-    MANUAL = "manual"
-    SEMI_AUTO = "semi_auto"
-    AUTO = "auto"
-
-
-class PrivacyFlag(str, Enum):
-    """Privacy flags shared by the service contract."""
-
-    NO_MEMORY = "no_memory"
-    NO_TRAINING = "no_training"
-    PRIVATE = "private"
-    NO_SUMMARY = "no_summary"
-
-
-class RiskLevel(str, Enum):
-    """Risk levels shared by the service contract."""
-
-    LOW = "low"
-    MEDIUM = "medium"
-    HIGH = "high"
-    CRITICAL = "critical"
+__all__ = ["ChatMode", "Decision", "LLMPurpose", "PrivacyFlag", "RiskLevel"]
 
 
 class ModelTask(str, Enum):
@@ -107,13 +84,53 @@ class FeedbackItem(JsonDataclass):
 
 @dataclass(frozen=True)
 class ContactProfileData(JsonDataclass):
-    """Owner-supplied profile describing the contact in a specific chat."""
+    """Owner-supplied profile describing the contact in a specific chat.
+
+    Covers three concerns the Go ``ContactProfile`` carries:
+      * Собеседник — who the contact is (``name``/``gender``/``role``/…).
+      * Я с ним — how the OWNER writes to this contact (``owner_style``, ``tone``,
+        ``emoji_usage``, ``address_form``).  ``owner_style`` is owner-authored and
+        belongs in the OWNER prompt section, not the contact description.
+      * Чат — what the conversation is about (``chat_context``, ``do_not_discuss``).
+    """
 
     name: str = ""
     gender: str = ""
     role: str = ""
     relationship_type: str = ""
+    # Я с ним — owner's writing style toward this contact (from style_notes /
+    # the legacy notes me_style field).  This is the primary basis for the draft.
+    owner_style: str = ""
+    tone: str = ""
+    emoji_usage: str = ""
+    address_form: str = ""
+    # Чат — conversation framing supplied by the owner.
+    chat_context: str = ""
+    do_not_discuss: tuple[str, ...] = field(default_factory=tuple)
+    # Собеседник/Чат — attributes the Go ContactProfile already sends but the
+    # prompt previously dropped on the floor.
+    topics: tuple[str, ...] = field(default_factory=tuple)
+    language: str = ""
+    contact_timezone: str = ""
+    preferred_address: str = ""
+    # Legacy free-text notes, retained for backward compatibility.  Never rendered
+    # raw into the prompt — owner_style / chat_context are derived from it.
     notes: str = ""
+
+
+@dataclass(frozen=True)
+class UserSettingsData(JsonDataclass):
+    """Owner identity/preferences (User Layer) used to ground draft generation.
+
+    The Go backend already sends ``user_settings`` on every process-message
+    request; these fields were previously parsed away and never reached the prompt.
+    """
+
+    display_name: str = ""
+    bio: str = ""
+    timezone: str = ""
+    primary_language: str = ""
+    language_for_drafts: str = ""
 
 
 @dataclass(frozen=True)
@@ -126,6 +143,10 @@ class AIProcessMessageRequest(JsonDataclass):
     memory_context: tuple[str, ...] = field(default_factory=tuple)
     feedback_context: tuple[FeedbackItem, ...] = field(default_factory=tuple)
     contact_profile: ContactProfileData | None = None
+    user_settings: UserSettingsData | None = None
+    # trace_id is the deterministic W3C trace-id derived from event.event_id.
+    # Default "" keeps positional construction backwards-compatible.
+    trace_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -140,6 +161,9 @@ class AIProcessMessageResponse(JsonDataclass):
     model_used: str
     usage: Usage
     memory_used: tuple[str, ...] = field(default_factory=tuple)
+    # Set by the Phase 3 OutputSafetyScanner when toxicity/sensitive is found
+    # in the draft but repair could not salvage it.  Bot UI annotates with ⚠.
+    flagged: bool = False
 
 
 @dataclass(frozen=True)
@@ -153,6 +177,7 @@ class AuditEvent(JsonDataclass):
     decision: Decision
     reason: str
     created_at: str
+    trace_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -213,6 +238,7 @@ class MemoryExtractionRequest(JsonDataclass):
     tenant_id: str = ""
     chat_id: str = ""
     privacy_flags: tuple[PrivacyFlag, ...] = field(default_factory=tuple)
+    trace_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -250,14 +276,28 @@ class TypedExtractionRequest(JsonDataclass):
     tenant_id: str = ""
     chat_id: str = ""
     privacy_flags: tuple[PrivacyFlag, ...] = field(default_factory=tuple)
+    trace_id: str = ""
 
 
 @dataclass(frozen=True)
 class TypedExtractionResponse(JsonDataclass):
-    """Response body for `/ai/extract-facts-typed`."""
+    """Response body for `/ai/extract-facts-typed`.
+
+    The diagnostic fields (``model_used``, ``raw_output``, ``llm_facts_count``,
+    ``deterministic_facts_count``) let the Go backend persist an ``extraction_log``
+    row so the pipeline stops being a black box — previously a returned ``[]`` was
+    indistinguishable from a silent failure.  They default to empty so existing
+    positional callers/tests keep working.
+    """
 
     facts: tuple[TypedFact, ...]
     blocked_by_privacy: bool
+    model_used: str = ""
+    # Verbatim LLM output (truncated) — what the model actually returned before
+    # normalization, for debugging "why so few facts".
+    raw_output: str = ""
+    llm_facts_count: int = 0
+    deterministic_facts_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -270,6 +310,7 @@ class EmbedTextsRequest(JsonDataclass):
 
     texts: tuple[str, ...]
     model: str = "qwen/qwen3-embedding-8b"
+    trace_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -289,6 +330,7 @@ class ChatSummaryRequest(JsonDataclass):
 
     messages: tuple[str, ...] = field(default_factory=tuple)
     privacy_flags: tuple[PrivacyFlag, ...] = field(default_factory=tuple)
+    trace_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -311,6 +353,7 @@ class GatewayRequest(JsonDataclass):
     system_prompt: str
     user_payload: str
     metadata: dict[str, Any] = field(default_factory=dict)
+    trace_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -320,6 +363,9 @@ class GatewayResponse(JsonDataclass):
     text: str
     model_used: str
     usage: Usage
+    # cost_usd is parsed from the LiteLLM ``x-litellm-response-cost`` header
+    # (Phase 2).  Defaults to 0.0 when the legacy direct provider path is used.
+    cost_usd: float = 0.0
 
 
 def parse_process_message_request(payload: dict[str, Any]) -> AIProcessMessageRequest:
@@ -329,6 +375,7 @@ def parse_process_message_request(payload: dict[str, Any]) -> AIProcessMessageRe
     memory_context = payload.get("memory_context") or []
     return AIProcessMessageRequest(
         request_id=str(payload["request_id"]),
+        trace_id=str(payload.get("trace_id", "")),
         event=NormalizedTelegramEvent(
             event_id=str(event["event_id"]),
             tenant_id=str(event["tenant_id"]),
@@ -350,6 +397,7 @@ def parse_process_message_request(payload: dict[str, Any]) -> AIProcessMessageRe
         memory_context=tuple(str(item) for item in memory_context),
         feedback_context=_parse_feedback_context(payload.get("feedback_context", [])),
         contact_profile=_parse_contact_profile(payload.get("contact_profile")),
+        user_settings=_parse_user_settings(payload.get("user_settings")),
     )
 
 
@@ -381,6 +429,7 @@ def parse_memory_request(payload: dict[str, Any]) -> MemoryExtractionRequest:
         tenant_id=str(payload.get("tenant_id", "")),
         chat_id=str(payload.get("chat_id", "")),
         privacy_flags=_parse_privacy_flags(payload.get("privacy_flags", [])),
+        trace_id=str(payload.get("trace_id", "")),
     )
 
 
@@ -390,6 +439,7 @@ def parse_embed_texts_request(payload: dict[str, Any]) -> EmbedTextsRequest:
     return EmbedTextsRequest(
         texts=tuple(str(t) for t in texts),
         model=str(payload.get("model", "qwen/qwen3-embedding-8b")),
+        trace_id=str(payload.get("trace_id", "")),
     )
 
 
@@ -400,6 +450,7 @@ def parse_typed_extraction_request(payload: dict[str, Any]) -> TypedExtractionRe
         tenant_id=str(payload.get("tenant_id", "")),
         chat_id=str(payload.get("chat_id", "")),
         privacy_flags=_parse_privacy_flags(payload.get("privacy_flags", [])),
+        trace_id=str(payload.get("trace_id", "")),
     )
 
 
@@ -413,20 +464,74 @@ def parse_summary_request(payload: dict[str, Any]) -> ChatSummaryRequest:
     return ChatSummaryRequest(
         messages=messages,
         privacy_flags=_parse_privacy_flags(payload.get("privacy_flags", [])),
+        trace_id=str(payload.get("trace_id", "")),
     )
 
 
 def _parse_contact_profile(raw: Any) -> ContactProfileData | None:
-    """Parse an optional contact_profile dict into a typed dataclass."""
+    """Parse an optional contact_profile dict into a typed dataclass.
+
+    The Go backend sends both structured style fields (``style_notes``, ``tone``,
+    ``emoji_usage``, ``address_form``, ``chat_context``, ``do_not_discuss``) and a
+    legacy ``notes`` JSON string ``{"me_style", "chat_context"}`` used by the Mini
+    App.  Structured fields win; the ``notes`` JSON is parsed as a fallback so chats
+    whose profile predates the structured columns still surface owner style.
+    """
     if not isinstance(raw, dict):
         return None
+    legacy = _parse_legacy_notes(raw.get("notes", ""))
+    owner_style = str(raw.get("style_notes", "")).strip() or legacy.get("me_style", "")
+    chat_context = str(raw.get("chat_context", "")).strip() or legacy.get("chat_context", "")
     return ContactProfileData(
         name=str(raw.get("name", "")),
         gender=str(raw.get("gender", "")),
         role=str(raw.get("role", "")),
         relationship_type=str(raw.get("relationship_type", "")),
+        owner_style=owner_style,
+        tone=str(raw.get("tone", "")),
+        emoji_usage=str(raw.get("emoji_usage", "")),
+        address_form=str(raw.get("address_form", "")),
+        chat_context=chat_context,
+        do_not_discuss=_parse_str_tuple(raw.get("do_not_discuss")),
+        topics=_parse_str_tuple(raw.get("topics")),
+        language=str(raw.get("language", "")),
+        contact_timezone=str(raw.get("contact_timezone", "")),
+        preferred_address=str(raw.get("preferred_address", "")),
         notes=str(raw.get("notes", "")),
     )
+
+
+def _parse_user_settings(raw: Any) -> UserSettingsData | None:
+    """Parse an optional user_settings dict into a typed dataclass."""
+    if not isinstance(raw, dict):
+        return None
+    return UserSettingsData(
+        display_name=str(raw.get("display_name", "")),
+        bio=str(raw.get("bio", "")),
+        timezone=str(raw.get("timezone", "")),
+        primary_language=str(raw.get("primary_language", "")),
+        language_for_drafts=str(raw.get("language_for_drafts", "")),
+    )
+
+
+def _parse_legacy_notes(notes: Any) -> dict[str, str]:
+    """Parse the legacy ``notes`` JSON string into a flat dict, tolerating garbage."""
+    if not isinstance(notes, str) or not notes.strip():
+        return {}
+    try:
+        parsed = json.loads(notes)
+    except (json.JSONDecodeError, ValueError):
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    return {str(k): str(v) for k, v in parsed.items() if isinstance(v, str)}
+
+
+def _parse_str_tuple(value: Any) -> tuple[str, ...]:
+    """Coerce a JSON list of strings into a tuple, dropping non-strings/blanks."""
+    if not isinstance(value, list):
+        return ()
+    return tuple(str(v).strip() for v in value if isinstance(v, str) and str(v).strip())
 
 
 def _parse_feedback_context(values: Any) -> tuple[FeedbackItem, ...]:

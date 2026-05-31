@@ -44,6 +44,16 @@ services:
       TELEGRAM_WEBHOOK_SECRET: ${TELEGRAM_WEBHOOK_SECRET:-}
       TELEGRAM_AUTO_SETUP: ${TELEGRAM_AUTO_SETUP:-false}
       MINIAPP_DIR: /app/miniapp
+      # LLM Safety & Observability flags (Phase 0–5).  All default safe-off.
+      SAFETY_INPUT_ENABLED: ${SAFETY_INPUT_ENABLED:-false}
+      SAFETY_OUTPUT_ENABLED: ${SAFETY_OUTPUT_ENABLED:-false}
+      LLM_GATEWAY: ${LLM_GATEWAY:-none}
+      OBSERVABILITY_SINK: ${OBSERVABILITY_SINK:-none}
+      SHADOW_MODE_ONLY: ${SHADOW_MODE_ONLY:-false}
+      CUTOVER: ${CUTOVER:-false}
+      LANGFUSE_HOST: ${LANGFUSE_HOST:-}
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
     ports:
       - "${BACKEND_PORT:-8080}:8080"
     volumes:
@@ -74,6 +84,18 @@ services:
       OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
       OPENROUTER_APP_NAME: ${OPENROUTER_APP_NAME:-DoubleU}
       OPENROUTER_APP_URL: ${OPENROUTER_APP_URL:-}
+      # LLM Safety & Observability flags (Phase 0–5).  All default safe-off.
+      SAFETY_INPUT_ENABLED: ${SAFETY_INPUT_ENABLED:-false}
+      SAFETY_OUTPUT_ENABLED: ${SAFETY_OUTPUT_ENABLED:-false}
+      LLM_GATEWAY: ${LLM_GATEWAY:-none}
+      OBSERVABILITY_SINK: ${OBSERVABILITY_SINK:-none}
+      SHADOW_MODE_ONLY: ${SHADOW_MODE_ONLY:-false}
+      CUTOVER: ${CUTOVER:-false}
+      LITELLM_BASE_URL: ${LITELLM_BASE_URL:-http://litellm:4000}
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-}
+      LANGFUSE_HOST: ${LANGFUSE_HOST:-}
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
     ports:
       - "${AI_SERVICE_PORT:-8090}:8090"
     depends_on:

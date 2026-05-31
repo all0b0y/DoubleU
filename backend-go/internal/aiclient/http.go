@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"doubleu/backend-go/internal/contracts"
+	tracepkg "doubleu/backend-go/internal/trace"
 )
 
 // HTTPClient calls the Python AI service over HTTP.
@@ -91,6 +92,12 @@ func (c *HTTPClient) ExtractFactsTyped(ctx context.Context, request TypedExtract
 	return response, nil
 }
 
+// embedTimeout is the per-call deadline for /ai/embed-texts.
+// Embedding a batch via a remote provider (OpenRouter/qwen) typically takes
+// 5–20 seconds; the default http.Client timeout of 10 s is too tight and
+// causes Broken-pipe errors when the provider is slow.
+const embedTimeout = 60 * time.Second
+
 // EmbedTexts calls the Python AI /ai/embed-texts endpoint to generate embeddings.
 // The Go embedding worker calls this in batches for facts without embeddings.
 func (c *HTTPClient) EmbedTexts(ctx context.Context, request EmbedTextsRequest) (EmbedTextsResponse, error) {
@@ -98,7 +105,11 @@ func (c *HTTPClient) EmbedTexts(ctx context.Context, request EmbedTextsRequest) 
 	if c.baseURL == "" {
 		return response, fmt.Errorf("ai base url is empty")
 	}
-	if err := c.postJSON(ctx, "/ai/embed-texts", request, &response); err != nil {
+	// Override the shared client timeout: embedding a batch through a remote
+	// provider takes much longer than a chat-completion request.
+	embedCtx, cancel := context.WithTimeout(ctx, embedTimeout)
+	defer cancel()
+	if err := c.postJSON(embedCtx, "/ai/embed-texts", request, &response); err != nil {
 		return response, err
 	}
 	return response, nil
@@ -114,6 +125,13 @@ func (c *HTTPClient) postJSON(ctx context.Context, path string, input any, outpu
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	// Propagate the W3C trace-id end-to-end so Python pipelines and Langfuse
+	// land on the same trace.  Legacy X-DoubleU-Trace-ID is sent for one
+	// release as a transitional fallback for any consumer not yet on W3C.
+	if traceID := tracepkg.FromContext(ctx); traceID != "" {
+		req.Header.Set("traceparent", tracepkg.FormatTraceparent(traceID))
+		req.Header.Set("X-DoubleU-Trace-ID", traceID)
+	}
 	res, err := c.client.Do(req)
 	if err != nil {
 		return err

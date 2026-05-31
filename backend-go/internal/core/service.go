@@ -16,6 +16,7 @@ import (
 	"doubleu/backend-go/internal/contracts"
 	"doubleu/backend-go/internal/store"
 	"doubleu/backend-go/internal/telegram"
+	tracepkg "doubleu/backend-go/internal/trace"
 )
 
 // DecisionEngine applies backend-owned policy to AI proposals.
@@ -101,6 +102,15 @@ type Service struct {
 	// notify pushes real-time events to connected Mini App clients.
 	// When set, bot draft cards are suppressed — the Mini App is the primary UI.
 	notify func(tenantID, eventType string, payload any)
+	// scoreSender attaches owner feedback (approve / reject / thumb) to the
+	// Langfuse trace of the draft.  nil means observability is off.
+	scoreSender OwnerFeedbackSender
+}
+
+// OwnerFeedbackSender is implemented by observability.ScoreSender; the
+// interface keeps the core package decoupled from the OTel/Langfuse SDK.
+type OwnerFeedbackSender interface {
+	SendOwnerFeedback(ctx context.Context, traceID string, rating string, comment string)
 }
 
 // Option configures a Service.
@@ -135,6 +145,13 @@ func WithLogger(logger *slog.Logger) Option {
 func WithNotifier(notify func(tenantID, eventType string, payload any)) Option {
 	return func(service *Service) {
 		service.notify = notify
+	}
+}
+
+// WithOwnerFeedbackSender wires a Langfuse-backed owner feedback forwarder.
+func WithOwnerFeedbackSender(sender OwnerFeedbackSender) Option {
+	return func(service *Service) {
+		service.scoreSender = sender
 	}
 }
 
@@ -208,6 +225,9 @@ func (s *Service) HandleTelegramWebhook(ctx context.Context, payload []byte, ten
 	}
 
 	event, err := telegram.NormalizeUpdate(payload, tenantHint, s.now())
+	// Stamp the request context with the deterministic trace-id derived from
+	// event_id.  Idempotent webhook replays share a trace (Phase 0 envelope).
+	ctx = tracepkg.WithTraceID(ctx, tracepkg.DeriveTraceID(event.EventID))
 	if err != nil {
 		audit := s.auditEvent(contracts.NormalizedTelegramEvent{
 			TenantID:        valueOrDefault(tenantHint, "unknown"),
@@ -282,8 +302,6 @@ func (s *Service) HandleTelegramWebhook(ctx context.Context, payload []byte, ten
 		return InboundResult{Event: event, Decision: contracts.DecisionIgnore, Reason: "passive_processing"}, nil
 	}
 
-	s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateReceived)
-	s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateNormalized)
 	settings := s.repository.ChatSettings(event.TenantID, event.ChatID)
 	s.repository.SaveChat(store.ChatRecord{
 		TenantID:             event.TenantID,
@@ -294,6 +312,15 @@ func (s *Service) HandleTelegramWebhook(ctx context.Context, payload []byte, ten
 		LastSourceMessageID:  event.SourceMessageID,
 		LastSeenAt:           s.now(),
 	})
+	// Persist the message row BEFORE any state/audit write so the DB foreign
+	// keys from message_states and audit_events back to messages always resolve.
+	// no_memory chats skip persistence — for those, AppendState / AppendAudit
+	// silently fall back to in-memory tracking inside the repository.
+	if !settings.PrivacyFlags.Contains(contracts.PrivacyNoMemory) {
+		s.repository.SaveMessage(event)
+	}
+	s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateReceived)
+	s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateNormalized)
 	s.logger.Info("telegram chat observed and stored",
 		"tenant_id", event.TenantID,
 		"chat_id", event.ChatID,
@@ -318,7 +345,6 @@ func (s *Service) HandleTelegramWebhook(ctx context.Context, payload []byte, ten
 	}
 
 	if !settings.PrivacyFlags.Contains(contracts.PrivacyNoMemory) {
-		s.repository.SaveMessage(event)
 		// Runtime State Layer: open or update the active episode for this chat (§6.2).
 		now := s.now()
 		ep := store.ActiveEpisodeRecord{
@@ -417,6 +443,7 @@ func (s *Service) HandleTelegramWebhook(ctx context.Context, payload []byte, ten
 	}
 	request := contracts.AIProcessMessageRequest{
 		RequestID:       event.EventID,
+		TraceID:         tracepkg.DeriveTraceID(event.EventID),
 		Event:           event,
 		ChatSettings:    settings,
 		MemoryContext:   s.conversationContext(ctx, event, ownerID, 20),
@@ -519,12 +546,12 @@ func (s *Service) HandleTelegramWebhook(ctx context.Context, payload []byte, ten
 				result.DraftID = draft.DraftID
 				if s.notify != nil {
 					s.notify(draft.TenantID, "new_draft", map[string]any{
-						"chat_id":    draft.ChatID,
-						"draft_id":  draft.DraftID,
-						"draft_type": draft.DraftType,
-						"options":   draft.SuggestedOptions,
+						"chat_id":     draft.ChatID,
+						"draft_id":    draft.DraftID,
+						"draft_type":  draft.DraftType,
+						"options":     draft.SuggestedOptions,
 						"source_text": draft.SourceMessageText,
-						"created_at": draft.CreatedAt.UTC().Format("2006-01-02T15:04:05Z"),
+						"created_at":  draft.CreatedAt.UTC().Format("2006-01-02T15:04:05Z"),
 					})
 				} else {
 					s.sendQuestionToOwner(ctx, event, draft, ownerID)
@@ -533,9 +560,12 @@ func (s *Service) HandleTelegramWebhook(ctx context.Context, payload []byte, ten
 			}
 		}
 		draft := s.createDraft(event, event.EventID, proposal.ResponseText)
+		if proposal.Flagged {
+			draft.ActionHistory = append(draft.ActionHistory, "flagged")
+		}
 		s.repository.SaveDraft(draft)
 		s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateDraftSentToOwner)
-		s.logger.Info("owner draft prepared", "tenant_id", event.TenantID, "chat_id", event.ChatID, "draft_id", draft.DraftID, "decision", decision)
+		s.logger.Info("owner draft prepared", "tenant_id", event.TenantID, "chat_id", event.ChatID, "draft_id", draft.DraftID, "decision", decision, "flagged", proposal.Flagged)
 		result.DraftID = draft.DraftID
 		if s.notify != nil {
 			s.notify(draft.TenantID, "new_draft", map[string]any{
@@ -568,20 +598,43 @@ func (s *Service) HandleTelegramWebhook(ctx context.Context, payload []byte, ten
 			go func() {
 				extractCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 				defer cancel()
+				start := s.now()
 				resp, err := typedExtractor.ExtractFactsTyped(extractCtx, aiclient.TypedExtractionRequest{
 					MessageText:  event.MessageText,
 					TenantID:     event.TenantID,
 					ChatID:       event.ChatID,
 					PrivacyFlags: privacyStrings,
 				})
+				durationMS := int(s.now().Sub(start).Milliseconds())
 				if err != nil {
 					s.logger.Warn("async typed extraction failed",
 						"tenant_id", event.TenantID, "chat_id", event.ChatID, "error", err)
+					s.repository.LogExtraction(store.ExtractionLogRecord{
+						TenantID:        event.TenantID,
+						ChatID:          event.ChatID,
+						InputMessageIDs: []string{event.SourceMessageID},
+						Error:           err.Error(),
+						DurationMS:      durationMS,
+					})
 					return
 				}
-				if !resp.BlockedByPrivacy {
-					s.saveTypedFacts(event, resp.Facts)
+				if resp.BlockedByPrivacy {
+					return
 				}
+				outcome := s.saveTypedFacts(event, resp.Facts)
+				// Persist the attempt so a returned empty fact set is observable and
+				// distinguishable from a silent failure (extraction observability).
+				s.repository.LogExtraction(store.ExtractionLogRecord{
+					TenantID:        event.TenantID,
+					ChatID:          event.ChatID,
+					InputMessageIDs: []string{event.SourceMessageID},
+					ModelUsed:       resp.ModelUsed,
+					RawOutput:       resp.RawOutput,
+					FactsCreated:    outcome.CreatedIDs,
+					FactsSkipped:    outcome.Skipped,
+					FactsMerged:     resp.DeterministicFactsCount,
+					DurationMS:      durationMS,
+				})
 			}()
 		} else if extractor, ok := s.ai.(aiclient.MemoryExtractor); ok {
 			go func() {
@@ -654,10 +707,11 @@ func (s *Service) conversationContext(ctx context.Context, event contracts.Norma
 	parts := make([]string, 0, len(records)+30)
 
 	// Embed the incoming message for similarity-based retrieval (design §8).
-	// Uses a short sub-context so a slow AI service never blocks the reply path.
+	// Uses a bounded sub-context so a slow provider never blocks the reply path.
+	// 5 s covers typical OpenRouter embedding latency (~2–3 s) with margin.
 	var queryVector []float64
 	if embedder, ok := s.ai.(aiclient.TextEmbedder); ok && event.MessageText != "" {
-		embedCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		embedCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		resp, err := embedder.EmbedTexts(embedCtx, aiclient.EmbedTextsRequest{Texts: []string{event.MessageText}})
 		cancel()
 		if err == nil && len(resp.Embeddings) > 0 {
@@ -670,9 +724,11 @@ func (s *Service) conversationContext(ctx context.Context, event contracts.Norma
 
 	// Greeting state: injected from the authoritative DB function (view_chat_greeted_today)
 	// so the Python prompt builder does not need to re-derive this by parsing timestamps.
-	if s.repository.GreetedToday(event.TenantID, event.ChatID, ownerID) {
-		parts = append(parts, "[RUNTIME: greeting_sent_today=true]")
-	}
+	// Authoritative greeting state from the DB, always emitted (true AND false)
+	// so the Python prompt builder can trust this flag and skip re-deriving
+	// "greeted today" by scanning every transcript line.
+	parts = append(parts, fmt.Sprintf("[RUNTIME: greeting_sent_today=%t]",
+		s.repository.GreetedToday(event.TenantID, event.ChatID, ownerID)))
 
 	// Open commitments: injected so the prompt can reference active obligations without
 	// a full fact scan.  Uses view_open_commitments DB function for consistency.
@@ -768,7 +824,6 @@ func (s *Service) feedbackContext(tenantID, chatID string, limit int) []contract
 	return items
 }
 
-
 // contextMarkerPrefixes are strings that identify assembled prompt context lines injected
 // by the Go backend (e.g. date headers, retrieved facts, conversation history).
 // If any of these appear in memory_used they are context contamination — not extracted facts —
@@ -858,19 +913,40 @@ func (s *Service) processPassive(ctx context.Context, event contracts.Normalized
 		go func() {
 			extractCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
+			start := s.now()
 			resp, err := typedExtractor.ExtractFactsTyped(extractCtx, aiclient.TypedExtractionRequest{
 				MessageText: event.MessageText,
 				TenantID:    event.TenantID,
 				ChatID:      event.ChatID,
 			})
+			durationMS := int(s.now().Sub(start).Milliseconds())
 			if err != nil {
 				s.logger.Warn("passive typed extraction failed",
 					"tenant_id", event.TenantID, "chat_id", event.ChatID, "error", err)
+				s.repository.LogExtraction(store.ExtractionLogRecord{
+					TenantID:        event.TenantID,
+					ChatID:          event.ChatID,
+					InputMessageIDs: []string{event.SourceMessageID},
+					Error:           err.Error(),
+					DurationMS:      durationMS,
+				})
 				return
 			}
-			if !resp.BlockedByPrivacy {
-				s.saveTypedFacts(event, resp.Facts)
+			if resp.BlockedByPrivacy {
+				return
 			}
+			outcome := s.saveTypedFacts(event, resp.Facts)
+			s.repository.LogExtraction(store.ExtractionLogRecord{
+				TenantID:        event.TenantID,
+				ChatID:          event.ChatID,
+				InputMessageIDs: []string{event.SourceMessageID},
+				ModelUsed:       resp.ModelUsed,
+				RawOutput:       resp.RawOutput,
+				FactsCreated:    outcome.CreatedIDs,
+				FactsSkipped:    outcome.Skipped,
+				FactsMerged:     resp.DeterministicFactsCount,
+				DurationMS:      durationMS,
+			})
 		}()
 	} else if extractor, ok := s.ai.(aiclient.MemoryExtractor); ok {
 		go func() {
@@ -893,35 +969,53 @@ func (s *Service) processPassive(ctx context.Context, event contracts.Normalized
 	}
 }
 
+// ownerGlobalMinConfidence is the floor a subject=owner biographical/health fact
+// must clear before it is promoted to owner_global (visible in every chat).  A
+// low-confidence guess like "sitting in class" (0.7) otherwise leaked into all
+// chats and over-anchored the draft model; below the floor the fact is kept
+// chat-scoped so it informs only the chat it was observed in.
+const ownerGlobalMinConfidence = 0.8
+
 // saveTypedFacts persists typed facts returned by the Python AI typed-extraction endpoint.
 // Applies deterministic scope routing per design §5.4:
-//   - subject=owner AND fact_type∈(health,biographical) → scope_kind=owner_global
+//   - subject=owner AND fact_type∈(health,biographical) AND confidence≥ownerGlobalMinConfidence → scope_kind=owner_global
 //   - everything else → scope_kind=chat (overrides Python hint for safety)
 //
 // Health facts with scope_kind=owner_global are routed to the pending_global_health_facts
 // confirmation queue rather than written directly to semantic_facts.
-func (s *Service) saveTypedFacts(event contracts.NormalizedTelegramEvent, facts []aiclient.TypedFact) {
+// extractionOutcome summarises what saveTypedFacts did with a batch of facts, so
+// the caller can persist an extraction_log row for observability.
+type extractionOutcome struct {
+	CreatedIDs []int64
+	Skipped    int
+}
+
+func (s *Service) saveTypedFacts(event contracts.NormalizedTelegramEvent, facts []aiclient.TypedFact) extractionOutcome {
+	outcome := extractionOutcome{}
 	if len(facts) == 0 || s.repository == nil {
-		return
+		return outcome
 	}
 	for _, f := range facts {
 		text := strings.TrimSpace(f.FactText)
 		if text == "" || len(text) < 5 || len(text) > 200 {
+			outcome.Skipped++
 			continue
 		}
 		if isContextContamination(text) {
 			s.logger.Warn("saveTypedFacts: rejected context-contaminated string",
 				"tenant_id", event.TenantID, "fact_preview", truncateForLog(text, 80))
+			outcome.Skipped++
 			continue
 		}
 
-		// Deterministic scope routing: owner health/biographical always global.
-		scopeKind := f.ScopeKind
-		if f.Subject == "owner" && (f.FactType == "health" || f.FactType == "biographical") {
+		// Deterministic scope routing: backend always decides — Python hint is ignored.
+		// Start from "chat"; promote to owner_global only when the conditions are
+		// unambiguously met. This prevents a low-confidence Python guess like
+		// "sitting in class" from leaking into every other chat.
+		scopeKind := "chat"
+		if f.Subject == "owner" && (f.FactType == "health" || f.FactType == "biographical") &&
+			f.Confidence >= ownerGlobalMinConfidence {
 			scopeKind = "owner_global"
-		}
-		if scopeKind != "owner_global" {
-			scopeKind = "chat"
 		}
 
 		// Health facts from the owner require confirmation before entering semantic_facts.
@@ -933,6 +1027,7 @@ func (s *Service) saveTypedFacts(event contracts.NormalizedTelegramEvent, facts 
 				FactText:        text,
 				Confidence:      f.Confidence,
 			})
+			// Routed to the confirmation queue rather than written — not a skip.
 			continue
 		}
 
@@ -940,7 +1035,7 @@ func (s *Service) saveTypedFacts(event contracts.NormalizedTelegramEvent, facts 
 		if scopeKind == "owner_global" {
 			chatID = ""
 		}
-		s.repository.UpsertSemanticFact(store.SemanticFactRecord{
+		result := s.repository.UpsertSemanticFact(store.SemanticFactRecord{
 			TenantID:        event.TenantID,
 			ScopeKind:       scopeKind,
 			ChatID:          chatID,
@@ -951,7 +1046,11 @@ func (s *Service) saveTypedFacts(event contracts.NormalizedTelegramEvent, facts 
 			Source:          "llm_extracted",
 			SourceMessageID: event.SourceMessageID,
 		})
+		if result.FactID != 0 {
+			outcome.CreatedIDs = append(outcome.CreatedIDs, result.FactID)
+		}
 	}
+	return outcome
 }
 
 func isOwnerAuthoredMessage(event contracts.NormalizedTelegramEvent, ownerID string) bool {
@@ -1170,6 +1269,9 @@ func (s *Service) HandleApprovalCallback(ctx context.Context, payload contracts.
 			ResponseText: draft.ResponseText,
 			CreatedAt:    now,
 		})
+		if s.scoreSender != nil {
+			s.scoreSender.SendOwnerFeedback(ctx, draft.TraceID, "up", "")
+		}
 		s.removeDraftCard(ctx, draft)
 		s.notifyDraftStatus(draft)
 		return ApprovalResult{Action: payload.Action, DraftID: draft.DraftID, Status: string(draft.Status)}, nil
@@ -1178,12 +1280,40 @@ func (s *Service) HandleApprovalCallback(ctx context.Context, payload contracts.
 		draft.UpdatedAt = now
 		s.repository.UpdateDraft(draft)
 		s.repository.AppendState(draft.TenantID, draft.ChatID, draft.SourceMessageID, contracts.StateIgnored)
+		if s.scoreSender != nil {
+			s.scoreSender.SendOwnerFeedback(ctx, draft.TraceID, "down", "")
+		}
 		s.removeDraftCard(ctx, draft)
 		s.notifyDraftStatus(draft)
 		return ApprovalResult{Action: payload.Action, DraftID: draft.DraftID, Status: string(draft.Status)}, nil
 	case contracts.ApprovalEdit:
 		if strings.TrimSpace(payload.EditedText) == "" {
 			return ApprovalResult{}, fmt.Errorf("edited_text is required for edit action")
+		}
+		// Edit-delta capture: the original AI text the owner chose to rewrite is the
+		// single richest negative signal. Record it once — on the FIRST edit, before
+		// ResponseText is overwritten — as a "down". The eventual approve records the
+		// sent text as "up", yielding a clean original→final pair under the
+		// UNIQUE(draft_id, rating) constraint that future drafts learn from.
+		alreadyEdited := false
+		for _, a := range draft.ActionHistory {
+			if a == "edit" {
+				alreadyEdited = true
+				break
+			}
+		}
+		if !alreadyEdited {
+			s.repository.SaveDraftFeedback(contracts.DraftFeedback{
+				DraftID:      draft.DraftID,
+				TenantID:     draft.TenantID,
+				ChatID:       draft.ChatID,
+				Rating:       "down",
+				ResponseText: draft.ResponseText,
+				CreatedAt:    now,
+			})
+			if s.scoreSender != nil {
+				s.scoreSender.SendOwnerFeedback(ctx, draft.TraceID, "down", "")
+			}
 		}
 		draft.ResponseText = payload.EditedText
 		draft.ActionHistory = append(draft.ActionHistory, "edit")
@@ -1233,6 +1363,9 @@ func (s *Service) HandleApprovalCallback(ctx context.Context, payload contracts.
 			ResponseText: draft.ResponseText,
 			CreatedAt:    now,
 		})
+		if s.scoreSender != nil {
+			s.scoreSender.SendOwnerFeedback(ctx, draft.TraceID, "up", "")
+		}
 		s.stripRatingButtons(ctx, draft)
 		return ApprovalResult{Action: payload.Action, DraftID: draft.DraftID, Status: "feedback_saved"}, nil
 	case contracts.ApprovalThumbDown:
@@ -1244,6 +1377,9 @@ func (s *Service) HandleApprovalCallback(ctx context.Context, payload contracts.
 			ResponseText: draft.ResponseText,
 			CreatedAt:    now,
 		})
+		if s.scoreSender != nil {
+			s.scoreSender.SendOwnerFeedback(ctx, draft.TraceID, "down", "")
+		}
 		s.stripRatingButtons(ctx, draft)
 		return ApprovalResult{Action: payload.Action, DraftID: draft.DraftID, Status: "feedback_saved"}, nil
 	default:
@@ -1288,6 +1424,7 @@ func (s *Service) regenerateDraft(ctx context.Context, draft store.DraftRecord) 
 	}
 	regenRequest := contracts.AIProcessMessageRequest{
 		RequestID:     draft.DecisionID + ":regenerate",
+		TraceID:       tracepkg.DeriveTraceID(event.EventID),
 		Event:         event,
 		ChatSettings:  settings,
 		MemoryContext: s.conversationContext(ctx, event, ownerID, 20),
@@ -1326,6 +1463,7 @@ func (s *Service) regenerateDraftWithHint(ctx context.Context, draft store.Draft
 	)
 	hintRequest := contracts.AIProcessMessageRequest{
 		RequestID:       draft.DecisionID + ":hint",
+		TraceID:         tracepkg.DeriveTraceID(event.EventID),
 		Event:           event,
 		ChatSettings:    settings,
 		MemoryContext:   hintContext,
@@ -1395,8 +1533,11 @@ func (s *Service) createDraft(event contracts.NormalizedTelegramEvent, decisionI
 		SourceMessageText:    event.MessageText,
 		ResponseText:         text,
 		Status:               store.DraftPending,
-		CreatedAt:            now,
-		UpdatedAt:            now,
+		// Persisting trace_id lets owner feedback (approve / thumb) attach a
+		// Langfuse score back to the Phase 4 generation span.
+		TraceID:   tracepkg.DeriveTraceID(event.EventID),
+		CreatedAt: now,
+		UpdatedAt: now,
 	}
 }
 
@@ -1451,7 +1592,10 @@ func (s *Service) auditEvent(event contracts.NormalizedTelegramEvent, decision c
 		SourceMessageID: valueOrDefault(event.SourceMessageID, "unknown"),
 		Decision:        decision,
 		Reason:          reason,
-		CreatedAt:       s.now(),
+		// trace_id is derived from event_id so all audit/state rows produced for
+		// the same webhook share a trace (idempotent on retries).
+		TraceID:   tracepkg.DeriveTraceID(event.EventID),
+		CreatedAt: s.now(),
 	}
 }
 

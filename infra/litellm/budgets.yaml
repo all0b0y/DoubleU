@@ -1,0 +1,14 @@
+# Per-tenant daily/monthly USD budgets for LiteLLM Proxy.
+# Reloadable via POST /budget/update (see docs/litellm-runbook.md).
+
+default:
+  max_budget: 5.00    # USD/day, applies when a tenant is not listed below.
+  budget_duration: 1d
+
+tenants:
+  - tenant_id: tenant:user:demo
+    max_budget: 1.00
+    budget_duration: 1d
+  - tenant_id: tenant:user:enterprise
+    max_budget: 50.00
+    budget_duration: 1d
