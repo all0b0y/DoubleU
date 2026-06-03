@@ -41,6 +41,51 @@ Items below are in dependency order.
 
 ---
 
+## Memory Retrieval Quality Roadmap — ✅ COMPLETED
+
+All 6 steps plus the two "After" items have been implemented. Shadow-measure
+before shipping to production (see verification section in the plan file).
+
+**Steps implemented:**
+- ✅ Step 1: Real embeddings — Go embedding worker + episode summary embeddings ([`service.go`](../backend-go/internal/core/service.go))
+- ✅ Step 2: Dedup stored proc — already in migrations 001/002; Go uses `UpsertSemanticFact`
+- ✅ Step 3: Multi-turn extraction context window ([`extraction.py`](../ai-python/ai_agent/pipelines/extraction.py), `recent_messages` field)
+- ✅ Step 4: Episodic summaries + embeddings + LLM topic tagging (`StartEpisodeCloser`, `StartDailySummaryScheduler` now started; [`topic.py`](../ai-python/ai_agent/pipelines/topic.py))
+- ✅ Step 5: Cross-encoder reranking ([`reranking.py`](../ai-python/ai_agent/pipelines/reranking.py), `/ai/rerank-facts`, `rerankFacts()` in service.go)
+- ✅ Step 6: BM25 hybrid search (migration 008, `SemanticFactsByBM25`, `rrfFuse` in service.go)
+- ✅ After: v4 Temporal knowledge graph (`fact_relations` table in migration 009, `SaveFactRelation` in store.go)
+- ✅ After: Sleep-time consolidation (`consolidate_facts()` in migration 010, `StartConsolidationWorker`)
+
+**Open (shadow-measurement required before production cutover):**
+- Run shadow harness on a fixed chat set before/after to confirm retrieval quality improvement.
+- Measure `extraction_log` before/after multi-turn window to confirm fact yield improves.
+
+### After steps 1–6 — deferred, do NOT start before retrieval works
+
+These are architecturally *above* the current design and only make sense once the
+base retrieval (steps 1–6) is functional and measured. Starting them earlier would
+build on broken data.
+
+- **v4 — Temporal knowledge graph (Zep/Graphiti, GraphRAG).** This is the one
+  approach that is genuinely higher than the current flat-`semantic_facts` design
+  and still fits the model. The fact types `commitment`, `event`, `relationship`
+  (design §5.2) **evolve over time** ("promised to send the contract by Friday" →
+  "sent it"); flat `semantic_facts` models this poorly, a graph with temporal edges
+  models it well. Candidate for a v4 schema iteration, **only after** base retrieval
+  (steps 1–6) is working and shadow-measured. Scope when picked up: model facts as
+  nodes + time-bounded edges, supersession as edge invalidation rather than row
+  delete, and a graph-aware read-path that resolves "current truth" at query time.
+
+- **Sleep-time / memory consolidation (background reflection, Letta-style).**
+  Periodically compress and merge facts in the background — the next logical step on
+  top of the existing decay model (design §7.2). Distinct from step-2 write-time
+  dedup: this is *offline* consolidation (merge near-duplicates that accumulated,
+  collapse superseded chains, promote recurring chat facts, age out stale ones).
+  Depends on steps 1–3 (a real, deduped semantic layer to reflect over) and pairs
+  naturally with the v4 graph once it lands.
+
+---
+
 ## Repo Hygiene / Garbage
 
 - `prototypeui/` — contains 6 dark-theme HTML prototype screens; not wired into the running app. Keep as design reference or delete when Iteration 2 mini-app replaces them.

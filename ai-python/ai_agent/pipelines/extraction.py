@@ -51,7 +51,8 @@ def extract_facts_typed(
 
     deterministic = typed_extractor.extract(request.message_text, request.privacy_flags)
     llm_facts, raw_output, model_used = _extract_facts_llm_typed(
-        prompt_builder, router, request.message_text, request.privacy_flags
+        prompt_builder, router, request.message_text, request.privacy_flags,
+        recent_messages=request.recent_messages,
     )
 
     merged = list(llm_facts)
@@ -75,6 +76,7 @@ def _extract_facts_llm_typed(
     router: ModelRouter,
     message_text: str,
     privacy_flags: tuple[PrivacyFlag, ...],
+    recent_messages: tuple[str, ...] = (),
 ) -> tuple[tuple[TypedFact, ...], str, str]:
     """Ask the LLM for typed facts.
 
@@ -82,15 +84,33 @@ def _extract_facts_llm_typed(
     or when memory is off; ``raw_output``/``model_used`` are surfaced for the
     extraction-log diagnostics so a returned ``[]`` is distinguishable from a
     silent error.
+
+    ``recent_messages`` (oldest first) is prepended as conversation history so
+    the extractor can detect multi-turn facts spread across several messages.
     """
     if PrivacyFlag.NO_MEMORY in privacy_flags or not message_text.strip():
         return (), "", ""
+
+    # Build the user content: conversation history (if any) + current message.
+    if recent_messages:
+        history_block = "\n".join(f"- {m}" for m in recent_messages if m.strip())
+        user_content = (
+            f"[CONVERSATION HISTORY — for context only, do not re-extract]\n"
+            f"{history_block}\n\n"
+            f"[CURRENT MESSAGE — extract facts from this]\n"
+            f"{message_text}"
+        )
+    else:
+        user_content = message_text
+
     system_prompt, user_payload = prompt_builder.build(
         (
-            "Extract ONLY durable, long-lived facts from the message below — stable "
+            "Extract ONLY durable, long-lived facts from the CURRENT MESSAGE below — stable "
             "traits that will still be true weeks from now (profession, place of "
             "residence/study, family, long-standing preferences, commitments with a "
             "clear deadline). "
+            "Use the CONVERSATION HISTORY only to resolve ambiguous references in the "
+            "current message (e.g. 'there' refers to a university named earlier). "
             "Do NOT extract transient or in-the-moment statements (what someone is "
             "doing right now, today, this moment, current mood, one-off small talk). "
             "For example 'sitting in class right now' is transient — skip it; "
@@ -106,7 +126,7 @@ def _extract_facts_llm_typed(
             "Return [] if there are no durable facts. "
             "Output only the JSON array, no prose."
         ),
-        message_text,
+        user_content,
         (),
     )
     raw = ""

@@ -27,8 +27,10 @@ from .pipelines import (
     extraction,
     intent,
     memory,
+    reranking,
     risk,
     summarization,
+    topic,
 )
 from .schemas import (
     AIProcessMessageRequest,
@@ -46,8 +48,12 @@ from .schemas import (
     MemoryExtractionRequest,
     MemoryExtractionResponse,
     PrivacyFlag,
+    RerankFactsRequest,
+    RerankFactsResponse,
     RiskRequest,
     RiskResponse,
+    TopicTaggingRequest,
+    TopicTaggingResponse,
     TypedExtractionRequest,
     TypedExtractionResponse,
     Usage,
@@ -147,6 +153,14 @@ class AIService:
     def embed_texts(self, request: EmbedTextsRequest) -> EmbedTextsResponse:
         """Generate embeddings for a batch of texts via the embedding pipeline."""
         return embedding.embed_texts(request)
+
+    def tag_topic(self, request: TopicTaggingRequest) -> TopicTaggingResponse:
+        """Return a short topic label for the active conversation episode."""
+        return topic.tag_topic(self._prompt_builder, self._router, request)
+
+    def rerank_facts(self, request: RerankFactsRequest) -> RerankFactsResponse:
+        """Rerank a set of candidate facts by relevance to a query."""
+        return reranking.rerank_facts(self._router, request)
 
     def process_message(self, request: AIProcessMessageRequest) -> AIProcessMessageResponse:
         """Process a normalized Telegram event into an AI decision proposal."""

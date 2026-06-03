@@ -109,6 +109,7 @@ type EpisodeSummaryRecord struct {
 	ClosureReason string
 	MessageCount  int
 	CreatedAt     time.Time
+	Embedding     []float64 // populated by the embedding worker; nil until then
 }
 
 // ExtractionLogRecord captures one async fact-extraction attempt for observability.
@@ -184,6 +185,17 @@ type SemanticFactUpsertResult struct {
 	FactID int64
 	// Action is "inserted" for a new fact or "occurrence_added" for an exact duplicate.
 	Action string
+}
+
+// FactRelationRecord represents a directed temporal edge between two semantic_facts rows.
+// Maps to the fact_relations table (migration 009).
+type FactRelationRecord struct {
+	ID           int64
+	TenantID     string
+	FactIDFrom   int64  // the older / replaced fact
+	FactIDTo     int64  // the newer / replacing fact
+	RelationType string // supersedes | fulfills | contradicts | updates | related
+	Confidence   float64
 }
 
 // PendingHealthFactRecord is a health fact awaiting owner confirmation before
@@ -2160,7 +2172,7 @@ func (r *Repository) LogExtraction(rec ExtractionLogRecord) {
 		rec.ModelUsed,
 		// raw_output is JSONB; store the verbatim text as a JSON string value.
 		rawOutputJSON(rawOutput),
-		pq.Array(rec.FactsCreated),
+		pq.Array(nilToEmptyInt64(rec.FactsCreated)),
 		rec.FactsSkipped, rec.FactsMerged,
 		nullableString(rec.Error),
 		rec.DurationMS,
@@ -2183,23 +2195,75 @@ func rawOutputJSON(s string) string {
 // ============================================================
 
 // SaveEpisodeSummary stores a compressed summary of a closed conversation episode.
-func (r *Repository) SaveEpisodeSummary(summary EpisodeSummaryRecord) {
+// Returns the inserted row ID (0 in memory-only mode), used by the embedding worker.
+func (r *Repository) SaveEpisodeSummary(summary EpisodeSummaryRecord) int64 {
 	r.mu.Lock()
 	r.episodeSummaries = append(r.episodeSummaries, summary)
 	r.mu.Unlock()
 	if r.db == nil {
-		return
+		return 0
 	}
-	_, _ = r.db.Exec(
+	var id int64
+	_ = r.db.QueryRow(
 		`INSERT INTO episode_summaries (
 		   tenant_id, chat_id, period_start, period_end, content,
 		   message_count, closure_reason
-		 ) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		 ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+		 RETURNING id`,
 		summary.TenantID, summary.ChatID,
 		summary.PeriodStart, summary.PeriodEnd,
 		summary.Content, summary.MessageCount,
 		valueOrDefault(summary.ClosureReason, "manual"),
+	).Scan(&id)
+	return id
+}
+
+// SaveEpisodeSummaryEmbedding persists the embedding vector for an episode summary row.
+// Called by the embedding worker after the Python service generates the vector.
+func (r *Repository) SaveEpisodeSummaryEmbedding(id int64, tenantID string, embedding []float64, model string) {
+	if r.db == nil || len(embedding) == 0 {
+		return
+	}
+	vec := float64SliceToVector(embedding)
+	_, _ = r.db.Exec(
+		`UPDATE episode_summaries
+		    SET embedding = $1::vector, embedding_model = $2
+		  WHERE id = $3 AND tenant_id = $4`,
+		vec, model, id, tenantID,
 	)
+}
+
+// EpisodeSummariesWithoutEmbeddings returns up to limit episode summary rows that
+// have no embedding vector yet. Used by the embedding worker for batch embedding.
+func (r *Repository) EpisodeSummariesWithoutEmbeddings(limit int) []EpisodeSummaryRecord {
+	if r.db == nil {
+		return nil
+	}
+	rows, err := r.db.Query(
+		`SELECT id, tenant_id, chat_id, period_start, period_end,
+		        content, closure_reason, message_count, created_at
+		   FROM episode_summaries
+		  WHERE embedding IS NULL
+		    AND deleted_at IS NULL
+		  LIMIT $1`,
+		limit,
+	)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	result := make([]EpisodeSummaryRecord, 0, limit)
+	for rows.Next() {
+		var s EpisodeSummaryRecord
+		if rows.Scan(
+			&s.ID, &s.TenantID, &s.ChatID,
+			&s.PeriodStart, &s.PeriodEnd,
+			&s.Content, &s.ClosureReason, &s.MessageCount, &s.CreatedAt,
+		) == nil {
+			result = append(result, s)
+		}
+	}
+	return result
 }
 
 // EpisodeSummaries returns recent episode summaries for a chat, newest first.
@@ -2385,6 +2449,152 @@ func (r *Repository) GlobalSemanticFactsByVector(tenantID string, queryVector []
 	defer rows.Close()
 	simFacts := scanSemanticFacts(rows)
 	return append(hardFacts, simFacts...)
+}
+
+// SemanticFactsByBM25 returns chat-scoped facts ranked by full-text (BM25) relevance to query.
+// Uses the 'simple' text-search configuration so it handles Russian and English without
+// a language-specific dictionary. Returns nil when the fact_tsv column is absent (pre-migration).
+func (r *Repository) SemanticFactsByBM25(tenantID, chatID, query string, limit int) []SemanticFactRecord {
+	if r.db == nil || strings.TrimSpace(query) == "" {
+		return nil
+	}
+	rows, err := r.db.Query(
+		`SELECT id, tenant_id, scope_kind, COALESCE(chat_id,''), fact_text, fact_type,
+		        subject, confidence, source, COALESCE(source_message_id,''), expires_at, created_at
+		   FROM semantic_facts
+		  WHERE tenant_id = $1 AND chat_id = $2
+		    AND scope_kind = 'chat'
+		    AND fact_tsv @@ plainto_tsquery('simple', $3)
+		    AND deleted_at IS NULL AND superseded_by_id IS NULL
+		  ORDER BY ts_rank_cd(fact_tsv, plainto_tsquery('simple', $3)) DESC
+		  LIMIT $4`,
+		tenantID, chatID, query, limit,
+	)
+	if err != nil {
+		return nil // column absent or query error — caller falls back to vector-only
+	}
+	defer rows.Close()
+	return scanSemanticFacts(rows)
+}
+
+// GlobalSemanticFactsByBM25 returns owner-global facts ranked by full-text relevance to query.
+func (r *Repository) GlobalSemanticFactsByBM25(tenantID, query string, limit int) []SemanticFactRecord {
+	if r.db == nil || strings.TrimSpace(query) == "" {
+		return nil
+	}
+	rows, err := r.db.Query(
+		`SELECT id, tenant_id, scope_kind, COALESCE(chat_id,''), fact_text, fact_type,
+		        subject, confidence, source, COALESCE(source_message_id,''), expires_at, created_at
+		   FROM semantic_facts
+		  WHERE tenant_id = $1
+		    AND scope_kind = 'owner_global'
+		    AND fact_tsv @@ plainto_tsquery('simple', $2)
+		    AND deleted_at IS NULL AND superseded_by_id IS NULL
+		  ORDER BY ts_rank_cd(fact_tsv, plainto_tsquery('simple', $2)) DESC
+		  LIMIT $3`,
+		tenantID, query, limit,
+	)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	return scanSemanticFacts(rows)
+}
+
+// SemanticFactsByIDs returns facts with the given IDs in the order the IDs are provided.
+// Used by the reranking path to assemble the final fact list from reranker-ordered IDs.
+func (r *Repository) SemanticFactsByIDs(tenantID string, ids []int64) []SemanticFactRecord {
+	if r.db == nil || len(ids) == 0 {
+		return nil
+	}
+	// Fetch all requested facts in one round-trip; preserve requested order below.
+	placeholders := make([]string, len(ids))
+	args := make([]any, 0, len(ids)+1)
+	args = append(args, tenantID)
+	for i, id := range ids {
+		placeholders[i] = fmt.Sprintf("$%d", i+2)
+		args = append(args, id)
+	}
+	query := fmt.Sprintf(
+		`SELECT id, tenant_id, scope_kind, COALESCE(chat_id,''), fact_text, fact_type,
+		        subject, confidence, source, COALESCE(source_message_id,''), expires_at, created_at
+		   FROM semantic_facts
+		  WHERE tenant_id = $1 AND id IN (%s)
+		    AND deleted_at IS NULL`,
+		strings.Join(placeholders, ","),
+	)
+	rows, err := r.db.Query(query, args...)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	byID := make(map[int64]SemanticFactRecord)
+	for _, f := range scanSemanticFacts(rows) {
+		byID[f.ID] = f
+	}
+	// Return in the caller-specified order (reranker-sorted).
+	result := make([]SemanticFactRecord, 0, len(ids))
+	for _, id := range ids {
+		if f, ok := byID[id]; ok {
+			result = append(result, f)
+		}
+	}
+	return result
+}
+
+// SaveFactRelation persists a directed temporal edge between two semantic_facts rows.
+// Idempotent: ON CONFLICT DO NOTHING so duplicate calls are safe.
+func (r *Repository) SaveFactRelation(rel FactRelationRecord) {
+	if r.db == nil {
+		return
+	}
+	_, _ = r.db.Exec(
+		`INSERT INTO fact_relations (tenant_id, fact_id_from, fact_id_to, relation_type, confidence)
+		 VALUES ($1, $2, $3, $4, $5)
+		 ON CONFLICT (fact_id_from, fact_id_to, relation_type) DO NOTHING`,
+		rel.TenantID, rel.FactIDFrom, rel.FactIDTo, rel.RelationType, rel.Confidence,
+	)
+}
+
+// FindSupersededFactID returns the ID of the fact that was superseded by newFactID, or 0
+// if no supersede happened. Used by the temporal graph write-path to create fact_relations.
+func (r *Repository) FindSupersededFactID(tenantID string, newFactID int64) int64 {
+	if r.db == nil {
+		return 0
+	}
+	var oldID int64
+	_ = r.db.QueryRow(
+		`SELECT id FROM semantic_facts
+		  WHERE tenant_id = $1 AND superseded_by_id = $2
+		  LIMIT 1`,
+		tenantID, newFactID,
+	).Scan(&oldID)
+	return oldID
+}
+
+// FactRelationsByFactID returns all temporal edges where fact_id_from = factID.
+func (r *Repository) FactRelationsByFactID(tenantID string, factID int64) []FactRelationRecord {
+	if r.db == nil {
+		return nil
+	}
+	rows, err := r.db.Query(
+		`SELECT id, tenant_id, fact_id_from, fact_id_to, relation_type, confidence
+		   FROM fact_relations
+		  WHERE tenant_id = $1 AND fact_id_from = $2`,
+		tenantID, factID,
+	)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var result []FactRelationRecord
+	for rows.Next() {
+		var rel FactRelationRecord
+		if rows.Scan(&rel.ID, &rel.TenantID, &rel.FactIDFrom, &rel.FactIDTo, &rel.RelationType, &rel.Confidence) == nil {
+			result = append(result, rel)
+		}
+	}
+	return result
 }
 
 // EpisodeSummariesByVector returns episode summaries ranked by cosine similarity to
@@ -2575,6 +2785,13 @@ func nilToEmpty(s []string) []string {
 	return s
 }
 
+func nilToEmptyInt64(s []int64) []int64 {
+	if s == nil {
+		return []int64{}
+	}
+	return s
+}
+
 // FactsWithoutEmbeddings returns up to limit semantic fact IDs + texts that have no embedding yet.
 // Used by the embedding worker to find facts to batch-embed.
 func (r *Repository) FactsWithoutEmbeddings(limit int) []SemanticFactRecord {
@@ -2742,6 +2959,18 @@ func (r *Repository) OpenCommitments(tenantID, chatID string) []SemanticFactReco
 		result = append(result, f)
 	}
 	return result
+}
+
+// ConsolidateFacts calls the consolidate_facts stored procedure for a tenant.
+// Returns the number of facts cleaned up (expired + soft-deleted). Safe to call
+// repeatedly; all operations are idempotent.
+func (r *Repository) ConsolidateFacts(tenantID string) int {
+	if r.db == nil {
+		return 0
+	}
+	var cleaned int
+	_ = r.db.QueryRow(`SELECT consolidate_facts($1)`, tenantID).Scan(&cleaned)
+	return cleaned
 }
 
 func chatKey(tenantID, chatID string) string {

@@ -223,6 +223,12 @@ func (s *Service) HandleTelegramWebhook(ctx context.Context, payload []byte, ten
 	if ownerMsg, ok, err := telegram.ParseOwnerMessageUpdate(payload); err == nil && ok {
 		return s.handleOwnerMessage(ctx, ownerMsg), nil
 	}
+	if ok, err := telegram.IsDeletedBusinessMessagesUpdate(payload); err != nil {
+		s.logger.Error("telegram deleted messages parse failed", "error", err, "tenant_hint", tenantHint)
+		return InboundResult{Decision: contracts.DecisionErrorFallback, Reason: "deleted_messages_parse_error:" + err.Error()}, err
+	} else if ok {
+		return InboundResult{Decision: contracts.DecisionIgnore, Reason: "deleted_business_messages"}, nil
+	}
 
 	event, err := telegram.NormalizeUpdate(payload, tenantHint, s.now())
 	// Stamp the request context with the deterministic trace-id derived from
@@ -359,6 +365,30 @@ func (s *Service) HandleTelegramWebhook(ctx context.Context, payload []byte, ten
 			ep.MessageCount = existing.MessageCount + 1
 		}
 		s.repository.UpsertActiveEpisode(ep)
+
+		// Async topic tagging: fire-and-forget LLM call that populates
+		// active_episodes.current_topic so the draft prompt can surface
+		// the episode context (design §6.2 / backlog step 4b).
+		if tagger, ok := s.ai.(aiclient.TopicTagger); ok && event.MessageText != "" {
+			msgText := event.MessageText
+			tenantID, chatID := event.TenantID, event.ChatID
+			go func() {
+				tagCtx, tagCancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer tagCancel()
+				resp, err := tagger.TagTopic(tagCtx, aiclient.TopicTaggingRequest{
+					MessageText: msgText,
+					TenantID:    tenantID,
+					ChatID:      chatID,
+				})
+				if err != nil || resp.Topic == "" {
+					return
+				}
+				updated := ep
+				updated.CurrentTopic = resp.Topic
+				s.repository.UpsertActiveEpisode(updated)
+			}()
+		}
+
 		// Message-limit trigger: close and summarise the episode when it reaches
 		// episodeMessageLimit messages (design §6.2). The closure is synchronous so a
 		// concurrent handler cannot create a duplicate; summarisation runs in a goroutine.
@@ -595,15 +625,26 @@ func (s *Service) HandleTelegramWebhook(ctx context.Context, payload []byte, ten
 			privacyStrings[i] = string(f)
 		}
 		if typedExtractor, ok := s.ai.(aiclient.TypedMemoryExtractor); ok {
+			// Capture the last 5 messages as context window so the extractor can detect
+			// multi-turn facts spread across several messages (e.g. "учусь в МГУ" followed
+			// by "на медицинском факультете").
+			recentMsgs := s.repository.RecentMessages(event.TenantID, event.ChatID, 5)
+			recentTexts := make([]string, 0, len(recentMsgs))
+			for _, m := range recentMsgs {
+				if t := strings.TrimSpace(m.Event.MessageText); t != "" && m.Event.SourceMessageID != event.SourceMessageID {
+					recentTexts = append(recentTexts, t)
+				}
+			}
 			go func() {
 				extractCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 				defer cancel()
 				start := s.now()
 				resp, err := typedExtractor.ExtractFactsTyped(extractCtx, aiclient.TypedExtractionRequest{
-					MessageText:  event.MessageText,
-					TenantID:     event.TenantID,
-					ChatID:       event.ChatID,
-					PrivacyFlags: privacyStrings,
+					MessageText:    event.MessageText,
+					TenantID:       event.TenantID,
+					ChatID:         event.ChatID,
+					PrivacyFlags:   privacyStrings,
+					RecentMessages: recentTexts,
 				})
 				durationMS := int(s.now().Sub(start).Milliseconds())
 				if err != nil {
@@ -746,15 +787,52 @@ func (s *Service) conversationContext(ctx context.Context, event contracts.Norma
 		}
 	}
 
-	// Semantic layer — owner-global facts (visible in all chats, §5.3).
-	// Uses vector similarity when a query embedding is available; recency fallback otherwise.
-	globalFacts := s.repository.GlobalSemanticFactsByVector(event.TenantID, queryVector, 5)
+	// Semantic layer — vector recall (broad candidates for reranking).
+	globalVector := s.repository.GlobalSemanticFactsByVector(event.TenantID, queryVector, 15)
+	chatVector := s.repository.SemanticFactsByVector(event.TenantID, event.ChatID, queryVector, 20)
+
+	// BM25 lexical recall (step 6): fuse with vector results via RRF so exact
+	// token matches (names, contract numbers, etc.) are not missed by embeddings.
+	var chatFacts, globalFacts []store.SemanticFactRecord
+	if event.MessageText != "" {
+		chatBM25 := s.repository.SemanticFactsByBM25(event.TenantID, event.ChatID, event.MessageText, 20)
+		globalBM25 := s.repository.GlobalSemanticFactsByBM25(event.TenantID, event.MessageText, 15)
+
+		if len(chatBM25) > 0 || len(globalBM25) > 0 {
+			// RRF fusion: merge vector + BM25 ranked lists into a single ordered set.
+			fusedChatIDs := rrfFuse(factIDs(chatVector), factIDs(chatBM25), 60)
+			fusedGlobalIDs := rrfFuse(factIDs(globalVector), factIDs(globalBM25), 60)
+			// Resolve fused IDs back to records (preserves RRF order).
+			chatFacts = s.repository.SemanticFactsByIDs(event.TenantID, fusedChatIDs)
+			globalFacts = s.repository.SemanticFactsByIDs(event.TenantID, fusedGlobalIDs)
+		} else {
+			// BM25 returned nothing (migration not applied or no keyword match) —
+			// fall through to vector-only candidates.
+			chatFacts = chatVector
+			globalFacts = globalVector
+		}
+	} else {
+		chatFacts = chatVector
+		globalFacts = globalVector
+	}
+
+	// Cross-encoder reranking (step 5): reduce broad RRF candidates to the most
+	// relevant facts. Falls back to RRF order when reranker is unavailable.
+	if reranker, ok := s.ai.(aiclient.FactReranker); ok && event.MessageText != "" && len(chatFacts)+len(globalFacts) > 0 {
+		chatFacts, globalFacts = s.rerankFacts(ctx, reranker, event.MessageText, chatFacts, globalFacts)
+	} else {
+		// No reranker: truncate to original design limits.
+		if len(chatFacts) > 8 {
+			chatFacts = chatFacts[:8]
+		}
+		if len(globalFacts) > 5 {
+			globalFacts = globalFacts[:5]
+		}
+	}
+
 	for _, fact := range globalFacts {
 		parts = append(parts, fmt.Sprintf("[ФАКТ О ВЛАДЕЛЬЦЕ: %s] %s", fact.FactType, fact.FactText))
 	}
-
-	// Semantic layer — chat-scoped facts about this contact (§5.3).
-	chatFacts := s.repository.SemanticFactsByVector(event.TenantID, event.ChatID, queryVector, 8)
 	for _, fact := range chatFacts {
 		parts = append(parts, fmt.Sprintf("[ФАКТ: %s] %s", fact.FactType, fact.FactText))
 	}
@@ -808,6 +886,134 @@ func (s *Service) conversationContext(ctx context.Context, event contracts.Norma
 	}
 
 	return parts
+}
+
+// rrfFuse merges two ranked ID lists using Reciprocal Rank Fusion (k=60).
+// Returns a deduplicated slice of IDs in descending fused-score order.
+// k=60 is the standard constant that balances precision vs recall for short lists.
+func rrfFuse(vectorIDs, bm25IDs []int64, k int) []int64 {
+	scores := make(map[int64]float64)
+	for rank, id := range vectorIDs {
+		scores[id] += 1.0 / float64(k+rank+1)
+	}
+	for rank, id := range bm25IDs {
+		scores[id] += 1.0 / float64(k+rank+1)
+	}
+	// Collect and sort by descending score.
+	type scored struct {
+		id    int64
+		score float64
+	}
+	list := make([]scored, 0, len(scores))
+	for id, sc := range scores {
+		list = append(list, scored{id, sc})
+	}
+	for i := 1; i < len(list); i++ {
+		for j := i; j > 0 && list[j].score > list[j-1].score; j-- {
+			list[j], list[j-1] = list[j-1], list[j]
+		}
+	}
+	result := make([]int64, len(list))
+	for i, s := range list {
+		result[i] = s.id
+	}
+	return result
+}
+
+// factIDs extracts the IDs from a slice of SemanticFactRecords, preserving order.
+func factIDs(facts []store.SemanticFactRecord) []int64 {
+	ids := make([]int64, len(facts))
+	for i, f := range facts {
+		ids[i] = f.ID
+	}
+	return ids
+}
+
+// rerankFacts calls the Python reranker to reduce broad recall results to the most
+// relevant chat and global facts for the given query. Returns the original slices
+// unchanged if the reranker errors or returns no results.
+// Chat facts are reduced to 8 and global facts to 5 after reranking.
+func (s *Service) rerankFacts(
+	ctx context.Context,
+	reranker aiclient.FactReranker,
+	query string,
+	chatFacts, globalFacts []store.SemanticFactRecord,
+) ([]store.SemanticFactRecord, []store.SemanticFactRecord) {
+	const (
+		topChat   = 8
+		topGlobal = 5
+		rerankTimeout = 5 * time.Second
+	)
+	// Build the combined candidate list, tagging each by scope so we can split
+	// the reranked IDs back into chat vs global.
+	candidates := make([]aiclient.RerankFact, 0, len(chatFacts)+len(globalFacts))
+	for _, f := range chatFacts {
+		candidates = append(candidates, aiclient.RerankFact{ID: f.ID, Text: f.FactText})
+	}
+	for _, f := range globalFacts {
+		candidates = append(candidates, aiclient.RerankFact{ID: f.ID, Text: f.FactText})
+	}
+
+	rerankCtx, cancel := context.WithTimeout(ctx, rerankTimeout)
+	defer cancel()
+	resp, err := reranker.RerankFacts(rerankCtx, aiclient.RerankFactsRequest{
+		Query: query,
+		Facts: candidates,
+		TopK:  topChat + topGlobal,
+	})
+	if err != nil || len(resp.RankedIDs) == 0 {
+		// Degrade gracefully: truncate to original design limits.
+		if len(chatFacts) > topChat {
+			chatFacts = chatFacts[:topChat]
+		}
+		if len(globalFacts) > topGlobal {
+			globalFacts = globalFacts[:topGlobal]
+		}
+		return chatFacts, globalFacts
+	}
+
+	// Resolve reranked IDs back to SemanticFactRecord, preserving reranked order.
+	allFacts := make([]store.SemanticFactRecord, 0, len(chatFacts)+len(globalFacts))
+	allFacts = append(allFacts, chatFacts...)
+	allFacts = append(allFacts, globalFacts...)
+	byID := make(map[int64]store.SemanticFactRecord, len(allFacts))
+	for _, f := range allFacts {
+		byID[f.ID] = f
+	}
+
+	var outChat, outGlobal []store.SemanticFactRecord
+	for _, id := range resp.RankedIDs {
+		f, ok := byID[id]
+		if !ok {
+			continue
+		}
+		if f.ScopeKind == "owner_global" {
+			if len(outGlobal) < topGlobal {
+				outGlobal = append(outGlobal, f)
+			}
+		} else {
+			if len(outChat) < topChat {
+				outChat = append(outChat, f)
+			}
+		}
+	}
+
+	// If reranker returned fewer than expected, backfill from original order.
+	if len(outChat) == 0 && len(chatFacts) > 0 {
+		n := topChat
+		if len(chatFacts) < n {
+			n = len(chatFacts)
+		}
+		outChat = chatFacts[:n]
+	}
+	if len(outGlobal) == 0 && len(globalFacts) > 0 {
+		n := topGlobal
+		if len(globalFacts) < n {
+			n = len(globalFacts)
+		}
+		outGlobal = globalFacts[:n]
+	}
+	return outChat, outGlobal
 }
 
 // feedbackContext returns recent draft feedback for this chat to send to the AI.
@@ -1048,6 +1254,18 @@ func (s *Service) saveTypedFacts(event contracts.NormalizedTelegramEvent, facts 
 		})
 		if result.FactID != 0 {
 			outcome.CreatedIDs = append(outcome.CreatedIDs, result.FactID)
+			// Temporal knowledge graph (v4): if the upsert superseded an older fact,
+			// record a directed 'supersedes' edge so the graph read-path can resolve
+			// "current truth" across time (design §v4).
+			if oldID := s.repository.FindSupersededFactID(event.TenantID, result.FactID); oldID > 0 {
+				s.repository.SaveFactRelation(store.FactRelationRecord{
+					TenantID:     event.TenantID,
+					FactIDFrom:   oldID,
+					FactIDTo:     result.FactID,
+					RelationType: "supersedes",
+					Confidence:   f.Confidence,
+				})
+			}
 		}
 	}
 	return outcome
@@ -2088,7 +2306,7 @@ func (s *Service) summarizeChatDay(ctx context.Context, tenantID, chatID string,
 	if err != nil || summ.BlockedByPrivacy || strings.TrimSpace(summ.Summary) == "" {
 		return
 	}
-	s.repository.SaveEpisodeSummary(store.EpisodeSummaryRecord{
+	_ = s.repository.SaveEpisodeSummary(store.EpisodeSummaryRecord{
 		TenantID:      tenantID,
 		ChatID:        chatID,
 		PeriodStart:   startOfDay,
@@ -2202,6 +2420,31 @@ func (s *Service) StartDailySummaryScheduler(ctx context.Context) {
 	}
 }
 
+// StartConsolidationWorker runs nightly at 02:00 UTC and calls the consolidate_facts
+// stored procedure for every active tenant to clean up expired and superseded facts
+// and collapse deep supersession chains (design: sleep-time memory consolidation).
+func (s *Service) StartConsolidationWorker(ctx context.Context) {
+	for {
+		now := s.now().UTC()
+		// Schedule for 02:00 UTC the following calendar day.
+		nextRun := time.Date(now.Year(), now.Month(), now.Day()+1, 2, 0, 0, 0, time.UTC)
+		select {
+		case <-time.After(time.Until(nextRun)):
+			for _, tenantID := range s.repository.AllActiveTenantIDs() {
+				cleaned := s.repository.ConsolidateFacts(tenantID)
+				if cleaned > 0 {
+					s.logger.Info("fact consolidation completed",
+						"tenant_id", tenantID,
+						"facts_cleaned", cleaned,
+					)
+				}
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
 // StartEmbeddingWorker runs every 5 minutes and generates embeddings for any semantic facts
 // that were inserted without one.  Runs in a separate goroutine; safe to call concurrently.
 // Activates only when the AI client implements TextEmbedder; otherwise it is a no-op.
@@ -2222,10 +2465,15 @@ func (s *Service) StartEmbeddingWorker(ctx context.Context) {
 	}
 }
 
-// runEmbeddingBatch fetches facts without embeddings (up to 50 at a time), calls the
-// Python embedding endpoint, and persists vectors into fact_embeddings.
+// runEmbeddingBatch fetches facts and episode summaries without embeddings (up to 50
+// at a time), calls the Python embedding endpoint, and persists vectors.
 func (s *Service) runEmbeddingBatch(ctx context.Context, embedder aiclient.TextEmbedder) {
 	const batchSize = 50
+	s.runFactEmbeddingBatch(ctx, embedder, batchSize)
+	s.runEpisodeSummaryEmbeddingBatch(ctx, embedder, batchSize)
+}
+
+func (s *Service) runFactEmbeddingBatch(ctx context.Context, embedder aiclient.TextEmbedder, batchSize int) {
 	facts := s.repository.FactsWithoutEmbeddings(batchSize)
 	if len(facts) == 0 {
 		return
@@ -2239,23 +2487,46 @@ func (s *Service) runEmbeddingBatch(ctx context.Context, embedder aiclient.TextE
 		Model: "qwen/qwen3-embedding-8b",
 	})
 	if err != nil || resp.ModelUsed == "none" || resp.ModelUsed == "error" {
-		s.logger.Warn("embedding batch failed", "error", err, "model", resp.ModelUsed)
+		s.logger.Warn("fact embedding batch failed", "error", err, "model", resp.ModelUsed)
 		return
 	}
 	for i, f := range facts {
 		if i >= len(resp.Embeddings) {
 			break
 		}
-		emb := resp.Embeddings[i]
-		if len(emb) == 0 {
-			continue
+		if emb := resp.Embeddings[i]; len(emb) > 0 {
+			s.repository.SaveFactEmbedding(f.ID, f.TenantID, f.ScopeKind, f.ChatID, emb, resp.ModelUsed)
 		}
-		s.repository.SaveFactEmbedding(f.ID, f.TenantID, f.ScopeKind, f.ChatID, emb, resp.ModelUsed)
 	}
-	s.logger.Info("embedding batch completed",
-		"facts_embedded", len(facts),
-		"model", resp.ModelUsed,
-	)
+	s.logger.Info("fact embedding batch completed", "facts_embedded", len(facts), "model", resp.ModelUsed)
+}
+
+func (s *Service) runEpisodeSummaryEmbeddingBatch(ctx context.Context, embedder aiclient.TextEmbedder, batchSize int) {
+	summaries := s.repository.EpisodeSummariesWithoutEmbeddings(batchSize)
+	if len(summaries) == 0 {
+		return
+	}
+	texts := make([]string, len(summaries))
+	for i, sm := range summaries {
+		texts[i] = sm.Content
+	}
+	resp, err := embedder.EmbedTexts(ctx, aiclient.EmbedTextsRequest{
+		Texts: texts,
+		Model: "qwen/qwen3-embedding-8b",
+	})
+	if err != nil || resp.ModelUsed == "none" || resp.ModelUsed == "error" {
+		s.logger.Warn("episode summary embedding batch failed", "error", err, "model", resp.ModelUsed)
+		return
+	}
+	for i, sm := range summaries {
+		if i >= len(resp.Embeddings) {
+			break
+		}
+		if emb := resp.Embeddings[i]; len(emb) > 0 {
+			s.repository.SaveEpisodeSummaryEmbedding(sm.ID, sm.TenantID, emb, resp.ModelUsed)
+		}
+	}
+	s.logger.Info("episode summary embedding batch completed", "summaries_embedded", len(summaries), "model", resp.ModelUsed)
 }
 
 // sendRecommendationsToOwner delivers proactive recommendations to the owner's bot chat.

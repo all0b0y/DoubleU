@@ -12,6 +12,7 @@ pipeline marks the call as ``error_fallback``.
 
 from __future__ import annotations
 
+import http.client
 import json
 import socket
 import urllib.error
@@ -127,10 +128,17 @@ def _urlopen_with_headers(
     request: urllib.request.Request, timeout_seconds: float,
 ) -> tuple[bytes, dict[str, str]]:
     """Default transport: stdlib urlopen exposing response headers for cost parsing."""
-    with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
-        body = response.read()
-        headers = {k.lower(): v for k, v in response.headers.items()}
-        return body, headers
+    # RemoteDisconnected is raised by http.client during getresponse() when the
+    # server closes the connection after the TCP handshake but before sending any
+    # HTTP response headers.  urllib only wraps errors from the send phase, so we
+    # normalise it to URLError here so the caller's existing handler picks it up.
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            body = response.read()
+            headers = {k.lower(): v for k, v in response.headers.items()}
+            return body, headers
+    except http.client.RemoteDisconnected as exc:
+        raise urllib.error.URLError(exc) from exc
 
 
 def _parse_cost(headers: dict[str, str]) -> float:

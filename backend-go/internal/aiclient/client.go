@@ -56,11 +56,14 @@ type MemoryExtractor interface {
 
 // TypedExtractionRequest is sent to the Python AI service for typed, scoped fact extraction.
 type TypedExtractionRequest struct {
-	MessageText  string   `json:"message_text"`
-	TenantID     string   `json:"tenant_id"`
-	ChatID       string   `json:"chat_id"`
-	PrivacyFlags []string `json:"privacy_flags"`
-	TraceID      string   `json:"trace_id,omitempty"`
+	MessageText    string   `json:"message_text"`
+	TenantID       string   `json:"tenant_id"`
+	ChatID         string   `json:"chat_id"`
+	PrivacyFlags   []string `json:"privacy_flags"`
+	TraceID        string   `json:"trace_id,omitempty"`
+	// RecentMessages contains the last few messages in the chat (oldest first) so the
+	// Python extractor can detect multi-turn facts spread across several messages.
+	RecentMessages []string `json:"recent_messages,omitempty"`
 }
 
 // TypedFact is a single typed, atomic fact extracted from a message.
@@ -108,4 +111,49 @@ type EmbedTextsResponse struct {
 // The Go embedding worker calls this to populate fact_embeddings rows.
 type TextEmbedder interface {
 	EmbedTexts(ctx context.Context, request EmbedTextsRequest) (EmbedTextsResponse, error)
+}
+
+// TopicTaggingRequest is sent to the Python AI service to label the current episode topic.
+type TopicTaggingRequest struct {
+	MessageText    string   `json:"message_text"`
+	RecentMessages []string `json:"recent_messages,omitempty"`
+	TenantID       string   `json:"tenant_id,omitempty"`
+	ChatID         string   `json:"chat_id,omitempty"`
+}
+
+// TopicTaggingResponse contains the short topic label for the active episode.
+type TopicTaggingResponse struct {
+	Topic     string `json:"topic"`
+	ModelUsed string `json:"model_used"`
+}
+
+// TopicTagger is optionally implemented by AI clients that can tag conversation topics.
+// Called asynchronously after each message to populate active_episodes.current_topic.
+type TopicTagger interface {
+	TagTopic(ctx context.Context, request TopicTaggingRequest) (TopicTaggingResponse, error)
+}
+
+// RerankFactsRequest is sent to the Python AI service to rerank candidate facts.
+type RerankFactsRequest struct {
+	Query string       `json:"query"`
+	Facts []RerankFact `json:"facts"`
+	TopK  int          `json:"top_k"`
+}
+
+// RerankFact is a single candidate fact with its database ID and text.
+type RerankFact struct {
+	ID   int64  `json:"id"`
+	Text string `json:"text"`
+}
+
+// RerankFactsResponse contains fact IDs in order of descending relevance.
+type RerankFactsResponse struct {
+	RankedIDs []int64 `json:"ranked_ids"`
+	ModelUsed string  `json:"model_used"`
+}
+
+// FactReranker is optionally implemented by AI clients that support cross-encoder reranking.
+// Called during conversationContext construction to reorder broad recall results.
+type FactReranker interface {
+	RerankFacts(ctx context.Context, request RerankFactsRequest) (RerankFactsResponse, error)
 }

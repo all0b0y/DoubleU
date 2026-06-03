@@ -430,6 +430,20 @@ func ParseBotCommandUpdate(payload []byte) (BotCommandUpdate, bool, error) {
 	}, true, nil
 }
 
+// IsDeletedBusinessMessagesUpdate returns true when the payload is a deleted_business_messages update.
+// Such updates contain only a list of deleted message IDs and no message body, so they must be
+// silently acknowledged rather than routed through the message-processing pipeline.
+func IsDeletedBusinessMessagesUpdate(payload []byte) (bool, error) {
+	var update struct {
+		UpdateID                *int64           `json:"update_id"`
+		DeletedBusinessMessages *json.RawMessage `json:"deleted_business_messages"`
+	}
+	if err := json.Unmarshal(payload, &update); err != nil {
+		return false, err
+	}
+	return update.UpdateID != nil && update.DeletedBusinessMessages != nil, nil
+}
+
 // NormalizeUpdate converts a Telegram webhook payload into the frozen normalized event.
 func NormalizeUpdate(payload []byte, tenantHint string, now time.Time) (contracts.NormalizedTelegramEvent, error) {
 	var update telegramUpdate

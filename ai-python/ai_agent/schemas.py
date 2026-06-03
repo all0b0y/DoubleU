@@ -277,6 +277,8 @@ class TypedExtractionRequest(JsonDataclass):
     chat_id: str = ""
     privacy_flags: tuple[PrivacyFlag, ...] = field(default_factory=tuple)
     trace_id: str = ""
+    # Last few messages in the chat (oldest first) for multi-turn fact detection.
+    recent_messages: tuple[str, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)
@@ -298,6 +300,49 @@ class TypedExtractionResponse(JsonDataclass):
     raw_output: str = ""
     llm_facts_count: int = 0
     deterministic_facts_count: int = 0
+
+
+@dataclass(frozen=True)
+class TopicTaggingRequest(JsonDataclass):
+    """Request body for `/ai/tag-topic`.
+
+    The Go backend sends the current message and recent history so the AI can
+    produce a short topic label for the active episode.
+    """
+
+    message_text: str
+    recent_messages: tuple[str, ...] = field(default_factory=tuple)
+    tenant_id: str = ""
+    chat_id: str = ""
+
+
+@dataclass(frozen=True)
+class TopicTaggingResponse(JsonDataclass):
+    """Response body for `/ai/tag-topic`."""
+
+    topic: str
+    model_used: str = ""
+
+
+@dataclass(frozen=True)
+class RerankFactsRequest(JsonDataclass):
+    """Request body for `/ai/rerank-facts`.
+
+    The Go backend sends a query and a list of candidate facts; the AI returns
+    the top-k most relevant fact IDs in order of descending relevance.
+    """
+
+    query: str
+    facts: tuple[dict, ...]  # [{"id": int, "text": str}, ...]
+    top_k: int = 5
+
+
+@dataclass(frozen=True)
+class RerankFactsResponse(JsonDataclass):
+    """Response body for `/ai/rerank-facts`."""
+
+    ranked_ids: tuple[int, ...]
+    model_used: str = ""
 
 
 @dataclass(frozen=True)
@@ -445,12 +490,40 @@ def parse_embed_texts_request(payload: dict[str, Any]) -> EmbedTextsRequest:
 
 def parse_typed_extraction_request(payload: dict[str, Any]) -> TypedExtractionRequest:
     """Parse an extract-facts-typed JSON object into a typed request."""
+    recent_raw = payload.get("recent_messages") or []
     return TypedExtractionRequest(
         message_text=str(payload["message_text"]),
         tenant_id=str(payload.get("tenant_id", "")),
         chat_id=str(payload.get("chat_id", "")),
         privacy_flags=_parse_privacy_flags(payload.get("privacy_flags", [])),
         trace_id=str(payload.get("trace_id", "")),
+        recent_messages=tuple(str(m) for m in recent_raw if m),
+    )
+
+
+def parse_topic_tagging_request(payload: dict[str, Any]) -> TopicTaggingRequest:
+    """Parse a tag-topic JSON object into a typed request."""
+    recent_raw = payload.get("recent_messages") or []
+    return TopicTaggingRequest(
+        message_text=str(payload.get("message_text", "")),
+        recent_messages=tuple(str(m) for m in recent_raw if m),
+        tenant_id=str(payload.get("tenant_id", "")),
+        chat_id=str(payload.get("chat_id", "")),
+    )
+
+
+def parse_rerank_facts_request(payload: dict[str, Any]) -> RerankFactsRequest:
+    """Parse a rerank-facts JSON object into a typed request."""
+    raw_facts = payload.get("facts") or []
+    facts = tuple(
+        {"id": int(f["id"]), "text": str(f["text"])}
+        for f in raw_facts
+        if isinstance(f, dict) and "id" in f and "text" in f
+    )
+    return RerankFactsRequest(
+        query=str(payload.get("query", "")),
+        facts=facts,
+        top_k=int(payload.get("top_k", 5)),
     )
 
 

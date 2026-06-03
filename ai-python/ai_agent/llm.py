@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+import http.client
 import json
 import socket
 from typing import TYPE_CHECKING, Callable
@@ -366,8 +367,16 @@ def _estimate_tokens(text: str) -> int:
 
 
 def _urlopen_bytes(request: urllib.request.Request, timeout_seconds: float) -> bytes:
-    with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
-        return response.read()
+    # RemoteDisconnected is raised by http.client during getresponse() (after the
+    # request is sent) when the server closes the connection without sending any
+    # HTTP response.  urllib.request only wraps OSError raised during the send
+    # phase, so RemoteDisconnected from the read phase escapes as a raw exception
+    # unless we convert it here.
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            return response.read()
+    except http.client.RemoteDisconnected as exc:
+        raise urllib.error.URLError(exc) from exc
 
 
 def _openrouter_text(response: dict[str, object]) -> str:

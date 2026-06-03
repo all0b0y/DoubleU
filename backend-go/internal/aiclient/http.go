@@ -115,6 +115,32 @@ func (c *HTTPClient) EmbedTexts(ctx context.Context, request EmbedTextsRequest) 
 	return response, nil
 }
 
+// TagTopic calls the Python AI /ai/tag-topic endpoint to label the active episode topic.
+// Designed for async use; callers should fire-and-forget via a goroutine.
+func (c *HTTPClient) TagTopic(ctx context.Context, request TopicTaggingRequest) (TopicTaggingResponse, error) {
+	var response TopicTaggingResponse
+	if c.baseURL == "" {
+		return response, fmt.Errorf("ai base url is empty")
+	}
+	if err := c.postJSON(ctx, "/ai/tag-topic", request, &response); err != nil {
+		return response, err
+	}
+	return response, nil
+}
+
+// RerankFacts calls the Python AI /ai/rerank-facts endpoint to reorder candidate facts.
+// Returns fact IDs in descending relevance order, truncated to TopK.
+func (c *HTTPClient) RerankFacts(ctx context.Context, request RerankFactsRequest) (RerankFactsResponse, error) {
+	var response RerankFactsResponse
+	if c.baseURL == "" {
+		return response, fmt.Errorf("ai base url is empty")
+	}
+	if err := c.postJSON(ctx, "/ai/rerank-facts", request, &response); err != nil {
+		return response, err
+	}
+	return response, nil
+}
+
 func (c *HTTPClient) postJSON(ctx context.Context, path string, input any, output any) error {
 	body, err := json.Marshal(input)
 	if err != nil {
