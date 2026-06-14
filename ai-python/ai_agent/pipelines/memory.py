@@ -1,9 +1,9 @@
 """Regex-based memory extraction pipeline.
 
 This is the synchronous fast path used in :meth:`AIService.process_message`
-to fill ``memory_used``.  The richer LLM-driven extraction lives in
-:mod:`ai_agent.pipelines.extraction` and runs asynchronously after the draft
-is dispatched (see backlog item §7.1).
+to fill ``memory_used``.  The richer LLM-driven extraction lives in the agent
+runtime (``AgentRuntime.extract_facts_typed``) and runs asynchronously after
+the draft is dispatched (see backlog item §7.1).
 """
 
 from __future__ import annotations

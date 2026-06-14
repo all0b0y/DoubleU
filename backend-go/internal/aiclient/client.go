@@ -76,16 +76,26 @@ type TypedFact struct {
 	Confidence float64 `json:"confidence"`
 }
 
+// ProfileSuggestion is an AI-proposed update to one contact-profile field
+// (§4.5, MEM-4). Staged in contact_profile_suggestions for owner review;
+// never applied to the profile directly.
+type ProfileSuggestion struct {
+	FieldName      string `json:"field_name"`
+	SuggestedValue string `json:"suggested_value"`
+	Rationale      string `json:"rationale,omitempty"`
+}
+
 // TypedExtractionResponse is returned by the Python AI service for typed fact extraction.
 // The diagnostic fields back the extraction_log row so a returned empty Facts slice is
 // distinguishable from a silent failure (design: extraction observability).
 type TypedExtractionResponse struct {
-	Facts                   []TypedFact `json:"facts"`
-	BlockedByPrivacy        bool        `json:"blocked_by_privacy"`
-	ModelUsed               string      `json:"model_used"`
-	RawOutput               string      `json:"raw_output"`
-	LLMFactsCount           int         `json:"llm_facts_count"`
-	DeterministicFactsCount int         `json:"deterministic_facts_count"`
+	Facts                   []TypedFact         `json:"facts"`
+	BlockedByPrivacy        bool                `json:"blocked_by_privacy"`
+	ModelUsed               string              `json:"model_used"`
+	RawOutput               string              `json:"raw_output"`
+	LLMFactsCount           int                 `json:"llm_facts_count"`
+	DeterministicFactsCount int                 `json:"deterministic_facts_count"`
+	ProfileSuggestions      []ProfileSuggestion `json:"profile_suggestions,omitempty"`
 }
 
 // TypedMemoryExtractor is optionally implemented by AI clients that support typed extraction.

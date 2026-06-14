@@ -13,7 +13,9 @@ import (
 	"time"
 
 	"doubleu/backend-go/internal/aiclient"
+	"doubleu/backend-go/internal/botservice"
 	"doubleu/backend-go/internal/config"
+	"doubleu/backend-go/internal/contracts"
 	"doubleu/backend-go/internal/core"
 	"doubleu/backend-go/internal/httpapi"
 	"doubleu/backend-go/internal/observability"
@@ -59,6 +61,7 @@ func main() {
 		}
 	}
 	repository := store.NewRepository()
+	repository.SetLogger(logger)
 	storage := "memory"
 	if cfg.DatabaseURL != "" {
 		migrationPaths := discoverMigrationPaths(logger)
@@ -85,19 +88,43 @@ func main() {
 		_ = obsShutdown(context.Background())
 	}()
 	hub := httpapi.NewSSEHub()
-	service := core.NewService(repository, ai, sender,
+	ingestionDefault, ok := contracts.ParseIngestionMode(cfg.IngestionModeDefault)
+	if !ok {
+		logger.Warn("invalid INGESTION_MODE_DEFAULT, falling back to bot", "value", cfg.IngestionModeDefault)
+		ingestionDefault = contracts.IngestionModeBot
+	}
+	// The bot manager and the core service reference each other (manager feeds
+	// events in, service resolves outbound senders through the manager), so the
+	// handler closes over the service variable assigned right below.
+	var service *core.Service
+	botManager := botservice.NewManager(repository,
+		botservice.HandlerFunc(func(ctx context.Context, event contracts.NormalizedTelegramEvent) error {
+			_, err := service.HandleBotMessage(ctx, event)
+			return err
+		}),
+		telegramHTTPClient,
+		botservice.WithLogger(logger),
+		botservice.WithDefaultIngestionMode(ingestionDefault),
+	)
+	service = core.NewService(repository, ai, sender,
 		core.WithLogger(logger),
 		core.WithReplyDelay(cfg.ReplyDelay),
 		core.WithNotifier(hub.Broadcast),
+		core.WithBotSenderProvider(botManager),
+		core.WithDefaultIngestionMode(ingestionDefault),
+		core.WithAIMemorySource(string(flags.AIMemorySource)),
 	)
 	server := httpapi.NewServer(service,
 		httpapi.WithHub(hub),
 		httpapi.WithBotToken(cfg.TelegramBotToken),
+		httpapi.WithWebhookSecret(cfg.TelegramWebhookSecret),
 		httpapi.WithMiniAppDir(cfg.MiniAppDir),
+		httpapi.WithBotManager(botManager),
 	)
 	serverCtx, serverCancel := context.WithCancel(context.Background())
 	defer serverCancel()
 	server.Start(serverCtx)
+	go botManager.Run(serverCtx)
 	go service.StartEmbeddingWorker(serverCtx)
 	go service.StartEpisodeCloser(serverCtx)
 	go service.StartDailySummaryScheduler(serverCtx)
@@ -125,6 +152,8 @@ func configureTelegramBot(logger *slog.Logger, bot *telegram.BotSender, webhookU
 		{Command: "mode_manual", Description: "Черновики на одобрение"},
 		{Command: "mode_semi_auto", Description: "Умные автоответы"},
 		{Command: "mode_auto", Description: "Полная автономия"},
+		{Command: "forget", Description: "Стереть память чата (безвозвратно)"},
+		{Command: "forget_all", Description: "Стереть все данные (безвозвратно)"},
 	}); err != nil {
 		logger.Error("telegram set commands failed", "error", err)
 	} else {

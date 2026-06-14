@@ -13,8 +13,8 @@ from __future__ import annotations
 import unittest
 
 from ai_agent.pipelines import draft as draft_pipeline
-from ai_agent.schemas import ContactProfileData
-from ai_agent.schemas import _parse_contact_profile
+from ai_agent.schemas import AIRoleData, ContactProfileData
+from ai_agent.schemas import _parse_ai_role, _parse_contact_profile
 
 # Opaque markers: if one appears in the prompt it can only have come from the
 # matching profile field — never from a hard-coded default.
@@ -149,6 +149,115 @@ class DraftPromptAssemblyTests(unittest.TestCase):
         self.assertNotIn("owner-name-sentinel", contact_block)
 
 
+class AIRolePromptTests(unittest.TestCase):
+    """The assigned AI role drives the persona block of the system prompt."""
+
+    ROLE = AIRoleData(
+        name="role-name-sentinel",
+        description="role-description-sentinel",
+        speaking_style="role-style-sentinel",
+        goals="role-goals-sentinel",
+        constraints="role-constraints-sentinel",
+    )
+
+    def _compose(self, ai_role: AIRoleData | None, **kwargs) -> str:
+        return draft_pipeline._compose_base_instruction(
+            clean_memory=["[CURRENT DATE: 2026-05-30]"],
+            owner_style_facts=kwargs.pop("owner_style_facts", []),
+            contact_profile=kwargs.pop("contact_profile", None),
+            current_draft=None,
+            owner_instruction=None,
+            feedback_hint="",
+            ai_role=ai_role,
+            **kwargs,
+        )
+
+    def test_role_fields_render_in_persona_block(self) -> None:
+        """Name, description, style, goals and constraints all reach the persona block."""
+        persona_block, contact_block = _split_sections(self._compose(self.ROLE))
+        for sentinel in (
+            "role-name-sentinel",
+            "role-description-sentinel",
+            "role-style-sentinel",
+            "role-goals-sentinel",
+            "role-constraints-sentinel",
+        ):
+            self.assertIn(sentinel, persona_block)
+            self.assertNotIn(sentinel, contact_block)
+
+    def test_role_style_wins_over_owner_style(self) -> None:
+        """With a role speaking_style set, the owner's observed style is not injected."""
+        profile = ContactProfileData(owner_style=OWNER_STYLE)
+        prompt = self._compose(self.ROLE, contact_profile=profile)
+        self.assertIn("role-style-sentinel", prompt)
+        self.assertNotIn(OWNER_STYLE, prompt)
+
+    def test_role_without_style_falls_back_to_owner_style(self) -> None:
+        """A role with no speaking_style borrows the owner's per-chat style as a hint."""
+        role = AIRoleData(name="role-name-sentinel", description="d")
+        profile = ContactProfileData(owner_style=OWNER_STYLE)
+        persona_block, _ = _split_sections(self._compose(role, contact_profile=profile))
+        self.assertIn(OWNER_STYLE, persona_block)
+
+    def test_no_role_falls_back_to_owner_assistant_persona(self) -> None:
+        """Without a role the prompt keeps the legacy copy-the-owner behaviour."""
+        profile = ContactProfileData(owner_style=OWNER_STYLE)
+        persona_block, _ = _split_sections(self._compose(None, contact_profile=profile))
+        self.assertIn("Роль для чата не задана", persona_block)
+        self.assertIn(OWNER_STYLE, persona_block)
+
+    def test_prompt_pins_memory_to_this_chat(self) -> None:
+        """The prompt forbids referencing conversations outside this chat's context."""
+        prompt = self._compose(self.ROLE)
+        self.assertIn("только из этого чата", prompt)
+
+    def test_parse_ai_role_requires_name(self) -> None:
+        """A role payload without a name is treated as no role at all."""
+        self.assertIsNone(_parse_ai_role({"description": "x"}))
+        self.assertIsNone(_parse_ai_role(None))
+        parsed = _parse_ai_role({"name": " n ", "constraints": " c "})
+        assert parsed is not None
+        self.assertEqual(parsed.name, "n")
+        self.assertEqual(parsed.constraints, "c")
+
+    def test_custom_fields_render_in_persona_block(self) -> None:
+        """Owner-defined custom fields reach the persona block, not the contact block."""
+        from ai_agent.schemas import AIRoleCustomFieldData
+
+        role = AIRoleData(
+            name="role-name-sentinel",
+            description="d",
+            custom_fields=(
+                AIRoleCustomFieldData(
+                    title="cf-title-sentinel",
+                    description="cf-desc-sentinel",
+                    context="cf-context-sentinel",
+                ),
+            ),
+        )
+        persona_block, contact_block = _split_sections(self._compose(role))
+        for sentinel in ("cf-title-sentinel", "cf-desc-sentinel", "cf-context-sentinel"):
+            self.assertIn(sentinel, persona_block)
+            self.assertNotIn(sentinel, contact_block)
+
+    def test_parse_ai_role_drops_custom_fields_without_title(self) -> None:
+        """Custom fields without a title are dropped on parse."""
+        parsed = _parse_ai_role(
+            {
+                "name": "n",
+                "custom_fields": [
+                    {"title": " keep ", "description": " why "},
+                    {"title": "", "description": "no title"},
+                    "not-a-dict",
+                ],
+            }
+        )
+        assert parsed is not None
+        self.assertEqual(len(parsed.custom_fields), 1)
+        self.assertEqual(parsed.custom_fields[0].title, "keep")
+        self.assertEqual(parsed.custom_fields[0].description, "why")
+
+
 class GreetingRuleTests(unittest.TestCase):
     """``_greeting_rule`` trusts the Go-supplied flag as the single source of truth."""
 
@@ -194,9 +303,9 @@ class PromptBuilderTests(unittest.TestCase):
 
 
 def _split_sections(prompt: str) -> tuple[str, str]:
-    """Return (owner_role_block, contact_block) substrings of the system prompt."""
-    role_start = prompt.index("РОЛЬ — КТО ПИШЕТ:")
-    contact_start = prompt.index("СОБЕСЕДНИК — КОМУ ПИШЕМ:")
+    """Return (persona_block, contact_block) substrings of the system prompt."""
+    role_start = prompt.index("КТО ТЫ В ЭТОМ ЧАТЕ:")
+    contact_start = prompt.index("СОБЕСЕДНИК — КОМУ ПИШЕШЬ:")
     task_start = prompt.index("ЗАДАЧА:")
     return prompt[role_start:contact_start], prompt[contact_start:task_start]
 

@@ -30,6 +30,7 @@ export const api = {
   chats:        ()              => request('GET',   '/api/v1/chats'),
   addChats:     (chatIds)       => request('POST',  '/api/v1/chats', { chat_ids: chatIds }),
   messages:     (chatId)        => request('GET',   `/api/v1/chats/${chatId}/messages`),
+  sendMessage:  (chatId, text)  => request('POST',  `/api/v1/chats/${chatId}/send`, { text }),
   drafts:       (chatId)        => request('GET',   `/api/v1/chats/${chatId}/drafts`),
   draftAction:  (chatId, draftId, action, editedText) =>
     request('POST', `/api/v1/chats/${chatId}/drafts/${draftId}/action`,
@@ -40,6 +41,36 @@ export const api = {
   getProfile:     (chatId)        => request('GET',   `/api/v1/chats/${chatId}/profile`),
   saveProfile:    (chatId, data)  => request('PUT',   `/api/v1/chats/${chatId}/profile`, data),
   avatarURL:      (chatId)        => `/api/v1/chats/${chatId}/avatar`,
+
+  // AI roles (personas)
+  roles:          ()              => request('GET',    '/api/v1/roles'),
+  createRole:     (data)          => request('POST',   '/api/v1/roles', data),
+  updateRole:     (roleId, data)  => request('PUT',    `/api/v1/roles/${roleId}`, data),
+  deleteRole:     (roleId)        => request('DELETE', `/api/v1/roles/${roleId}`),
+  assignRole:     (chatId, roleId) => request('PUT',   `/api/v1/chats/${chatId}/role`, { role_id: roleId }),
+
+  // AI profile suggestions
+  suggestions:    (chatId)        => request('GET',
+    chatId ? `/api/v1/chats/${chatId}/suggestions` : '/api/v1/suggestions'),
+  suggestionAction: (id, action)  => request('POST',  `/api/v1/suggestions/${id}/action`, { action }),
+
+  // Memory: summary, facts, episodes, erasure
+  summarize:      (chatId)        => request('POST',   `/api/v1/chats/${chatId}/summary`),
+  facts:          (chatId)        => request('GET',    `/api/v1/chats/${chatId}/facts`),
+  deleteFact:     (factId)        => request('DELETE', `/api/v1/facts/${factId}`),
+  episodes:       (chatId)        => request('GET',    `/api/v1/chats/${chatId}/episodes`),
+  forgetChat:     (chatId)        => request('POST',   `/api/v1/chats/${chatId}/forget`),
+  forgetAll:      (phrase)        => request('POST',   '/api/v1/forget-all', { confirm_phrase: phrase }),
+
+  // Owner-level settings ("Я" screen)
+  userSettings:     ()            => request('GET',   '/api/v1/settings/user'),
+  saveUserSettings: (data)        => request('PUT',   '/api/v1/settings/user', data),
+
+  // Bot ingestion (user-supplied bot)
+  getBot:        ()       => request('GET',    '/api/v1/bots'),
+  registerBot:   (token)  => request('POST',   '/api/v1/bots', { token }),
+  setBotRole:    (roleId) => request('PUT',    '/api/v1/bots/role', { role_id: roleId }),
+  disconnectBot: ()       => request('DELETE', '/api/v1/bots'),
 };
 
 /** Open an SSE stream; returns the EventSource. Caller owns closing it. */

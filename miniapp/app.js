@@ -6,6 +6,10 @@ import { renderChat }      from '/miniapp/screens/chat.js';
 import { renderSettings }  from '/miniapp/screens/settings.js';
 import { renderAddChat }   from '/miniapp/screens/add-chat.js';
 import { renderProfile }   from '/miniapp/screens/profile.js';
+import { renderRoles }     from '/miniapp/screens/roles.js';
+import { renderRoleEdit }  from '/miniapp/screens/role-edit.js';
+import { renderMe }        from '/miniapp/screens/me.js';
+import { renderAddBot }    from '/miniapp/screens/add-bot.js';
 
 const twa = window.Telegram?.WebApp;
 const app = document.getElementById('app');
@@ -13,10 +17,14 @@ const app = document.getElementById('app');
 // ── TMA initialisation ────────────────────────────────────────────────────────
 twa?.ready();
 twa?.expand();
-twa?.requestFullscreen?.();
-twa?.setHeaderColor?.('#14141A');
-twa?.setBackgroundColor?.('#14141A');
-twa?.setBottomBarColor?.('#14141A');
+// requestFullscreen throws WebAppMethodUnsupported (not just warns) on TWA < 8.0,
+// which would abort this whole module and leave a black screen.
+try { twa?.requestFullscreen?.(); } catch (_) { /* older Telegram client */ }
+try {
+  twa?.setHeaderColor?.('#14141A');
+  twa?.setBackgroundColor?.('#14141A');
+  twa?.setBottomBarColor?.('#14141A');
+} catch (_) { /* older Telegram client */ }
 
 // Push our UI below Telegram's native header in fullscreen mode.
 // safeAreaInset.top = status bar; contentSafeAreaInset.top = Telegram header.
@@ -52,6 +60,12 @@ const routes = {
   '/chat/:id/settings':   (p) => renderSettings(navigate, p.id),
   '/chat/:id/profile':    (p) => renderProfile(navigate, p.id),
   '/add-chat':            () => renderAddChat(navigate),
+  '/add-bot':             () => renderAddBot(navigate),
+  // '/roles/new' must precede '/roles/:id' — the router matches in order.
+  '/roles':               () => renderRoles(navigate),
+  '/roles/new':           () => renderRoleEdit(navigate, null),
+  '/roles/:id':           (p) => renderRoleEdit(navigate, p.id),
+  '/me':                  () => renderMe(navigate),
 };
 
 export function navigate(path) {
@@ -86,7 +100,7 @@ async function route() {
   if (!found) { navigate('/chats'); return; }
 
   // Guard: check connection status before any protected route
-  const protected_ = ['/chats', '/chat', '/add-chat', '/chat/:id/settings'];
+  const protected_ = ['/chats', '/chat', '/add-chat', '/add-bot', '/chat/:id/settings', '/roles', '/me'];
   const needsAuth = protected_.some(p => hash.replace('#', '').startsWith(p.replace(':id', '')));
   if (needsAuth) {
     try {

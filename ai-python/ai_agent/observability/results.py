@@ -27,8 +27,8 @@ class ScanResult:
 class SafetyBlocked(Exception):
     """Raised by InputSafety/OutputSafety to abort an LLM call.
 
-    The router maps this to a ``GatewayResponse(model_used="blocked")`` or to
-    a Decision-level ``ignore``/``ask_owner`` per pipeline.
+    The agent runtime maps this to a canned-reply ``DraftOutcome`` with
+    ``model_used="blocked"`` (and degrades gracefully for non-draft endpoints).
     """
 
     def __init__(self, reason: str, canned_reply: str = "", scanner: str = "") -> None:

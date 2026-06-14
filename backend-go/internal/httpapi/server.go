@@ -3,6 +3,7 @@ package httpapi
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"net/http"
 
@@ -23,6 +24,13 @@ func WithBotToken(token string) ServerOption {
 	return func(s *Server) { s.botToken = token }
 }
 
+// WithWebhookSecret sets the secret token registered with Telegram via setWebhook.
+// When non-empty, inbound webhook requests must carry a matching
+// X-Telegram-Bot-Api-Secret-Token header or they are rejected.
+func WithWebhookSecret(secret string) ServerOption {
+	return func(s *Server) { s.webhookSecret = secret }
+}
+
 // WithMiniAppDir configures the directory of Mini App static files to serve.
 func WithMiniAppDir(dir string) ServerOption {
 	return func(s *Server) { s.miniappDir = dir }
@@ -30,11 +38,13 @@ func WithMiniAppDir(dir string) ServerOption {
 
 // Server exposes health, Telegram webhook, approval callback, and Mini App API handlers.
 type Server struct {
-	service    *core.Service
-	mux        *http.ServeMux
-	hub        *SSEHub
-	botToken   string
-	miniappDir string
+	service       *core.Service
+	mux           *http.ServeMux
+	hub           *SSEHub
+	bots          BotManager
+	botToken      string
+	webhookSecret string
+	miniappDir    string
 }
 
 // NewServer creates an HTTP server wrapper.
@@ -50,6 +60,7 @@ func NewServer(service *core.Service, opts ...ServerOption) *Server {
 // Start launches background goroutines bound to the given context.
 // Call this once after NewServer, before accepting requests.
 func (s *Server) Start(ctx context.Context) {
+	s.service.StartWebhookWorkers(ctx)
 	go s.service.StartDailySummaryScheduler(ctx)
 	go s.service.StartEpisodeCloser(ctx)
 }
@@ -78,12 +89,46 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/v1/chats/{chat_id}/messages", s.tmaAuth(s.apiMessages))
 	s.mux.HandleFunc("GET /api/v1/chats/{chat_id}/drafts", s.tmaAuth(s.apiDrafts))
 	s.mux.HandleFunc("POST /api/v1/chats/{chat_id}/drafts/{draft_id}/action", s.tmaAuth(s.apiDraftAction))
+	s.mux.HandleFunc("POST /api/v1/chats/{chat_id}/send", s.tmaAuth(s.apiSendMessage))
 	s.mux.HandleFunc("GET /api/v1/chats/{chat_id}/settings", s.tmaAuth(s.apiGetChatSettings))
 	s.mux.HandleFunc("PATCH /api/v1/chats/{chat_id}/settings", s.tmaAuth(s.apiUpdateChatSettings))
 	s.mux.HandleFunc("GET /api/v1/contacts", s.tmaAuth(s.apiContacts))
 	s.mux.HandleFunc("GET /api/v1/chats/{chat_id}/profile", s.tmaAuth(s.apiGetProfile))
 	s.mux.HandleFunc("PUT /api/v1/chats/{chat_id}/profile", s.tmaAuth(s.apiSaveProfile))
 	s.mux.HandleFunc("GET /api/v1/chats/{chat_id}/avatar", s.tmaAuth(s.apiGetChatAvatar))
+
+	// AI roles (personas) — CRUD plus per-chat assignment.
+	s.mux.HandleFunc("GET /api/v1/roles", s.tmaAuth(s.apiRoles))
+	s.mux.HandleFunc("POST /api/v1/roles", s.tmaAuth(s.apiCreateRole))
+	s.mux.HandleFunc("PUT /api/v1/roles/{role_id}", s.tmaAuth(s.apiUpdateRole))
+	s.mux.HandleFunc("DELETE /api/v1/roles/{role_id}", s.tmaAuth(s.apiDeleteRole))
+	s.mux.HandleFunc("PUT /api/v1/chats/{chat_id}/role", s.tmaAuth(s.apiAssignChatRole))
+
+	// AI profile suggestions: tenant-wide inbox and per-chat list.
+	s.mux.HandleFunc("GET /api/v1/suggestions", s.tmaAuth(s.apiSuggestions))
+	s.mux.HandleFunc("GET /api/v1/chats/{chat_id}/suggestions", s.tmaAuth(s.apiSuggestions))
+	s.mux.HandleFunc("POST /api/v1/suggestions/{suggestion_id}/action", s.tmaAuth(s.apiSuggestionAction))
+
+	// Memory: on-demand summary, facts, episode summaries, erasure.
+	s.mux.HandleFunc("POST /api/v1/chats/{chat_id}/summary", s.tmaAuth(s.apiChatSummary))
+	s.mux.HandleFunc("GET /api/v1/chats/{chat_id}/facts", s.tmaAuth(s.apiFacts))
+	s.mux.HandleFunc("DELETE /api/v1/facts/{fact_id}", s.tmaAuth(s.apiDeleteFact))
+	s.mux.HandleFunc("GET /api/v1/chats/{chat_id}/episodes", s.tmaAuth(s.apiEpisodes))
+	s.mux.HandleFunc("POST /api/v1/chats/{chat_id}/forget", s.tmaAuth(s.apiForgetChat))
+	s.mux.HandleFunc("POST /api/v1/forget-all", s.tmaAuth(s.apiForgetAll))
+
+	// Owner-level settings ("Я" screen).
+	s.mux.HandleFunc("GET /api/v1/settings/user", s.tmaAuth(s.apiGetUserSettings))
+	s.mux.HandleFunc("PUT /api/v1/settings/user", s.tmaAuth(s.apiSaveUserSettings))
+
+	// Bot ingestion settings (UI is the configuration surface; the bot is the
+	// communication channel).
+	s.mux.HandleFunc("GET /api/v1/bots", s.tmaAuth(s.apiGetBot))
+	s.mux.HandleFunc("POST /api/v1/bots", s.tmaAuth(s.apiRegisterBot))
+	s.mux.HandleFunc("PUT /api/v1/bots/role", s.tmaAuth(s.apiSetBotRole))
+	s.mux.HandleFunc("DELETE /api/v1/bots", s.tmaAuth(s.apiDisconnectBot))
+	s.mux.HandleFunc("GET /api/v1/settings/ingestion-mode", s.tmaAuth(s.apiGetIngestionMode))
+	s.mux.HandleFunc("PUT /api/v1/settings/ingestion-mode", s.tmaAuth(s.apiSetIngestionMode))
 
 	// Mini App static files
 	if s.miniappDir != "" {
@@ -146,6 +191,17 @@ func (s *Server) chatSettings(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) telegramWebhook(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
+	// Authenticate the caller as Telegram: the secret token registered via
+	// setWebhook is echoed back in this header on every legitimate delivery.
+	// Without this check the endpoint accepts forged updates from anyone who
+	// knows the public URL. Skipped only when no secret is configured (dev).
+	if s.webhookSecret != "" {
+		got := r.Header.Get("X-Telegram-Bot-Api-Secret-Token")
+		if subtle.ConstantTimeCompare([]byte(got), []byte(s.webhookSecret)) != 1 {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid webhook secret"})
+			return
+		}
+	}
 	var raw json.RawMessage
 	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
@@ -153,12 +209,10 @@ func (s *Server) telegramWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 	tenantHint := r.Header.Get("X-Tenant-ID")
 	// Ack immediately so Telegram does not retry within the 60s window.
-	// The duplicate-receive gate in HandleTelegramWebhook ensures any concurrent
-	// re-delivery is dropped once processing has started.
+	// Processing goes through the per-chat ordered worker pool (ARCH-7); the
+	// duplicate-receive gate inside ensures re-deliveries are dropped.
 	w.WriteHeader(http.StatusOK)
-	go func() {
-		_, _ = s.service.HandleTelegramWebhook(context.Background(), raw, tenantHint)
-	}()
+	s.service.EnqueueTelegramWebhook(raw, tenantHint)
 }
 
 func (s *Server) approvalCallback(w http.ResponseWriter, r *http.Request) {

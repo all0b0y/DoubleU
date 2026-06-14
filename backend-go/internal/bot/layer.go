@@ -4,6 +4,7 @@ package bot
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"doubleu/backend-go/internal/contracts"
 	"doubleu/backend-go/internal/store"
@@ -62,9 +63,134 @@ func (l *Layer) HandleCommand(command telegram.BotCommandUpdate, tenantID string
 		return l.handleProfileCommand(command, tenantID)
 	case "/profile_set":
 		return l.handleProfileSetCommand(command, tenantID)
+	case "/roles":
+		return l.handleRolesCommand(tenantID)
+	case "/role":
+		return l.handleRoleCommand(command, tenantID)
+	case "/role_create":
+		return l.handleRoleCreateCommand(command, tenantID)
+	case "/role_assign":
+		return l.handleRoleAssignCommand(command, tenantID)
+	case "/role_clear":
+		return l.handleRoleClearCommand(command, tenantID)
+	case "/forget":
+		return l.handleForgetCommand(command, tenantID)
+	case "/forget_all":
+		return l.handleForgetAllCommand(command, tenantID)
+	case "/suggestions":
+		return l.handleSuggestionsCommand(tenantID)
 	default:
 		return CommandResponse{Text: helpText(), Reason: "unknown_command"}
 	}
+}
+
+// handleForgetCommand starts the two-step memory-erasure flow for one chat
+// (§10.2): the destructive action runs only after the owner presses the
+// inline confirmation button (handled in service.handleCallbackQuery).
+func (l *Layer) handleForgetCommand(command telegram.BotCommandUpdate, tenantID string) CommandResponse {
+	selector := strings.TrimSpace(command.Arguments)
+	if selector == "" {
+		return CommandResponse{Text: "Формат: /forget <номер чата>. Список: /chats", Reason: "forget_bad_args", ReplyMarkup: mainMenuKeyboard()}
+	}
+	chat, ok := l.repository.ChatBySelector(tenantID, selector)
+	if !ok {
+		return CommandResponse{Text: "Чат не найден. Используй /chats.", Reason: "forget_chat_not_found", ReplyMarkup: mainMenuKeyboard()}
+	}
+	return CommandResponse{
+		Text: fmt.Sprintf(
+			"⚠️ Удалить ВСЮ память чата «%s»?\nФакты, сводки, история сообщений и черновики будут стёрты безвозвратно. Сам чат и его режим останутся.",
+			chatName(chat)),
+		Reason:      "forget_confirmation_requested",
+		ReplyMarkup: ForgetConfirmKeyboard(chat.ChatID),
+	}
+}
+
+// handleForgetAllCommand arms the phrase-confirmation step for full erasure.
+func (l *Layer) handleForgetAllCommand(command telegram.BotCommandUpdate, tenantID string) CommandResponse {
+	l.repository.SetPendingInput(tenantID, command.ChatID, contracts.PendingInput{
+		TenantID:  tenantID,
+		ChatID:    command.ChatID,
+		Type:      contracts.PendingInputForgetAll,
+		ExpiresAt: time.Now().Add(5 * time.Minute),
+	})
+	return CommandResponse{
+		Text: "⚠️ Это удалит ВСЕ данные: чаты, память, профили, настройки. Безвозвратно.\n" +
+			"Для подтверждения отправь фразу: " + contracts.ForgetAllConfirmationPhrase +
+			"\nЛюбое другое сообщение отменит удаление.",
+		Reason: "forget_all_confirmation_requested",
+	}
+}
+
+// SuggestionFieldLabels maps suggestion field names to owner-facing labels.
+var SuggestionFieldLabels = map[string]string{
+	"relationship_type": "тип отношений",
+	"preferred_address": "обращение",
+	"language":          "язык",
+	"tone":              "тон",
+	"gender":            "пол",
+}
+
+// handleSuggestionsCommand lists pending AI profile suggestions for the tenant
+// (§4.5); each is re-sent with its accept/reject keyboard by the caller's
+// follow-up taps, so the list itself stays read-only.
+func (l *Layer) handleSuggestionsCommand(tenantID string) CommandResponse {
+	pending := l.repository.PendingSuggestions(tenantID, "")
+	if len(pending) == 0 {
+		return CommandResponse{Text: "Нет ожидающих предложений по профилям.", Reason: "suggestions_empty", ReplyMarkup: mainMenuKeyboard()}
+	}
+	lines := []string{"💡 Ожидают решения:"}
+	rows := make([][]telegram.InlineKeyboardButton, 0, len(pending))
+	for i, sg := range pending {
+		if i >= 10 {
+			lines = append(lines, fmt.Sprintf("… и ещё %d", len(pending)-10))
+			break
+		}
+		label := SuggestionFieldLabels[sg.FieldName]
+		lines = append(lines, fmt.Sprintf("%d. чат %s: %s → %s", i+1, sg.ChatID, valueOrDash(label), sg.SuggestedValue))
+		rows = append(rows, []telegram.InlineKeyboardButton{
+			{Text: fmt.Sprintf("✅ %d", i+1), CallbackData: contracts.CallbackDataEncodeSuggestion(sg.ID, true)},
+			{Text: fmt.Sprintf("❌ %d", i+1), CallbackData: contracts.CallbackDataEncodeSuggestion(sg.ID, false)},
+		})
+	}
+	return CommandResponse{
+		Text:        strings.Join(lines, "\n"),
+		Reason:      "suggestions_list",
+		ReplyMarkup: telegram.InlineKeyboardMarkup{InlineKeyboard: rows},
+	}
+}
+
+// SuggestionCardText formats the owner notification for one AI profile
+// suggestion (§4.5): "ИИ считает, что X — коллега. Принять?".
+func SuggestionCardText(chatName, fieldLabel, value, rationale string) string {
+	lines := []string{
+		fmt.Sprintf("💡 ИИ предлагает обновить профиль «%s»:", chatName),
+		fmt.Sprintf("• %s → %s", valueOrDash(fieldLabel), value),
+	}
+	if rationale != "" {
+		lines = append(lines, fmt.Sprintf("Основание: %s", rationale))
+	}
+	lines = append(lines, "", "Принять это изменение?")
+	return strings.Join(lines, "\n")
+}
+
+// SuggestionKeyboard is the accept/reject keyboard for a profile suggestion.
+func SuggestionKeyboard(id int64) telegram.InlineKeyboardMarkup {
+	return telegram.InlineKeyboardMarkup{InlineKeyboard: [][]telegram.InlineKeyboardButton{
+		{
+			{Text: "✅ Принять", CallbackData: contracts.CallbackDataEncodeSuggestion(id, true)},
+			{Text: "❌ Отклонить", CallbackData: contracts.CallbackDataEncodeSuggestion(id, false)},
+		},
+	}}
+}
+
+// ForgetConfirmKeyboard is the confirm/cancel keyboard of the /forget flow.
+func ForgetConfirmKeyboard(chatID string) telegram.InlineKeyboardMarkup {
+	return telegram.InlineKeyboardMarkup{InlineKeyboard: [][]telegram.InlineKeyboardButton{
+		{
+			{Text: "🗑 Да, удалить память", CallbackData: contracts.CallbackDataEncodeForget(chatID)},
+			{Text: "Отмена", CallbackData: contracts.ForgetCancelCallbackData},
+		},
+	}}
 }
 
 func (l *Layer) handleProfileCommand(command telegram.BotCommandUpdate, tenantID string) CommandResponse {
@@ -139,6 +265,139 @@ func (l *Layer) handleProfileSetCommand(command telegram.BotCommandUpdate, tenan
 		Reason:      "profile_set_saved",
 		ReplyMarkup: mainMenuKeyboard(),
 	}
+}
+
+// roleCreateUsage is shown whenever /role_create arguments cannot be parsed.
+const roleCreateUsage = "Формат: /role_create Имя | Описание | стиль речи | цели | ограничения\n" +
+	"Обязательны имя и описание, остальное — по желанию.\n" +
+	"Пример: /role_create Менеджер | Личный менеджер Алексея, отвечает клиентам от его имени | вежливо, кратко, на «вы» | договориться о встрече | не обещать скидки"
+
+func (l *Layer) handleRolesCommand(tenantID string) CommandResponse {
+	roles := l.repository.AIRoles(tenantID)
+	if len(roles) == 0 {
+		return CommandResponse{
+			Text:        "Ролей пока нет. Создай первую:\n" + roleCreateUsage,
+			Reason:      "roles_empty",
+			ReplyMarkup: mainMenuKeyboard(),
+		}
+	}
+	lines := []string{"🎭 Твои AI-роли:"}
+	for _, role := range roles {
+		lines = append(lines, fmt.Sprintf("• %s — %s", role.Name, truncateText(role.Description, 80)))
+	}
+	lines = append(lines, "",
+		"/role_assign <номер чата> <имя роли> — назначить роль на чат",
+		"/role <номер чата> — какая роль отвечает в чате",
+		"/role_create — создать или обновить роль",
+	)
+	return CommandResponse{Text: strings.Join(lines, "\n"), Reason: "roles_list", ReplyMarkup: mainMenuKeyboard()}
+}
+
+func (l *Layer) handleRoleCommand(command telegram.BotCommandUpdate, tenantID string) CommandResponse {
+	selector := strings.TrimSpace(command.Arguments)
+	if selector == "" {
+		selector = "1"
+	}
+	chat, ok := l.repository.ChatBySelector(tenantID, selector)
+	if !ok {
+		return CommandResponse{Text: "Чат не найден. Используй /chats.", Reason: "role_chat_not_found", ReplyMarkup: mainMenuKeyboard()}
+	}
+	role, ok := l.repository.AIRoleForChat(tenantID, chat.ChatID)
+	if !ok {
+		return CommandResponse{
+			Text:        fmt.Sprintf("В чате «%s» роль не задана — ИИ отвечает как ассистент в стиле владельца.\nНазначить: /role_assign %s <имя роли> (список: /roles)", chatName(chat), selector),
+			Reason:      "role_not_assigned",
+			ReplyMarkup: mainMenuKeyboard(),
+		}
+	}
+	lines := []string{
+		fmt.Sprintf("🎭 Роль в чате «%s»: %s", chatName(chat), role.Name),
+		fmt.Sprintf("• Описание: %s", valueOrDash(role.Description)),
+		fmt.Sprintf("• Стиль речи: %s", valueOrDash(role.SpeakingStyle)),
+		fmt.Sprintf("• Цели: %s", valueOrDash(role.Goals)),
+		fmt.Sprintf("• Ограничения: %s", valueOrDash(role.Constraints)),
+		"",
+		fmt.Sprintf("Снять роль: /role_clear %s", selector),
+	}
+	return CommandResponse{Text: strings.Join(lines, "\n"), Reason: "role_command", ReplyMarkup: mainMenuKeyboard()}
+}
+
+func (l *Layer) handleRoleCreateCommand(command telegram.BotCommandUpdate, tenantID string) CommandResponse {
+	fields := strings.Split(command.Arguments, "|")
+	part := func(i int) string {
+		if i < len(fields) {
+			return strings.TrimSpace(fields[i])
+		}
+		return ""
+	}
+	name, description := part(0), part(1)
+	if name == "" || description == "" || len(name) > 64 {
+		return CommandResponse{Text: roleCreateUsage, Reason: "role_create_bad_args", ReplyMarkup: mainMenuKeyboard()}
+	}
+	role := l.repository.SaveAIRole(store.AIRoleRecord{
+		TenantID:      tenantID,
+		Name:          name,
+		Description:   description,
+		SpeakingStyle: part(2),
+		Goals:         part(3),
+		Constraints:   part(4),
+	})
+	if role.ID == 0 && role.Name == "" {
+		return CommandResponse{Text: "Не удалось сохранить роль, попробуй ещё раз.", Reason: "role_create_failed", ReplyMarkup: mainMenuKeyboard()}
+	}
+	return CommandResponse{
+		Text:        fmt.Sprintf("✅ Роль «%s» сохранена.\nНазначь её на чат: /role_assign <номер чата> %s", role.Name, role.Name),
+		Reason:      "role_create_saved",
+		ReplyMarkup: mainMenuKeyboard(),
+	}
+}
+
+func (l *Layer) handleRoleAssignCommand(command telegram.BotCommandUpdate, tenantID string) CommandResponse {
+	parts := strings.SplitN(strings.TrimSpace(command.Arguments), " ", 2)
+	if len(parts) < 2 {
+		return CommandResponse{Text: "Формат: /role_assign <номер чата> <имя роли>\nСписок ролей: /roles, список чатов: /chats", Reason: "role_assign_bad_args", ReplyMarkup: mainMenuKeyboard()}
+	}
+	chat, ok := l.repository.ChatBySelector(tenantID, strings.TrimSpace(parts[0]))
+	if !ok {
+		return CommandResponse{Text: "Чат не найден. Используй /chats.", Reason: "role_assign_chat_not_found", ReplyMarkup: mainMenuKeyboard()}
+	}
+	roleName := strings.TrimSpace(parts[1])
+	role, ok := l.repository.AIRoleByName(tenantID, roleName)
+	if !ok {
+		return CommandResponse{Text: fmt.Sprintf("Роль «%s» не найдена. Список: /roles", roleName), Reason: "role_assign_role_not_found", ReplyMarkup: mainMenuKeyboard()}
+	}
+	l.repository.AssignAIRoleToChat(tenantID, chat.ChatID, role.ID)
+	return CommandResponse{
+		Text:        fmt.Sprintf("🎭 Теперь в чате «%s» отвечает роль «%s».", chatName(chat), role.Name),
+		Reason:      "role_assigned",
+		ReplyMarkup: mainMenuKeyboard(),
+	}
+}
+
+func (l *Layer) handleRoleClearCommand(command telegram.BotCommandUpdate, tenantID string) CommandResponse {
+	selector := strings.TrimSpace(command.Arguments)
+	if selector == "" {
+		return CommandResponse{Text: "Формат: /role_clear <номер чата>", Reason: "role_clear_bad_args", ReplyMarkup: mainMenuKeyboard()}
+	}
+	chat, ok := l.repository.ChatBySelector(tenantID, selector)
+	if !ok {
+		return CommandResponse{Text: "Чат не найден. Используй /chats.", Reason: "role_clear_chat_not_found", ReplyMarkup: mainMenuKeyboard()}
+	}
+	l.repository.AssignAIRoleToChat(tenantID, chat.ChatID, 0)
+	return CommandResponse{
+		Text:        fmt.Sprintf("Роль снята. В чате «%s» ИИ снова отвечает как ассистент в стиле владельца.", chatName(chat)),
+		Reason:      "role_cleared",
+		ReplyMarkup: mainMenuKeyboard(),
+	}
+}
+
+// truncateText shortens s to max runes for compact list rendering.
+func truncateText(s string, max int) string {
+	runes := []rune(s)
+	if len(runes) <= max {
+		return s
+	}
+	return string(runes[:max-1]) + "…"
 }
 
 func (l *Layer) handleModeCommand(command telegram.BotCommandUpdate, tenantID string) CommandResponse {
@@ -219,10 +478,18 @@ func helpText() string {
 		"/summary <номер> - сводка выбранного чата",
 		"/profile <номер> - профиль контакта и прогресс контекста",
 		"/profile_set <номер> имя, пол, роль, отношения, заметки",
+		"/roles - твои AI-роли (персоны для ответов)",
+		"/role_create Имя | Описание | стиль | цели | ограничения",
+		"/role_assign <номер> <имя роли> - назначить роль на чат",
+		"/role <номер> - роль, отвечающая в чате",
+		"/role_clear <номер> - снять роль с чата",
 		"/mode_silent <номер> - только наблюдение",
 		"/mode_manual <номер> - черновики на одобрение",
 		"/mode_semi_auto <номер> - умные автоответы",
 		"/mode_auto <номер> - полная автономия",
+		"/suggestions - предложения ИИ по профилям контактов",
+		"/forget <номер> - стереть память чата (безвозвратно)",
+		"/forget_all - стереть все данные (безвозвратно)",
 	}, "\n")
 }
 
@@ -442,6 +709,33 @@ func chatMenuKeyboard(chats []store.ChatRecord, tenantID string) telegram.ReplyK
 	// tenantID reserved for future per-chat unlock display.
 	_ = tenantID
 	return telegram.ReplyKeyboardMarkup{ResizeKeyboard: true, Keyboard: rows}
+}
+
+// WarningCardText formats the critical-risk warning card for the owner.
+// The note is a service message (e.g. "intimate content — reply manually");
+// no draft text is shown because none exists — the AI did not generate one.
+func WarningCardText(contactMsg, ownerNote, chatName string) string {
+	lines := []string{
+		fmt.Sprintf("⚠️ Сообщение от %s требует ручного ответа:", chatName),
+		"",
+		contactMsg,
+		"",
+		ownerNote,
+		"",
+		"Ответь собеседнику вручную из своего Telegram.",
+	}
+	return strings.Join(lines, "\n")
+}
+
+// WarningKeyboard returns the keyboard for a warning card: dismiss only.
+// Approve/Edit are intentionally absent so the service text can never be sent
+// to the contact (ARCH-1).
+func WarningKeyboard(draftID string) telegram.InlineKeyboardMarkup {
+	return telegram.InlineKeyboardMarkup{InlineKeyboard: [][]telegram.InlineKeyboardButton{
+		{
+			{Text: "✖️ Скрыть", CallbackData: contracts.CallbackDataEncode(contracts.ApprovalReject, draftID)},
+		},
+	}}
 }
 
 // QuestionCardText formats the owner notification for an incoming choice question.

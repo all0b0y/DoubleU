@@ -15,6 +15,19 @@ const (
 	GatewayLiteLLM LLMGatewayKind = "litellm"
 )
 
+// AIMemorySource selects which side owns memory writes after extraction.
+type AIMemorySource string
+
+const (
+	// MemorySourceGo keeps the legacy flow: Go persists extracted facts and
+	// profile suggestions returned by the Python service.
+	MemorySourceGo AIMemorySource = "go"
+	// MemorySourcePython delegates fact/suggestion persistence to the Python
+	// pydantic-ai runtime (direct PostgreSQL access); Go skips its write path
+	// so nothing is stored twice.
+	MemorySourcePython AIMemorySource = "python"
+)
+
 // ObservabilitySink selects the trace destination.
 type ObservabilitySink string
 
@@ -42,6 +55,9 @@ type FeatureFlags struct {
 	ShadowModeOnly bool
 	// Cutover skips the legacy gateway entirely and routes only via LiteLLM.
 	Cutover bool
+	// AIMemorySource picks who persists extracted memory (Go legacy path or
+	// the Python agent runtime). Defaults to MemorySourceGo (safe-off).
+	AIMemorySource AIMemorySource
 }
 
 // LoadFlags reads FeatureFlags from environment variables with safe defaults.
@@ -53,6 +69,16 @@ func LoadFlags() FeatureFlags {
 		ObservabilitySink:   parseSink(os.Getenv("OBSERVABILITY_SINK")),
 		ShadowModeOnly:      boolValue(os.Getenv("SHADOW_MODE_ONLY")),
 		Cutover:             boolValue(os.Getenv("CUTOVER")),
+		AIMemorySource:      parseMemorySource(os.Getenv("AI_MEMORY_SOURCE")),
+	}
+}
+
+func parseMemorySource(raw string) AIMemorySource {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case string(MemorySourcePython):
+		return MemorySourcePython
+	default:
+		return MemorySourceGo
 	}
 }
 

@@ -1,7 +1,7 @@
 """Input safety pre-gateway scanner pipeline (Phase 1).
 
-The scanner sits inside :class:`ai_agent.llm.ModelRouter` and runs before any
-gateway sees the payload.  It composes scanners per purpose from
+The scanner is invoked by :class:`ai_agent.agents.runtime.AgentRuntime` before
+any agent run sees the payload.  It composes scanners per purpose from
 :mod:`ai_agent.safety.policies`:
 
 * ``Anonymize`` rewrites emails / phones / cards / IBANs / IPs in place and

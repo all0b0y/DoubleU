@@ -119,6 +119,42 @@ class ContactProfileData(JsonDataclass):
 
 
 @dataclass(frozen=True)
+class AIRoleCustomFieldData(JsonDataclass):
+    """Owner-defined extra role attribute (title + why + optional context).
+
+    Lets owners extend a role beyond the fixed fields; each is injected into the
+    persona prompt.  ``title`` and ``description`` are required on the way in;
+    ``context`` is optional reference text for that field.
+    """
+
+    title: str = ""
+    description: str = ""
+    context: str = ""
+
+
+@dataclass(frozen=True)
+class AIRoleData(JsonDataclass):
+    """Owner-authored AI persona assigned to the chat.
+
+    The pivot from "digital copy of the owner": the AI reproduces the role the
+    owner described ("мой менеджер", "техподдержка", any invented character),
+    answering on the owner's behalf in that persona.  ``description`` is the
+    primary prompt material; the rest are optional refinements.
+    """
+
+    name: str = ""
+    description: str = ""
+    speaking_style: str = ""
+    goals: str = ""
+    constraints: str = ""
+    # Owner-supplied reference material (FAQ, pricing, docs) injected into the
+    # draft prompt so the persona answers with that knowledge.
+    context: str = ""
+    # Owner-defined extra fields beyond the fixed ones above.
+    custom_fields: tuple[AIRoleCustomFieldData, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
 class UserSettingsData(JsonDataclass):
     """Owner identity/preferences (User Layer) used to ground draft generation.
 
@@ -144,6 +180,9 @@ class AIProcessMessageRequest(JsonDataclass):
     feedback_context: tuple[FeedbackItem, ...] = field(default_factory=tuple)
     contact_profile: ContactProfileData | None = None
     user_settings: UserSettingsData | None = None
+    # ai_role is the persona assigned to this chat; None means the default
+    # assistant persona (reply in the owner's observed style).
+    ai_role: AIRoleData | None = None
     # trace_id is the deterministic W3C trace-id derived from event.event_id.
     # Default "" keeps positional construction backwards-compatible.
     trace_id: str = ""
@@ -164,6 +203,15 @@ class AIProcessMessageResponse(JsonDataclass):
     # Set by the Phase 3 OutputSafetyScanner when toxicity/sensitive is found
     # in the draft but repair could not salvage it.  Bot UI annotates with ⚠.
     flagged: bool = False
+    # Owner-facing service note (e.g. the critical-risk warning).  It must be
+    # rendered on the owner's card only and is NEVER sendable to the contact —
+    # response_text stays empty when this is set (ARCH-1).
+    owner_note: str = ""
+    # Suggested short replies when intent == "choice_question" (ARCH-4).
+    options: tuple[str, ...] = field(default_factory=tuple)
+    # 3-7 word conversation topic produced by the same draft call; replaces the
+    # separate /ai/tag-topic call in the hot path (ARCH-4).
+    topic: str = ""
 
 
 @dataclass(frozen=True)
@@ -178,26 +226,6 @@ class AuditEvent(JsonDataclass):
     reason: str
     created_at: str
     trace_id: str = ""
-
-
-@dataclass(frozen=True)
-class DraftRequest(JsonDataclass):
-    """Request body for `/ai/generate-draft`."""
-
-    request_id: str
-    message_text: str
-    memory_context: tuple[str, ...] = field(default_factory=tuple)
-    tone: str = "natural"
-
-
-@dataclass(frozen=True)
-class DraftResponse(JsonDataclass):
-    """Response body for `/ai/generate-draft`."""
-
-    draft_text: str
-    confidence: float
-    model_used: str
-    usage: Usage
 
 
 @dataclass(frozen=True)
@@ -253,9 +281,9 @@ class MemoryExtractionResponse(JsonDataclass):
 class TypedFact(JsonDataclass):
     """A single typed, atomic fact extracted from a message.
 
-    Mirrors the SemanticFact contract (§5.4): fact_type and subject determine
-    the scope routing on the Go side.  scope_kind is a hint; Go applies the
-    deterministic routing rules from the design document.
+    Mirrors the SemanticFact contract.  Memory is strictly per-chat, so
+    ``scope_kind`` is always "chat"; the field stays on the wire for
+    backwards compatibility and the Go backend enforces the invariant.
     """
 
     fact_text: str
@@ -263,7 +291,7 @@ class TypedFact(JsonDataclass):
     fact_type: str
     # One of: contact, owner, relationship, third_party.
     subject: str
-    # Routing hint: "chat" or "owner_global".  Go enforces deterministic routing.
+    # Always "chat" — per-chat memory invariant (see module docstring).
     scope_kind: str = "chat"
     confidence: float = 0.75
 
@@ -279,6 +307,19 @@ class TypedExtractionRequest(JsonDataclass):
     trace_id: str = ""
     # Last few messages in the chat (oldest first) for multi-turn fact detection.
     recent_messages: tuple[str, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
+class ProfileSuggestion(JsonDataclass):
+    """An AI-proposed update to one contact-profile field (§4.5, MEM-4).
+
+    Suggestions are never applied directly: the Go backend stages them in
+    ``contact_profile_suggestions`` and the owner accepts or rejects each one.
+    """
+
+    field_name: str
+    suggested_value: str
+    rationale: str = ""
 
 
 @dataclass(frozen=True)
@@ -300,6 +341,9 @@ class TypedExtractionResponse(JsonDataclass):
     raw_output: str = ""
     llm_facts_count: int = 0
     deterministic_facts_count: int = 0
+    # Identity attributes of the contact proposed for the profile (§4.5, MEM-4);
+    # staged via suggestions, never written to the profile directly.
+    profile_suggestions: tuple[ProfileSuggestion, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)
@@ -387,30 +431,9 @@ class ChatSummaryResponse(JsonDataclass):
     model_used: str
     usage: Usage
     blocked_by_privacy: bool = False
-
-
-@dataclass(frozen=True)
-class GatewayRequest(JsonDataclass):
-    """Model gateway request built by the model router."""
-
-    task: ModelTask
-    model_name: str
-    system_prompt: str
-    user_payload: str
-    metadata: dict[str, Any] = field(default_factory=dict)
-    trace_id: str = ""
-
-
-@dataclass(frozen=True)
-class GatewayResponse(JsonDataclass):
-    """Model gateway response returned to the model router."""
-
-    text: str
-    model_used: str
-    usage: Usage
-    # cost_usd is parsed from the LiteLLM ``x-litellm-response-cost`` header
-    # (Phase 2).  Defaults to 0.0 when the legacy direct provider path is used.
-    cost_usd: float = 0.0
+    # Proactive owner-facing suggestions derived from the conversation; the Go
+    # contract has carried this field since v4 but Python never filled it (ARCH-10).
+    recommendations: tuple[str, ...] = field(default_factory=tuple)
 
 
 def parse_process_message_request(payload: dict[str, Any]) -> AIProcessMessageRequest:
@@ -443,17 +466,7 @@ def parse_process_message_request(payload: dict[str, Any]) -> AIProcessMessageRe
         feedback_context=_parse_feedback_context(payload.get("feedback_context", [])),
         contact_profile=_parse_contact_profile(payload.get("contact_profile")),
         user_settings=_parse_user_settings(payload.get("user_settings")),
-    )
-
-
-def parse_draft_request(payload: dict[str, Any]) -> DraftRequest:
-    """Parse a generate-draft JSON object into a typed request."""
-    memory_context = payload.get("memory_context") or []
-    return DraftRequest(
-        request_id=str(payload.get("request_id", "")),
-        message_text=str(payload["message_text"]),
-        memory_context=tuple(str(item) for item in memory_context),
-        tone=str(payload.get("tone", "natural")),
+        ai_role=_parse_ai_role(payload.get("ai_role")),
     )
 
 
@@ -572,6 +585,45 @@ def _parse_contact_profile(raw: Any) -> ContactProfileData | None:
         preferred_address=str(raw.get("preferred_address", "")),
         notes=str(raw.get("notes", "")),
     )
+
+
+def _parse_ai_role(raw: Any) -> AIRoleData | None:
+    """Parse an optional ai_role dict; a role without a name is treated as absent."""
+    if not isinstance(raw, dict):
+        return None
+    name = str(raw.get("name", "")).strip()
+    if not name:
+        return None
+    return AIRoleData(
+        name=name,
+        description=str(raw.get("description", "")).strip(),
+        speaking_style=str(raw.get("speaking_style", "")).strip(),
+        goals=str(raw.get("goals", "")).strip(),
+        constraints=str(raw.get("constraints", "")).strip(),
+        context=str(raw.get("context", "")).strip(),
+        custom_fields=_parse_role_custom_fields(raw.get("custom_fields")),
+    )
+
+
+def _parse_role_custom_fields(raw: Any) -> tuple[AIRoleCustomFieldData, ...]:
+    """Parse the optional custom_fields list; fields without a title are dropped."""
+    if not isinstance(raw, list):
+        return ()
+    fields: list[AIRoleCustomFieldData] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title", "")).strip()
+        if not title:
+            continue
+        fields.append(
+            AIRoleCustomFieldData(
+                title=title,
+                description=str(item.get("description", "")).strip(),
+                context=str(item.get("context", "")).strip(),
+            )
+        )
+    return tuple(fields)
 
 
 def _parse_user_settings(raw: Any) -> UserSettingsData | None:

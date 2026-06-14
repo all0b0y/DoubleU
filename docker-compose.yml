@@ -103,6 +103,95 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      litellm:
+        condition: service_healthy
+
+  # ── LLM gateway & observability ────────────────────────────────────────────
+  # Previously opt-in overlays (infra/{litellm,langfuse,phoenix}); folded into the
+  # base stack so `docker compose up` brings the full routing + tracing pipeline.
+
+  litellm:
+    # LiteLLM Proxy: central routing, retries, budget checks and — via the
+    # Langfuse success callback in config.yaml — full prompt/response logging.
+    # Reuses postgres (schema `litellm`, migration 006) and redis (dedup cache).
+    image: ghcr.io/berriai/litellm-database:main-stable
+    restart: unless-stopped
+    command: ["--config", "/etc/litellm/config.yaml", "--port", "4000"]
+    environment:
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-sk-doubleu-local-master}
+      # Prisma keeps its bookkeeping tables in the dedicated `litellm` schema so
+      # they never collide with the DoubleU application tables.
+      LITELLM_DATABASE_URL: ${LITELLM_DATABASE_URL:-postgresql://doubleu:doubleu@postgres:5432/doubleu?schema=litellm}
+      DATABASE_URL: ${LITELLM_DATABASE_URL:-postgresql://doubleu:doubleu@postgres:5432/doubleu?schema=litellm}
+      # All models use the openrouter/ prefix — DEEPSEEK_API_KEY is intentionally
+      # absent so no traffic bypasses OpenRouter.
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      # Langfuse success-callback target (full request/response logging).
+      LANGFUSE_HOST: ${LITELLM_LANGFUSE_HOST:-http://langfuse-web:3000}
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-pk-lf-doubleu-local}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-sk-lf-doubleu-local}
+    volumes:
+      - ./infra/litellm/config.yaml:/etc/litellm/config.yaml:ro
+      - ./infra/litellm/budgets.yaml:/etc/litellm/budgets.yaml:ro
+    ports:
+      - "${LITELLM_PORT:-4000}:4000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4000/health/liveliness')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+
+  langfuse-web:
+    # Langfuse v2 (Postgres-only) for prompt/response trace inspection. Headless
+    # LANGFUSE_INIT_* seeds a deterministic org/project/keys + login user so the
+    # LiteLLM success-callback can authenticate without a manual UI bootstrap.
+    # UI: http://localhost:3001
+    image: langfuse/langfuse:2
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: ${LANGFUSE_DATABASE_URL:-postgresql://doubleu:doubleu@postgres:5432/langfuse}
+      NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET:-doubleu-local-nextauth-secret}
+      NEXTAUTH_URL: ${LANGFUSE_NEXTAUTH_URL:-http://localhost:3001}
+      SALT: ${LANGFUSE_SALT:-doubleu-local-salt}
+      TELEMETRY_ENABLED: "false"
+      LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: "false"
+      LANGFUSE_INIT_ORG_ID: ${LANGFUSE_INIT_ORG_ID:-doubleu}
+      LANGFUSE_INIT_ORG_NAME: ${LANGFUSE_INIT_ORG_NAME:-DoubleU}
+      LANGFUSE_INIT_PROJECT_ID: ${LANGFUSE_INIT_PROJECT_ID:-doubleu}
+      LANGFUSE_INIT_PROJECT_NAME: ${LANGFUSE_INIT_PROJECT_NAME:-DoubleU}
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-pk-lf-doubleu-local}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-sk-lf-doubleu-local}
+      LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_INIT_USER_EMAIL:-admin@doubleu.local}
+      LANGFUSE_INIT_USER_NAME: ${LANGFUSE_INIT_USER_NAME:-DoubleU Admin}
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:-doubleu-local-admin}
+    ports:
+      - "${LANGFUSE_PORT:-3001}:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      # Langfuse binds to the container's eth0 IP, not localhost — probe via
+      # `hostname -i` so the check hits the interface the app actually listens on.
+      test: ["CMD-SHELL", "wget -qO- http://$$(hostname -i):3000/api/public/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+
+  phoenix:
+    # Arize Phoenix — RAG / retrieval debugging UI. UI: http://localhost:6006
+    image: arizephoenix/phoenix:latest
+    restart: unless-stopped
+    ports:
+      - "${PHOENIX_PORT:-6006}:6006"
+    environment:
+      PHOENIX_PORT: "6006"
 
 volumes:
   postgres_data:

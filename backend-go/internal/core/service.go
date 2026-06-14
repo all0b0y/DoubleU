@@ -5,8 +5,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -52,7 +55,10 @@ func (DecisionEngine) Decide(settings contracts.ChatSettings, proposal contracts
 		return contracts.DecisionObserve, "chat_silent"
 	}
 	if proposal.RiskLevel == contracts.RiskCritical {
-		if strings.TrimSpace(proposal.ResponseText) == "" {
+		// OwnerNote carries the owner-facing warning (ARCH-1); ResponseText is a
+		// legacy fallback for AI services that still put the warning there. In
+		// both cases the text is owner-only and never sendable to the contact.
+		if strings.TrimSpace(proposal.OwnerNote) == "" && strings.TrimSpace(proposal.ResponseText) == "" {
 			return contracts.DecisionIgnore, "critical_risk_no_safe_draft"
 		}
 		return contracts.DecisionAskOwner, "critical_risk_owner_required"
@@ -105,7 +111,55 @@ type Service struct {
 	// scoreSender attaches owner feedback (approve / reject / thumb) to the
 	// Langfuse trace of the draft.  nil means observability is off.
 	scoreSender OwnerFeedbackSender
+	// webhookWorkers are per-shard ordered queues for async webhook processing
+	// (ARCH-7). Updates for the same chat hash to the same shard, preserving
+	// per-chat ordering. nil until StartWebhookWorkers is called.
+	webhookWorkers []chan webhookJob
+	workersMu      sync.RWMutex
+	// asyncLLM bounds concurrent fire-and-forget LLM tasks (extraction,
+	// episode summarisation) so a message burst cannot become a request storm.
+	asyncLLM chan struct{}
+	// embedNudge wakes the embedding worker right after new facts are inserted
+	// (ARCH-12) instead of waiting for the next 5-minute tick, closing the
+	// retrieval blind spot for fresh facts. Buffered(1): coalesces bursts.
+	embedNudge chan struct{}
+	// botSenders resolves per-tenant outbound senders for bot-transport chats
+	// (replies go out through the same user bot the message arrived from).
+	botSenders BotSenderProvider
+	// defaultIngestionMode applies to tenants that have not chosen a mode
+	// explicitly (env INGESTION_MODE_DEFAULT; "bot" while the Business path
+	// is shelved).
+	defaultIngestionMode contracts.IngestionMode
+	// aiMemorySource: "python" means the AI service persists extracted facts
+	// and profile suggestions itself (pydantic-ai runtime with direct DB
+	// access) and Go must skip its own write path to avoid double writes.
+	// Default "go" keeps the legacy flow (AI_MEMORY_SOURCE flag).
+	aiMemorySource string
 }
+
+// BotSenderProvider resolves the outbound sender bound to a tenant's
+// user-supplied bot. Implemented by botservice.Manager; the interface keeps
+// core decoupled from the polling transport.
+type BotSenderProvider interface {
+	SenderFor(tenantID string) (telegram.Sender, bool)
+}
+
+// webhookJob is one queued Telegram update awaiting async processing.
+type webhookJob struct {
+	payload    []byte
+	tenantHint string
+}
+
+const (
+	// webhookWorkerCount is the number of ordered processing shards (ARCH-7).
+	webhookWorkerCount = 4
+	// webhookQueueDepth bounds each shard's backlog; overflow degrades to a
+	// direct goroutine so updates are never dropped.
+	webhookQueueDepth = 256
+	// maxAsyncLLMConcurrency caps simultaneous fire-and-forget LLM calls
+	// (typed extraction, message-limit summarisation) across all chats.
+	maxAsyncLLMConcurrency = 8
+)
 
 // OwnerFeedbackSender is implemented by observability.ScoreSender; the
 // interface keeps the core package decoupled from the OTel/Langfuse SDK.
@@ -155,6 +209,32 @@ func WithOwnerFeedbackSender(sender OwnerFeedbackSender) Option {
 	}
 }
 
+// WithBotSenderProvider wires per-tenant bot senders for bot-transport replies.
+func WithBotSenderProvider(provider BotSenderProvider) Option {
+	return func(service *Service) {
+		service.botSenders = provider
+	}
+}
+
+// WithDefaultIngestionMode sets the mode used for tenants without an explicit
+// ingestion_mode selection.
+func WithDefaultIngestionMode(mode contracts.IngestionMode) Option {
+	return func(service *Service) {
+		if mode != "" {
+			service.defaultIngestionMode = mode
+		}
+	}
+}
+
+// WithAIMemorySource selects who persists extracted memory: "go" (legacy,
+// default) or "python" (the pydantic-ai runtime writes directly to PostgreSQL
+// and Go skips its own fact/suggestion writes).
+func WithAIMemorySource(source string) Option {
+	return func(service *Service) {
+		service.aiMemorySource = source
+	}
+}
+
 // NewService creates a backend core service.
 func NewService(repository *store.Repository, ai aiclient.Client, sender telegram.Sender, options ...Option) *Service {
 	if repository == nil {
@@ -164,18 +244,113 @@ func NewService(repository *store.Repository, ai aiclient.Client, sender telegra
 		sender = telegram.NoopSender{}
 	}
 	service := &Service{
-		repository: repository,
-		ai:         ai,
-		sender:     sender,
-		botLayer:   bot.NewLayer(repository),
-		engine:     NewDecisionEngine(),
-		logger:     slog.Default(),
-		now:        time.Now,
+		repository:           repository,
+		ai:                   ai,
+		sender:               sender,
+		botLayer:             bot.NewLayer(repository),
+		engine:               NewDecisionEngine(),
+		logger:               slog.Default(),
+		now:                  time.Now,
+		asyncLLM:             make(chan struct{}, maxAsyncLLMConcurrency),
+		embedNudge:           make(chan struct{}, 1),
+		defaultIngestionMode: contracts.IngestionModeBot,
 	}
 	for _, option := range options {
 		option(service)
 	}
 	return service
+}
+
+// StartWebhookWorkers launches the ordered per-shard webhook processing pool
+// (ARCH-7). Until this is called, EnqueueTelegramWebhook degrades to one
+// goroutine per update (the previous behaviour) so tests and minimal setups
+// keep working without lifecycle management.
+func (s *Service) StartWebhookWorkers(ctx context.Context) {
+	s.workersMu.Lock()
+	if s.webhookWorkers != nil {
+		s.workersMu.Unlock()
+		return
+	}
+	workers := make([]chan webhookJob, webhookWorkerCount)
+	for i := range workers {
+		workers[i] = make(chan webhookJob, webhookQueueDepth)
+		go func(jobs <-chan webhookJob) {
+			for {
+				select {
+				case job := <-jobs:
+					if _, err := s.HandleTelegramWebhook(ctx, job.payload, job.tenantHint); err != nil {
+						s.logger.Error("async webhook processing failed", "error", err)
+					}
+				case <-ctx.Done():
+					return
+				}
+			}
+		}(workers[i])
+	}
+	s.webhookWorkers = workers
+	s.workersMu.Unlock()
+}
+
+// EnqueueTelegramWebhook accepts a raw Telegram update for asynchronous
+// processing and returns immediately, so the HTTP handler can ACK within
+// Telegram's retry window (ARCH-7). Updates for the same business chat are
+// routed to the same shard to preserve per-chat ordering; non-chat updates
+// (commands, callbacks) have no ordering requirement and spread round-robin
+// via the hash of the raw payload.
+func (s *Service) EnqueueTelegramWebhook(payload []byte, tenantHint string) {
+	s.workersMu.RLock()
+	workers := s.webhookWorkers
+	s.workersMu.RUnlock()
+	if workers == nil {
+		go func() {
+			_, _ = s.HandleTelegramWebhook(context.Background(), payload, tenantHint)
+		}()
+		return
+	}
+	job := webhookJob{payload: payload, tenantHint: tenantHint}
+	shard := webhookShard(payload, tenantHint)
+	select {
+	case workers[shard] <- job:
+	default:
+		// Shard backlog full: degrade to a direct goroutine rather than block
+		// the HTTP handler or drop the update. Ordering may suffer under this
+		// overload, but idempotency keys make reprocessing safe.
+		s.logger.Warn("webhook shard queue full, processing out of band", "shard", shard)
+		go func() {
+			_, _ = s.HandleTelegramWebhook(context.Background(), payload, tenantHint)
+		}()
+	}
+}
+
+// webhookShard maps an update to a worker shard. Business messages hash by
+// (tenantHint, chat id) so one chat is always processed in order.
+func webhookShard(payload []byte, tenantHint string) int {
+	var probe struct {
+		BusinessMessage struct {
+			Chat struct {
+				ID int64 `json:"id"`
+			} `json:"chat"`
+		} `json:"business_message"`
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(tenantHint))
+	if json.Unmarshal(payload, &probe) == nil && probe.BusinessMessage.Chat.ID != 0 {
+		_, _ = fmt.Fprintf(h, "%d", probe.BusinessMessage.Chat.ID)
+	} else {
+		_, _ = h.Write(payload)
+	}
+	return int(h.Sum32() % webhookWorkerCount)
+}
+
+// runAsyncLLMTask executes fn in the background under the shared LLM
+// concurrency cap (ARCH-7): the goroutine is cheap, but the LLM call inside
+// fn waits for a slot so bursts cannot fan out into a request storm.
+func (s *Service) runAsyncLLMTask(fn func()) {
+	go func() {
+		s.asyncLLM <- struct{}{}
+		defer func() { <-s.asyncLLM }()
+		fn()
+	}()
 }
 
 // InboundResult describes the result of one Telegram webhook.
@@ -271,6 +446,17 @@ func (s *Service) HandleTelegramWebhook(ctx context.Context, payload []byte, ten
 		event.ChatDisplayName = anonymousChatName(event.ChatID)
 	}
 
+	// Ingestion-mode gate: when the tenant runs on bot ingestion, business
+	// messages are acknowledged but not processed. The Business path is
+	// shelved, not removed — switching the mode back re-enables it.
+	if !s.ingestionModeFor(event.TenantID).AllowsBusiness() {
+		s.repository.AppendAudit(s.auditEvent(event, contracts.DecisionIgnore, "ingestion_mode_bot"))
+		s.logger.Info("business message skipped by ingestion mode",
+			"tenant_id", event.TenantID, "chat_id", event.ChatID)
+		return InboundResult{Event: event, Decision: contracts.DecisionIgnore, Reason: "ingestion_mode_bot"}, nil
+	}
+	event.Transport = contracts.TransportBusiness
+
 	// Gate: only process chats the owner has explicitly added.
 	// New contacts are staged in unclaimed_chats for owner decision.
 	// When the owner tenant is known, messages are persisted and facts are extracted in the
@@ -308,6 +494,66 @@ func (s *Service) HandleTelegramWebhook(ctx context.Context, payload []byte, ten
 		return InboundResult{Event: event, Decision: contracts.DecisionIgnore, Reason: "passive_processing"}, nil
 	}
 
+	replyBlockNote := ""
+	if hasConnection && !connection.CanReply {
+		replyBlockNote = "Telegram не дал боту право отвечать от имени владельца. Включи reply permission в Telegram Settings -> Chat Automation или ответь вручную."
+	}
+	return s.processContactMessage(ctx, event, ownerID, replyBlockNote)
+}
+
+// HandleBotMessage processes a normalized message that arrived through the
+// tenant's user-supplied bot (botservice poller). Unlike the Business webhook
+// path the tenant is always known from the bot registration, so there is no
+// connection resolution and no unclaimed staging: the owner connected the bot
+// deliberately, so its chats are managed immediately.
+func (s *Service) HandleBotMessage(ctx context.Context, event contracts.NormalizedTelegramEvent) (InboundResult, error) {
+	ctx = tracepkg.WithTraceID(ctx, tracepkg.DeriveTraceID(event.EventID))
+	if !s.ingestionModeFor(event.TenantID).AllowsBot() {
+		s.repository.AppendAudit(s.auditEvent(event, contracts.DecisionIgnore, "ingestion_mode_personal"))
+		s.logger.Info("bot message skipped by ingestion mode",
+			"tenant_id", event.TenantID, "chat_id", event.ChatID, "bot_id", event.BotID)
+		return InboundResult{Event: event, Decision: contracts.DecisionIgnore, Reason: "ingestion_mode_personal"}, nil
+	}
+	if event.ChatDisplayName == "" {
+		event.ChatDisplayName = anonymousChatName(event.ChatID)
+	}
+	// Bot tenants are keyed "tenant:user:<telegram_user_id>" at registration,
+	// so the owner id falls out of the tenant id without a connection lookup.
+	ownerID := strings.TrimPrefix(event.TenantID, "tenant:user:")
+	if ownerID == event.TenantID {
+		ownerID = ""
+	}
+	s.logger.Info("bot message received",
+		"tenant_id", event.TenantID,
+		"chat_id", event.ChatID,
+		"bot_id", event.BotID,
+		"source_message_id", event.SourceMessageID,
+	)
+	return s.processContactMessage(ctx, event, ownerID, "")
+}
+
+// pythonOwnsMemory reports whether fact persistence is delegated to the
+// Python agent runtime (AI_MEMORY_SOURCE=python).
+func (s *Service) pythonOwnsMemory() bool {
+	return s.aiMemorySource == "python"
+}
+
+// ingestionModeFor resolves the tenant's effective ingestion mode
+// (explicit per-tenant selection or the configured default).
+func (s *Service) ingestionModeFor(tenantID string) contracts.IngestionMode {
+	if mode := s.repository.TenantIngestionMode(tenantID); mode != "" {
+		return mode
+	}
+	return s.defaultIngestionMode
+}
+
+// processContactMessage is the transport-agnostic inbound pipeline shared by
+// the Business webhook path and the bot polling path: persist → dedupe →
+// episode upkeep → debounce → AI call → policy decision → dispatch.
+// replyBlockNote, when non-empty, short-circuits AI processing with an
+// owner-facing draft explaining why replies are blocked (Business-specific
+// can_reply permission).
+func (s *Service) processContactMessage(ctx context.Context, event contracts.NormalizedTelegramEvent, ownerID string, replyBlockNote string) (InboundResult, error) {
 	settings := s.repository.ChatSettings(event.TenantID, event.ChatID)
 	s.repository.SaveChat(store.ChatRecord{
 		TenantID:             event.TenantID,
@@ -317,6 +563,7 @@ func (s *Service) HandleTelegramWebhook(ctx context.Context, payload []byte, ten
 		BusinessConnectionID: event.BusinessConnectionID,
 		LastSourceMessageID:  event.SourceMessageID,
 		LastSeenAt:           s.now(),
+		Transport:            event.Transport,
 	})
 	// Persist the message row BEFORE any state/audit write so the DB foreign
 	// keys from message_states and audit_events back to messages always resolve.
@@ -366,28 +613,9 @@ func (s *Service) HandleTelegramWebhook(ctx context.Context, payload []byte, ten
 		}
 		s.repository.UpsertActiveEpisode(ep)
 
-		// Async topic tagging: fire-and-forget LLM call that populates
-		// active_episodes.current_topic so the draft prompt can surface
-		// the episode context (design §6.2 / backlog step 4b).
-		if tagger, ok := s.ai.(aiclient.TopicTagger); ok && event.MessageText != "" {
-			msgText := event.MessageText
-			tenantID, chatID := event.TenantID, event.ChatID
-			go func() {
-				tagCtx, tagCancel := context.WithTimeout(context.Background(), 10*time.Second)
-				defer tagCancel()
-				resp, err := tagger.TagTopic(tagCtx, aiclient.TopicTaggingRequest{
-					MessageText: msgText,
-					TenantID:    tenantID,
-					ChatID:      chatID,
-				})
-				if err != nil || resp.Topic == "" {
-					return
-				}
-				updated := ep
-				updated.CurrentTopic = resp.Topic
-				s.repository.UpsertActiveEpisode(updated)
-			}()
-		}
+		// Topic tagging no longer fires a separate LLM call per message: the
+		// structured draft response carries the topic (ARCH-4), persisted after
+		// the process-message call below. /ai/tag-topic remains for episode workers.
 
 		// Message-limit trigger: close and summarise the episode when it reaches
 		// episodeMessageLimit messages (design §6.2). The closure is synchronous so a
@@ -399,9 +627,11 @@ func (s *Service) HandleTelegramWebhook(ctx context.Context, payload []byte, ten
 				"chat_id", event.ChatID,
 				"message_count", ep.MessageCount,
 			)
-			closedAt := ep.LastMessageAt
+			startedAt, closedAt := ep.StartedAt, ep.LastMessageAt
 			tenantID, chatID := event.TenantID, event.ChatID
-			go s.summarizeChatDay(ctx, tenantID, chatID, closedAt, "message_limit")
+			s.runAsyncLLMTask(func() {
+				s.summarizeEpisode(context.Background(), tenantID, chatID, startedAt, closedAt, "message_count")
+			})
 		}
 	}
 	s.repository.IncrementChatMessageCount(event.TenantID, event.ChatID)
@@ -410,6 +640,9 @@ func (s *Service) HandleTelegramWebhook(ctx context.Context, payload []byte, ten
 	}
 	s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StatePolicyChecked)
 	if isOwnerAuthoredMessage(event, ownerID) {
+		// The owner replied themselves: the open question is answered and no
+		// owner action is pending any more (§6.2 lifecycle, MEM-5).
+		s.repository.ClearEpisodeRuntimeState(event.TenantID, event.ChatID)
 		s.repository.AppendAudit(s.auditEvent(event, contracts.DecisionObserve, "owner_message_observed"))
 		s.logger.Info("owner-authored business message stored as context without ai reply",
 			"tenant_id", event.TenantID,
@@ -420,12 +653,12 @@ func (s *Service) HandleTelegramWebhook(ctx context.Context, payload []byte, ten
 		return InboundResult{Event: event, Decision: contracts.DecisionObserve, Reason: "owner_message_observed"}, nil
 	}
 
-	if hasConnection && !connection.CanReply {
-		draft := s.createDraft(event, event.EventID, "Telegram не дал боту право отвечать от имени владельца. Включи reply permission в Telegram Settings -> Chat Automation или ответь вручную.")
+	if replyBlockNote != "" {
+		draft := s.createDraft(event, event.EventID, replyBlockNote)
 		s.repository.SaveDraft(draft)
 		s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateDraftSentToOwner)
 		s.repository.AppendAudit(s.auditEvent(event, contracts.DecisionAskOwner, "business_connection_cannot_reply"))
-		s.logger.Info("ai analysis blocked by telegram reply permission", "tenant_id", event.TenantID, "chat_id", event.ChatID, "can_reply", connection.CanReply)
+		s.logger.Info("ai analysis blocked by telegram reply permission", "tenant_id", event.TenantID, "chat_id", event.ChatID)
 		return InboundResult{Event: event, Decision: contracts.DecisionAskOwner, Reason: "business_connection_cannot_reply", DraftID: draft.DraftID}, nil
 	}
 
@@ -471,17 +704,20 @@ func (s *Service) HandleTelegramWebhook(ctx context.Context, payload []byte, ten
 	if s.notify != nil {
 		s.notify(event.TenantID, "ai_thinking", map[string]any{"chat_id": event.ChatID})
 	}
+	memoryContext, recentRecords := s.conversationContextAndMessages(ctx, event, ownerID, 20)
 	request := contracts.AIProcessMessageRequest{
 		RequestID:       event.EventID,
 		TraceID:         tracepkg.DeriveTraceID(event.EventID),
 		Event:           event,
 		ChatSettings:    settings,
-		MemoryContext:   s.conversationContext(ctx, event, ownerID, 20),
+		MemoryContext:   memoryContext,
 		FeedbackContext: s.feedbackContext(event.TenantID, event.ChatID, 5),
 	}
 	if profile, ok := s.repository.ContactProfile(event.TenantID, event.ChatID); ok {
 		request.ContactProfile = &profile
 	}
+	// AI role: the persona assigned to this chat (nil → default assistant persona).
+	request.AIRole = s.aiRoleFor(event.TenantID, event.ChatID)
 	// User Layer: owner identity and preferences (§3).
 	if us, ok := s.repository.UserSettings(event.TenantID); ok {
 		request.UserSettings = &us
@@ -525,7 +761,7 @@ func (s *Service) HandleTelegramWebhook(ctx context.Context, payload []byte, ten
 	// Persist fast (regex) facts returned by process-message synchronously.
 	// LLM-based extraction is fired asynchronously below, after the draft is dispatched,
 	// so it never adds latency to the reply path (see backlog §7.1).
-	if !settings.PrivacyFlags.Contains(contracts.PrivacyNoMemory) {
+	if !settings.PrivacyFlags.Contains(contracts.PrivacyNoMemory) && !s.pythonOwnsMemory() {
 		s.saveExtractedFacts(event, proposal.MemoryUsed)
 	}
 	s.logger.Info("ai analysis completed",
@@ -545,6 +781,9 @@ func (s *Service) HandleTelegramWebhook(ctx context.Context, payload []byte, ten
 	decision, reason := s.engine.Decide(settings, proposal)
 	s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateDecisionMade)
 	s.logger.Info("backend final decision made", "tenant_id", event.TenantID, "chat_id", event.ChatID, "decision", decision, "reason", reason)
+	if !settings.PrivacyFlags.Contains(contracts.PrivacyNoMemory) {
+		s.updateEpisodeRuntime(event, proposal, decision)
+	}
 	result := InboundResult{Event: event, Decision: decision, Reason: reason}
 	switch decision {
 	case contracts.DecisionAutoReply:
@@ -558,14 +797,45 @@ func (s *Service) HandleTelegramWebhook(ctx context.Context, payload []byte, ten
 		s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateSentToRecipient)
 		s.logger.Info("telegram auto reply sent", "tenant_id", event.TenantID, "chat_id", event.ChatID, "source_message_id", event.SourceMessageID)
 		s.saveOutgoingMessage(event, ownerID, sentMsgID, proposal.ResponseText, event.EventID)
+		// A reply went out on the owner's behalf: nothing is awaited from the owner.
+		s.repository.ClearEpisodeRuntimeState(event.TenantID, event.ChatID)
 		if s.notify != nil {
 			s.notify(event.TenantID, "new_message", map[string]any{"chat_id": event.ChatID})
 		}
 	case contracts.DecisionDraft, contracts.DecisionAskOwner:
+		// Critical-risk warning (ARCH-1): the note is owner-facing only. The draft
+		// row carries an empty ResponseText and DraftType="warning" so no approval
+		// path can ever deliver the service text to the contact.
+		if ownerNote := s.ownerNoteFor(proposal); decision == contracts.DecisionAskOwner && ownerNote != "" {
+			draft := s.createDraft(event, event.EventID, "")
+			draft.DraftType = "warning"
+			s.repository.SaveDraft(draft)
+			s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateDraftSentToOwner)
+			s.logger.Info("warning card prepared", "tenant_id", event.TenantID, "chat_id", event.ChatID, "draft_id", draft.DraftID)
+			result.DraftID = draft.DraftID
+			if s.notify != nil {
+				s.notify(draft.TenantID, "new_draft", map[string]any{
+					"chat_id":     draft.ChatID,
+					"draft_id":    draft.DraftID,
+					"draft_type":  draft.DraftType,
+					"owner_note":  ownerNote,
+					"source_text": draft.SourceMessageText,
+					"created_at":  draft.CreatedAt.UTC().Format("2006-01-02T15:04:05Z"),
+				})
+			} else {
+				s.sendWarningToOwner(ctx, event, draft, ownerNote)
+			}
+			break
+		}
 		// When the AI flags the incoming message as a choice question, replace the normal
 		// draft flow with an interactive question card that lets the owner pick an option.
 		if proposal.Intent == "choice_question" {
-			options := parseOptions(proposal.ResponseText)
+			// Structured output carries options directly (ARCH-4); the line-split
+			// of ResponseText remains as a legacy fallback.
+			options := proposal.Options
+			if len(options) == 0 {
+				options = parseOptions(proposal.ResponseText)
+			}
 			if len(options) > 0 {
 				draft := s.createDraft(event, event.EventID, "")
 				draft.DraftType = "question"
@@ -618,24 +888,27 @@ func (s *Service) HandleTelegramWebhook(ctx context.Context, payload []byte, ten
 	// Async LLM fact extraction: fires after the draft is dispatched so it never blocks
 	// the reply path.  Prefers TypedMemoryExtractor (/ai/extract-facts-typed) for proper
 	// scope routing; falls back to MemoryExtractor (/ai/extract-memory) if unavailable.
-	// Only runs when the AI client supports extraction and memory is not disabled.
-	if !settings.PrivacyFlags.Contains(contracts.PrivacyNoMemory) {
+	// Only runs when the AI client supports extraction, memory is not disabled, and the
+	// message passes the cheap fact-bearing pre-filter (MEM-13).
+	if !settings.PrivacyFlags.Contains(contracts.PrivacyNoMemory) && shouldExtractFacts(event.MessageText) {
 		privacyStrings := make([]string, len(settings.PrivacyFlags))
 		for i, f := range settings.PrivacyFlags {
 			privacyStrings[i] = string(f)
 		}
 		if typedExtractor, ok := s.ai.(aiclient.TypedMemoryExtractor); ok {
-			// Capture the last 5 messages as context window so the extractor can detect
-			// multi-turn facts spread across several messages (e.g. "учусь в МГУ" followed
-			// by "на медицинском факультете").
-			recentMsgs := s.repository.RecentMessages(event.TenantID, event.ChatID, 5)
-			recentTexts := make([]string, 0, len(recentMsgs))
-			for _, m := range recentMsgs {
+			// Context window for multi-turn fact detection (e.g. "учусь в МГУ"
+			// followed by "на медицинском факультете"): reuse the messages already
+			// fetched for the prompt (ARCH-8) and keep the last 5 of them.
+			recentTexts := make([]string, 0, 5)
+			for _, m := range recentRecords {
 				if t := strings.TrimSpace(m.Event.MessageText); t != "" && m.Event.SourceMessageID != event.SourceMessageID {
 					recentTexts = append(recentTexts, t)
 				}
 			}
-			go func() {
+			if len(recentTexts) > 5 {
+				recentTexts = recentTexts[len(recentTexts)-5:]
+			}
+			s.runAsyncLLMTask(func() {
 				extractCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 				defer cancel()
 				start := s.now()
@@ -662,23 +935,30 @@ func (s *Service) HandleTelegramWebhook(ctx context.Context, payload []byte, ten
 				if resp.BlockedByPrivacy {
 					return
 				}
-				outcome := s.saveTypedFacts(event, resp.Facts)
+				// AI_MEMORY_SOURCE=python: the agent runtime already wrote the
+				// facts/suggestions through upsert_semantic_fact; Go only logs.
+				outcome := extractionOutcome{}
+				if !s.pythonOwnsMemory() {
+					outcome = s.saveTypedFacts(event, resp.Facts)
+					s.saveProfileSuggestions(extractCtx, event, resp.ProfileSuggestions)
+				}
 				// Persist the attempt so a returned empty fact set is observable and
 				// distinguishable from a silent failure (extraction observability).
+				// Health-fact texts are redacted to ID markers first (§10.3, MEM-8).
 				s.repository.LogExtraction(store.ExtractionLogRecord{
 					TenantID:        event.TenantID,
 					ChatID:          event.ChatID,
 					InputMessageIDs: []string{event.SourceMessageID},
 					ModelUsed:       resp.ModelUsed,
-					RawOutput:       resp.RawOutput,
+					RawOutput:       redactHealthFacts(resp.RawOutput, resp.Facts, outcome.HealthFactIDs),
 					FactsCreated:    outcome.CreatedIDs,
 					FactsSkipped:    outcome.Skipped,
 					FactsMerged:     resp.DeterministicFactsCount,
 					DurationMS:      durationMS,
 				})
-			}()
+			})
 		} else if extractor, ok := s.ai.(aiclient.MemoryExtractor); ok {
-			go func() {
+			s.runAsyncLLMTask(func() {
 				extractCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 				defer cancel()
 				resp, err := extractor.ExtractMemory(extractCtx, aiclient.MemoryExtractionRequest{
@@ -692,10 +972,10 @@ func (s *Service) HandleTelegramWebhook(ctx context.Context, payload []byte, ten
 						"tenant_id", event.TenantID, "chat_id", event.ChatID, "error", err)
 					return
 				}
-				if !resp.BlockedByPrivacy {
+				if !resp.BlockedByPrivacy && !s.pythonOwnsMemory() {
 					s.saveExtractedFacts(event, resp.Memories)
 				}
-			}()
+			})
 		}
 	}
 
@@ -737,119 +1017,159 @@ func telegramUpdateSummary(payload []byte) map[string]any {
 	return summary
 }
 
+// contextTokenBudget caps the assembled memory context size (design §8.1 / MEM-9).
+// Tokens are estimated as len(text)/3 — coarse but dependency-free for ru/en mix.
+const contextTokenBudget = 4000
+
+// estimateTokens returns a rough token count for budget accounting (§8.1).
+func estimateTokens(lines []string) int {
+	total := 0
+	for _, l := range lines {
+		total += len(l) / 3
+	}
+	return total
+}
+
 // conversationContext assembles the full memory context slice for the AI.
-// It embeds the incoming message text (best-effort, 2-second timeout) and uses
-// vector similarity search for semantic/episodic retrieval when embeddings are
-// available (design §8). Falls back to recency ordering when they are not.
+// See conversationContextAndMessages; this wrapper discards the raw messages.
 func (s *Service) conversationContext(ctx context.Context, event contracts.NormalizedTelegramEvent, ownerID string, limit int) []string {
-	records := s.repository.RecentMessages(event.TenantID, event.ChatID, limit)
+	parts, _ := s.conversationContextAndMessages(ctx, event, ownerID, limit)
+	return parts
+}
+
+// conversationContextAndMessages assembles the memory context for the AI and
+// also returns the raw recent messages so callers (extraction window) reuse the
+// same fetch instead of issuing a second query (ARCH-8).
+//
+// Independent reads run concurrently: the embedding call (~2-5 s) overlaps the
+// DB reads instead of preceding them, and the vector-dependent retrieval runs
+// once the embedding is ready. The result is budget-trimmed per §8.1: messages
+// → episodic summaries → chat facts → pending drafts, in that order; runtime
+// lines, commitments, and hard-include facts (taboo/health) are never trimmed.
+func (s *Service) conversationContextAndMessages(ctx context.Context, event contracts.NormalizedTelegramEvent, ownerID string, limit int) ([]string, []store.MessageRecord) {
 	now := s.now().UTC()
-	// Use "parts" to avoid shadowing the "context" package import.
-	parts := make([]string, 0, len(records)+30)
 
-	// Embed the incoming message for similarity-based retrieval (design §8).
-	// Uses a bounded sub-context so a slow provider never blocks the reply path.
-	// 5 s covers typical OpenRouter embedding latency (~2–3 s) with margin.
-	var queryVector []float64
-	if embedder, ok := s.ai.(aiclient.TextEmbedder); ok && event.MessageText != "" {
-		embedCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		resp, err := embedder.EmbedTexts(embedCtx, aiclient.EmbedTextsRequest{Texts: []string{event.MessageText}})
-		cancel()
-		if err == nil && len(resp.Embeddings) > 0 {
-			queryVector = resp.Embeddings[0]
+	// Phase 1 — independent reads in parallel (ARCH-8). The embedding API call
+	// dominates (~2-5 s); everything else is a DB roundtrip that overlaps it.
+	var (
+		queryVector []float64
+		records     []store.MessageRecord
+		greeted     bool
+		pausedHours float64
+		commitments []store.SemanticFactRecord
+		episode     store.ActiveEpisodeRecord
+		hasEpisode  bool
+		drafts      []store.DraftRecord
+		bm25        []store.SemanticFactRecord
+	)
+	var wg sync.WaitGroup
+	run := func(fn func()) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			fn()
+		}()
+	}
+	run(func() {
+		// Embed the incoming message for similarity-based retrieval (design §8).
+		// Bounded so a slow provider never blocks the reply path; 5 s covers
+		// typical OpenRouter embedding latency (~2–3 s) with margin.
+		if embedder, ok := s.ai.(aiclient.TextEmbedder); ok && event.MessageText != "" {
+			embedCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			resp, err := embedder.EmbedTexts(embedCtx, aiclient.EmbedTextsRequest{Texts: []string{event.MessageText}})
+			if err == nil && len(resp.Embeddings) > 0 {
+				queryVector = resp.Embeddings[0]
+			}
 		}
+	})
+	run(func() { records = s.repository.RecentMessages(event.TenantID, event.ChatID, limit) })
+	run(func() { greeted = s.repository.GreetedToday(event.TenantID, event.ChatID, ownerID) })
+	run(func() { pausedHours = s.repository.ChatPausedHours(event.TenantID, event.ChatID) })
+	run(func() { commitments = s.repository.OpenCommitments(event.TenantID, event.ChatID) })
+	run(func() { episode, hasEpisode = s.repository.ActiveEpisodeByChat(event.TenantID, event.ChatID) })
+	run(func() { drafts = s.repository.DraftsForChat(event.TenantID, event.ChatID) })
+	run(func() {
+		if event.MessageText != "" {
+			bm25 = s.repository.SemanticFactsByBM25(event.TenantID, event.ChatID, event.MessageText, 20)
+		}
+	})
+	wg.Wait()
+
+	// Phase 2 — vector-dependent retrieval.
+	// Memory is strictly per-chat: only facts observed in THIS chat are recalled.
+	chatVector := s.repository.SemanticFactsByVector(event.TenantID, event.ChatID, queryVector, 20)
+	chatFacts := chatVector
+	if len(bm25) > 0 {
+		// RRF fusion: merge vector + BM25 ranked lists into a single ordered set,
+		// then resolve fused IDs back to records (preserves RRF order).
+		fusedChatIDs := rrfFuse(factIDs(chatVector), factIDs(bm25), 60)
+		chatFacts = s.repository.SemanticFactsByIDs(event.TenantID, fusedChatIDs)
 	}
+	// Final ordering (ARCH-5): deterministic cosine reranking in SQL replaces the
+	// listwise LLM reranker; hard-include facts (taboo/health, §8.2) always survive.
+	chatFacts = s.finalizeFactOrder(event.TenantID, chatFacts, queryVector, 8)
+	episodeSummaries := s.repository.EpisodeSummariesByVector(event.TenantID, event.ChatID, queryVector, 3)
 
-	// Current date so the AI can reason about time gaps between messages.
-	parts = append(parts, fmt.Sprintf("[CURRENT DATE: %s]", now.Format("2006-01-02")))
+	// --- Section assembly (then budget trimming per §8.1) ---
 
-	// Greeting state: injected from the authoritative DB function (view_chat_greeted_today)
-	// so the Python prompt builder does not need to re-derive this by parsing timestamps.
+	// Header: dates, runtime flags, commitments — never trimmed.
+	header := make([]string, 0, len(commitments)+6)
+	header = append(header, fmt.Sprintf("[CURRENT DATE: %s]", now.Format("2006-01-02")))
 	// Authoritative greeting state from the DB, always emitted (true AND false)
-	// so the Python prompt builder can trust this flag and skip re-deriving
-	// "greeted today" by scanning every transcript line.
-	parts = append(parts, fmt.Sprintf("[RUNTIME: greeting_sent_today=%t]",
-		s.repository.GreetedToday(event.TenantID, event.ChatID, ownerID)))
-
-	// Open commitments: injected so the prompt can reference active obligations without
-	// a full fact scan.  Uses view_open_commitments DB function for consistency.
-	for _, c := range s.repository.OpenCommitments(event.TenantID, event.ChatID) {
-		parts = append(parts, fmt.Sprintf("[ОБЯЗАТЕЛЬСТВО: %s]", c.FactText))
+	// so the Python prompt builder can trust this flag and skip re-deriving it.
+	header = append(header, fmt.Sprintf("[RUNTIME: greeting_sent_today=%t]", greeted))
+	// Pause length from view_chat_paused_hours — the authoritative gap signal
+	// for the Python greeting rule (MEM-9).
+	header = append(header, fmt.Sprintf("[RUNTIME: paused_hours=%.1f]", pausedHours))
+	for _, c := range commitments {
+		header = append(header, fmt.Sprintf("[ОБЯЗАТЕЛЬСТВО: %s]", c.FactText))
 	}
-
-	// Runtime state: what's currently happening in this chat (open episode data).
-	if episode, ok := s.repository.ActiveEpisodeByChat(event.TenantID, event.ChatID); ok {
+	if hasEpisode {
 		if episode.CurrentTopic != "" {
-			parts = append(parts, fmt.Sprintf("[RUNTIME: тема разговора] %s", episode.CurrentTopic))
+			header = append(header, fmt.Sprintf("[RUNTIME: тема разговора] %s", episode.CurrentTopic))
 		}
 		if episode.PendingOwnerAction != "" {
-			parts = append(parts, fmt.Sprintf("[RUNTIME: ожидается действие владельца] %s", episode.PendingOwnerAction))
+			header = append(header, fmt.Sprintf("[RUNTIME: ожидается действие владельца] %s", episode.PendingOwnerAction))
+		}
+		// Unanswered contact question (§6.2, MEM-5): surface its text so the
+		// draft can address it instead of only the newest message.
+		if episode.OpenQuestionMsgID != "" && episode.OpenQuestionMsgID != event.SourceMessageID {
+			if msg, ok := s.repository.Message(event.TenantID, event.ChatID, episode.OpenQuestionMsgID); ok {
+				if text := strings.TrimSpace(msg.Event.MessageText); text != "" {
+					header = append(header, fmt.Sprintf("[RUNTIME: незакрытый вопрос] %s", text))
+				}
+			}
 		}
 	}
 
-	// Semantic layer — vector recall (broad candidates for reranking).
-	globalVector := s.repository.GlobalSemanticFactsByVector(event.TenantID, queryVector, 15)
-	chatVector := s.repository.SemanticFactsByVector(event.TenantID, event.ChatID, queryVector, 20)
-
-	// BM25 lexical recall (step 6): fuse with vector results via RRF so exact
-	// token matches (names, contract numbers, etc.) are not missed by embeddings.
-	var chatFacts, globalFacts []store.SemanticFactRecord
-	if event.MessageText != "" {
-		chatBM25 := s.repository.SemanticFactsByBM25(event.TenantID, event.ChatID, event.MessageText, 20)
-		globalBM25 := s.repository.GlobalSemanticFactsByBM25(event.TenantID, event.MessageText, 15)
-
-		if len(chatBM25) > 0 || len(globalBM25) > 0 {
-			// RRF fusion: merge vector + BM25 ranked lists into a single ordered set.
-			fusedChatIDs := rrfFuse(factIDs(chatVector), factIDs(chatBM25), 60)
-			fusedGlobalIDs := rrfFuse(factIDs(globalVector), factIDs(globalBM25), 60)
-			// Resolve fused IDs back to records (preserves RRF order).
-			chatFacts = s.repository.SemanticFactsByIDs(event.TenantID, fusedChatIDs)
-			globalFacts = s.repository.SemanticFactsByIDs(event.TenantID, fusedGlobalIDs)
-		} else {
-			// BM25 returned nothing (migration not applied or no keyword match) —
-			// fall through to vector-only candidates.
-			chatFacts = chatVector
-			globalFacts = globalVector
-		}
-	} else {
-		chatFacts = chatVector
-		globalFacts = globalVector
-	}
-
-	// Cross-encoder reranking (step 5): reduce broad RRF candidates to the most
-	// relevant facts. Falls back to RRF order when reranker is unavailable.
-	if reranker, ok := s.ai.(aiclient.FactReranker); ok && event.MessageText != "" && len(chatFacts)+len(globalFacts) > 0 {
-		chatFacts, globalFacts = s.rerankFacts(ctx, reranker, event.MessageText, chatFacts, globalFacts)
-	} else {
-		// No reranker: truncate to original design limits.
-		if len(chatFacts) > 8 {
-			chatFacts = chatFacts[:8]
-		}
-		if len(globalFacts) > 5 {
-			globalFacts = globalFacts[:5]
-		}
-	}
-
-	for _, fact := range globalFacts {
-		parts = append(parts, fmt.Sprintf("[ФАКТ О ВЛАДЕЛЬЦЕ: %s] %s", fact.FactType, fact.FactText))
-	}
+	// Facts: hard-include (taboo/health) lines are exempt from trimming.
+	hardFactLines := make([]string, 0, 2)
+	softFactLines := make([]string, 0, len(chatFacts))
 	for _, fact := range chatFacts {
-		parts = append(parts, fmt.Sprintf("[ФАКТ: %s] %s", fact.FactType, fact.FactText))
+		// Owner-subject facts stay chat-scoped but keep a distinct marker so the
+		// prompt can separate "кто пишет" background from contact facts.
+		line := fmt.Sprintf("[ФАКТ: %s] %s", fact.FactType, fact.FactText)
+		if fact.Subject == "owner" {
+			line = fmt.Sprintf("[ФАКТ О ВЛАДЕЛЬЦЕ: %s] %s", fact.FactType, fact.FactText)
+		}
+		if fact.FactType == "taboo" || fact.FactType == "health" {
+			hardFactLines = append(hardFactLines, line)
+		} else {
+			softFactLines = append(softFactLines, line)
+		}
 	}
 
 	// Episodic layer: compressed summaries of past closed episodes, oldest first (§7.5).
-	episodeSummaries := s.repository.EpisodeSummariesByVector(event.TenantID, event.ChatID, queryVector, 3)
-	if len(episodeSummaries) > 0 {
-		parts = append(parts, "--- ЭПИЗОДИЧЕСКАЯ ПАМЯТЬ (сводки прошлых диалогов) ---")
-		for i := len(episodeSummaries) - 1; i >= 0; i-- {
-			sm := episodeSummaries[i]
-			parts = append(parts, fmt.Sprintf("[СВОДКА %s] %s",
-				sm.PeriodEnd.UTC().Format("2006-01-02"), sm.Content))
-		}
+	summaryLines := make([]string, 0, len(episodeSummaries))
+	for i := len(episodeSummaries) - 1; i >= 0; i-- {
+		sm := episodeSummaries[i]
+		summaryLines = append(summaryLines, fmt.Sprintf("[СВОДКА %s] %s",
+			sm.PeriodEnd.UTC().Format("2006-01-02"), sm.Content))
 	}
 
-	// Working layer: recent raw messages from this chat.
-	parts = append(parts, "--- ПАМЯТЬ ТЕКУЩЕГО ДНЯ ---")
+	// Working layer: recent raw messages from this chat (oldest first).
+	messageLines := make([]string, 0, len(records))
 	for _, record := range records {
 		if record.Event.SourceMessageID == event.SourceMessageID {
 			continue
@@ -863,29 +1183,71 @@ func (s *Service) conversationContext(ctx context.Context, event contracts.Norma
 			role = "OWNER"
 		}
 		msgDate := record.Event.CreatedAt.UTC().Format("2006-01-02 15:04")
-		parts = append(parts, fmt.Sprintf("[%s] %s: %s", msgDate, role, text))
+		messageLines = append(messageLines, fmt.Sprintf("[%s] %s: %s", msgDate, role, text))
 	}
 
-	// Pending drafts: responses prepared by the AI but not yet sent (awaiting owner approval).
-	// Included so the AI understands there is an unanswered obligation and can deflect gracefully
-	// in autonomous mode — using a tone appropriate for the contact's relationship type.
-	pendingDrafts := s.repository.DraftsForChat(event.TenantID, event.ChatID)
-	hasBlock := false
-	for _, d := range pendingDrafts {
+	// Pending drafts: unanswered obligations awaiting owner approval.
+	draftLines := make([]string, 0, 4)
+	for _, d := range drafts {
 		if d.Status != store.DraftPending {
 			continue
 		}
-		if !hasBlock {
-			parts = append(parts, "--- НЕОТПРАВЛЕННЫЕ ЧЕРНОВИКИ (ожидают подтверждения владельца) ---")
-			hasBlock = true
-		}
-		parts = append(parts, fmt.Sprintf(
+		draftLines = append(draftLines, fmt.Sprintf(
 			"[ЧЕРНОВИК НЕ ОТПРАВЛЕН] В ответ на: %q\nПредложено (не отправлено): %q",
 			d.SourceMessageText, d.ResponseText,
 		))
 	}
 
-	return parts
+	// Budget trimming, strictly in §8.1 order. Each step only runs while the
+	// estimate is still above contextTokenBudget.
+	estimate := func() int {
+		return estimateTokens(header) + estimateTokens(hardFactLines) + estimateTokens(softFactLines) +
+			estimateTokens(summaryLines) + estimateTokens(messageLines) + estimateTokens(draftLines)
+	}
+	trimmed := []string{}
+	if estimate() > contextTokenBudget && len(messageLines) > 10 {
+		messageLines = messageLines[len(messageLines)-10:]
+		trimmed = append(trimmed, "messages→10")
+	}
+	if estimate() > contextTokenBudget && len(summaryLines) > 1 {
+		// The most relevant summary is the last line (retrieval order was reversed
+		// for oldest-first rendering) — keep that one.
+		summaryLines = summaryLines[len(summaryLines)-1:]
+		trimmed = append(trimmed, "summaries→1")
+	}
+	if estimate() > contextTokenBudget && len(softFactLines) > 5 {
+		softFactLines = softFactLines[:5]
+		trimmed = append(trimmed, "facts→5")
+	}
+	if estimate() > contextTokenBudget && len(draftLines) > 2 {
+		draftLines = draftLines[len(draftLines)-2:]
+		trimmed = append(trimmed, "drafts→2")
+	}
+	if len(trimmed) > 0 {
+		s.logger.Info("context budget trimming applied",
+			"tenant_id", event.TenantID,
+			"chat_id", event.ChatID,
+			"trimmed", strings.Join(trimmed, ","),
+			"final_token_estimate", estimate(),
+		)
+	}
+
+	// Final assembly preserves the historical section order.
+	parts := make([]string, 0, len(header)+len(hardFactLines)+len(softFactLines)+len(summaryLines)+len(messageLines)+len(draftLines)+3)
+	parts = append(parts, header...)
+	parts = append(parts, hardFactLines...)
+	parts = append(parts, softFactLines...)
+	if len(summaryLines) > 0 {
+		parts = append(parts, "--- ЭПИЗОДИЧЕСКАЯ ПАМЯТЬ (сводки прошлых диалогов) ---")
+		parts = append(parts, summaryLines...)
+	}
+	parts = append(parts, "--- ПАМЯТЬ ТЕКУЩЕГО ДНЯ ---")
+	parts = append(parts, messageLines...)
+	if len(draftLines) > 0 {
+		parts = append(parts, "--- НЕОТПРАВЛЕННЫЕ ЧЕРНОВИКИ (ожидают подтверждения владельца) ---")
+		parts = append(parts, draftLines...)
+	}
+	return parts, records
 }
 
 // rrfFuse merges two ranked ID lists using Reciprocal Rank Fusion (k=60).
@@ -908,11 +1270,13 @@ func rrfFuse(vectorIDs, bm25IDs []int64, k int) []int64 {
 	for id, sc := range scores {
 		list = append(list, scored{id, sc})
 	}
-	for i := 1; i < len(list); i++ {
-		for j := i; j > 0 && list[j].score > list[j-1].score; j-- {
-			list[j], list[j-1] = list[j-1], list[j]
+	// Tie-break on id so map iteration order cannot make results non-deterministic.
+	sort.Slice(list, func(i, j int) bool {
+		if list[i].score != list[j].score {
+			return list[i].score > list[j].score
 		}
-	}
+		return list[i].id < list[j].id
+	})
 	result := make([]int64, len(list))
 	for i, s := range list {
 		result[i] = s.id
@@ -929,91 +1293,88 @@ func factIDs(facts []store.SemanticFactRecord) []int64 {
 	return ids
 }
 
-// rerankFacts calls the Python reranker to reduce broad recall results to the most
-// relevant chat and global facts for the given query. Returns the original slices
-// unchanged if the reranker errors or returns no results.
-// Chat facts are reduced to 8 and global facts to 5 after reranking.
-func (s *Service) rerankFacts(
-	ctx context.Context,
-	reranker aiclient.FactReranker,
-	query string,
-	chatFacts, globalFacts []store.SemanticFactRecord,
-) ([]store.SemanticFactRecord, []store.SemanticFactRecord) {
-	const (
-		topChat   = 8
-		topGlobal = 5
-		rerankTimeout = 5 * time.Second
-	)
-	// Build the combined candidate list, tagging each by scope so we can split
-	// the reranked IDs back into chat vs global.
-	candidates := make([]aiclient.RerankFact, 0, len(chatFacts)+len(globalFacts))
+// finalizeFactOrder reduces RRF-fused recall candidates to the top `limit`
+// facts for the prompt. Hard-include facts (taboo/health) always survive;
+// the rest are reordered by cosine distance to the query vector in SQL when
+// possible, with the incoming RRF order as the deterministic fallback for
+// facts that have no embedding yet (the async worker fills those later).
+// When the candidate set already fits the limit no ranking work is done at all.
+func (s *Service) finalizeFactOrder(tenantID string, chatFacts []store.SemanticFactRecord, queryVector []float64, limit int) []store.SemanticFactRecord {
+	hard := make([]store.SemanticFactRecord, 0, 2)
+	rest := make([]store.SemanticFactRecord, 0, len(chatFacts))
 	for _, f := range chatFacts {
-		candidates = append(candidates, aiclient.RerankFact{ID: f.ID, Text: f.FactText})
-	}
-	for _, f := range globalFacts {
-		candidates = append(candidates, aiclient.RerankFact{ID: f.ID, Text: f.FactText})
-	}
-
-	rerankCtx, cancel := context.WithTimeout(ctx, rerankTimeout)
-	defer cancel()
-	resp, err := reranker.RerankFacts(rerankCtx, aiclient.RerankFactsRequest{
-		Query: query,
-		Facts: candidates,
-		TopK:  topChat + topGlobal,
-	})
-	if err != nil || len(resp.RankedIDs) == 0 {
-		// Degrade gracefully: truncate to original design limits.
-		if len(chatFacts) > topChat {
-			chatFacts = chatFacts[:topChat]
+		if f.FactType == "taboo" || f.FactType == "health" {
+			hard = append(hard, f)
+		} else {
+			rest = append(rest, f)
 		}
-		if len(globalFacts) > topGlobal {
-			globalFacts = globalFacts[:topGlobal]
-		}
-		return chatFacts, globalFacts
 	}
-
-	// Resolve reranked IDs back to SemanticFactRecord, preserving reranked order.
-	allFacts := make([]store.SemanticFactRecord, 0, len(chatFacts)+len(globalFacts))
-	allFacts = append(allFacts, chatFacts...)
-	allFacts = append(allFacts, globalFacts...)
-	byID := make(map[int64]store.SemanticFactRecord, len(allFacts))
-	for _, f := range allFacts {
-		byID[f.ID] = f
+	slots := limit - len(hard)
+	if slots < 0 {
+		slots = 0
 	}
-
-	var outChat, outGlobal []store.SemanticFactRecord
-	for _, id := range resp.RankedIDs {
-		f, ok := byID[id]
-		if !ok {
-			continue
-		}
-		if f.ScopeKind == "owner_global" {
-			if len(outGlobal) < topGlobal {
-				outGlobal = append(outGlobal, f)
+	if len(rest) > slots {
+		if len(queryVector) > 0 {
+			ranked := s.repository.RankFactsByCosine(tenantID, factIDs(rest), queryVector, slots)
+			// Backfill facts without embeddings in their RRF order.
+			if len(ranked) < slots {
+				seen := make(map[int64]bool, len(ranked))
+				for _, f := range ranked {
+					seen[f.ID] = true
+				}
+				for _, f := range rest {
+					if len(ranked) >= slots {
+						break
+					}
+					if !seen[f.ID] {
+						ranked = append(ranked, f)
+					}
+				}
+			}
+			if len(ranked) > 0 {
+				rest = ranked
+			} else {
+				rest = rest[:slots]
 			}
 		} else {
-			if len(outChat) < topChat {
-				outChat = append(outChat, f)
-			}
+			rest = rest[:slots]
 		}
 	}
+	return append(hard, rest...)
+}
 
-	// If reranker returned fewer than expected, backfill from original order.
-	if len(outChat) == 0 && len(chatFacts) > 0 {
-		n := topChat
-		if len(chatFacts) < n {
-			n = len(chatFacts)
-		}
-		outChat = chatFacts[:n]
+// aiRoleFor resolves the chat's assigned AI role into the contract shape.
+// Returns nil when no role is assigned so the Python service falls back to the
+// default assistant persona.
+func (s *Service) aiRoleFor(tenantID, chatID string) *contracts.AIRole {
+	role, ok := s.resolveRole(tenantID, chatID)
+	if !ok {
+		return nil
 	}
-	if len(outGlobal) == 0 && len(globalFacts) > 0 {
-		n := topGlobal
-		if len(globalFacts) < n {
-			n = len(globalFacts)
-		}
-		outGlobal = globalFacts[:n]
+	return &contracts.AIRole{
+		Name:          role.Name,
+		Description:   role.Description,
+		SpeakingStyle: role.SpeakingStyle,
+		Goals:         role.Goals,
+		Constraints:   role.Constraints,
+		Context:       role.Context,
+		CustomFields:  role.CustomFields,
 	}
-	return outChat, outGlobal
+}
+
+// resolveRole picks the persona for a chat. Bot-transport chats answer in the
+// bot's role and nothing else — the bot role overrides any per-chat assignment
+// ("и никак иначе"); a bot without a role falls through to the default persona.
+// Non-bot chats keep the legacy per-chat role assignment.
+func (s *Service) resolveRole(tenantID, chatID string) (store.AIRoleRecord, bool) {
+	if s.repository.ChatTransport(tenantID, chatID) == contracts.TransportBot {
+		bot, ok := s.repository.UserBotByTenant(tenantID)
+		if !ok || bot.AIRoleID == 0 {
+			return store.AIRoleRecord{}, false
+		}
+		return s.repository.AIRoleByID(tenantID, bot.AIRoleID)
+	}
+	return s.repository.AIRoleForChat(tenantID, chatID)
 }
 
 // feedbackContext returns recent draft feedback for this chat to send to the AI.
@@ -1059,6 +1420,34 @@ func isContextContamination(s string) bool {
 	return false
 }
 
+// embedCandidates synchronously embeds fact texts for write-time dedup (MEM-1).
+// One batched call with a 5-second budget; on any failure it returns nil and
+// dedup degrades to hash-only (the async embedding worker fills vectors later).
+func (s *Service) embedCandidates(texts []string) [][]float64 {
+	if len(texts) == 0 {
+		return nil
+	}
+	embedder, ok := s.ai.(aiclient.TextEmbedder)
+	if !ok {
+		return nil
+	}
+	embedCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resp, err := embedder.EmbedTexts(embedCtx, aiclient.EmbedTextsRequest{Texts: texts})
+	if err != nil || len(resp.Embeddings) != len(texts) {
+		return nil
+	}
+	return resp.Embeddings
+}
+
+// embeddingAt safely indexes a possibly-nil batch embedding result.
+func embeddingAt(embeddings [][]float64, i int) []float64 {
+	if i < len(embeddings) {
+		return embeddings[i]
+	}
+	return nil
+}
+
 // saveExtractedFacts persists facts returned by the AI service into the Semantic Layer.
 // Only genuinely new facts extracted from the incoming message are stored; context marker
 // strings that indicate assembled prompt lines are rejected as contamination.
@@ -1068,6 +1457,7 @@ func (s *Service) saveExtractedFacts(event contracts.NormalizedTelegramEvent, fa
 	if len(facts) == 0 || s.repository == nil {
 		return
 	}
+	valid := make([]string, 0, len(facts))
 	for _, fact := range facts {
 		fact = strings.TrimSpace(fact)
 		if fact == "" || len(fact) < 5 || len(fact) > 200 {
@@ -1081,6 +1471,10 @@ func (s *Service) saveExtractedFacts(event contracts.NormalizedTelegramEvent, fa
 			)
 			continue
 		}
+		valid = append(valid, fact)
+	}
+	embeddings := s.embedCandidates(valid)
+	for i, fact := range valid {
 		s.repository.UpsertSemanticFact(store.SemanticFactRecord{
 			TenantID:        event.TenantID,
 			ScopeKind:       "chat",
@@ -1091,7 +1485,7 @@ func (s *Service) saveExtractedFacts(event contracts.NormalizedTelegramEvent, fa
 			Confidence:      0.75,
 			Source:          "llm_extracted",
 			SourceMessageID: event.SourceMessageID,
-		})
+		}, embeddingAt(embeddings, i))
 	}
 }
 
@@ -1115,8 +1509,12 @@ func (s *Service) processPassive(ctx context.Context, event contracts.Normalized
 	s.repository.UpsertActiveEpisode(ep)
 
 	// Fire lightweight extraction in the background — no response generation.
+	// Short fact-free messages are skipped entirely (MEM-13).
+	if !shouldExtractFacts(event.MessageText) {
+		return
+	}
 	if typedExtractor, ok := s.ai.(aiclient.TypedMemoryExtractor); ok {
-		go func() {
+		s.runAsyncLLMTask(func() {
 			extractCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 			start := s.now()
@@ -1147,15 +1545,15 @@ func (s *Service) processPassive(ctx context.Context, event contracts.Normalized
 				ChatID:          event.ChatID,
 				InputMessageIDs: []string{event.SourceMessageID},
 				ModelUsed:       resp.ModelUsed,
-				RawOutput:       resp.RawOutput,
+				RawOutput:       redactHealthFacts(resp.RawOutput, resp.Facts, outcome.HealthFactIDs),
 				FactsCreated:    outcome.CreatedIDs,
 				FactsSkipped:    outcome.Skipped,
 				FactsMerged:     resp.DeterministicFactsCount,
 				DurationMS:      durationMS,
 			})
-		}()
+		})
 	} else if extractor, ok := s.ai.(aiclient.MemoryExtractor); ok {
-		go func() {
+		s.runAsyncLLMTask(func() {
 			extractCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 			resp, err := extractor.ExtractMemory(extractCtx, aiclient.MemoryExtractionRequest{
@@ -1171,29 +1569,111 @@ func (s *Service) processPassive(ctx context.Context, event contracts.Normalized
 			if !resp.BlockedByPrivacy {
 				s.saveExtractedFacts(event, resp.Memories)
 			}
-		}()
+		})
 	}
 }
 
-// ownerGlobalMinConfidence is the floor a subject=owner biographical/health fact
-// must clear before it is promoted to owner_global (visible in every chat).  A
-// low-confidence guess like "sitting in class" (0.7) otherwise leaked into all
-// chats and over-anchored the draft model; below the floor the fact is kept
-// chat-scoped so it informs only the chat it was observed in.
-const ownerGlobalMinConfidence = 0.8
-
 // saveTypedFacts persists typed facts returned by the Python AI typed-extraction endpoint.
-// Applies deterministic scope routing per design §5.4:
-//   - subject=owner AND fact_type∈(health,biographical) AND confidence≥ownerGlobalMinConfidence → scope_kind=owner_global
-//   - everything else → scope_kind=chat (overrides Python hint for safety)
+// Every fact is chat-scoped: memory is strictly per-chat (design v5), so a fact
+// observed in one chat never leaks into another — including subject=owner facts.
+// Any scope hint from Python is ignored.
 //
-// Health facts with scope_kind=owner_global are routed to the pending_global_health_facts
-// confirmation queue rather than written directly to semantic_facts.
 // extractionOutcome summarises what saveTypedFacts did with a batch of facts, so
 // the caller can persist an extraction_log row for observability.
 type extractionOutcome struct {
 	CreatedIDs []int64
 	Skipped    int
+	// HealthFactIDs maps persisted health-fact text → fact ID so the caller
+	// can redact the plain text from extraction_log.raw_output (§10.3, MEM-8).
+	HealthFactIDs map[string]int64
+}
+
+// saveProfileSuggestions stages AI-proposed profile updates for owner review
+// (§4.5, MEM-4). The AI never writes contact_profiles directly: every value
+// goes through contact_profile_suggestions and an explicit accept. Duplicate
+// pending suggestions for the same field are dropped by the store.
+func (s *Service) saveProfileSuggestions(ctx context.Context, event contracts.NormalizedTelegramEvent, suggestions []aiclient.ProfileSuggestion) {
+	for _, sg := range suggestions {
+		id := s.repository.SaveProfileSuggestion(store.ProfileSuggestionRecord{
+			TenantID:       event.TenantID,
+			ChatID:         event.ChatID,
+			FieldName:      sg.FieldName,
+			SuggestedValue: sg.SuggestedValue,
+			Rationale:      sg.Rationale,
+		})
+		if id == 0 {
+			continue // invalid field or duplicate pending suggestion
+		}
+		s.logger.Info("profile suggestion staged",
+			"tenant_id", event.TenantID, "chat_id", event.ChatID,
+			"suggestion_id", id, "field", sg.FieldName)
+		if s.notify != nil {
+			s.notify(event.TenantID, "profile_suggestion", map[string]any{
+				"chat_id":         event.ChatID,
+				"suggestion_id":   id,
+				"field_name":      sg.FieldName,
+				"suggested_value": sg.SuggestedValue,
+			})
+			continue
+		}
+		ownerChatID := s.ownerChatIDForEvent(event)
+		if ownerChatID == "" {
+			continue
+		}
+		_ = s.sender.SendMessage(ctx, telegram.OutboundMessage{
+			TenantID:    event.TenantID,
+			ChatID:      ownerChatID,
+			Text:        bot.SuggestionCardText(event.ChatDisplayName, bot.SuggestionFieldLabels[sg.FieldName], sg.SuggestedValue, sg.Rationale),
+			ReplyMarkup: bot.SuggestionKeyboard(id),
+		})
+	}
+}
+
+// shouldExtractFacts is the cheap pre-filter before the extraction LLM call
+// (MEM-13): short acknowledgements («ок», «да», «спасибо») cannot contain a
+// durable fact, yet production extraction_log shows they dominate the calls
+// and almost always return []. Messages are kept when they are long enough OR
+// contain a digit/capitalised name-like token (dates, sums, identifiers).
+func shouldExtractFacts(text string) bool {
+	text = strings.TrimSpace(text)
+	runes := []rune(text)
+	if len(runes) >= 15 {
+		return true
+	}
+	for i, r := range runes {
+		if r >= '0' && r <= '9' {
+			return true
+		}
+		// A capitalised token after the start hints at a proper name.
+		if i > 0 && runes[i-1] == ' ' && r != ' ' && strings.ToLower(string(r)) != string(r) {
+			return true
+		}
+	}
+	return false
+}
+
+// redactHealthFacts replaces health-fact texts inside the raw LLM output with
+// `[health fact #id]` markers before the output is persisted to extraction_log
+// (§10.3, MEM-8). Health is the only redacted type: taboo facts are owner-set
+// conversation boundaries ("не обсуждать цену") whose text is diagnostically
+// useful and not medically sensitive — documented decision per the backlog.
+// Unsaved health candidates are redacted without an ID.
+func redactHealthFacts(raw string, facts []aiclient.TypedFact, healthIDs map[string]int64) string {
+	for _, f := range facts {
+		if f.FactType != "health" {
+			continue
+		}
+		text := strings.TrimSpace(f.FactText)
+		if text == "" {
+			continue
+		}
+		marker := "[health fact]"
+		if id, ok := healthIDs[text]; ok && id > 0 {
+			marker = fmt.Sprintf("[health fact #%d]", id)
+		}
+		raw = strings.ReplaceAll(raw, text, marker)
+	}
+	return raw
 }
 
 func (s *Service) saveTypedFacts(event contracts.NormalizedTelegramEvent, facts []aiclient.TypedFact) extractionOutcome {
@@ -1201,6 +1681,8 @@ func (s *Service) saveTypedFacts(event contracts.NormalizedTelegramEvent, facts 
 	if len(facts) == 0 || s.repository == nil {
 		return outcome
 	}
+	valid := make([]aiclient.TypedFact, 0, len(facts))
+	texts := make([]string, 0, len(facts))
 	for _, f := range facts {
 		text := strings.TrimSpace(f.FactText)
 		if text == "" || len(text) < 5 || len(text) > 200 {
@@ -1213,60 +1695,48 @@ func (s *Service) saveTypedFacts(event contracts.NormalizedTelegramEvent, facts 
 			outcome.Skipped++
 			continue
 		}
-
-		// Deterministic scope routing: backend always decides — Python hint is ignored.
-		// Start from "chat"; promote to owner_global only when the conditions are
-		// unambiguously met. This prevents a low-confidence Python guess like
-		// "sitting in class" from leaking into every other chat.
-		scopeKind := "chat"
-		if f.Subject == "owner" && (f.FactType == "health" || f.FactType == "biographical") &&
-			f.Confidence >= ownerGlobalMinConfidence {
-			scopeKind = "owner_global"
-		}
-
-		// Health facts from the owner require confirmation before entering semantic_facts.
-		if f.FactType == "health" && scopeKind == "owner_global" {
-			s.repository.SavePendingHealthFact(store.PendingHealthFactRecord{
-				TenantID:        event.TenantID,
-				ChatID:          event.ChatID,
-				SourceMessageID: event.SourceMessageID,
-				FactText:        text,
-				Confidence:      f.Confidence,
-			})
-			// Routed to the confirmation queue rather than written — not a skip.
-			continue
-		}
-
-		chatID := event.ChatID
-		if scopeKind == "owner_global" {
-			chatID = ""
-		}
+		f.FactText = text
+		valid = append(valid, f)
+		texts = append(texts, text)
+	}
+	// Candidate embeddings power write-time semantic dedup (MEM-1). On embed
+	// failure dedup degrades to hash-only; the async worker embeds later.
+	embeddings := s.embedCandidates(texts)
+	for i, f := range valid {
 		result := s.repository.UpsertSemanticFact(store.SemanticFactRecord{
 			TenantID:        event.TenantID,
-			ScopeKind:       scopeKind,
-			ChatID:          chatID,
-			FactText:        text,
+			ScopeKind:       "chat",
+			ChatID:          event.ChatID,
+			FactText:        f.FactText,
 			FactType:        f.FactType,
 			Subject:         f.Subject,
 			Confidence:      f.Confidence,
 			Source:          "llm_extracted",
 			SourceMessageID: event.SourceMessageID,
-		})
+		}, embeddingAt(embeddings, i))
 		if result.FactID != 0 {
 			outcome.CreatedIDs = append(outcome.CreatedIDs, result.FactID)
-			// Temporal knowledge graph (v4): if the upsert superseded an older fact,
-			// record a directed 'supersedes' edge so the graph read-path can resolve
-			// "current truth" across time (design §v4).
-			if oldID := s.repository.FindSupersededFactID(event.TenantID, result.FactID); oldID > 0 {
+			if f.FactType == "health" {
+				if outcome.HealthFactIDs == nil {
+					outcome.HealthFactIDs = make(map[string]int64)
+				}
+				outcome.HealthFactIDs[f.FactText] = result.FactID
+			}
+			// Temporal knowledge graph (v4): a supersede creates a directed edge so
+			// the graph read-path can resolve "current truth" across time.
+			if result.SupersededFactID > 0 {
 				s.repository.SaveFactRelation(store.FactRelationRecord{
 					TenantID:     event.TenantID,
-					FactIDFrom:   oldID,
+					FactIDFrom:   result.SupersededFactID,
 					FactIDTo:     result.FactID,
 					RelationType: "supersedes",
 					Confidence:   f.Confidence,
 				})
 			}
 		}
+	}
+	if len(outcome.CreatedIDs) > 0 {
+		s.nudgeEmbeddingWorker()
 	}
 	return outcome
 }
@@ -1314,6 +1784,45 @@ func (s *Service) handleBusinessConnection(ctx context.Context, update telegram.
 	return InboundResult{Event: event, Decision: contracts.DecisionObserve, Reason: reason}
 }
 
+// Sentinel errors returned by SummarizeChat so both the bot command and the
+// Mini App endpoint can map the same failure to their own user-facing message.
+var (
+	// ErrSummaryBlockedByPrivacy means the chat carries the no_summary flag.
+	ErrSummaryBlockedByPrivacy = errors.New("summary blocked by no_summary privacy flag")
+	// ErrSummaryNoMessages means the chat has no text messages to compress.
+	ErrSummaryNoMessages = errors.New("no messages to summarize")
+)
+
+// SummarizeChat builds an on-demand summary of the last 50 messages of a chat.
+// The no_summary privacy contract is enforced here so every caller honours it.
+// Returns the message count alongside the response so callers can render a
+// fallback ("N сообщений, сводка недоступна") when the AI service fails.
+func (s *Service) SummarizeChat(ctx context.Context, tenantID, chatID string) (contracts.ChatSummaryResponse, int, error) {
+	settings := s.repository.ChatSettings(tenantID, chatID)
+	if settings.PrivacyFlags.Contains(contracts.PrivacyNoSummary) {
+		return contracts.ChatSummaryResponse{}, 0, ErrSummaryBlockedByPrivacy
+	}
+	messages := s.repository.RecentMessages(tenantID, chatID, 50)
+	texts := make([]string, 0, len(messages))
+	for _, m := range messages {
+		if t := strings.TrimSpace(m.Event.MessageText); t != "" {
+			texts = append(texts, t)
+		}
+	}
+	if len(texts) == 0 {
+		return contracts.ChatSummaryResponse{}, 0, ErrSummaryNoMessages
+	}
+	summarizer, ok := s.ai.(aiclient.ChatSummarizer)
+	if !ok {
+		return contracts.ChatSummaryResponse{}, len(texts), fmt.Errorf("summarizer not available")
+	}
+	summ, err := summarizer.SummarizeChat(ctx, contracts.ChatSummaryRequest{
+		Messages:     texts,
+		PrivacyFlags: settings.PrivacyFlags,
+	})
+	return summ, len(texts), err
+}
+
 func (s *Service) handleSummaryCommand(ctx context.Context, command telegram.BotCommandUpdate, tenantID string, event contracts.NormalizedTelegramEvent) InboundResult {
 	selector := strings.TrimSpace(command.Arguments)
 	if selector == "" {
@@ -1329,8 +1838,8 @@ func (s *Service) handleSummaryCommand(ctx context.Context, command telegram.Bot
 		return InboundResult{Event: event, Decision: contracts.DecisionObserve, Reason: "summary_chat_not_found"}
 	}
 
-	settings := s.repository.ChatSettings(tenantID, chat.ChatID)
-	if settings.PrivacyFlags.Contains(contracts.PrivacyNoSummary) {
+	summ, msgCount, err := s.SummarizeChat(ctx, tenantID, chat.ChatID)
+	if errors.Is(err, ErrSummaryBlockedByPrivacy) {
 		_ = s.sender.SendMessage(ctx, telegram.OutboundMessage{
 			TenantID: tenantID,
 			ChatID:   command.ChatID,
@@ -1338,15 +1847,7 @@ func (s *Service) handleSummaryCommand(ctx context.Context, command telegram.Bot
 		})
 		return InboundResult{Event: event, Decision: contracts.DecisionObserve, Reason: "summary_blocked_by_privacy"}
 	}
-
-	messages := s.repository.RecentMessages(tenantID, chat.ChatID, 50)
-	texts := make([]string, 0, len(messages))
-	for _, m := range messages {
-		if t := strings.TrimSpace(m.Event.MessageText); t != "" {
-			texts = append(texts, t)
-		}
-	}
-	if len(texts) == 0 {
+	if errors.Is(err, ErrSummaryNoMessages) {
 		_ = s.sender.SendMessage(ctx, telegram.OutboundMessage{
 			TenantID: tenantID,
 			ChatID:   command.ChatID,
@@ -1355,19 +1856,9 @@ func (s *Service) handleSummaryCommand(ctx context.Context, command telegram.Bot
 		return InboundResult{Event: event, Decision: contracts.DecisionObserve, Reason: "summary_no_messages"}
 	}
 
-	summ, err := func() (contracts.ChatSummaryResponse, error) {
-		if summarizer, ok := s.ai.(aiclient.ChatSummarizer); ok {
-			return summarizer.SummarizeChat(ctx, contracts.ChatSummaryRequest{
-				Messages:     texts,
-				PrivacyFlags: settings.PrivacyFlags,
-			})
-		}
-		return contracts.ChatSummaryResponse{}, fmt.Errorf("summarizer not available")
-	}()
-
 	replyText := ""
 	if err != nil || summ.Summary == "" {
-		replyText = fmt.Sprintf("📊 Чат «%s»: %d сообщений. Сводка недоступна.", chatDisplayName(chat), len(texts))
+		replyText = fmt.Sprintf("📊 Чат «%s»: %d сообщений. Сводка недоступна.", chatDisplayName(chat), msgCount)
 	} else {
 		replyText = fmt.Sprintf("📊 Сводка чата «%s»:\n\n%s", chatDisplayName(chat), summ.Summary)
 		if len(summ.ActionItems) > 0 {
@@ -1455,9 +1946,18 @@ func (s *Service) HandleApprovalCallback(ctx context.Context, payload contracts.
 	if !ok {
 		return ApprovalResult{}, fmt.Errorf("draft not found")
 	}
+	// Warning cards carry an owner-facing service note, not a reply. Every
+	// mutating/sending action is blocked so no callback path can deliver the
+	// note (or an edit of it) to the contact — only dismissal works (ARCH-1).
+	if draft.DraftType == "warning" && payload.Action != contracts.ApprovalReject {
+		return ApprovalResult{}, fmt.Errorf("warning card supports only reject")
+	}
 	now := s.now()
 	switch payload.Action {
 	case contracts.ApprovalApprove:
+		if strings.TrimSpace(draft.ResponseText) == "" {
+			return ApprovalResult{}, fmt.Errorf("draft has no sendable text")
+		}
 		s.repository.AppendState(draft.TenantID, draft.ChatID, draft.SourceMessageID, contracts.StateApprovedByOwner)
 		sentMsgID, err := s.sendRecipient(ctx, contracts.NormalizedTelegramEvent{
 			TenantID:             draft.TenantID,
@@ -1475,6 +1975,8 @@ func (s *Service) HandleApprovalCallback(ctx context.Context, payload contracts.
 		s.repository.UpdateDraft(draft)
 		s.saveOutgoingMessageFromDraft(draft)
 		s.repository.AppendState(draft.TenantID, draft.ChatID, draft.SourceMessageID, contracts.StateSentToRecipient)
+		// The approved reply answers the open question; owner action completed (MEM-5).
+		s.repository.ClearEpisodeRuntimeState(draft.TenantID, draft.ChatID)
 		if s.notify != nil {
 			s.notify(draft.TenantID, "new_message", map[string]any{"chat_id": draft.ChatID})
 		}
@@ -1650,6 +2152,7 @@ func (s *Service) regenerateDraft(ctx context.Context, draft store.DraftRecord) 
 	if profile, ok := s.repository.ContactProfile(draft.TenantID, draft.ChatID); ok {
 		regenRequest.ContactProfile = &profile
 	}
+	regenRequest.AIRole = s.aiRoleFor(draft.TenantID, draft.ChatID)
 	s.repository.AppendState(draft.TenantID, draft.ChatID, draft.SourceMessageID, contracts.StateAIRequested)
 	proposal, err := s.ai.ProcessMessage(ctx, regenRequest)
 	if err != nil {
@@ -1690,6 +2193,7 @@ func (s *Service) regenerateDraftWithHint(ctx context.Context, draft store.Draft
 	if profile, ok := s.repository.ContactProfile(draft.TenantID, draft.ChatID); ok {
 		hintRequest.ContactProfile = &profile
 	}
+	hintRequest.AIRole = s.aiRoleFor(draft.TenantID, draft.ChatID)
 	s.repository.AppendState(draft.TenantID, draft.ChatID, draft.SourceMessageID, contracts.StateAIRequested)
 	proposal, err := s.ai.ProcessMessage(ctx, hintRequest)
 	if err != nil {
@@ -1793,13 +2297,45 @@ func (s *Service) sendRecipient(ctx context.Context, event contracts.NormalizedT
 		ReplyToMessageID:     event.SourceMessageID,
 		DecisionID:           decisionID,
 		Text:                 text,
+		// Contact-facing replies carry LLM text that may use Markdown (lists,
+		// bold, code). The sender falls back to plain text if Telegram rejects
+		// the markup, so formatting is best-effort and never loses a reply.
+		ParseMode: "Markdown",
 	}
-	if idSender, ok := s.sender.(interface {
+	sender, err := s.recipientSender(event)
+	if err != nil {
+		return "", err
+	}
+	if idSender, ok := sender.(interface {
 		SendMessageGetID(context.Context, telegram.OutboundMessage) (string, error)
 	}); ok {
 		return idSender.SendMessageGetID(ctx, msg)
 	}
-	return "", s.sender.SendMessage(ctx, msg)
+	return "", sender.SendMessage(ctx, msg)
+}
+
+// recipientSender picks the outbound channel for a contact-facing reply:
+// bot-transport chats answer through the tenant's own bot, everything else
+// through the Business connection on the control bot. The reply must leave
+// through the same channel the message arrived from.
+func (s *Service) recipientSender(event contracts.NormalizedTelegramEvent) (telegram.Sender, error) {
+	transport := event.Transport
+	if transport == "" && event.BusinessConnectionID == "" {
+		// Reconstructed events (approval callbacks build a minimal event from
+		// the draft) carry no transport; the chat row recorded it on receipt.
+		transport = s.repository.ChatTransport(event.TenantID, event.ChatID)
+	}
+	if transport != contracts.TransportBot {
+		return s.sender, nil
+	}
+	if s.botSenders == nil {
+		return nil, fmt.Errorf("bot transport reply for tenant %s: no bot sender provider configured", event.TenantID)
+	}
+	sender, ok := s.botSenders.SenderFor(event.TenantID)
+	if !ok {
+		return nil, fmt.Errorf("bot transport reply for tenant %s: no active bot registered", event.TenantID)
+	}
+	return sender, nil
 }
 
 func (s *Service) auditEvent(event contracts.NormalizedTelegramEvent, decision contracts.Decision, reason string) contracts.AuditEvent {
@@ -1854,36 +2390,122 @@ func tenantForUser(userID string) string {
 	return "tenant:user:" + userID
 }
 
+// updateEpisodeRuntime persists Runtime-State-Layer signals (§6.2 / MEM-5)
+// derived from the structured AI response — no extra LLM call:
+//   - topic comes from the draft JSON (ARCH-4);
+//   - an unanswered contact question (intent question/choice_question that did
+//     not get an auto-reply) sets open_question_message_id;
+//   - draft/ask_owner decisions record what the owner is expected to do.
+//
+// The matching reset paths: an owner-authored message and a successfully sent
+// reply both call ClearEpisodeRuntimeState.
+func (s *Service) updateEpisodeRuntime(event contracts.NormalizedTelegramEvent, proposal contracts.AIProcessMessageResponse, decision contracts.Decision) {
+	topic := strings.TrimSpace(proposal.Topic)
+	openQuestion := ""
+	pendingAction := ""
+	awaitingOwner := decision == contracts.DecisionDraft || decision == contracts.DecisionAskOwner
+	if awaitingOwner && (proposal.Intent == "question" || proposal.Intent == "choice_question") {
+		openQuestion = event.SourceMessageID
+	}
+	switch {
+	case decision == contracts.DecisionAskOwner:
+		pendingAction = "ответить вручную (критичное сообщение)"
+	case decision == contracts.DecisionDraft:
+		pendingAction = "подтвердить черновик ответа"
+	}
+	if topic == "" && openQuestion == "" && pendingAction == "" {
+		return
+	}
+	s.repository.UpdateEpisodeRuntime(event.TenantID, event.ChatID, topic, openQuestion, pendingAction)
+}
+
+// ownerNoteFor extracts the owner-facing warning from an AI proposal.
+// OwnerNote is the contract field (ARCH-1); for legacy AI services that still
+// put the warning into ResponseText on critical risk, that text is treated as
+// the note — it is never allowed to become a sendable draft.
+func (s *Service) ownerNoteFor(proposal contracts.AIProcessMessageResponse) string {
+	if note := strings.TrimSpace(proposal.OwnerNote); note != "" {
+		return note
+	}
+	if proposal.RiskLevel == contracts.RiskCritical {
+		return strings.TrimSpace(proposal.ResponseText)
+	}
+	return ""
+}
+
+// sendWarningToOwner delivers a critical-risk warning card to the owner's bot chat.
+// The card has no Approve/Edit controls — the owner can only dismiss it and reply
+// manually from their own Telegram (ARCH-1).
+func (s *Service) sendWarningToOwner(ctx context.Context, event contracts.NormalizedTelegramEvent, draft store.DraftRecord, ownerNote string) {
+	ownerChatID := s.ownerChatIDForEvent(event)
+	if ownerChatID == "" {
+		s.logger.Warn("cannot deliver warning card to owner: chat ID not found",
+			"business_connection_id", event.BusinessConnectionID, "draft_id", draft.DraftID)
+		return
+	}
+	msg := telegram.OutboundMessage{
+		TenantID:        event.TenantID,
+		ChatID:          ownerChatID,
+		SourceMessageID: event.SourceMessageID,
+		DecisionID:      draft.DecisionID,
+		Text:            bot.WarningCardText(event.MessageText, ownerNote, event.ChatDisplayName),
+		ReplyMarkup:     bot.WarningKeyboard(draft.DraftID),
+	}
+	if idSender, ok := s.sender.(interface {
+		SendMessageGetID(context.Context, telegram.OutboundMessage) (string, error)
+	}); ok {
+		msgID, err := idSender.SendMessageGetID(ctx, msg)
+		if err == nil && msgID != "" {
+			draft.OwnerChatID = ownerChatID
+			draft.OwnerMessageID = msgID
+			s.repository.UpdateDraft(draft)
+		}
+	} else {
+		_ = s.sender.SendMessage(ctx, msg)
+	}
+}
+
+// ownerChatIDForEvent resolves the owner's control-bot chat for any transport.
+// Bot-transport tenants are keyed "tenant:user:<id>" where <id> is the owner's
+// Telegram user id (which equals their DM chat with the control bot); business
+// transport keeps the connection-based lookup with its fallbacks.
+func (s *Service) ownerChatIDForEvent(event contracts.NormalizedTelegramEvent) string {
+	if event.Transport == contracts.TransportBot || event.BusinessConnectionID == "" {
+		if owner := strings.TrimPrefix(event.TenantID, "tenant:user:"); owner != event.TenantID {
+			return owner
+		}
+		if event.BusinessConnectionID == "" {
+			return ""
+		}
+	}
+	return s.ownerChatIDFor(event.BusinessConnectionID)
+}
+
+// ownerChatIDFor resolves the owner's bot chat for a business connection,
+// falling back to inference from claimed chats (shared by draft/question/warning cards).
+func (s *Service) ownerChatIDFor(businessConnectionID string) string {
+	if connection, ok := s.repository.BusinessConnection(businessConnectionID); ok && connection.UserChatID != "" {
+		return connection.UserChatID
+	}
+	ownerChatID := s.inferOwnerChatID(businessConnectionID)
+	if ownerChatID != "" {
+		s.repository.SaveBusinessConnection(store.BusinessConnectionRecord{
+			ConnectionID: businessConnectionID,
+			TenantID:     "tenant:user:" + ownerChatID,
+			UserID:       ownerChatID,
+			UserChatID:   ownerChatID,
+			CanReply:     true,
+			IsEnabled:    true,
+			UpdatedAt:    s.now(),
+		})
+	}
+	return ownerChatID
+}
+
 // sendDraftToOwner delivers a draft card with approval keyboard to the owner's bot chat.
 // Stores the Telegram message_id of the card so it can be deleted/edited later.
 func (s *Service) sendDraftToOwner(ctx context.Context, event contracts.NormalizedTelegramEvent, draft store.DraftRecord, ownerID string) {
-	connection, ok := s.repository.BusinessConnection(event.BusinessConnectionID)
-
-	ownerChatID := ""
-	if ok && connection.UserChatID != "" {
-		ownerChatID = connection.UserChatID
-	} else {
-		// Fallback: business_connection record not in DB (e.g. service restarted before it was persisted).
-		// Infer the owner's chat ID from claimed chats that reference this connection_id.
-		ownerChatID = s.inferOwnerChatID(event.BusinessConnectionID)
-		if ownerChatID != "" {
-			s.logger.Info("draft delivery: using fallback owner chat (reconnect bot to persist properly)",
-				"business_connection_id", event.BusinessConnectionID,
-				"inferred_owner_chat_id", ownerChatID,
-			)
-			// Auto-save the connection so future lookups don't need the fallback.
-			s.repository.SaveBusinessConnection(store.BusinessConnectionRecord{
-				ConnectionID: event.BusinessConnectionID,
-				TenantID:     "tenant:user:" + ownerChatID,
-				UserID:       ownerChatID,
-				UserChatID:   ownerChatID,
-				CanReply:     true,
-				IsEnabled:    true,
-				UpdatedAt:    s.now(),
-			})
-		}
-	}
-
+	ownerChatID := s.ownerChatIDForEvent(event)
 	if ownerChatID == "" {
 		s.logger.Warn("cannot deliver draft to owner: business connection not found and no fallback available",
 			"business_connection_id", event.BusinessConnectionID,
@@ -1945,6 +2567,40 @@ func (s *Service) handleCallbackQuery(ctx context.Context, cbq telegram.Callback
 	if optionIdx, draftID, idempotencyKey, choiceOK := contracts.CallbackDataDecodeChoice(cbq.Data); choiceOK {
 		_ = s.sender.AnswerCallbackQuery(ctx, cbq.QueryID)
 		return s.handleChoiceOption(ctx, event, tenantID, cbq, optionIdx, draftID, idempotencyKey)
+	}
+
+	// Forget-chat confirmation flow (§10.2, MEM-2).
+	if forgetChatID, forgetOK := contracts.CallbackDataDecodeForget(cbq.Data); forgetOK {
+		_ = s.sender.AnswerCallbackQuery(ctx, cbq.QueryID)
+		text := "🗑 Память чата удалена безвозвратно."
+		if err := s.repository.ForgetChat(tenantID, forgetChatID); err != nil {
+			s.logger.Error("forget chat failed", "tenant_id", tenantID, "chat_id", forgetChatID, "error", err)
+			text = "Не удалось удалить память чата: " + err.Error()
+		} else {
+			s.logger.Info("chat memory forgotten", "tenant_id", tenantID, "chat_id", forgetChatID)
+		}
+		_ = s.sender.SendMessage(ctx, telegram.OutboundMessage{TenantID: tenantID, ChatID: cbq.ChatID, Text: text})
+		return InboundResult{Event: event, Decision: contracts.DecisionObserve, Reason: "forget_chat_confirmed"}
+	}
+	if cbq.Data == contracts.ForgetCancelCallbackData {
+		_ = s.sender.AnswerCallbackQuery(ctx, cbq.QueryID)
+		_ = s.sender.SendMessage(ctx, telegram.OutboundMessage{TenantID: tenantID, ChatID: cbq.ChatID, Text: "Удаление отменено."})
+		return InboundResult{Event: event, Decision: contracts.DecisionObserve, Reason: "forget_chat_cancelled"}
+	}
+
+	// Profile-suggestion review (§4.5, MEM-4).
+	if suggestionID, accept, suggestionOK := contracts.CallbackDataDecodeSuggestion(cbq.Data); suggestionOK {
+		_ = s.sender.AnswerCallbackQuery(ctx, cbq.QueryID)
+		text := "✅ Предложение принято — профиль обновлён."
+		if !accept {
+			text = "Предложение отклонено."
+		}
+		if err := s.repository.ResolveSuggestion(tenantID, suggestionID, accept); err != nil {
+			s.logger.Warn("suggestion resolution failed", "tenant_id", tenantID, "suggestion_id", suggestionID, "error", err)
+			text = "Предложение уже обработано или не найдено."
+		}
+		_ = s.sender.SendMessage(ctx, telegram.OutboundMessage{TenantID: tenantID, ChatID: cbq.ChatID, Text: text})
+		return InboundResult{Event: event, Decision: contracts.DecisionObserve, Reason: "suggestion_resolved"}
 	}
 
 	action, draftID, idempotencyKey, ok := contracts.CallbackDataDecode(cbq.Data)
@@ -2075,6 +2731,33 @@ func (s *Service) handleOwnerMessage(ctx context.Context, msg telegram.OwnerMess
 	s.repository.ClearPendingInput(tenantID, msg.ChatID)
 
 	switch pending.Type {
+	case contracts.PendingInputForgetAll:
+		// §10.2: full erasure runs only on the exact confirmation phrase.
+		if strings.TrimSpace(msg.Text) != contracts.ForgetAllConfirmationPhrase {
+			_ = s.sender.SendMessage(ctx, telegram.OutboundMessage{
+				TenantID: tenantID,
+				ChatID:   msg.ChatID,
+				Text:     "Фраза не совпала — удаление отменено.",
+			})
+			return InboundResult{Event: event, Decision: contracts.DecisionObserve, Reason: "forget_all_cancelled"}
+		}
+		if err := s.repository.ForgetAll(tenantID); err != nil {
+			s.logger.Error("forget all failed", "tenant_id", tenantID, "error", err)
+			_ = s.sender.SendMessage(ctx, telegram.OutboundMessage{
+				TenantID: tenantID,
+				ChatID:   msg.ChatID,
+				Text:     "Не удалось удалить данные: " + err.Error(),
+			})
+			return InboundResult{Event: event, Decision: contracts.DecisionErrorFallback, Reason: "forget_all_failed"}
+		}
+		s.logger.Info("tenant memory forgotten", "tenant_id", tenantID)
+		_ = s.sender.SendMessage(ctx, telegram.OutboundMessage{
+			TenantID: tenantID,
+			ChatID:   msg.ChatID,
+			Text:     "🗑 Все данные удалены безвозвратно. Подключи бота заново, чтобы начать с чистого листа.",
+		})
+		return InboundResult{Event: event, Decision: contracts.DecisionObserve, Reason: "forget_all_confirmed"}
+
 	case contracts.PendingInputFeedback:
 		if msg.Text != "/skip" {
 			s.repository.SaveDraftFeedback(contracts.DraftFeedback{
@@ -2249,6 +2932,66 @@ func (s *Service) saveOutgoingMessageFromDraft(draft store.DraftRecord) {
 	})
 }
 
+// ManualSend delivers an owner-authored reply through the chat's own channel
+// (the tenant's bot for bot chats) exactly as if the owner had typed it in
+// Telegram. The reply is stored as an outgoing owner message so it becomes
+// context the AI sees on later replies, and any pending AI drafts in the chat
+// are discarded — the owner has answered, so the suggestions are now obsolete.
+func (s *Service) ManualSend(ctx context.Context, tenantID, chatID, text string) error {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return fmt.Errorf("message text is required")
+	}
+	ownerID := strings.TrimPrefix(tenantID, "tenant:user:")
+	decisionID := fmt.Sprintf("manual:%s:%d", chatID, s.now().UnixNano())
+	sentMsgID, err := s.sendRecipient(ctx, contracts.NormalizedTelegramEvent{
+		TenantID: tenantID,
+		ChatID:   chatID,
+	}, decisionID, text)
+	if err != nil {
+		return err
+	}
+	if sentMsgID == "" {
+		// Senders without a message-id capability (or idempotent replays) return
+		// an empty id; fall back to the decisionID so the stored row stays unique.
+		sentMsgID = decisionID
+	}
+	// Owner-authored outgoing message with no virtual DoubleU draft, so the Mini
+	// App labels it "Ты"; lands in RecentMessages → the AI accounts for it next.
+	s.repository.SaveMessage(contracts.NormalizedTelegramEvent{
+		EventID:          "out:" + decisionID,
+		TenantID:         tenantID,
+		ChatID:           chatID,
+		SourceMessageID:  sentMsgID,
+		SenderID:         ownerID,
+		MessageText:      text,
+		MessageType:      "text",
+		TelegramUpdateID: outgoingUpdateID(decisionID),
+		CreatedAt:        s.now(),
+	})
+	s.discardPendingDrafts(ctx, tenantID, chatID)
+	if s.notify != nil {
+		s.notify(tenantID, "new_message", map[string]any{"chat_id": chatID})
+	}
+	return nil
+}
+
+// discardPendingDrafts rejects every pending draft in a chat. Used when the
+// owner answers manually so the AI's now-obsolete suggestions disappear from
+// the chat and the owner's bot card.
+func (s *Service) discardPendingDrafts(ctx context.Context, tenantID, chatID string) {
+	for _, draft := range s.repository.DraftsForChat(tenantID, chatID) {
+		if draft.Status != store.DraftPending {
+			continue
+		}
+		draft.Status = store.DraftRejected
+		draft.UpdatedAt = s.now()
+		s.repository.UpdateDraft(draft)
+		s.removeDraftCard(ctx, draft)
+		s.notifyDraftStatus(draft)
+	}
+}
+
 func valueOrDefault(value, fallback string) string {
 	if value == "" {
 		return fallback
@@ -2269,27 +3012,35 @@ func truncateForLog(value string, limit int) string {
 // (design §6.2 — episode lifecycle trigger: message_limit).
 const episodeMessageLimit = 40
 
-// summarizeChatDay compresses one day's conversation for a chat into an episode summary.
-// closureReason records what triggered the episode close: "silence_gap", "message_limit",
-// or "daily_summary". Skips if a summary for that date already exists. Safe to call concurrently.
-func (s *Service) summarizeChatDay(ctx context.Context, tenantID, chatID string, date time.Time, closureReason string) {
+// summarizeEpisode compresses the messages of one closed episode — real
+// episode bounds, not calendar days (MEM-6) — into an episode summary with
+// full provenance (source_message_ids). Idempotency is period-overlap based:
+// a second close of the same episode, or a daily fallback over an already
+// summarised window, is a no-op. Safe to call concurrently.
+func (s *Service) summarizeEpisode(ctx context.Context, tenantID, chatID string, startedAt, closedAt time.Time, closureReason string) {
 	settings := s.repository.ChatSettings(tenantID, chatID)
 	if settings.PrivacyFlags.Contains(contracts.PrivacyNoSummary) {
 		return
 	}
-	if s.repository.EpisodeSummaryExistsForDate(tenantID, chatID, date) {
+	if !closedAt.After(startedAt) {
 		return
 	}
-	startOfDay := time.Date(date.Year(), date.Month(), date.Day(), 0, 0, 0, 0, time.UTC)
-	endOfDay := startOfDay.Add(24 * time.Hour)
-	messages := s.repository.MessagesByDateRange(tenantID, chatID, startOfDay, endOfDay)
+	// Half-open fetch window: nudge the end by a second so the message that
+	// closed the episode (received_at == closedAt) is included.
+	fetchEnd := closedAt.Add(time.Second)
+	if s.repository.EpisodeSummaryOverlaps(tenantID, chatID, startedAt, fetchEnd) {
+		return
+	}
+	messages := s.repository.MessagesByDateRange(tenantID, chatID, startedAt, fetchEnd)
 	if len(messages) < 3 {
 		return
 	}
 	texts := make([]string, 0, len(messages))
+	sourceIDs := make([]string, 0, len(messages))
 	for _, m := range messages {
 		if t := strings.TrimSpace(m.Event.MessageText); t != "" {
 			texts = append(texts, t)
+			sourceIDs = append(sourceIDs, m.Event.SourceMessageID)
 		}
 	}
 	if len(texts) == 0 {
@@ -2303,26 +3054,57 @@ func (s *Service) summarizeChatDay(ctx context.Context, tenantID, chatID string,
 		Messages:     texts,
 		PrivacyFlags: settings.PrivacyFlags,
 	})
-	if err != nil || summ.BlockedByPrivacy || strings.TrimSpace(summ.Summary) == "" {
+	if err != nil || summ.BlockedByPrivacy {
 		return
 	}
-	_ = s.repository.SaveEpisodeSummary(store.EpisodeSummaryRecord{
-		TenantID:      tenantID,
-		ChatID:        chatID,
-		PeriodStart:   startOfDay,
-		PeriodEnd:     endOfDay,
-		Content:       summ.Summary,
-		MessageCount:  len(messages),
-		ClosureReason: closureReason,
+	content := strings.TrimSpace(summ.Summary)
+	// episode_summaries.content carries CHECK (50..1500 chars): a too-short
+	// summary previously failed the INSERT silently (MEM-6/MEM-10).
+	if runes := []rune(content); len(runes) < 50 {
+		s.logger.Warn("episode summary too short, skipped",
+			"tenant_id", tenantID, "chat_id", chatID, "length", len(runes))
+		return
+	} else if len(runes) > 1500 {
+		content = string(runes[:1500])
+	}
+	id := s.repository.SaveEpisodeSummary(store.EpisodeSummaryRecord{
+		TenantID:         tenantID,
+		ChatID:           chatID,
+		PeriodStart:      startedAt,
+		PeriodEnd:        closedAt,
+		Content:          content,
+		MessageCount:     len(messages),
+		SourceMessageIDs: sourceIDs,
+		ClosureReason:    closureReason,
 	})
 	s.logger.Info("episode summary saved",
 		"tenant_id", tenantID, "chat_id", chatID,
-		"date", date.UTC().Format("2006-01-02"),
+		"summary_id", id,
+		"period_start", startedAt.UTC().Format(time.RFC3339),
+		"period_end", closedAt.UTC().Format(time.RFC3339),
 		"closure_reason", closureReason,
 	)
+	s.nudgeEmbeddingWorker()
 	if len(summ.Recommendations) > 0 {
 		s.sendRecommendationsToOwner(ctx, tenantID, chatID, summ.Recommendations)
 	}
+}
+
+// summarizeChatDay is the daily fallback grid (MEM-6): it summarises only the
+// part of the day that no episode summary already covers — closing the "chat
+// active past midnight without an episode close" gap without duplicating
+// episode-close summaries.
+func (s *Service) summarizeChatDay(ctx context.Context, tenantID, chatID string, date time.Time, closureReason string) {
+	startOfDay := time.Date(date.Year(), date.Month(), date.Day(), 0, 0, 0, 0, time.UTC)
+	endOfDay := startOfDay.Add(24 * time.Hour)
+	from := startOfDay
+	if covered := s.repository.LatestCoveredEnd(tenantID, chatID, startOfDay, endOfDay); covered.After(from) {
+		from = covered
+	}
+	if !endOfDay.After(from) {
+		return // the whole day is already covered by episode summaries
+	}
+	s.summarizeEpisode(ctx, tenantID, chatID, from, endOfDay.Add(-time.Second), closureReason)
 }
 
 // maxSummaryConcurrency caps simultaneous LLM summarisation calls across all tenants.
@@ -2367,7 +3149,7 @@ func (s *Service) closeStaleEpisodes(ctx context.Context) {
 			if s.now().Sub(ep.LastMessageAt) < 6*time.Hour {
 				continue
 			}
-			tenantID, chatID, lastMsg := tenantID, chat.ChatID, ep.LastMessageAt
+			tenantID, chatID, startedAt, lastMsg := tenantID, chat.ChatID, ep.StartedAt, ep.LastMessageAt
 			// Close the active episode record before launching the goroutine so a
 			// second closeStaleEpisodes call for the same chat cannot race.
 			s.repository.CloseActiveEpisode(tenantID, chatID)
@@ -2379,7 +3161,7 @@ func (s *Service) closeStaleEpisodes(ctx context.Context) {
 			sem <- struct{}{}
 			go func() {
 				defer func() { <-sem }()
-				s.summarizeChatDay(ctx, tenantID, chatID, lastMsg, "silence_gap")
+				s.summarizeEpisode(ctx, tenantID, chatID, startedAt, lastMsg, "silence_gap")
 			}()
 		}
 	}
@@ -2438,6 +3220,11 @@ func (s *Service) StartConsolidationWorker(ctx context.Context) {
 						"facts_cleaned", cleaned,
 					)
 				}
+				// Profile suggestions the owner ignored for 14 days expire (§4.5, MEM-4).
+				if expired := s.repository.ExpireOldSuggestions(tenantID, 14*24*time.Hour); expired > 0 {
+					s.logger.Info("stale profile suggestions expired",
+						"tenant_id", tenantID, "count", expired)
+				}
 			}
 		case <-ctx.Done():
 			return
@@ -2445,9 +3232,20 @@ func (s *Service) StartConsolidationWorker(ctx context.Context) {
 	}
 }
 
-// StartEmbeddingWorker runs every 5 minutes and generates embeddings for any semantic facts
-// that were inserted without one.  Runs in a separate goroutine; safe to call concurrently.
-// Activates only when the AI client implements TextEmbedder; otherwise it is a no-op.
+// nudgeEmbeddingWorker signals the embedding worker that new facts need
+// vectors (ARCH-12). Non-blocking: a pending nudge already covers the batch.
+func (s *Service) nudgeEmbeddingWorker() {
+	select {
+	case s.embedNudge <- struct{}{}:
+	default:
+	}
+}
+
+// StartEmbeddingWorker generates embeddings for any semantic facts inserted
+// without one. It wakes on a 5-minute ticker OR immediately on a nudge from
+// saveTypedFacts (ARCH-12) — previously fresh facts were invisible to vector
+// recall for up to 5 minutes. Runs in a separate goroutine; safe to call
+// concurrently. Activates only when the AI client implements TextEmbedder.
 func (s *Service) StartEmbeddingWorker(ctx context.Context) {
 	embedder, ok := s.ai.(aiclient.TextEmbedder)
 	if !ok {
@@ -2458,6 +3256,8 @@ func (s *Service) StartEmbeddingWorker(ctx context.Context) {
 	for {
 		select {
 		case <-ticker.C:
+			s.runEmbeddingBatch(ctx, embedder)
+		case <-s.embedNudge:
 			s.runEmbeddingBatch(ctx, embedder)
 		case <-ctx.Done():
 			return
@@ -2558,23 +3358,7 @@ func (s *Service) sendRecommendationsToOwner(ctx context.Context, tenantID, chat
 
 // sendQuestionToOwner delivers a question card with AI-suggested option buttons to the owner's bot chat.
 func (s *Service) sendQuestionToOwner(ctx context.Context, event contracts.NormalizedTelegramEvent, draft store.DraftRecord, ownerID string) {
-	connection, ok := s.repository.BusinessConnection(event.BusinessConnectionID)
-	ownerChatID := ""
-	if ok && connection.UserChatID != "" {
-		ownerChatID = connection.UserChatID
-	} else {
-		ownerChatID = s.inferOwnerChatID(event.BusinessConnectionID)
-		if ownerChatID != "" {
-			s.repository.SaveBusinessConnection(store.BusinessConnectionRecord{
-				ConnectionID: event.BusinessConnectionID,
-				TenantID:     "tenant:user:" + ownerChatID,
-				UserID:       ownerChatID,
-				UserChatID:   ownerChatID,
-				CanReply:     true,
-				IsEnabled:    true,
-			})
-		}
-	}
+	ownerChatID := s.ownerChatIDForEvent(event)
 	if ownerChatID == "" {
 		s.logger.Warn("cannot deliver question card to owner: chat ID not found", "business_connection_id", event.BusinessConnectionID, "draft_id", draft.DraftID)
 		return

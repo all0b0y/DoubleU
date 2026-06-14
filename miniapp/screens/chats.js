@@ -1,4 +1,5 @@
 import { api, openEvents } from '/miniapp/api/client.js';
+import { renderBottomNav } from '/miniapp/components/nav.js';
 
 const twa = window.Telegram?.WebApp;
 
@@ -22,7 +23,6 @@ function timeAgo(iso) {
   if (diff < 3600)  return `${Math.floor(diff / 60)} мин`;
   if (diff < 86400) return `${Math.floor(diff / 3600)} ч`;
   const d = new Date(iso);
-  const now = new Date();
   const days = ['вс','пн','вт','ср','чт','пт','сб'];
   if (diff < 7 * 86400) return days[d.getDay()];
   return d.toLocaleDateString('ru', { day: 'numeric', month: 'short' });
@@ -51,24 +51,8 @@ function chatItemHTML(chat) {
         </div>
         <div class="chat-item-row2">
           <span class="chat-mode-inline ${mode}">${modeLabel(mode)}</span>
+          ${chat.ai_role_name ? `<span class="role-chip">🎭 ${chat.ai_role_name}</span>` : ''}
           <span class="chat-item-preview">${chat.last_message || 'Нет сообщений'}</span>
-        </div>
-      </div>
-    </div>
-  `;
-}
-
-function suggestedItemHTML(chat) {
-  return `
-    <div class="chat-item" data-id="${chat.chat_id}" data-suggested="true">
-      <div class="avatar avatar-md avatar-muted">${initials(chat.display_name)}</div>
-      <div class="chat-item-body">
-        <div class="chat-item-row1">
-          <div class="chat-item-name">${chat.display_name || chat.chat_id}</div>
-          <button class="suggested-add-btn" data-add="${chat.chat_id}">+ Добавить</button>
-        </div>
-        <div class="chat-item-row2">
-          <span class="chat-item-preview" style="color:var(--muted)">новый контакт</span>
         </div>
       </div>
     </div>
@@ -84,7 +68,7 @@ export function renderChats(navigate) {
         <span class="chats-header-brand">DoubleU</span>
         <span class="chats-header-title">Чаты</span>
       </div>
-      <button class="chats-header-add" id="btn-add" aria-label="Добавить чат">+</button>
+      <button class="chats-header-add" id="btn-add" aria-label="Добавить">+</button>
     </div>
 
     <div class="search-bar" style="margin:0 20px 8px;">
@@ -96,101 +80,113 @@ export function renderChats(navigate) {
       <div class="loading-row"><div class="spinner"></div></div>
     </div>
 
-    <nav class="bottom-nav">
-      <button class="bottom-nav-item active">
-        <span class="bottom-nav-icon">💬</span>
-        <span class="bottom-nav-label">чаты</span>
-      </button>
-      <button class="bottom-nav-item">
-        <span class="bottom-nav-icon">🎭</span>
-        <span class="bottom-nav-label">роли</span>
-      </button>
-      <button class="bottom-nav-item">
-        <span class="bottom-nav-icon">🛍</span>
-        <span class="bottom-nav-label">маркет</span>
-      </button>
-      <button class="bottom-nav-item">
-        <span class="bottom-nav-icon">👤</span>
-        <span class="bottom-nav-label">я</span>
-      </button>
-    </nav>
+    <div id="add-menu-overlay" class="sheet-overlay" style="display:none;">
+      <div class="sheet">
+        <div class="sheet-handle"></div>
+        <div class="sheet-item" data-menu="add-bot">
+          <span class="sheet-item-icon">🤖</span>
+          <div class="sheet-item-body">
+            <p class="sheet-item-title">Подключить бота</p>
+            <p class="sheet-item-desc">ИИ будет отвечать в чатах твоего бота</p>
+          </div>
+        </div>
+      </div>
+    </div>
   `;
+  el.appendChild(renderBottomNav('chats', navigate));
 
-  // Hide Telegram back button on root screen
   twa?.BackButton?.hide();
 
+  // Personal chats are disabled in this iteration — the bot section is the only
+  // surface. The personal tab and its add-chat entry point were removed from the UI.
   let myChats = [];
-  let suggestedChats = [];
+  let bot = { connected: false };
+
+  function refreshList() {
+    renderList(el.querySelector('#search-input').value);
+  }
+
+  // ── Bots section ──────────────────────────────────────────────────────────
+
+  function botSectionHTML(botChats) {
+    if (!bot.connected) {
+      return `
+        <div class="empty-state">
+          <div class="empty-icon">🤖</div>
+          <div class="empty-title">Бот не подключён</div>
+          <div class="empty-subtitle">
+            Подключи своего Telegram-бота — ИИ будет отвечать его собеседникам:
+            с ролью, памятью и черновиками под твоим контролем.
+          </div>
+          <button class="btn btn-primary" id="btn-connect-bot" style="max-width:260px;margin-top:8px;">
+            Подключить бота
+          </button>
+        </div>`;
+    }
+    const statusOk = bot.status === 'active' || !bot.status;
+    return `
+      <div class="bot-card" id="bot-card">
+        <div class="role-card-icon" style="background:rgba(16,185,129,0.16);">🤖</div>
+        <div class="chat-item-body">
+          <div class="chat-item-row1">
+            <div class="role-card-name">@${bot.bot_username || bot.bot_id}</div>
+            <span class="role-card-usage" style="${statusOk ? '' : 'color:var(--danger);'}">
+              ${statusOk ? `${botChats.length} ${plural(botChats.length, 'чат', 'чата', 'чатов')}` : bot.status}
+            </span>
+          </div>
+          <div class="role-card-desc">ИИ отвечает собеседникам этого бота</div>
+        </div>
+      </div>
+      ${botChats.length
+        ? `<div style="display:flex;flex-direction:column;gap:2px;padding:4px 0;">
+             ${botChats.map(c => chatItemHTML(c)).join('')}
+           </div>`
+        : `<div class="empty-state" style="padding:24px;">
+             <div class="empty-icon">💬</div>
+             <div class="empty-subtitle">Пока никто не написал боту.<br>Как только придёт сообщение — чат появится здесь.</div>
+           </div>`}
+    `;
+  }
+
+  function plural(n, one, few, many) {
+    const m10 = n % 10, m100 = n % 100;
+    if (m10 === 1 && m100 !== 11) return one;
+    if (m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14)) return few;
+    return many;
+  }
+
+  // ── List rendering ────────────────────────────────────────────────────────
 
   function renderList(filter = '') {
     const list = el.querySelector('#chat-list');
     const q = filter.toLowerCase();
+    const match = c => !q || (c.display_name || '').toLowerCase().includes(q);
 
-    const mine = q ? myChats.filter(c => (c.display_name || '').toLowerCase().includes(q)) : myChats;
-    const sug  = q ? suggestedChats.filter(c => (c.display_name || '').toLowerCase().includes(q)) : suggestedChats;
+    const botChats = myChats.filter(c => c.transport === 'bot' && c.claimed).filter(match);
+    list.innerHTML = botSectionHTML(botChats);
 
-    let html = '';
-
-    if (mine.length) {
-      html += `<div style="display:flex;flex-direction:column;gap:2px;padding:4px 0;">
-        ${mine.map(c => chatItemHTML(c)).join('')}
-      </div>`;
-    } else {
-      html += `
-        <div class="empty-state">
-          <div class="empty-icon">💬</div>
-          <div class="empty-title">Нет добавленных чатов</div>
-          <div class="empty-subtitle">Добавь чат из предложений ниже или нажми +</div>
-        </div>`;
-    }
-
-    if (sug.length) {
-      html += `
-        <div class="section-header" style="margin-top:8px;">
-          <span class="section-title">Предложения</span>
-          <span style="font-size:11px;color:var(--muted);">новые контакты</span>
-        </div>
-        <div style="display:flex;flex-direction:column;gap:2px;padding:4px 0;">
-          ${sug.map(c => suggestedItemHTML(c)).join('')}
-        </div>`;
-    }
-
-    list.innerHTML = html;
-
-    // Navigate to chat
-    list.querySelectorAll('.chat-item').forEach(item => {
-      item.addEventListener('click', (e) => {
-        if (e.target.closest('[data-add]')) return;
-        if (item.dataset.suggested === 'true') return;
-        twa?.HapticFeedback?.selectionChanged();
-        navigate(`/chat/${item.dataset.id}`);
-      });
+    list.querySelector('#btn-connect-bot')?.addEventListener('click', () => {
+      twa?.HapticFeedback?.impactOccurred('medium');
+      navigate('/add-bot');
     });
 
-    // "+ Добавить" in suggested
-    list.querySelectorAll('[data-add]').forEach(btn => {
-      btn.addEventListener('click', async (e) => {
-        e.stopPropagation();
-        twa?.HapticFeedback?.impactOccurred('medium');
-        btn.textContent = '…'; btn.disabled = true;
-        try {
-          await api.addChats([btn.dataset.add]);
-          twa?.HapticFeedback?.notificationOccurred('success');
-          await loadChats();
-        } catch {
-          btn.textContent = '+ Добавить'; btn.disabled = false;
-        }
+    list.querySelectorAll('.chat-item').forEach(item => {
+      item.addEventListener('click', () => {
+        twa?.HapticFeedback?.selectionChanged();
+        navigate(`/chat/${item.dataset.id}`);
       });
     });
   }
 
   async function loadChats() {
     try {
-      const [chatsData, contactsData] = await Promise.all([api.chats(), api.contacts()]);
+      const [chatsData, botData] = await Promise.all([
+        api.chats(),
+        api.getBot().catch(() => ({ connected: false })),
+      ]);
       myChats = chatsData.chats || [];
-      const addedIds = new Set(myChats.map(c => c.chat_id));
-      suggestedChats = (contactsData.contacts || []).filter(c => !addedIds.has(c.chat_id));
-      renderList(el.querySelector('#search-input').value);
+      bot = botData || { connected: false };
+      refreshList();
     } catch (err) {
       el.querySelector('#chat-list').innerHTML = `
         <div class="empty-state">
@@ -201,17 +197,30 @@ export function renderChats(navigate) {
     }
   }
 
+  // ── "+" burger menu ───────────────────────────────────────────────────────
+
+  const overlay = el.querySelector('#add-menu-overlay');
   el.querySelector('#btn-add').addEventListener('click', () => {
     twa?.HapticFeedback?.impactOccurred('light');
-    navigate('/add-chat');
+    overlay.style.display = 'flex';
+  });
+  overlay.addEventListener('click', (e) => {
+    if (e.target === overlay) overlay.style.display = 'none';
+  });
+  overlay.querySelector('[data-menu="add-bot"]').addEventListener('click', () => {
+    twa?.HapticFeedback?.selectionChanged();
+    overlay.style.display = 'none';
+    navigate('/add-bot');
   });
 
   el.querySelector('#search-input').addEventListener('input', e => renderList(e.target.value));
 
   // Real-time
   const es = openEvents({
+    new_message: () => loadChats(),
     new_draft: () => loadChats(),
     chat_mode_changed: () => loadChats(),
+    chat_role_changed: () => loadChats(),
     chats_updated: () => loadChats(),
   });
   const obs = new MutationObserver(() => {

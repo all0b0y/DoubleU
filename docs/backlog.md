@@ -2,14 +2,42 @@
 
 ---
 
+## AI / Backend Architecture Backlog
+
+**✅ ВЫПОЛНЕН (2026-06-11)** — все 15 задач ARCH-1…ARCH-15 реализованы, статус и остаточные
+хвосты в **[ai_backend_architecture_backlog.md](ai_backend_architecture_backlog.md)**.
+Итог: горячий путь — `embed + 1 структурированный LLM-вызов`
+(reply/intent/options/confidence/topic в одном JSON, ARCH-4); critical-warning отделён от
+черновика и недоставим собеседнику (owner_note + warning-карточка, ARCH-1); LLM-reranker
+заменён косинусом в SQL (ARCH-5); вебхуки — шардированная очередь с мгновенным ACK и
+ограниченным пулом async-LLM-задач (ARCH-7); контекст собирается параллельно (ARCH-8)
+с токен-бюджетом 4000 (ARCH-15/MEM-9).
+
+**Открытые cutover-замеры (не код):**
+- Shadow-сравнение порядка фактов LLM-rerank vs cosine на ~50 реальных запросах → после него удалить `/ai/rerank-facts` + `FactReranker` (ARCH-5 п.3).
+- `extraction_log` до/после pre-filter; решение про батчинг extraction по эпизодам (MEM-13).
+
+---
+
 ## Inefficiency Backlog
 
-- `ContextScore` recomputes on every mode selection check — could be cached per chat with a short TTL.
-- `RecentMessages` in in-memory mode iterates all messages on every call — O(n). Switch to sorted structure for large in-memory datasets.
+- ~~`ContextScore` recomputes on every mode selection check~~ → ✅ TTL-кэш + инвалидация на write (ARCH-8).
+- ~~`RecentMessages` in-memory O(n)~~ → ✅ per-chat индекс (ARCH-13).
+- ~~`Repository.UpsertSemanticFact` unbounded in-memory slice growth~~ → ✅ аппенд на DB-пути убран (ARCH-13).
 
 ---
 
 ## Tech Debt
+
+- ~~**(v5 roles)** `upsert_semantic_fact` stored proc dead `RAISE EXCEPTION` branch~~ → ✅ закрыто миграцией 013 (v3 процедуры без global-веток, MEM-1).
+- ~~**(v5 roles)** `/ai/generate-draft` (`DraftRequest`) does not carry `ai_role`~~ → ✅ эндпоинт помечен deprecated в openapi (ARCH-14): regenerate идёт через process-message, Go-клиент standalone-вызов не делает.
+- ~~**(v5 roles)** Role editing UX is `|`-delimited one-liner (`/role_create`); a guided multi-step dialog (pending-input flow like draft edit) would be friendlier for long descriptions.~~ → ✅ закрыто Mini App (2026-06-12): экран `/roles` + форма с 5 полями (`miniapp/screens/role-edit.js`), REST CRUD `/api/v1/roles`; бот-команда осталась как fallback.
+
+- **(bot ingestion, 2026-06-11)** `user_bots.token` хранится в БД открытым текстом (в логи не пишется, наружу не отдаётся). Нужно app-level шифрование ключом из env перед продом.
+- **(bot ingestion, 2026-06-11)** Long polling (`getUpdates`) — решение для MVP/отладки. Для прода заменить на webhook per bot: транспорт инкапсулирован в `internal/botservice/poller.go`, точка замены одна (manager поверх UpdateSource), core не трогается.
+- **(pydantic-ai, 2026-06-11)** HTTP-сервер ai-python остался на stdlib (`http_server.py`): миграция на FastAPI/uvicorn отложена осознанно — контракт и context-propagation покрыты тестами, агентный runtime мостится через выделенный event-loop-тред. Переходить на FastAPI имеет смысл вместе с переводом `schemas.py` (frozen dataclasses) на pydantic BaseModel — оба шага меняют сериализацию и должны идти под защитой `test_contracts.py`.
+- **(pydantic-ai, 2026-06-11)** `search_facts` агентного toolset: embedding-ветка (cosine по `fact_embeddings`) требует прокинутый `deps.embedder` — сейчас runtime его не настраивает, и поиск работает по ILIKE-fallback. Подключить embedder через OpenRouter `/embeddings` (alias `embed-qwen`) при cutover памяти.
+- **(pydantic-ai, 2026-06-11)** При `AI_MEMORY_SOURCE=python` LLM-extraction пишет факты из runtime (см. `_persist_extraction`), но `extraction_log` продолжает писать Go с пустыми `facts_created` — счётчики диагностики надо перенести в Python или возвращать created-IDs в ответе.
 
 - **Promptfoo CI eval harness for prompt regressions.** **Offline-only** — does not touch the runtime safety/observability pipeline. Runs against `MOCK_LLM=true` for determinism + zero cost (mock gateway already produces stable outputs for known keywords). File structure:
   - `promptfooconfig.yaml` at repo root — providers per purpose pointing to `eval/providers/<purpose>.py` thin scripts; tests reference jsonl datasets.
@@ -22,22 +50,35 @@
 
 ---
 
+## Memory Architecture Backlog
+
+**✅ ВЫПОЛНЕН (2026-06-11)** — задачи MEM-1…MEM-13 реализованы (миграции 013–016), статус и
+сознательно отложенное (export, GRANT-вариант, EXPLAIN-проверка HNSW, батчинг extraction) в
+**[memory_architecture_backlog.md](memory_architecture_backlog.md)**. Ключевое: семантический дедуп
+теперь использует embedding кандидата и атомарный supersede (миграция 013); deletion contract §10.2 —
+`/forget`, `/forget_all` с подтверждениями; suggestions flow §4.5 — extraction → карточки accept/reject;
+token budget §8.1 — 4000 токенов с детерминированным урезанием; halfvec-HNSW ANN (миграция 015);
+`MEMORY_ARCHITECTURE.md` обновлён до v6.
+
+---
+
 ## Memory / RAG Implementation Gap
 
 Items below are in dependency order.
 
-1. **Conflict resolution chat vs global (design §5.6).** When a chat fact and a global fact of the same `fact_type`/`subject` have cosine > 0.85, the chat fact should win and the global fact dropped from the prompt. Currently both are emitted without resolution.
-2. **Health confirmation flow.** Wire `pending_global_health_facts` + `accept_pending_health_fact` (design §9.3) and the owner-facing accept/reject UI. The table exists in schema but the flow is unused.
-3. **Extraction is fact-starved — single-message context (evidence-based).** Production AI-service logs show `/ai/extract-facts-typed` runs healthily (~2 s, valid `[]`) but is invoked on **single short messages** with `memory_context_count: 0` (e.g. "Просто интересно"). Casual small talk has no durable facts in isolation, so almost everything correctly returns `[]` — only 1 fact extracted across the dataset. Now that `extraction_log` is populated (model/raw_output/created/skipped/duration), use it to measure before/after, then: (a) pass a small recent-conversation window into `TypedExtractionRequest` so multi-turn facts ("учусь на медика" spread over messages) become extractable — dedup via `normalized_fact_hash` makes re-extraction safe; (b) re-tune the `confidence ≥ 0.8` floor and the transience filter in `extraction.py` if the log shows over-filtering. Do NOT change extraction semantics blind — read `extraction_log` first.
-4. **Episode `current_topic` always NULL — LLM topic tagging.** The prompt slot exists ([service.go conversationContext](../backend-go/internal/core/service.go)) but nothing populates `active_episodes.current_topic`. Deterministic tagging is too noisy; needs a cheap LLM topic label on episode update (or reuse the summarizer). `pending_owner_action` is already covered functionally by the unsent-drafts block in the prompt, so it is lower priority.
+1. ~~**Conflict resolution chat vs global (design §5.6).**~~ Closed by v5: global scope removed (migration 011), межчатовых конфликтов не существует.
+2. ~~**Health confirmation flow.**~~ Closed by v5: health facts are chat-scoped, `pending_global_health_facts` dropped (migration 011).
+3. **Extraction is fact-starved — частично закрыто.** Пункт (a) выполнен: окно последних 5 сообщений передаётся в `TypedExtractionRequest.recent_messages` (переиспользуется фетч контекста, ARCH-8); короткие фактологически пустые сообщения отсеиваются pre-filter'ом до LLM (`shouldExtractFacts`, MEM-13). Остаётся пункт (b): по `extraction_log` (до/после) перенастроить порог `confidence ≥ 0.8` и transience-фильтр в `extraction.py`, если лог покажет over-filtering. Do NOT change extraction semantics blind — read `extraction_log` first.
+4. ~~**Episode `current_topic` always NULL.**~~ ✅ Закрыто ARCH-4: topic приходит в структурированном ответе `/ai/process-message` и пишется в `active_episodes.current_topic` без отдельного LLM-вызова; `/ai/tag-topic` остался для эпизодных воркеров.
 
 ### Memory Architecture Status Gaps
 
 | Design Component | Status |
 |---|---|
-| `pending_global_health_facts` queue | Stored proc only — no owner-facing confirmation UI |
-| §5.6 chat-vs-global conflict resolution | Not implemented |
-| §9.3 health confirmation flow (accept/reject UI) | Not implemented |
+| `pending_global_health_facts` queue | ✅ Obsolete — dropped in v5 (migration 011) |
+| §5.6 chat-vs-global conflict resolution | ✅ Obsolete — global scope removed in v5 |
+| §9.3 health confirmation flow (accept/reject UI) | ✅ Obsolete — health facts chat-scoped in v5 |
+| §13 AI roles (`ai_roles` + role-first prompt) | ✅ Implemented in v5 (migration 011, бот-команды, role-first промпт) |
 
 ---
 
@@ -94,9 +135,11 @@ build on broken data.
 
 ## Iteration 2
 
-- Mini App UI — web dashboard for draft review, memory viewer, chat management.
-- AI Roles Marketplace — persona presets per chat (Sales, Support, Personal assistant).
+- ~~Mini App UI — web dashboard for draft review, memory viewer, chat management.~~ → ✅ реализовано (2026-06-12/13): экраны чатов (две секции Боты/Личные), ролей, настроек, «Я», подключения бота.
+- AI Roles Marketplace — persona presets per chat. ⚠️ Частично: 2 готовых пресета роли (`ROLE_TEMPLATES` в `miniapp/screens/roles.js`) уже в проде; полноценный маркетплейс с шарингом — позже.
 - Telegram Client API / MTProto — historical message access for tenants granting full access.
+- **(2026-06-13)** Личные (business) чаты в Mini App намеренно заблокированы (`chat-item-locked`, ingestion mode `bot`): приложение их не обрабатывает, фокус на ботах. Разблокировка — переключить вкладку «Личные» из read-only в рабочий режим, когда LS-флоу будет готов.
+- **(2026-06-13)** Role context (`ai_roles.context_notes`, migration 101): файлы читаются в браузере и кладутся в текстовое поле context. Возможное улучшение — реальная загрузка бинарных файлов (PDF/docx) с извлечением текста на бэкенде вместо client-side `file.text()`.
 
 ---
 
@@ -109,7 +152,7 @@ build on broken data.
 - `docs/litellm-runbook.md` — runbook for adding model aliases, rotating keys, inspecting spend.
 - `docs/dev-observability.md` — Phoenix RAG debug workflow.
 - `infra/langfuse/alerts.json` — alert webhook config (block_rate / cost / latency / error_rate).
-- `ai-python/ai_agent/pipelines/embedding.py` — embed path still hits OpenRouter directly; move it through LiteLLM during cutover cleanup.
+- ~~`ai-python/ai_agent/pipelines/embedding.py` — embed path still hits OpenRouter directly~~ → перенесено в ARCH-14 ([ai_backend_architecture_backlog.md](ai_backend_architecture_backlog.md)).
 - `Dockerfile.ai-python` — output scanner prewarm missing (same prewarm work as input scanners).
 - `ai-python/requirements.txt` — `langfuse==2.*` still commented out; keep this open if SDK features are needed beyond the stdlib uploader.
 

@@ -94,6 +94,63 @@ func TestHandleModeCommandClaimsUnboundBusinessChat(t *testing.T) {
 	}
 }
 
+// TestRoleLifecycleViaCommands walks the full owner flow: create a role,
+// list it, assign it to a chat, inspect it, then clear it.
+func TestRoleLifecycleViaCommands(t *testing.T) {
+	repository := store.NewRepository()
+	repository.SaveChat(store.ChatRecord{
+		TenantID:    "tenant:user:77",
+		ChatID:      "42",
+		DisplayName: "Customer Alice",
+		LastSeenAt:  time.Unix(2, 0).UTC(),
+	})
+	layer := NewLayer(repository)
+	command := func(cmd, args string) CommandResponse {
+		return layer.HandleCommand(telegram.BotCommandUpdate{
+			Command: cmd, Arguments: args, SenderID: "77",
+		}, "tenant:user:77")
+	}
+
+	if resp := command("/role_create", "Менеджер | Личный менеджер, отвечает клиентам | вежливо, кратко | договориться о встрече | не обещать скидки"); resp.Reason != "role_create_saved" {
+		t.Fatalf("role_create response = %+v", resp)
+	}
+	if resp := command("/roles", ""); resp.Reason != "roles_list" || !strings.Contains(resp.Text, "Менеджер") {
+		t.Fatalf("roles response = %+v", resp)
+	}
+	if resp := command("/role_assign", "1 Менеджер"); resp.Reason != "role_assigned" {
+		t.Fatalf("role_assign response = %+v", resp)
+	}
+	role, ok := repository.AIRoleForChat("tenant:user:77", "42")
+	if !ok || role.Name != "Менеджер" || role.Constraints != "не обещать скидки" {
+		t.Fatalf("assigned role = %+v ok=%v", role, ok)
+	}
+	if resp := command("/role", "1"); resp.Reason != "role_command" || !strings.Contains(resp.Text, "не обещать скидки") {
+		t.Fatalf("role response = %+v", resp)
+	}
+	if resp := command("/role_clear", "1"); resp.Reason != "role_cleared" {
+		t.Fatalf("role_clear response = %+v", resp)
+	}
+	if _, ok := repository.AIRoleForChat("tenant:user:77", "42"); ok {
+		t.Fatal("role still assigned after /role_clear")
+	}
+}
+
+// TestRoleCreateRequiresNameAndDescription verifies the usage hint is returned
+// when the owner omits the mandatory fields.
+func TestRoleCreateRequiresNameAndDescription(t *testing.T) {
+	layer := NewLayer(store.NewRepository())
+
+	response := layer.HandleCommand(telegram.BotCommandUpdate{
+		Command:   "/role_create",
+		Arguments: "ТолькоИмя",
+		SenderID:  "77",
+	}, "tenant:user:77")
+
+	if response.Reason != "role_create_bad_args" || !strings.Contains(response.Text, "/role_create") {
+		t.Fatalf("response = %+v", response)
+	}
+}
+
 func TestHandleModeCommandExplainsEmptyLimitedAccess(t *testing.T) {
 	layer := NewLayer(store.NewRepository())
 

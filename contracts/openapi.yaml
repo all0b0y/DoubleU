@@ -46,6 +46,16 @@ components:
         message_text: { type: string }
         message_type: { type: string, default: text }
         created_at: { type: string, format: date-time }
+        transport:
+          type: string
+          enum: [business, bot]
+          description: >
+            Ingestion channel. "business" — Telegram Business webhook,
+            "bot" — user-supplied bot via long polling. Absent means
+            "business" (events stored before the field existed).
+        bot_id:
+          type: string
+          description: Telegram bot identifier; present only when transport is "bot".
     ChatSettings:
       type: object
       required: [tenant_id, chat_id, mode, privacy_flags]
@@ -60,6 +70,36 @@ components:
           items:
             type: string
             enum: [no_memory, no_training, private, no_summary]
+    AIRole:
+      type: object
+      description: >
+        Owner-authored persona the AI plays when answering on the owner's behalf
+        in this chat. Absent means the default assistant persona (reply in the
+        owner's observed style).
+      required: [name]
+      properties:
+        name: { type: string }
+        description: { type: string }
+        speaking_style: { type: string }
+        goals: { type: string }
+        constraints: { type: string }
+        context:
+          type: string
+          description: >
+            Owner-supplied reference material for the role (FAQ, pricing, docs).
+            Plain text injected into the draft prompt.
+        custom_fields:
+          type: array
+          description: >
+            Owner-defined extra role attributes beyond the fixed fields. Each is
+            injected into the persona prompt.
+          items:
+            type: object
+            required: [title, description]
+            properties:
+              title: { type: string }
+              description: { type: string }
+              context: { type: string }
     AIProcessMessageRequest:
       type: object
       required: [request_id, event, chat_settings, memory_context]
@@ -72,6 +112,8 @@ components:
         memory_context:
           type: array
           items: { type: string }
+        ai_role:
+          $ref: "#/components/schemas/AIRole"
     AIProcessMessageResponse:
       type: object
       required: [decision, response_text, confidence, risk_level, intent, model_used, usage, memory_used]
@@ -87,7 +129,9 @@ components:
         risk_level:
           type: string
           enum: [low, medium, high, critical]
-        intent: { type: string }
+        intent:
+          type: string
+          enum: [question, scheduling, commercial, acknowledgement, request, choice_question, general_message]
         model_used: { type: string }
         usage:
           type: object
@@ -98,6 +142,22 @@ components:
         memory_used:
           type: array
           items: { type: string }
+        flagged:
+          type: boolean
+          description: Output-safety layer flagged the draft (toxicity/sensitive); the bot UI annotates it.
+        owner_note:
+          type: string
+          description: >
+            Owner-facing service note (e.g. critical-risk warning). Rendered on the
+            owner's card only; MUST NOT be sent to the contact. response_text is
+            empty when this is set.
+        options:
+          type: array
+          items: { type: string }
+          description: AI-suggested short replies; non-empty only for intent=choice_question.
+        topic:
+          type: string
+          description: 3-7 word conversation topic from the same draft call (replaces per-message /ai/tag-topic).
     AuditEvent:
       type: object
       required: [audit_id, tenant_id, chat_id, source_message_id, decision, reason, created_at]

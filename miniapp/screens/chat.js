@@ -68,7 +68,6 @@ export function renderChat(navigate, chatId) {
         <div class="chat-topbar-name" id="chat-name">…</div>
         <div class="chat-topbar-mode" id="chat-mode"></div>
       </div>
-      <button class="chat-topbar-btn" id="btn-profile" title="Досье">ⓘ</button>
       <button class="chat-topbar-btn" id="btn-settings" title="Настройки">⚙</button>
     </div>
 
@@ -77,6 +76,14 @@ export function renderChat(navigate, chatId) {
     </div>
 
     <div id="draft-panel"></div>
+
+    <div class="chat-composer" id="chat-composer"
+         style="display:flex;gap:8px;align-items:flex-end;padding:8px 12px calc(8px + var(--inset-bottom,0px));border-top:1px solid var(--border,rgba(255,255,255,0.08));">
+      <textarea id="composer-input" rows="1" placeholder="Ответить от имени бота…"
+        style="flex:1;resize:none;max-height:120px;background:var(--card,#1c1c24);color:var(--text,#fff);border:1px solid var(--border,rgba(255,255,255,0.08));border-radius:18px;padding:9px 14px;font-size:14px;line-height:1.3;"></textarea>
+      <button id="composer-send" title="Отправить" disabled
+        style="flex-shrink:0;width:40px;height:40px;border:none;border-radius:50%;background:var(--accent,#5b8cff);color:#fff;font-size:18px;cursor:pointer;">↑</button>
+    </div>
   `;
 
   const handleBack = () => navigate('/chats');
@@ -87,9 +94,43 @@ export function renderChat(navigate, chatId) {
     twa?.HapticFeedback?.impactOccurred('light');
     navigate(`/chat/${chatId}/settings`);
   });
-  el.querySelector('#btn-profile').addEventListener('click', () => {
-    twa?.HapticFeedback?.impactOccurred('light');
-    navigate(`/chat/${chatId}/profile`);
+
+  // ── Composer: owner replies manually as the bot ────────────────────────────
+  // The reply goes out through the bot and is stored as context the AI uses on
+  // later drafts; any pending draft in this chat is discarded server-side.
+  const composerInput = el.querySelector('#composer-input');
+  const composerSend  = el.querySelector('#composer-send');
+
+  function autoGrowComposer() {
+    composerInput.style.height = 'auto';
+    composerInput.style.height = Math.min(composerInput.scrollHeight, 120) + 'px';
+    composerSend.disabled = composerInput.value.trim() === '';
+  }
+  composerInput.addEventListener('input', autoGrowComposer);
+
+  async function sendComposer() {
+    const text = composerInput.value.trim();
+    if (!text) return;
+    composerSend.disabled = true;
+    composerInput.disabled = true;
+    twa?.HapticFeedback?.impactOccurred('medium');
+    try {
+      await api.sendMessage(chatId, text);
+      composerInput.value = '';
+      autoGrowComposer();
+      twa?.HapticFeedback?.notificationOccurred('success');
+      await loadChatData();
+    } catch (err) {
+      twa?.HapticFeedback?.notificationOccurred('error');
+      twa?.showAlert(`Ошибка: ${err.message}`);
+    } finally {
+      composerInput.disabled = false;
+    }
+  }
+  composerSend.addEventListener('click', sendComposer);
+  composerInput.addEventListener('keydown', (e) => {
+    // Enter sends; Shift+Enter inserts a newline.
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendComposer(); }
   });
 
   let currentDrafts = [];
@@ -437,7 +478,10 @@ export function renderChat(navigate, chatId) {
       }
       if (settingsData) {
         const modeEl = el.querySelector('#chat-mode');
-        modeEl.textContent = MODE_LABELS[settingsData.mode] || settingsData.mode;
+        const modeText = MODE_LABELS[settingsData.mode] || settingsData.mode;
+        modeEl.textContent = settingsData.ai_role
+          ? `${modeText} · 🎭 ${settingsData.ai_role.name}`
+          : modeText;
         modeEl.style.color  = MODE_COLORS[settingsData.mode] || 'var(--hint)';
       }
     } catch (_) {}
@@ -453,6 +497,7 @@ export function renderChat(navigate, chatId) {
     new_message:  (d) => { if (d.chat_id === chatId) loadChatData(); },
     ai_thinking:  (d) => { if (d.chat_id === chatId) showThinkingIndicator(); },
     ai_done:      (d) => { if (d.chat_id === chatId) hideThinkingIndicator(); },
+    chat_role_changed: (d) => { if (d.chat_id === chatId) loadChatMeta(); },
   });
 
   const obs = new MutationObserver(() => {

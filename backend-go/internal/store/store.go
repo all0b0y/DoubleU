@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strconv"
 	"strings"
@@ -68,7 +69,9 @@ type DraftRecord struct {
 type SemanticFactRecord struct {
 	ID       int64
 	TenantID string
-	// ScopeKind: "chat" or "owner_global".
+	// ScopeKind is always "chat": memory is strictly per-chat (migration 011
+	// retired the owner_global scope). The column survives for provenance of
+	// soft-deleted legacy rows.
 	ScopeKind string
 	ChatID    string
 	FactText  string
@@ -108,8 +111,11 @@ type EpisodeSummaryRecord struct {
 	Content       string
 	ClosureReason string
 	MessageCount  int
-	CreatedAt     time.Time
-	Embedding     []float64 // populated by the embedding worker; nil until then
+	// SourceMessageIDs are the messages compressed into this summary —
+	// provenance per design §6 (MEM-6).
+	SourceMessageIDs []string
+	CreatedAt        time.Time
+	Embedding        []float64 // populated by the embedding worker; nil until then
 }
 
 // ExtractionLogRecord captures one async fact-extraction attempt for observability.
@@ -163,6 +169,9 @@ type ChatRecord struct {
 	// Status tracks ownership lifecycle: "unclaimed" → awaiting owner decision,
 	// "managed" → owner actively using this chat. Defaults to "managed".
 	Status string
+	// Transport is the channel the chat's messages arrive through ("business"
+	// or "bot"). Fixed by the first message; replies go out the same channel.
+	Transport string
 }
 
 // UnclaimedChatRecord stores a business chat that arrived before the owner claimed it.
@@ -183,8 +192,12 @@ type UnclaimedChatRecord struct {
 // SemanticFactUpsertResult describes the outcome of an UpsertSemanticFact call.
 type SemanticFactUpsertResult struct {
 	FactID int64
-	// Action is "inserted" for a new fact or "occurrence_added" for an exact duplicate.
+	// Action is one of "inserted", "occurrence_added", "occurrence_added_race",
+	// "superseded", or "rejected" — mirrors the upsert_semantic_fact v3 proc.
 	Action string
+	// SupersededFactID is the retired older fact when Action == "superseded";
+	// 0 otherwise. The caller records the fact_relations(supersedes) edge.
+	SupersededFactID int64
 }
 
 // FactRelationRecord represents a directed temporal edge between two semantic_facts rows.
@@ -198,16 +211,31 @@ type FactRelationRecord struct {
 	Confidence   float64
 }
 
-// PendingHealthFactRecord is a health fact awaiting owner confirmation before
-// being promoted to semantic_facts.  Maps to the pending_global_health_facts table.
-type PendingHealthFactRecord struct {
-	ID              int64
-	TenantID        string
-	ChatID          string
-	SourceMessageID string
-	FactText        string
-	Confidence      float64
-	Status          string // "pending", "accepted", "rejected", "expired"
+// AIRoleRecord is an owner-authored AI persona (роль).  Maps to the ai_roles
+// table.  A role describes WHO the AI plays when answering on the owner's
+// behalf in a chat ("менеджер Алексея", "техподдержка"); one role may be
+// assigned to many chats via chat_settings.ai_role_id.
+type AIRoleRecord struct {
+	ID       int64
+	TenantID string
+	// Name is the short unique-per-tenant label the owner refers to the role by.
+	Name string
+	// Description is the owner's free-text persona description — the primary
+	// prompt material.
+	Description string
+	// SpeakingStyle describes how the role talks (lexicon, tone, length).
+	SpeakingStyle string
+	// Goals describes what the role tries to achieve in conversations.
+	Goals string
+	// Constraints describes what the role must not do or discuss.
+	Constraints string
+	// Context is owner-supplied reference material (FAQ, pricing, docs —
+	// pasted or extracted from files in the Mini App), injected into the
+	// draft prompt. Maps to ai_roles.context_notes (migration 101).
+	Context string
+	// CustomFields are owner-defined extra role attributes (title + why +
+	// optional context). Maps to ai_roles.custom_fields jsonb (migration 102).
+	CustomFields []contracts.AIRoleCustomField
 }
 
 // Repository stores state — in memory when no DB is configured, in Postgres otherwise.
@@ -219,6 +247,11 @@ type Repository struct {
 	sendKeys            map[string]SendRecord
 	callbackKeys        map[string]struct{}
 	messages            map[string]MessageRecord
+	// chatMessageKeys indexes message keys per chat in insertion order so the
+	// in-memory RecentMessages path avoids an O(all messages) scan (ARCH-13).
+	chatMessageKeys map[string][]string
+	// profileSuggestions is the in-memory fallback for contact_profile_suggestions (MEM-4).
+	profileSuggestions []ProfileSuggestionRecord
 	audits              []contracts.AuditEvent
 	drafts              map[string]DraftRecord
 	draftsByMsg         map[string]string
@@ -231,12 +264,64 @@ type Repository struct {
 	connectionTenants   map[string]string
 	chats               map[string]ChatRecord
 	unclaimedChats      map[string]UnclaimedChatRecord
+	// userBots and tenantModes back bot-transport ingestion in memory mode
+	// (user_bots table / tenants.ingestion_mode column in Postgres mode).
+	userBots    map[string]UserBotRecord
+	tenantModes map[string]contracts.IngestionMode
 	// New memory architecture fields
 	semanticFacts    []SemanticFactRecord
 	activeEpisodes   map[string]ActiveEpisodeRecord
 	episodeSummaries []EpisodeSummaryRecord
 	userSettings     map[string]contracts.UserSettings // keyed by tenantID
+	// AI roles (in-memory mode): role records by ID plus per-chat assignment.
+	aiRoles       map[int64]AIRoleRecord
+	aiRoleSeq     int64
+	chatAIRoleIDs map[string]int64 // chatKey -> ai_roles.id
+	// ctxScoreCache memoises ContextScoreForChat with a short TTL (ARCH-8):
+	// the score gates mode selection and was recomputed (3 queries) per check.
+	// Writes that affect the score delete the entry so reads stay fresh.
+	ctxScoreCache sync.Map // chatKey -> ctxScoreEntry
+	// logger reports memory-layer write failures (MEM-10). Defaults to
+	// slog.Default(); override via SetLogger.
+	logger *slog.Logger
+	// halfvecOK is true when pgvector ≥ 0.7 provides the halfvec type, so
+	// vector queries can target the HNSW expression indexes (MEM-7).
+	halfvecOK bool
 }
+
+// SetLogger overrides the repository logger (MEM-10 write-path observability).
+func (r *Repository) SetLogger(logger *slog.Logger) {
+	if logger != nil {
+		r.logger = logger
+	}
+}
+
+// logWriteError records a failed memory-layer write. Memory writes are
+// fire-and-forget by design, but the two silent-failure bugs found in the
+// 2026-06-11 audit (lost summaries, never-saved embeddings) lived undetected
+// precisely because these errors were discarded (MEM-10).
+func (r *Repository) logWriteError(op, tenantID, chatID string, err error) {
+	if err == nil {
+		return
+	}
+	logger := r.logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	// TODO(observability): also increment memory_write_errors_total{op} once a
+	// counters mechanism exists in the observability package.
+	logger.Warn("memory write failed", "op", op, "tenant_id", tenantID, "chat_id", chatID, "error", err)
+}
+
+// ctxScoreEntry is one cached context-score value with its computation time.
+type ctxScoreEntry struct {
+	score int
+	at    time.Time
+}
+
+// ctxScoreTTL bounds context-score staleness for reads not covered by
+// write-path invalidation (e.g. fact decay).
+const ctxScoreTTL = 30 * time.Second
 
 // NewRepository creates an empty repository.
 func NewRepository() *Repository {
@@ -246,6 +331,7 @@ func NewRepository() *Repository {
 		sendKeys:            make(map[string]SendRecord),
 		callbackKeys:        make(map[string]struct{}),
 		messages:            make(map[string]MessageRecord),
+		chatMessageKeys:     make(map[string][]string),
 		drafts:              make(map[string]DraftRecord),
 		draftsByMsg:         make(map[string]string),
 		businessConnections: make(map[string]BusinessConnectionRecord),
@@ -253,11 +339,15 @@ func NewRepository() *Repository {
 		connectionTenants:   make(map[string]string),
 		chats:               make(map[string]ChatRecord),
 		unclaimedChats:      make(map[string]UnclaimedChatRecord),
+		userBots:            make(map[string]UserBotRecord),
+		tenantModes:         make(map[string]contracts.IngestionMode),
 		pendingInputs:       make(map[string]contracts.PendingInput),
 		contactProfiles:     make(map[string]contracts.ContactProfile),
 		messageCounts:       make(map[string]int),
 		activeEpisodes:      make(map[string]ActiveEpisodeRecord),
 		userSettings:        make(map[string]contracts.UserSettings),
+		aiRoles:             make(map[int64]AIRoleRecord),
+		chatAIRoleIDs:       make(map[string]int64),
 	}
 }
 
@@ -282,7 +372,23 @@ func NewPostgresRepository(databaseURL string, migrationPaths ...string) (*Repos
 		_ = db.Close()
 		return nil, err
 	}
+	// halfvec (pgvector ≥ 0.7) enables the HNSW expression indexes from
+	// migration 015; queries emit halfvec casts only when the type exists.
+	_ = db.QueryRow(
+		`SELECT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'halfvec')`,
+	).Scan(&repository.halfvecOK)
 	return repository, nil
+}
+
+// vectorOrderExpr returns the cosine-distance ORDER BY expression for the
+// given embedding column and query-vector placeholder. With halfvec available
+// the expression matches the migration-015 HNSW indexes so the planner uses
+// ANN; otherwise it stays on the plain vector operator (seq scan, MEM-7).
+func (r *Repository) vectorOrderExpr(column, placeholder string) string {
+	if r.halfvecOK {
+		return fmt.Sprintf("(%s::halfvec(4096) <=> %s::halfvec(4096))", column, placeholder)
+	}
+	return fmt.Sprintf("(%s <=> %s::vector)", column, placeholder)
 }
 
 // Close releases database resources held by the repository.
@@ -395,9 +501,15 @@ func (r *Repository) SaveMessage(event contracts.NormalizedTelegramEvent) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	key := messageKey(event.TenantID, event.ChatID, event.SourceMessageID)
-	record := r.messages[key]
+	record, existed := r.messages[key]
 	record.Event = event
 	r.messages[key] = record
+	if !existed {
+		// Per-chat insertion-order index so in-memory RecentMessages reads a
+		// bounded slice instead of scanning every stored message (ARCH-13).
+		ck := chatKey(event.TenantID, event.ChatID)
+		r.chatMessageKeys[ck] = append(r.chatMessageKeys[ck], key)
+	}
 	if r.db != nil {
 		_, _ = r.db.Exec(
 			`INSERT INTO messages (
@@ -1032,14 +1144,22 @@ func (r *Repository) SaveChat(record ChatRecord) {
 	if record.Status == "" {
 		record.Status = "managed"
 	}
+	if record.Transport == "" {
+		record.Transport = contracts.TransportBusiness
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	// Transport is fixed by the first message: keep the original channel
+	// when the chat row already exists (mirrors the SQL ON CONFLICT below).
+	if existing, ok := r.chats[chatKey(record.TenantID, record.ChatID)]; ok && existing.Transport != "" {
+		record.Transport = existing.Transport
+	}
 	r.chats[chatKey(record.TenantID, record.ChatID)] = record
 	if r.db != nil {
 		r.ensureTenant(record.TenantID, "")
 		_, _ = r.db.Exec(
-			`INSERT INTO chats (tenant_id, chat_id, telegram_chat_id, chat_type, display_name, status)
-			 VALUES ($1, $2, $3, $4, $5, $6)
+			`INSERT INTO chats (tenant_id, chat_id, telegram_chat_id, chat_type, display_name, status, transport)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7)
 			 ON CONFLICT (tenant_id, chat_id) DO UPDATE SET
 			   telegram_chat_id = EXCLUDED.telegram_chat_id,
 			   chat_type        = EXCLUDED.chat_type,
@@ -1053,6 +1173,7 @@ func (r *Repository) SaveChat(record ChatRecord) {
 			valueOrDefault(record.ChatType, "private"),
 			record.DisplayName,
 			record.Status,
+			record.Transport,
 		)
 	}
 }
@@ -1255,19 +1376,24 @@ func (r *Repository) RecentMessages(tenantID, chatID string, limit int) []Messag
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	messages := make([]MessageRecord, 0)
-	for _, record := range r.messages {
-		if record.Event.TenantID == tenantID && record.Event.ChatID == chatID && record.Event.EventID != "" {
+	// Per-chat index (ARCH-13): only this chat's messages are touched instead
+	// of scanning the whole message map on every call.
+	keys := r.chatMessageKeys[chatKey(tenantID, chatID)]
+	messages := make([]MessageRecord, 0, len(keys))
+	for _, key := range keys {
+		if record, ok := r.messages[key]; ok && record.Event.EventID != "" {
 			messages = append(messages, record)
 		}
 	}
+	// Insertion order is normally chronological; sort to keep the contract
+	// strict for out-of-order saves (synthetic outgoing messages, tests).
 	sort.Slice(messages, func(i, j int) bool {
 		return messages[i].Event.CreatedAt.Before(messages[j].Event.CreatedAt)
 	})
 	if len(messages) > limit {
 		messages = messages[len(messages)-limit:]
 	}
-	return append([]MessageRecord(nil), messages...)
+	return messages
 }
 
 // unclaimedChatsForOwnerLocked returns pending unclaimed chats visible to tenantID.
@@ -1421,7 +1547,8 @@ func (r *Repository) dbChatsForTenant(tenantID string) []ChatRecord {
 		           ORDER BY m.received_at DESC
 		           LIMIT 1
 		        ), '') AS last_source_message_id,
-		        c.updated_at
+		        c.updated_at,
+		        COALESCE(c.transport, 'business')
 		   FROM chats c
 		  WHERE c.tenant_id = $1 AND c.status = 'managed'`,
 		tenantID,
@@ -1461,7 +1588,8 @@ func (r *Repository) dbChatByID(tenantID, chatID string) (ChatRecord, bool) {
 		           ORDER BY m.received_at DESC
 		           LIMIT 1
 		        ), '') AS last_source_message_id,
-		        c.updated_at
+		        c.updated_at,
+		        COALESCE(c.transport, 'business')
 		   FROM chats c
 		  WHERE c.tenant_id = $1 AND c.chat_id = $2 AND c.status = 'managed'`,
 		tenantID,
@@ -1490,6 +1618,7 @@ func scanChats(rows *sql.Rows) []ChatRecord {
 			&chat.BusinessConnectionID,
 			&chat.LastSourceMessageID,
 			&chat.LastSeenAt,
+			&chat.Transport,
 		) == nil {
 			chats = append(chats, chat)
 		}
@@ -1528,6 +1657,7 @@ func (r *Repository) ClearPendingInput(tenantID, chatID string) {
 
 // SaveDraftFeedback stores owner feedback on a generated draft.
 func (r *Repository) SaveDraftFeedback(feedback contracts.DraftFeedback) {
+	r.invalidateContextScore(feedback.TenantID, feedback.ChatID)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.draftFeedbacks = append(r.draftFeedbacks, feedback)
@@ -1592,6 +1722,7 @@ func (r *Repository) RecentFeedback(tenantID, chatID string, limit int) []contra
 // (DisplayNames, StyleNotes, ChatContext, Tone, EmojiUsage, AddressForm, …) to
 // the contact_profiles table.
 func (r *Repository) SaveContactProfile(profile contracts.ContactProfile) {
+	r.invalidateContextScore(profile.TenantID, profile.ChatID)
 	// Synchronise Name ↔ DisplayNames[0] so both representations stay consistent.
 	if profile.Name != "" && len(profile.DisplayNames) == 0 {
 		profile.DisplayNames = []string{profile.Name}
@@ -1802,12 +1933,26 @@ func (r *Repository) OwnerTenantForBusinessConnection(businessConnectionID strin
 }
 
 // ContextScoreForChat computes the 0–100 richness score for a chat.
-// It now uses SemanticFacts instead of the deprecated MemoryFacts.
+// Results are cached per chat with a short TTL (ARCH-8); writes that change
+// the inputs (profile, facts, feedback) invalidate the entry immediately.
 func (r *Repository) ContextScoreForChat(tenantID, chatID string) int {
+	key := tenantID + "/" + chatID
+	if v, ok := r.ctxScoreCache.Load(key); ok {
+		if e, ok := v.(ctxScoreEntry); ok && time.Since(e.at) < ctxScoreTTL {
+			return e.score
+		}
+	}
 	profile, _ := r.ContactProfile(tenantID, chatID)
 	facts := r.SemanticFacts(tenantID, chatID, 20)
 	feedback := r.RecentFeedback(tenantID, chatID, 10)
-	return contracts.ContextScore(profile, facts, feedback)
+	score := contracts.ContextScore(profile, facts, feedback)
+	r.ctxScoreCache.Store(key, ctxScoreEntry{score: score, at: time.Now()})
+	return score
+}
+
+// invalidateContextScore drops the cached score after a write that affects it.
+func (r *Repository) invalidateContextScore(tenantID, chatID string) {
+	r.ctxScoreCache.Delete(tenantID + "/" + chatID)
 }
 
 // MessagesByDateRange returns all messages for a chat in the half-open interval [from, to).
@@ -1897,49 +2042,56 @@ func (r *Repository) AvailableModesForChat(tenantID, chatID string) []contracts.
 // Semantic Layer (semantic_facts table)
 // ============================================================
 
-// SaveSemanticFact inserts a typed semantic fact.
-// On exact-duplicate (same normalised hash), the fact is silently ignored.
-// Returns the fact ID (may be 0 in memory-only mode).
-func (r *Repository) SaveSemanticFact(fact SemanticFactRecord) int64 {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.semanticFacts = append(r.semanticFacts, fact)
-	if r.db == nil {
-		return 0
-	}
-	var id int64
-	err := r.db.QueryRow(
-		`INSERT INTO semantic_facts (
-		   tenant_id, scope_kind, chat_id, fact_text, normalized_fact_hash,
-		   fact_type, subject, confidence, source, source_message_id, expires_at
-		 ) VALUES (
-		   $1, $2, NULLIF($3,''), $4,
-		   normalize_fact_text($4),
-		   $5, $6, $7, $8, NULLIF($9,''), $10
-		 )
-		 ON CONFLICT (tenant_id, scope_kind, COALESCE(chat_id,''), fact_type, subject, normalized_fact_hash)
-		   WHERE deleted_at IS NULL AND superseded_by_id IS NULL
-		 DO NOTHING
-		 RETURNING id`,
-		fact.TenantID, fact.ScopeKind, fact.ChatID, fact.FactText,
-		fact.FactType, fact.Subject, fact.Confidence, fact.Source,
-		fact.SourceMessageID, nullableTime(fact.ExpiresAt),
-	).Scan(&id)
-	if err != nil {
-		return 0
-	}
-	return id
+// normalizeFactKey approximates the DB normalize_fact_text hash for the
+// in-memory fallback: lowercase, collapsed whitespace.
+func normalizeFactKey(text string) string {
+	return strings.Join(strings.Fields(strings.ToLower(text)), " ")
 }
 
-// UpsertSemanticFact deduplicates using the upsert_semantic_fact stored proc when a DB
-// is configured.  The proc applies three-tier dedup logic (exact hash → high cosine → supersede)
-// with a pg_advisory_xact_lock to prevent races.  In-memory mode falls back to SaveSemanticFact
-// with linear dedup on normalized text.
-func (r *Repository) UpsertSemanticFact(fact SemanticFactRecord) SemanticFactUpsertResult {
+// SaveSemanticFact stores a fact in the in-memory fallback only. Every DB
+// write goes through the upsert_semantic_fact stored procedure (MEM-11): a
+// direct INSERT path here would bypass dedup and the advisory lock.
+// Returns the synthetic in-memory ID, or 0 when an exact duplicate exists.
+func (r *Repository) SaveSemanticFact(fact SemanticFactRecord) int64 {
 	if r.db != nil {
-		var id int64
+		return r.UpsertSemanticFact(fact, nil).FactID
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	key := normalizeFactKey(fact.FactText)
+	for _, existing := range r.semanticFacts {
+		if existing.TenantID == fact.TenantID && existing.ChatID == fact.ChatID &&
+			existing.FactType == fact.FactType && existing.Subject == fact.Subject &&
+			normalizeFactKey(existing.FactText) == key {
+			return 0
+		}
+	}
+	r.aiRoleSeq++ // reuse the in-memory sequence; IDs only need to be unique per process
+	fact.ID = r.aiRoleSeq
+	r.semanticFacts = append(r.semanticFacts, fact)
+	return fact.ID
+}
+
+// UpsertSemanticFact deduplicates a fact via the upsert_semantic_fact v3 stored
+// procedure when a DB is configured (MEM-1): exact-hash tier always runs; the
+// semantic tiers run only when the candidate embedding is provided. The proc
+// returns (action, fact_id, superseded_fact_id) so no follow-up query is needed.
+// In-memory mode falls back to hash-style dedup on normalised text.
+//
+// The in-memory semanticFacts slice is NOT appended on the DB path (ARCH-13):
+// it exists solely as the no-DB fallback and previously grew unboundedly for
+// the lifetime of the process.
+func (r *Repository) UpsertSemanticFact(fact SemanticFactRecord, embedding []float64) SemanticFactUpsertResult {
+	if r.db != nil {
+		var embeddingArg any
+		if len(embedding) > 0 {
+			embeddingArg = float64SliceToVector(embedding)
+		}
+		var result SemanticFactUpsertResult
+		var superseded *int64
 		err := r.db.QueryRow(
-			`SELECT upsert_semantic_fact($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+			`SELECT action, fact_id, superseded_fact_id
+			   FROM upsert_semantic_fact($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
 			fact.TenantID,
 			fact.ScopeKind,
 			nullableString(fact.ChatID),
@@ -1950,43 +2102,313 @@ func (r *Repository) UpsertSemanticFact(fact SemanticFactRecord) SemanticFactUps
 			fact.Source,
 			fact.SourceMessageID,
 			nullableTime(fact.ExpiresAt),
-		).Scan(&id)
+			embeddingArg,
+			"qwen/qwen3-embedding-8b",
+		).Scan(&result.Action, &result.FactID, &superseded)
 		if err != nil {
-			// Proc failed (e.g. constraint violation for blocked health facts) — do not persist.
+			r.logWriteError("upsert_semantic_fact", fact.TenantID, fact.ChatID, err)
 			return SemanticFactUpsertResult{Action: "rejected"}
 		}
-		r.mu.Lock()
-		r.semanticFacts = append(r.semanticFacts, fact)
-		r.mu.Unlock()
-		if id == 0 {
-			return SemanticFactUpsertResult{Action: "occurrence_added"}
+		if superseded != nil {
+			result.SupersededFactID = *superseded
 		}
-		return SemanticFactUpsertResult{FactID: id, Action: "inserted"}
+		r.invalidateContextScore(fact.TenantID, fact.ChatID)
+		return result
 	}
 	id := r.SaveSemanticFact(fact)
+	r.invalidateContextScore(fact.TenantID, fact.ChatID)
 	if id == 0 {
 		return SemanticFactUpsertResult{Action: "occurrence_added"}
 	}
 	return SemanticFactUpsertResult{FactID: id, Action: "inserted"}
 }
 
-// SavePendingHealthFact queues a health fact for owner confirmation before it is promoted
-// to semantic_facts.  When a DB is configured it writes to pending_global_health_facts.
-// The in-memory store does not track pending health facts (they are ephemeral between restarts
-// and require the confirmation UI which is DB-backed).
-func (r *Repository) SavePendingHealthFact(fact PendingHealthFactRecord) {
-	if fact.Status == "" {
-		fact.Status = "pending"
+// SaveAIRole creates or updates (by tenant+name) an owner-authored AI role and
+// returns the stored record with its ID populated.
+func (r *Repository) SaveAIRole(role AIRoleRecord) AIRoleRecord {
+	if r.db != nil {
+		err := r.db.QueryRow(
+			`INSERT INTO ai_roles (tenant_id, name, description, speaking_style, goals, constraints_text, context_notes, custom_fields)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			 ON CONFLICT (tenant_id, name) DO UPDATE SET
+			   description      = EXCLUDED.description,
+			   speaking_style   = EXCLUDED.speaking_style,
+			   goals            = EXCLUDED.goals,
+			   constraints_text = EXCLUDED.constraints_text,
+			   context_notes    = EXCLUDED.context_notes,
+			   custom_fields    = EXCLUDED.custom_fields,
+			   updated_at       = now()
+			 RETURNING id`,
+			role.TenantID, role.Name, role.Description, role.SpeakingStyle, role.Goals, role.Constraints, role.Context,
+			encodeRoleCustomFields(role.CustomFields),
+		).Scan(&role.ID)
+		if err != nil {
+			return AIRoleRecord{}
+		}
+		return role
 	}
-	if r.db == nil {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for id, existing := range r.aiRoles {
+		if existing.TenantID == role.TenantID && strings.EqualFold(existing.Name, role.Name) {
+			role.ID = id
+			r.aiRoles[id] = role
+			return role
+		}
+	}
+	r.aiRoleSeq++
+	role.ID = r.aiRoleSeq
+	r.aiRoles[role.ID] = role
+	return role
+}
+
+// aiRoleColumns is the shared SELECT projection for ai_roles, kept in one place
+// so every read returns the same fields (including the migration-102 jsonb).
+const aiRoleColumns = `id, tenant_id, name, description, speaking_style, goals, constraints_text, COALESCE(context_notes,''), COALESCE(custom_fields,'[]'::jsonb)`
+
+// rowScanner is satisfied by both *sql.Row and *sql.Rows.
+type rowScanner interface{ Scan(dest ...any) error }
+
+// scanAIRole reads one ai_roles row in aiRoleColumns order, decoding the
+// custom_fields jsonb into the typed slice.
+func scanAIRole(s rowScanner) (AIRoleRecord, error) {
+	var role AIRoleRecord
+	var customFields []byte
+	if err := s.Scan(&role.ID, &role.TenantID, &role.Name, &role.Description,
+		&role.SpeakingStyle, &role.Goals, &role.Constraints, &role.Context, &customFields); err != nil {
+		return AIRoleRecord{}, err
+	}
+	role.CustomFields = decodeRoleCustomFields(customFields)
+	return role, nil
+}
+
+// decodeRoleCustomFields unmarshals the custom_fields jsonb; a malformed or
+// empty value yields nil so callers always get a usable (possibly empty) slice.
+func decodeRoleCustomFields(raw []byte) []contracts.AIRoleCustomField {
+	if len(raw) == 0 {
+		return nil
+	}
+	var out []contracts.AIRoleCustomField
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil
+	}
+	return out
+}
+
+// encodeRoleCustomFields marshals custom fields for storage; nil/empty becomes
+// the jsonb empty array so the NOT NULL column always has a valid value.
+func encodeRoleCustomFields(fields []contracts.AIRoleCustomField) []byte {
+	if len(fields) == 0 {
+		return []byte("[]")
+	}
+	b, err := json.Marshal(fields)
+	if err != nil {
+		return []byte("[]")
+	}
+	return b
+}
+
+// AIRoles returns all roles defined by the tenant, ordered by name.
+func (r *Repository) AIRoles(tenantID string) []AIRoleRecord {
+	if r.db != nil {
+		rows, err := r.db.Query(
+			`SELECT `+aiRoleColumns+`
+			   FROM ai_roles WHERE tenant_id = $1 ORDER BY name`,
+			tenantID,
+		)
+		if err != nil {
+			return nil
+		}
+		defer rows.Close()
+		return scanAIRoles(rows)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	result := make([]AIRoleRecord, 0, len(r.aiRoles))
+	for _, role := range r.aiRoles {
+		if role.TenantID == tenantID {
+			result = append(result, role)
+		}
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
+	return result
+}
+
+// AIRoleByName returns the tenant's role with the given name (case-insensitive).
+func (r *Repository) AIRoleByName(tenantID, name string) (AIRoleRecord, bool) {
+	if r.db != nil {
+		role, err := scanAIRole(r.db.QueryRow(
+			`SELECT `+aiRoleColumns+`
+			   FROM ai_roles WHERE tenant_id = $1 AND lower(name) = lower($2)`,
+			tenantID, name,
+		))
+		if err != nil {
+			return AIRoleRecord{}, false
+		}
+		return role, true
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, role := range r.aiRoles {
+		if role.TenantID == tenantID && strings.EqualFold(role.Name, name) {
+			return role, true
+		}
+	}
+	return AIRoleRecord{}, false
+}
+
+// AssignAIRoleToChat binds a role to a chat; roleID 0 clears the assignment.
+// The chat_settings row is created with defaults when it does not exist yet so
+// the assignment survives for chats the owner has not configured otherwise.
+func (r *Repository) AssignAIRoleToChat(tenantID, chatID string, roleID int64) {
+	if r.db != nil {
+		_, _ = r.db.Exec(
+			`INSERT INTO chat_settings (tenant_id, chat_id, mode, ai_role_id)
+			 VALUES ($1, $2, 'manual'::chat_mode, NULLIF($3, 0))
+			 ON CONFLICT (tenant_id, chat_id) DO UPDATE SET
+			   ai_role_id = NULLIF($3, 0),
+			   updated_at = now()`,
+			tenantID, chatID, roleID,
+		)
 		return
 	}
-	_, _ = r.db.Exec(
-		`INSERT INTO pending_global_health_facts
-		   (tenant_id, chat_id, source_message_id, fact_text, confidence, status)
-		 VALUES ($1, $2, $3, $4, $5, 'pending')`,
-		fact.TenantID, fact.ChatID, fact.SourceMessageID, fact.FactText, fact.Confidence,
-	)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if roleID == 0 {
+		delete(r.chatAIRoleIDs, chatKey(tenantID, chatID))
+		return
+	}
+	r.chatAIRoleIDs[chatKey(tenantID, chatID)] = roleID
+}
+
+// AIRoleForChat resolves the role assigned to a chat, if any.
+func (r *Repository) AIRoleForChat(tenantID, chatID string) (AIRoleRecord, bool) {
+	if r.db != nil {
+		role, err := scanAIRole(r.db.QueryRow(
+			`SELECT ar.id, ar.tenant_id, ar.name, ar.description, ar.speaking_style, ar.goals, ar.constraints_text, COALESCE(ar.context_notes,''), COALESCE(ar.custom_fields,'[]'::jsonb)
+			   FROM chat_settings cs
+			   JOIN ai_roles ar ON ar.id = cs.ai_role_id
+			  WHERE cs.tenant_id = $1 AND cs.chat_id = $2`,
+			tenantID, chatID,
+		))
+		if err != nil {
+			return AIRoleRecord{}, false
+		}
+		return role, true
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	roleID, ok := r.chatAIRoleIDs[chatKey(tenantID, chatID)]
+	if !ok {
+		return AIRoleRecord{}, false
+	}
+	role, ok := r.aiRoles[roleID]
+	return role, ok
+}
+
+func scanAIRoles(rows *sql.Rows) []AIRoleRecord {
+	result := make([]AIRoleRecord, 0)
+	for rows.Next() {
+		if role, err := scanAIRole(rows); err == nil {
+			result = append(result, role)
+		}
+	}
+	return result
+}
+
+// AIRoleByID returns the tenant's role with the given ID.
+func (r *Repository) AIRoleByID(tenantID string, roleID int64) (AIRoleRecord, bool) {
+	if r.db != nil {
+		role, err := scanAIRole(r.db.QueryRow(
+			`SELECT `+aiRoleColumns+`
+			   FROM ai_roles WHERE tenant_id = $1 AND id = $2`,
+			tenantID, roleID,
+		))
+		if err != nil {
+			return AIRoleRecord{}, false
+		}
+		return role, true
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	role, ok := r.aiRoles[roleID]
+	if !ok || role.TenantID != tenantID {
+		return AIRoleRecord{}, false
+	}
+	return role, true
+}
+
+// UpdateAIRole rewrites an existing role addressed by ID. Unlike SaveAIRole
+// (which upserts by tenant+name and would create a second role on rename),
+// this is the rename-safe path. Returns false when the role does not exist.
+func (r *Repository) UpdateAIRole(role AIRoleRecord) bool {
+	if r.db != nil {
+		res, err := r.db.Exec(
+			`UPDATE ai_roles
+			    SET name = $3, description = $4, speaking_style = $5,
+			        goals = $6, constraints_text = $7, context_notes = $8,
+			        custom_fields = $9, updated_at = now()
+			  WHERE tenant_id = $1 AND id = $2`,
+			role.TenantID, role.ID, role.Name, role.Description,
+			role.SpeakingStyle, role.Goals, role.Constraints, role.Context,
+			encodeRoleCustomFields(role.CustomFields),
+		)
+		if err != nil {
+			r.logWriteError("update_ai_role", role.TenantID, "", err)
+			return false
+		}
+		n, _ := res.RowsAffected()
+		return n > 0
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	existing, ok := r.aiRoles[role.ID]
+	if !ok || existing.TenantID != role.TenantID {
+		return false
+	}
+	r.aiRoles[role.ID] = role
+	return true
+}
+
+// DeleteAIRole removes a role and clears its assignment from every chat in the
+// same transaction, so no chat_settings row is left pointing at a missing role.
+// Deleting an absent role is a no-op (idempotent).
+func (r *Repository) DeleteAIRole(tenantID string, roleID int64) error {
+	r.mu.Lock()
+	if role, ok := r.aiRoles[roleID]; ok && role.TenantID == tenantID {
+		delete(r.aiRoles, roleID)
+		for key, id := range r.chatAIRoleIDs {
+			if id == roleID {
+				delete(r.chatAIRoleIDs, key)
+			}
+		}
+	}
+	r.mu.Unlock()
+	if r.db == nil {
+		return nil
+	}
+	tx, err := r.db.Begin()
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(
+		`UPDATE chat_settings SET ai_role_id = NULL, updated_at = now()
+		  WHERE tenant_id = $1 AND ai_role_id = $2`,
+		tenantID, roleID,
+	); err != nil {
+		_ = tx.Rollback()
+		r.logWriteError("delete_ai_role_unassign", tenantID, "", err)
+		return err
+	}
+	if _, err := tx.Exec(
+		`DELETE FROM ai_roles WHERE tenant_id = $1 AND id = $2`,
+		tenantID, roleID,
+	); err != nil {
+		_ = tx.Rollback()
+		r.logWriteError("delete_ai_role", tenantID, "", err)
+		return err
+	}
+	return tx.Commit()
 }
 
 // SemanticFacts returns active (non-deleted, non-superseded) chat-scoped semantic facts.
@@ -2014,37 +2436,6 @@ func (r *Repository) SemanticFacts(tenantID, chatID string, limit int) []Semanti
 	for i := len(r.semanticFacts) - 1; i >= 0 && len(result) < limit; i-- {
 		f := r.semanticFacts[i]
 		if f.TenantID == tenantID && f.ChatID == chatID && f.ScopeKind == "chat" {
-			result = append(result, f)
-		}
-	}
-	return result
-}
-
-// GlobalSemanticFacts returns active owner-global semantic facts visible across all chats.
-func (r *Repository) GlobalSemanticFacts(tenantID string, limit int) []SemanticFactRecord {
-	if r.db != nil {
-		rows, err := r.db.Query(
-			`SELECT id, tenant_id, scope_kind, COALESCE(chat_id,''), fact_text, fact_type,
-			        subject, confidence, source, COALESCE(source_message_id,''), expires_at, created_at
-			   FROM semantic_facts
-			  WHERE tenant_id = $1
-			    AND scope_kind = 'owner_global'
-			    AND deleted_at IS NULL AND superseded_by_id IS NULL
-			  ORDER BY created_at DESC
-			  LIMIT $2`,
-			tenantID, limit,
-		)
-		if err == nil {
-			defer rows.Close()
-			return scanSemanticFacts(rows)
-		}
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	result := make([]SemanticFactRecord, 0)
-	for i := len(r.semanticFacts) - 1; i >= 0 && len(result) < limit; i-- {
-		f := r.semanticFacts[i]
-		if f.TenantID == tenantID && f.ScopeKind == "owner_global" {
 			result = append(result, f)
 		}
 	}
@@ -2085,7 +2476,7 @@ func (r *Repository) UpsertActiveEpisode(episode ActiveEpisodeRecord) {
 	if r.db == nil {
 		return
 	}
-	_, _ = r.db.Exec(
+	_, err := r.db.Exec(
 		`INSERT INTO active_episodes (
 		   tenant_id, chat_id, started_at, last_message_at, message_count,
 		   current_topic, open_question_message_id, pending_owner_action, updated_at
@@ -2103,6 +2494,69 @@ func (r *Repository) UpsertActiveEpisode(episode ActiveEpisodeRecord) {
 		nullableString(episode.OpenQuestionMsgID),
 		nullableString(episode.PendingOwnerAction),
 	)
+	r.logWriteError("upsert_active_episode", episode.TenantID, episode.ChatID, err)
+}
+
+// UpdateEpisodeRuntime sets runtime-state fields on the active episode without
+// touching message_count (MEM-5): UpsertActiveEpisode increments the counter on
+// conflict, so using it for post-AI runtime writes would inflate the count.
+// Empty arguments leave the corresponding field unchanged.
+func (r *Repository) UpdateEpisodeRuntime(tenantID, chatID, topic, openQuestionMsgID, pendingOwnerAction string) {
+	r.mu.Lock()
+	key := chatKey(tenantID, chatID)
+	if ep, ok := r.activeEpisodes[key]; ok {
+		if topic != "" {
+			ep.CurrentTopic = topic
+		}
+		if openQuestionMsgID != "" {
+			ep.OpenQuestionMsgID = openQuestionMsgID
+		}
+		if pendingOwnerAction != "" {
+			ep.PendingOwnerAction = pendingOwnerAction
+		}
+		r.activeEpisodes[key] = ep
+	}
+	r.mu.Unlock()
+	if r.db == nil {
+		return
+	}
+	_, err := r.db.Exec(
+		`UPDATE active_episodes
+		    SET current_topic            = COALESCE(NULLIF($3,''), current_topic),
+		        open_question_message_id = COALESCE(NULLIF($4,''), open_question_message_id),
+		        pending_owner_action     = COALESCE(NULLIF($5,''), pending_owner_action),
+		        updated_at               = now()
+		  WHERE tenant_id = $1 AND chat_id = $2`,
+		tenantID, chatID, topic, openQuestionMsgID, pendingOwnerAction,
+	)
+	r.logWriteError("update_episode_runtime", tenantID, chatID, err)
+}
+
+// ClearEpisodeRuntimeState nulls open_question_message_id and
+// pending_owner_action on the active episode (MEM-5). A separate method is
+// required because UpsertActiveEpisode COALESCEs those columns and therefore
+// cannot reset them.
+func (r *Repository) ClearEpisodeRuntimeState(tenantID, chatID string) {
+	r.mu.Lock()
+	key := chatKey(tenantID, chatID)
+	if ep, ok := r.activeEpisodes[key]; ok {
+		ep.OpenQuestionMsgID = ""
+		ep.PendingOwnerAction = ""
+		r.activeEpisodes[key] = ep
+	}
+	r.mu.Unlock()
+	if r.db == nil {
+		return
+	}
+	_, err := r.db.Exec(
+		`UPDATE active_episodes
+		    SET open_question_message_id = NULL,
+		        pending_owner_action = NULL,
+		        updated_at = now()
+		  WHERE tenant_id = $1 AND chat_id = $2`,
+		tenantID, chatID,
+	)
+	r.logWriteError("clear_episode_runtime_state", tenantID, chatID, err)
 }
 
 // ActiveEpisodeByChat returns the current open episode for a chat, if one exists.
@@ -2145,15 +2599,17 @@ func (r *Repository) CloseActiveEpisode(tenantID, chatID string) {
 	if r.db == nil {
 		return
 	}
-	_, _ = r.db.Exec(
+	_, err := r.db.Exec(
 		`DELETE FROM active_episodes WHERE tenant_id = $1 AND chat_id = $2`,
 		tenantID, chatID,
 	)
+	r.logWriteError("close_active_episode", tenantID, chatID, err)
 }
 
 // LogExtraction records one async fact-extraction attempt to the extraction_log table.
-// Best-effort: failures are swallowed because logging must never break the extraction
-// path. No-op when running without a DB (unit tests use the in-memory repository).
+// Best-effort: a failure must never break the extraction path, but it is logged
+// (MEM-10) so a broken diagnostics table is itself observable.
+// No-op when running without a DB (unit tests use the in-memory repository).
 func (r *Repository) LogExtraction(rec ExtractionLogRecord) {
 	if r.db == nil {
 		return
@@ -2162,7 +2618,7 @@ func (r *Repository) LogExtraction(rec ExtractionLogRecord) {
 	if len(rawOutput) > 4000 {
 		rawOutput = rawOutput[:4000]
 	}
-	_, _ = r.db.Exec(
+	_, err := r.db.Exec(
 		`INSERT INTO extraction_log (
 		   tenant_id, chat_id, input_message_ids, model_used, raw_output,
 		   facts_created, facts_skipped, facts_merged, error, duration_ms
@@ -2177,6 +2633,7 @@ func (r *Repository) LogExtraction(rec ExtractionLogRecord) {
 		nullableString(rec.Error),
 		rec.DurationMS,
 	)
+	r.logWriteError("log_extraction", rec.TenantID, rec.ChatID, err)
 }
 
 // rawOutputJSON wraps arbitrary extractor text as a valid JSON value for the
@@ -2204,17 +2661,21 @@ func (r *Repository) SaveEpisodeSummary(summary EpisodeSummaryRecord) int64 {
 		return 0
 	}
 	var id int64
-	_ = r.db.QueryRow(
+	err := r.db.QueryRow(
 		`INSERT INTO episode_summaries (
 		   tenant_id, chat_id, period_start, period_end, content,
-		   message_count, closure_reason
-		 ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+		   message_count, closure_reason, source_message_ids
+		 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		 RETURNING id`,
 		summary.TenantID, summary.ChatID,
 		summary.PeriodStart, summary.PeriodEnd,
 		summary.Content, summary.MessageCount,
 		valueOrDefault(summary.ClosureReason, "manual"),
+		pq.Array(nilToEmpty(summary.SourceMessageIDs)),
 	).Scan(&id)
+	// id=0 already signals failure to callers; the log makes the cause visible
+	// (a CHECK-constraint violation here once silently dropped all summaries — MEM-10).
+	r.logWriteError("save_episode_summary", summary.TenantID, summary.ChatID, err)
 	return id
 }
 
@@ -2225,12 +2686,15 @@ func (r *Repository) SaveEpisodeSummaryEmbedding(id int64, tenantID string, embe
 		return
 	}
 	vec := float64SliceToVector(embedding)
-	_, _ = r.db.Exec(
+	_, err := r.db.Exec(
 		`UPDATE episode_summaries
 		    SET embedding = $1::vector, embedding_model = $2
 		  WHERE id = $3 AND tenant_id = $4`,
 		vec, model, id, tenantID,
 	)
+	// A silent failure here once made the worker re-embed the same rows forever
+	// (missing column, fixed in migration 012) — keep it observable (MEM-10).
+	r.logWriteError("save_episode_summary_embedding", tenantID, "", err)
 }
 
 // EpisodeSummariesWithoutEmbeddings returns up to limit episode summary rows that
@@ -2328,37 +2792,21 @@ func float64SliceToVector(v []float64) string {
 
 // hardIncludeFactsByScope returns taboo and health facts for a given scope unconditionally.
 // Design §8.2: taboo and health facts must always appear in context regardless of similarity.
-func (r *Repository) hardIncludeFactsByScope(tenantID, chatID, scopeKind string) []SemanticFactRecord {
+func (r *Repository) hardIncludeChatFacts(tenantID, chatID string) []SemanticFactRecord {
 	if r.db == nil {
 		return nil
 	}
-	var rows *sql.Rows
-	var err error
-	if scopeKind == "chat" {
-		rows, err = r.db.Query(
-			`SELECT id, tenant_id, scope_kind, COALESCE(chat_id,''), fact_text, fact_type,
-			        subject, confidence, source, COALESCE(source_message_id,''), expires_at, created_at
-			   FROM semantic_facts
-			  WHERE tenant_id = $1 AND chat_id = $2
-			    AND scope_kind = 'chat'
-			    AND fact_type IN ('taboo', 'health')
-			    AND deleted_at IS NULL AND superseded_by_id IS NULL
-			  ORDER BY created_at DESC`,
-			tenantID, chatID,
-		)
-	} else {
-		rows, err = r.db.Query(
-			`SELECT id, tenant_id, scope_kind, COALESCE(chat_id,''), fact_text, fact_type,
-			        subject, confidence, source, COALESCE(source_message_id,''), expires_at, created_at
-			   FROM semantic_facts
-			  WHERE tenant_id = $1
-			    AND scope_kind = 'owner_global'
-			    AND fact_type IN ('taboo', 'health')
-			    AND deleted_at IS NULL AND superseded_by_id IS NULL
-			  ORDER BY created_at DESC`,
-			tenantID,
-		)
-	}
+	rows, err := r.db.Query(
+		`SELECT id, tenant_id, scope_kind, COALESCE(chat_id,''), fact_text, fact_type,
+		        subject, confidence, source, COALESCE(source_message_id,''), expires_at, created_at
+		   FROM semantic_facts
+		  WHERE tenant_id = $1 AND chat_id = $2
+		    AND scope_kind = 'chat'
+		    AND fact_type IN ('taboo', 'health')
+		    AND deleted_at IS NULL AND superseded_by_id IS NULL
+		  ORDER BY created_at DESC`,
+		tenantID, chatID,
+	)
 	if err != nil {
 		return nil
 	}
@@ -2377,7 +2825,7 @@ func (r *Repository) SemanticFactsByVector(tenantID, chatID string, queryVector 
 	}
 
 	// Hard-include: taboo + health always in context (design §8.2).
-	hardFacts := r.hardIncludeFactsByScope(tenantID, chatID, "chat")
+	hardFacts := r.hardIncludeChatFacts(tenantID, chatID)
 
 	// Top-K by cosine similarity, excluding hard-include types (they are already in).
 	remaining := limit - len(hardFacts)
@@ -2385,66 +2833,41 @@ func (r *Repository) SemanticFactsByVector(tenantID, chatID string, queryVector 
 		remaining = 1
 	}
 	vec := float64SliceToVector(queryVector)
-	rows, err := r.db.Query(
-		`SELECT sf.id, sf.tenant_id, sf.scope_kind, COALESCE(sf.chat_id,''), sf.fact_text, sf.fact_type,
-		        sf.subject, sf.confidence, sf.source, COALESCE(sf.source_message_id,''), sf.expires_at, sf.created_at
-		   FROM semantic_facts sf
-		   JOIN fact_embeddings fe ON fe.fact_id = sf.id
-		  WHERE sf.tenant_id = $1 AND sf.chat_id = $2
-		    AND sf.scope_kind = 'chat'
-		    AND sf.fact_type NOT IN ('taboo', 'health')
-		    AND sf.deleted_at IS NULL AND sf.superseded_by_id IS NULL
-		  ORDER BY (fe.embedding <=> $3::vector) *
-		           CASE sf.fact_type
+	// Two-stage ranking (MEM-7): the inner ANN query orders purely by cosine
+	// distance — the only shape the HNSW expression index can serve — over an
+	// oversampled K×3 candidate set; the type-boost re-sort happens outside.
+	// A boost-multiplied ORDER BY on the index expression would force a seq scan.
+	rows, err := r.db.Query(fmt.Sprintf(
+		`SELECT id, tenant_id, scope_kind, chat_id, fact_text, fact_type,
+		        subject, confidence, source, source_message_id, expires_at, created_at
+		   FROM (
+		     SELECT sf.id, sf.tenant_id, sf.scope_kind, COALESCE(sf.chat_id,'') AS chat_id,
+		            sf.fact_text, sf.fact_type, sf.subject, sf.confidence, sf.source,
+		            COALESCE(sf.source_message_id,'') AS source_message_id, sf.expires_at, sf.created_at,
+		            %s AS dist
+		       FROM semantic_facts sf
+		       JOIN fact_embeddings fe ON fe.fact_id = sf.id
+		      WHERE sf.tenant_id = $1 AND sf.chat_id = $2
+		        AND sf.scope_kind = 'chat'
+		        AND sf.fact_type NOT IN ('taboo', 'health')
+		        AND sf.deleted_at IS NULL AND sf.superseded_by_id IS NULL
+		        AND fe.embedding IS NOT NULL
+		      ORDER BY %s ASC
+		      LIMIT $4 * 3
+		   ) candidates
+		  ORDER BY dist * CASE fact_type
 		             WHEN 'commitment' THEN 0.667
 		             WHEN 'preference' THEN 0.833
 		             ELSE 1.0 END ASC
 		  LIMIT $4`,
+		r.vectorOrderExpr("fe.embedding", "$3"),
+		r.vectorOrderExpr("fe.embedding", "$3"),
+	),
 		tenantID, chatID, vec, remaining,
 	)
 	if err != nil {
 		// pgvector unavailable — fall back to recency-ordered query.
 		return r.SemanticFacts(tenantID, chatID, limit)
-	}
-	defer rows.Close()
-	simFacts := scanSemanticFacts(rows)
-	return append(hardFacts, simFacts...)
-}
-
-// GlobalSemanticFactsByVector returns owner-global facts ranked by cosine similarity to
-// queryVector. Taboo and health global facts are always included (design §8.2).
-// Falls back to GlobalSemanticFacts when queryVector is empty or pgvector is unavailable.
-func (r *Repository) GlobalSemanticFactsByVector(tenantID string, queryVector []float64, limit int) []SemanticFactRecord {
-	if r.db == nil || len(queryVector) == 0 {
-		return r.GlobalSemanticFacts(tenantID, limit)
-	}
-
-	hardFacts := r.hardIncludeFactsByScope(tenantID, "", "owner_global")
-
-	remaining := limit - len(hardFacts)
-	if remaining < 1 {
-		remaining = 1
-	}
-	vec := float64SliceToVector(queryVector)
-	rows, err := r.db.Query(
-		`SELECT sf.id, sf.tenant_id, sf.scope_kind, COALESCE(sf.chat_id,''), sf.fact_text, sf.fact_type,
-		        sf.subject, sf.confidence, sf.source, COALESCE(sf.source_message_id,''), sf.expires_at, sf.created_at
-		   FROM semantic_facts sf
-		   JOIN fact_embeddings fe ON fe.fact_id = sf.id
-		  WHERE sf.tenant_id = $1
-		    AND sf.scope_kind = 'owner_global'
-		    AND sf.fact_type NOT IN ('taboo', 'health')
-		    AND sf.deleted_at IS NULL AND sf.superseded_by_id IS NULL
-		  ORDER BY (fe.embedding <=> $2::vector) *
-		           CASE sf.fact_type
-		             WHEN 'commitment' THEN 0.667
-		             WHEN 'preference' THEN 0.833
-		             ELSE 1.0 END ASC
-		  LIMIT $3`,
-		tenantID, vec, remaining,
-	)
-	if err != nil {
-		return r.GlobalSemanticFacts(tenantID, limit)
 	}
 	defer rows.Close()
 	simFacts := scanSemanticFacts(rows)
@@ -2472,30 +2895,6 @@ func (r *Repository) SemanticFactsByBM25(tenantID, chatID, query string, limit i
 	)
 	if err != nil {
 		return nil // column absent or query error — caller falls back to vector-only
-	}
-	defer rows.Close()
-	return scanSemanticFacts(rows)
-}
-
-// GlobalSemanticFactsByBM25 returns owner-global facts ranked by full-text relevance to query.
-func (r *Repository) GlobalSemanticFactsByBM25(tenantID, query string, limit int) []SemanticFactRecord {
-	if r.db == nil || strings.TrimSpace(query) == "" {
-		return nil
-	}
-	rows, err := r.db.Query(
-		`SELECT id, tenant_id, scope_kind, COALESCE(chat_id,''), fact_text, fact_type,
-		        subject, confidence, source, COALESCE(source_message_id,''), expires_at, created_at
-		   FROM semantic_facts
-		  WHERE tenant_id = $1
-		    AND scope_kind = 'owner_global'
-		    AND fact_tsv @@ plainto_tsquery('simple', $2)
-		    AND deleted_at IS NULL AND superseded_by_id IS NULL
-		  ORDER BY ts_rank_cd(fact_tsv, plainto_tsquery('simple', $2)) DESC
-		  LIMIT $3`,
-		tenantID, query, limit,
-	)
-	if err != nil {
-		return nil
 	}
 	defer rows.Close()
 	return scanSemanticFacts(rows)
@@ -2542,34 +2941,557 @@ func (r *Repository) SemanticFactsByIDs(tenantID string, ids []int64) []Semantic
 	return result
 }
 
+// RankFactsByCosine reorders the given fact IDs by cosine distance to queryVector
+// (closest first), truncated to limit. Facts without an embedding row are absent
+// from the result — callers backfill them from their pre-ranked order. Replaces
+// the listwise LLM reranker in the hot retrieval path (ARCH-5): the embeddings
+// already exist in fact_embeddings, so the final ordering is one cheap SQL query.
+func (r *Repository) RankFactsByCosine(tenantID string, ids []int64, queryVector []float64, limit int) []SemanticFactRecord {
+	if r.db == nil || len(ids) == 0 || len(queryVector) == 0 {
+		return nil
+	}
+	placeholders := make([]string, len(ids))
+	args := make([]any, 0, len(ids)+3)
+	args = append(args, tenantID, float64SliceToVector(queryVector))
+	for i, id := range ids {
+		placeholders[i] = fmt.Sprintf("$%d", i+3)
+		args = append(args, id)
+	}
+	args = append(args, limit)
+	query := fmt.Sprintf(
+		`SELECT sf.id, sf.tenant_id, sf.scope_kind, COALESCE(sf.chat_id,''), sf.fact_text, sf.fact_type,
+		        sf.subject, sf.confidence, sf.source, COALESCE(sf.source_message_id,''), sf.expires_at, sf.created_at
+		   FROM semantic_facts sf
+		   JOIN fact_embeddings fe ON fe.fact_id = sf.id
+		  WHERE sf.tenant_id = $1 AND sf.id IN (%s)
+		    AND sf.deleted_at IS NULL
+		  ORDER BY %s ASC
+		  LIMIT $%d`,
+		strings.Join(placeholders, ","), r.vectorOrderExpr("fe.embedding", "$2"), len(ids)+3,
+	)
+	rows, err := r.db.Query(query, args...)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	return scanSemanticFacts(rows)
+}
+
 // SaveFactRelation persists a directed temporal edge between two semantic_facts rows.
 // Idempotent: ON CONFLICT DO NOTHING so duplicate calls are safe.
 func (r *Repository) SaveFactRelation(rel FactRelationRecord) {
 	if r.db == nil {
 		return
 	}
-	_, _ = r.db.Exec(
+	_, err := r.db.Exec(
 		`INSERT INTO fact_relations (tenant_id, fact_id_from, fact_id_to, relation_type, confidence)
 		 VALUES ($1, $2, $3, $4, $5)
 		 ON CONFLICT (fact_id_from, fact_id_to, relation_type) DO NOTHING`,
 		rel.TenantID, rel.FactIDFrom, rel.FactIDTo, rel.RelationType, rel.Confidence,
 	)
+	r.logWriteError("save_fact_relation", rel.TenantID, "", err)
 }
 
-// FindSupersededFactID returns the ID of the fact that was superseded by newFactID, or 0
-// if no supersede happened. Used by the temporal graph write-path to create fact_relations.
-func (r *Repository) FindSupersededFactID(tenantID string, newFactID int64) int64 {
-	if r.db == nil {
+// ============================================================
+// Contact profile suggestions (§4.5, MEM-4)
+// ============================================================
+
+// ProfileSuggestionRecord maps to contact_profile_suggestions: an AI-proposed
+// profile field update awaiting owner review. The AI never writes the profile
+// directly — accepted suggestions are applied by ResolveSuggestion (§15).
+type ProfileSuggestionRecord struct {
+	ID             int64
+	TenantID       string
+	ChatID         string
+	FieldName      string
+	SuggestedValue string
+	Rationale      string
+	Status         string // pending | accepted | rejected | expired
+	CreatedAt      time.Time
+}
+
+// suggestionProfileFields whitelists the contact_profiles columns a suggestion
+// may target; ResolveSuggestion refuses anything else (defence against a
+// poisoned field_name reaching the SQL identifier position).
+var suggestionProfileFields = map[string]bool{
+	"relationship_type": true,
+	"preferred_address": true,
+	"language":          true,
+	"tone":              true,
+	"gender":            true,
+}
+
+// SaveProfileSuggestion stages a suggestion for owner review. Returns the new
+// row ID, or 0 when an identical pending suggestion for the field exists
+// (unique partial index from migration 016).
+func (r *Repository) SaveProfileSuggestion(rec ProfileSuggestionRecord) int64 {
+	if !suggestionProfileFields[rec.FieldName] {
 		return 0
 	}
-	var oldID int64
-	_ = r.db.QueryRow(
-		`SELECT id FROM semantic_facts
-		  WHERE tenant_id = $1 AND superseded_by_id = $2
-		  LIMIT 1`,
-		tenantID, newFactID,
-	).Scan(&oldID)
-	return oldID
+	if r.db == nil {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		for _, existing := range r.profileSuggestions {
+			if existing.TenantID == rec.TenantID && existing.ChatID == rec.ChatID &&
+				existing.FieldName == rec.FieldName && existing.Status == "pending" {
+				return 0
+			}
+		}
+		r.aiRoleSeq++
+		rec.ID = r.aiRoleSeq
+		rec.Status = "pending"
+		rec.CreatedAt = time.Now()
+		r.profileSuggestions = append(r.profileSuggestions, rec)
+		return rec.ID
+	}
+	var id int64
+	err := r.db.QueryRow(
+		`INSERT INTO contact_profile_suggestions (tenant_id, chat_id, field_name, suggested_value, rationale)
+		 VALUES ($1, $2, $3, to_jsonb($4::text), NULLIF($5,''))
+		 ON CONFLICT (tenant_id, chat_id, field_name) WHERE status = 'pending'
+		 DO NOTHING
+		 RETURNING id`,
+		rec.TenantID, rec.ChatID, rec.FieldName, rec.SuggestedValue, rec.Rationale,
+	).Scan(&id)
+	if err != nil {
+		if err != sql.ErrNoRows {
+			r.logWriteError("save_profile_suggestion", rec.TenantID, rec.ChatID, err)
+		}
+		return 0
+	}
+	return id
+}
+
+// PendingSuggestions returns pending suggestions for a chat, or for the whole
+// tenant when chatID is empty (the /suggestions command view).
+func (r *Repository) PendingSuggestions(tenantID, chatID string) []ProfileSuggestionRecord {
+	if r.db == nil {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		result := make([]ProfileSuggestionRecord, 0)
+		for _, s := range r.profileSuggestions {
+			if s.TenantID == tenantID && s.Status == "pending" && (chatID == "" || s.ChatID == chatID) {
+				result = append(result, s)
+			}
+		}
+		return result
+	}
+	rows, err := r.db.Query(
+		`SELECT id, tenant_id, chat_id, field_name, suggested_value #>> '{}', COALESCE(rationale,''), status, created_at
+		   FROM contact_profile_suggestions
+		  WHERE tenant_id = $1 AND status = 'pending' AND ($2 = '' OR chat_id = $2)
+		  ORDER BY created_at ASC`,
+		tenantID, chatID,
+	)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	result := make([]ProfileSuggestionRecord, 0)
+	for rows.Next() {
+		var s ProfileSuggestionRecord
+		if rows.Scan(&s.ID, &s.TenantID, &s.ChatID, &s.FieldName, &s.SuggestedValue, &s.Rationale, &s.Status, &s.CreatedAt) == nil {
+			result = append(result, s)
+		}
+	}
+	return result
+}
+
+// ResolveSuggestion marks a pending suggestion accepted or rejected. Accepting
+// applies the value to contact_profiles in the same transaction — the only
+// path by which AI-derived data reaches the profile (§4.5/§15).
+func (r *Repository) ResolveSuggestion(tenantID string, id int64, accept bool) error {
+	status := "rejected"
+	if accept {
+		status = "accepted"
+	}
+	if r.db == nil {
+		r.mu.Lock()
+		var resolved *ProfileSuggestionRecord
+		for i := range r.profileSuggestions {
+			s := &r.profileSuggestions[i]
+			if s.TenantID == tenantID && s.ID == id && s.Status == "pending" {
+				s.Status = status
+				resolved = s
+				break
+			}
+		}
+		r.mu.Unlock()
+		if resolved == nil {
+			return fmt.Errorf("pending suggestion %d not found", id)
+		}
+		if accept {
+			profile, _ := r.ContactProfile(tenantID, resolved.ChatID)
+			profile.TenantID, profile.ChatID = tenantID, resolved.ChatID
+			switch resolved.FieldName {
+			case "relationship_type":
+				profile.RelationshipType = resolved.SuggestedValue
+			case "preferred_address":
+				profile.PreferredAddress = resolved.SuggestedValue
+			case "language":
+				profile.Language = resolved.SuggestedValue
+			case "tone":
+				profile.Tone = resolved.SuggestedValue
+			case "gender":
+				profile.Gender = resolved.SuggestedValue
+			}
+			r.SaveContactProfile(profile)
+		}
+		return nil
+	}
+	tx, err := r.db.Begin()
+	if err != nil {
+		return err
+	}
+	var chatID, fieldName, value string
+	if err := tx.QueryRow(
+		`UPDATE contact_profile_suggestions
+		    SET status = $3, reviewed_at = now()
+		  WHERE tenant_id = $1 AND id = $2 AND status = 'pending'
+		  RETURNING chat_id, field_name, suggested_value #>> '{}'`,
+		tenantID, id, status,
+	).Scan(&chatID, &fieldName, &value); err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("pending suggestion %d not found: %w", id, err)
+	}
+	if accept {
+		if !suggestionProfileFields[fieldName] {
+			_ = tx.Rollback()
+			return fmt.Errorf("suggestion field %q is not allowed", fieldName)
+		}
+		// Ensure the profile row exists, then set the single whitelisted column.
+		if _, err := tx.Exec(
+			`INSERT INTO contact_profiles (tenant_id, chat_id)
+			 VALUES ($1, $2) ON CONFLICT (tenant_id, chat_id) DO NOTHING`,
+			tenantID, chatID,
+		); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+		// fieldName is whitelist-validated above — safe in identifier position.
+		if _, err := tx.Exec(
+			fmt.Sprintf(`UPDATE contact_profiles SET %s = $3, updated_at = now()
+			  WHERE tenant_id = $1 AND chat_id = $2`, fieldName),
+			tenantID, chatID, value,
+		); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if accept {
+		r.invalidateContextScore(tenantID, chatID)
+		// Refresh the in-memory profile mirror from the DB on next read.
+		r.mu.Lock()
+		delete(r.contactProfiles, chatKey(tenantID, chatID))
+		r.mu.Unlock()
+	}
+	return nil
+}
+
+// ExpireOldSuggestions marks pending suggestions older than maxAge as expired
+// (nightly hygiene, §4.5). Returns the number of expired rows.
+func (r *Repository) ExpireOldSuggestions(tenantID string, maxAge time.Duration) int {
+	cutoff := time.Now().Add(-maxAge)
+	if r.db == nil {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		expired := 0
+		for i := range r.profileSuggestions {
+			s := &r.profileSuggestions[i]
+			if s.TenantID == tenantID && s.Status == "pending" && s.CreatedAt.Before(cutoff) {
+				s.Status = "expired"
+				expired++
+			}
+		}
+		return expired
+	}
+	res, err := r.db.Exec(
+		`UPDATE contact_profile_suggestions
+		    SET status = 'expired', reviewed_at = now()
+		  WHERE tenant_id = $1 AND status = 'pending' AND created_at < $2`,
+		tenantID, cutoff,
+	)
+	if err != nil {
+		r.logWriteError("expire_suggestions", tenantID, "", err)
+		return 0
+	}
+	n, _ := res.RowsAffected()
+	return int(n)
+}
+
+// ============================================================
+// Deletion contract (§10.2, MEM-2): hard delete, never soft.
+// ============================================================
+
+// insertForgetAuditTx writes the GDPR audit row inside the deletion transaction.
+// audit_events carries a NOT NULL FK to messages with ON DELETE CASCADE, so an
+// audit row referencing a deleted message would vanish with it; instead a
+// synthetic marker message is inserted first and the audit row points at it.
+// This is why the audit insert happens after the deletes — atomicity within
+// the transaction still guarantees "no deletion without an audit record".
+func insertForgetAuditTx(tx *sql.Tx, tenantID, chatID, auditType string) error {
+	markerID := fmt.Sprintf("%s:%d", auditType, time.Now().UnixNano())
+	if _, err := tx.Exec(
+		`INSERT INTO messages (
+		   tenant_id, chat_id, source_message_id, event_id, telegram_update_id,
+		   business_connection_id, sender_id, message_text, message_type
+		 ) VALUES ($1, $2, $3, $3, 0, '', 'system', '', 'system')`,
+		tenantID, chatID, markerID,
+	); err != nil {
+		return err
+	}
+	_, err := tx.Exec(
+		`INSERT INTO audit_events (tenant_id, chat_id, source_message_id, decision, reason)
+		 VALUES ($1, $2, $3, 'ignore'::decision, $4)`,
+		tenantID, chatID, markerID, auditType,
+	)
+	return err
+}
+
+// forgetChatTx hard-deletes every memory artifact of one chat inside tx.
+// Health facts go first as their own statement (§10.3); FK cascades from
+// semantic_facts cover fact_embeddings / fact_occurrences / fact_relations,
+// and the messages delete cascades message_states + audit_events. The chats
+// row and chat_settings survive — the owner forgets the memory, not the chat.
+func forgetChatTx(tx *sql.Tx, tenantID, chatID string) error {
+	statements := []string{
+		// §10.3: health facts deleted by a dedicated first statement.
+		`DELETE FROM semantic_facts WHERE tenant_id = $1 AND chat_id = $2 AND fact_type = 'health'`,
+		// Cascades: fact_embeddings, fact_occurrences, fact_relations (FK ON DELETE CASCADE).
+		`DELETE FROM semantic_facts WHERE tenant_id = $1 AND chat_id = $2`,
+		`DELETE FROM episode_summaries WHERE tenant_id = $1 AND chat_id = $2`,
+		`DELETE FROM active_episodes WHERE tenant_id = $1 AND chat_id = $2`,
+		`DELETE FROM extraction_log WHERE tenant_id = $1 AND chat_id = $2`,
+		`DELETE FROM contact_profile_suggestions WHERE tenant_id = $1 AND chat_id = $2`,
+		`DELETE FROM contact_profiles WHERE tenant_id = $1 AND chat_id = $2`,
+		`DELETE FROM draft_feedback WHERE tenant_id = $1 AND chat_id = $2`,
+		`DELETE FROM drafts WHERE tenant_id = $1 AND chat_id = $2`,
+		// Cascades: message_states, audit_events (FK ON DELETE CASCADE).
+		`DELETE FROM messages WHERE tenant_id = $1 AND chat_id = $2`,
+	}
+	for _, stmt := range statements {
+		if _, err := tx.Exec(stmt, tenantID, chatID); err != nil {
+			return err
+		}
+	}
+	return insertForgetAuditTx(tx, tenantID, chatID, "memory_forget_chat")
+}
+
+// forgetChatMemoryLocked scrubs the in-memory mirrors for one chat. Caller holds r.mu.
+func (r *Repository) forgetChatMemoryLocked(tenantID, chatID string) {
+	key := chatKey(tenantID, chatID)
+	for _, msgKey := range r.chatMessageKeys[key] {
+		delete(r.messages, msgKey)
+	}
+	delete(r.chatMessageKeys, key)
+	delete(r.contactProfiles, key)
+	delete(r.activeEpisodes, key)
+	delete(r.pendingInputs, key)
+	delete(r.messageCounts, key)
+	for id, d := range r.drafts {
+		if d.TenantID == tenantID && d.ChatID == chatID {
+			delete(r.drafts, id)
+		}
+	}
+	keepFeedback := r.draftFeedbacks[:0]
+	for _, fb := range r.draftFeedbacks {
+		if !(fb.TenantID == tenantID && fb.ChatID == chatID) {
+			keepFeedback = append(keepFeedback, fb)
+		}
+	}
+	r.draftFeedbacks = keepFeedback
+	keepFacts := r.semanticFacts[:0]
+	for _, f := range r.semanticFacts {
+		if !(f.TenantID == tenantID && f.ChatID == chatID) {
+			keepFacts = append(keepFacts, f)
+		}
+	}
+	r.semanticFacts = keepFacts
+	keepSummaries := r.episodeSummaries[:0]
+	for _, s := range r.episodeSummaries {
+		if !(s.TenantID == tenantID && s.ChatID == chatID) {
+			keepSummaries = append(keepSummaries, s)
+		}
+	}
+	r.episodeSummaries = keepSummaries
+	keepSuggestions := r.profileSuggestions[:0]
+	for _, s := range r.profileSuggestions {
+		if !(s.TenantID == tenantID && s.ChatID == chatID) {
+			keepSuggestions = append(keepSuggestions, s)
+		}
+	}
+	r.profileSuggestions = keepSuggestions
+	r.invalidateContextScore(tenantID, chatID)
+}
+
+// ForgetChat hard-deletes all memory of one chat (§10.2): facts, embeddings,
+// occurrences, relations, episode summaries, active episode, extraction log,
+// profile + suggestions, drafts, feedback, messages and their states/audits.
+// One transaction; an audit marker row records the operation. The chat row
+// itself and its settings remain so the chat keeps working with a clean slate.
+func (r *Repository) ForgetChat(tenantID, chatID string) error {
+	if tenantID == "" || chatID == "" {
+		return fmt.Errorf("tenant_id and chat_id are required")
+	}
+	r.mu.Lock()
+	r.forgetChatMemoryLocked(tenantID, chatID)
+	r.mu.Unlock()
+	if r.db == nil {
+		return nil
+	}
+	tx, err := r.db.Begin()
+	if err != nil {
+		return err
+	}
+	if err := forgetChatTx(tx, tenantID, chatID); err != nil {
+		_ = tx.Rollback()
+		r.logWriteError("forget_chat", tenantID, chatID, err)
+		return err
+	}
+	return tx.Commit()
+}
+
+// UnlearnFact hard-deletes a single semantic fact (§10.2). FK cascades remove
+// its embeddings, occurrences, and relations; the audit marker records the act.
+func (r *Repository) UnlearnFact(tenantID string, factID int64) error {
+	if tenantID == "" || factID == 0 {
+		return fmt.Errorf("tenant_id and fact_id are required")
+	}
+	r.mu.Lock()
+	chatID := ""
+	keep := r.semanticFacts[:0]
+	for _, f := range r.semanticFacts {
+		if f.TenantID == tenantID && f.ID == factID {
+			chatID = f.ChatID
+			continue
+		}
+		keep = append(keep, f)
+	}
+	r.semanticFacts = keep
+	r.mu.Unlock()
+	if r.db == nil {
+		return nil
+	}
+	tx, err := r.db.Begin()
+	if err != nil {
+		return err
+	}
+	if chatID == "" {
+		// The in-memory mirror may not know the fact; resolve its chat for the audit row.
+		_ = tx.QueryRow(
+			`SELECT COALESCE(chat_id,'') FROM semantic_facts WHERE tenant_id = $1 AND id = $2`,
+			tenantID, factID,
+		).Scan(&chatID)
+	}
+	if _, err := tx.Exec(
+		`DELETE FROM semantic_facts WHERE tenant_id = $1 AND id = $2`,
+		tenantID, factID,
+	); err != nil {
+		_ = tx.Rollback()
+		r.logWriteError("unlearn_fact", tenantID, chatID, err)
+		return err
+	}
+	if chatID != "" {
+		if err := insertForgetAuditTx(tx, tenantID, chatID, "memory_unlearn_fact"); err != nil {
+			_ = tx.Rollback()
+			r.logWriteError("unlearn_fact_audit", tenantID, chatID, err)
+			return err
+		}
+	}
+	if chatID != "" {
+		r.invalidateContextScore(tenantID, chatID)
+	}
+	return tx.Commit()
+}
+
+// ForgetAll hard-deletes every chat-derived artifact of a tenant (§10.2):
+// each chat's memory (per ForgetChat), then the chats themselves (cascading
+// chat_settings), business connections, unclaimed chats, idempotency records,
+// user settings, and AI roles. The tenants/users rows survive together with
+// one synthetic audit marker recording the erasure.
+func (r *Repository) ForgetAll(tenantID string) error {
+	if tenantID == "" {
+		return fmt.Errorf("tenant_id is required")
+	}
+	r.mu.Lock()
+	for key, chat := range r.chats {
+		if chat.TenantID == tenantID {
+			r.forgetChatMemoryLocked(tenantID, chat.ChatID)
+			delete(r.chats, key)
+		}
+	}
+	for key, settings := range r.chatSettings {
+		if settings.TenantID == tenantID {
+			delete(r.chatSettings, key)
+		}
+	}
+	for key, uc := range r.unclaimedChats {
+		if uc.OwnerTenantID == tenantID {
+			delete(r.unclaimedChats, key)
+		}
+	}
+	for id, conn := range r.businessConnections {
+		if conn.TenantID == tenantID {
+			delete(r.businessConnections, id)
+			delete(r.connectionByUser, conn.UserID)
+			delete(r.connectionTenants, id)
+		}
+	}
+	delete(r.userSettings, tenantID)
+	for id, role := range r.aiRoles {
+		if role.TenantID == tenantID {
+			delete(r.aiRoles, id)
+		}
+	}
+	r.mu.Unlock()
+	if r.db == nil {
+		return nil
+	}
+	tx, err := r.db.Begin()
+	if err != nil {
+		return err
+	}
+	statements := []string{
+		// §10.3: tenant-wide health facts first.
+		`DELETE FROM semantic_facts WHERE tenant_id = $1 AND fact_type = 'health'`,
+		`DELETE FROM semantic_facts WHERE tenant_id = $1`,
+		`DELETE FROM extraction_log WHERE tenant_id = $1`,
+		// Cascades from chats: chat_settings, messages (→ states, audits), drafts,
+		// draft_feedback, contact_profiles, suggestions, episodes, summaries.
+		`DELETE FROM chats WHERE tenant_id = $1`,
+		`DELETE FROM unclaimed_chats WHERE owner_tenant_id = $1`,
+		`DELETE FROM telegram_business_connections WHERE tenant_id = $1`,
+		`DELETE FROM idempotency_records WHERE tenant_id = $1`,
+		`DELETE FROM user_settings WHERE tenant_id = $1`,
+		`DELETE FROM ai_roles WHERE tenant_id = $1`,
+	}
+	for _, stmt := range statements {
+		if _, err := tx.Exec(stmt, tenantID); err != nil {
+			_ = tx.Rollback()
+			r.logWriteError("forget_all", tenantID, "", err)
+			return err
+		}
+	}
+	// Synthetic chat row so the audit marker has a valid FK chain.
+	if _, err := tx.Exec(
+		`INSERT INTO chats (tenant_id, chat_id, telegram_chat_id, display_name, chat_type, status)
+		 VALUES ($1, 'forget_all', 'forget_all', 'GDPR erasure marker', 'system', 'archived')
+		 ON CONFLICT DO NOTHING`,
+		tenantID,
+	); err != nil {
+		_ = tx.Rollback()
+		r.logWriteError("forget_all_marker", tenantID, "", err)
+		return err
+	}
+	if err := insertForgetAuditTx(tx, tenantID, "forget_all", "memory_forget_all"); err != nil {
+		_ = tx.Rollback()
+		r.logWriteError("forget_all_audit", tenantID, "", err)
+		return err
+	}
+	return tx.Commit()
 }
 
 // FactRelationsByFactID returns all temporal edges where fact_id_from = factID.
@@ -2605,15 +3527,17 @@ func (r *Repository) EpisodeSummariesByVector(tenantID, chatID string, queryVect
 		return r.EpisodeSummaries(tenantID, chatID, limit)
 	}
 	vec := float64SliceToVector(queryVector)
-	rows, err := r.db.Query(
+	rows, err := r.db.Query(fmt.Sprintf(
 		`SELECT id, tenant_id, chat_id, period_start, period_end,
 		        content, closure_reason, message_count, created_at
 		   FROM episode_summaries
 		  WHERE tenant_id = $1 AND chat_id = $2
 		    AND embedding IS NOT NULL
 		    AND deleted_at IS NULL
-		  ORDER BY embedding <=> $3::vector ASC
+		  ORDER BY %s ASC
 		  LIMIT $4`,
+		r.vectorOrderExpr("embedding", "$3"),
+	),
 		tenantID, chatID, vec, limit,
 	)
 	if err != nil {
@@ -2638,33 +3562,68 @@ func (r *Repository) EpisodeSummariesByVector(tenantID, chatID string, queryVect
 	return result
 }
 
-// EpisodeSummaryExistsForDate reports whether an episode summary covering the given calendar
-// date already exists. Used by the daily scheduler to avoid duplicate runs.
-func (r *Repository) EpisodeSummaryExistsForDate(tenantID, chatID string, date time.Time) bool {
-	startOfDay := time.Date(date.Year(), date.Month(), date.Day(), 0, 0, 0, 0, time.UTC)
-	endOfDay := startOfDay.Add(24 * time.Hour)
+// EpisodeSummaryOverlaps reports whether any summary already covers part of
+// the [start, end) period. This is the episode-closure idempotency check
+// (MEM-6): the previous one-summary-per-day rule silently dropped the second
+// episode of a day.
+func (r *Repository) EpisodeSummaryOverlaps(tenantID, chatID string, start, end time.Time) bool {
 	if r.db != nil {
 		var exists bool
-		_ = r.db.QueryRow(
+		err := r.db.QueryRow(
 			`SELECT EXISTS(
 			   SELECT 1 FROM episode_summaries
 			    WHERE tenant_id = $1 AND chat_id = $2
-			      AND period_start >= $3 AND period_end <= $4
+			      AND period_end > $3 AND period_start < $4
 			      AND deleted_at IS NULL
 			 )`,
-			tenantID, chatID, startOfDay, endOfDay,
+			tenantID, chatID, start, end,
 		).Scan(&exists)
-		return exists
+		if err == nil {
+			return exists
+		}
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for _, s := range r.episodeSummaries {
 		if s.TenantID == tenantID && s.ChatID == chatID &&
-			!s.PeriodStart.Before(startOfDay) && !s.PeriodEnd.After(endOfDay) {
+			s.PeriodEnd.After(start) && s.PeriodStart.Before(end) {
 			return true
 		}
 	}
 	return false
+}
+
+// LatestCoveredEnd returns the latest period_end among summaries overlapping
+// [start, end), or the zero time when none overlap. The daily fallback uses it
+// to summarise only the part of the day no episode summary covered (MEM-6).
+func (r *Repository) LatestCoveredEnd(tenantID, chatID string, start, end time.Time) time.Time {
+	if r.db != nil {
+		var covered sql.NullTime
+		err := r.db.QueryRow(
+			`SELECT MAX(period_end) FROM episode_summaries
+			  WHERE tenant_id = $1 AND chat_id = $2
+			    AND period_end > $3 AND period_start < $4
+			    AND deleted_at IS NULL`,
+			tenantID, chatID, start, end,
+		).Scan(&covered)
+		if err == nil {
+			if covered.Valid {
+				return covered.Time
+			}
+			return time.Time{}
+		}
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var latest time.Time
+	for _, s := range r.episodeSummaries {
+		if s.TenantID == tenantID && s.ChatID == chatID &&
+			s.PeriodEnd.After(start) && s.PeriodStart.Before(end) &&
+			s.PeriodEnd.After(latest) {
+			latest = s.PeriodEnd
+		}
+	}
+	return latest
 }
 
 // ============================================================
@@ -2833,7 +3792,7 @@ func (r *Repository) SaveFactEmbedding(factID int64, tenantID, scopeKind, chatID
 		return
 	}
 	// Encode as PostgreSQL array literal for compatibility with both FLOAT8[] and vector columns.
-	_, _ = r.db.Exec(
+	_, err := r.db.Exec(
 		`INSERT INTO fact_embeddings (fact_id, tenant_id, scope_kind, chat_id, embedding_model, embedding)
 		 VALUES ($1, $2, $3, $4, $5, $6::float8[])
 		 ON CONFLICT (fact_id) DO UPDATE SET
@@ -2841,6 +3800,7 @@ func (r *Repository) SaveFactEmbedding(factID int64, tenantID, scopeKind, chatID
 		   embedding_model = EXCLUDED.embedding_model`,
 		factID, tenantID, scopeKind, nullableString(chatID), model, float64SliceToArray(embedding),
 	)
+	r.logWriteError("save_fact_embedding", tenantID, chatID, err)
 }
 
 // float64SliceToArray converts a Go float64 slice to a PostgreSQL array literal string.

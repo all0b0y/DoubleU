@@ -195,6 +195,52 @@ func CallbackDataDecode(data string) (action ApprovalAction, draftID string, ide
 	return action, draftID, idempotencyKey, true
 }
 
+// CallbackDataEncodeForget encodes a forget-chat confirmation button (≤64 bytes).
+// Format: "fg:{chatID}" (confirm) — the cancel button is plain "fgx".
+func CallbackDataEncodeForget(chatID string) string {
+	return "fg:" + chatID
+}
+
+// CallbackDataDecodeForget parses a forget-chat confirmation callback.
+// ok is false for any other callback format.
+func CallbackDataDecodeForget(data string) (chatID string, ok bool) {
+	if !strings.HasPrefix(data, "fg:") {
+		return "", false
+	}
+	chatID = data[len("fg:"):]
+	return chatID, chatID != ""
+}
+
+// ForgetCancelCallbackData is the callback payload of the "cancel" button on
+// the forget-chat confirmation card.
+const ForgetCancelCallbackData = "fgx"
+
+// CallbackDataEncodeSuggestion encodes a profile-suggestion review button
+// (≤64 bytes). Format: "ps:a:{id}" (accept) / "ps:r:{id}" (reject).
+func CallbackDataEncodeSuggestion(id int64, accept bool) string {
+	verdict := "r"
+	if accept {
+		verdict = "a"
+	}
+	return fmt.Sprintf("ps:%s:%d", verdict, id)
+}
+
+// CallbackDataDecodeSuggestion parses a profile-suggestion review callback.
+func CallbackDataDecodeSuggestion(data string) (id int64, accept bool, ok bool) {
+	if !strings.HasPrefix(data, "ps:") {
+		return 0, false, false
+	}
+	rest := data[3:]
+	if len(rest) < 3 || rest[1] != ':' || (rest[0] != 'a' && rest[0] != 'r') {
+		return 0, false, false
+	}
+	parsed, err := strconv.ParseInt(rest[2:], 10, 64)
+	if err != nil || parsed <= 0 {
+		return 0, false, false
+	}
+	return parsed, rest[0] == 'a', true
+}
+
 // CallbackDataEncodeChoice encodes a question-option selection into a callback_data string (≤64 bytes).
 // Format: "co:{N}:{bareID}" where N is the single-digit option index (0–9).
 func CallbackDataEncodeChoice(draftID string, optionIdx int) string {
@@ -327,6 +373,40 @@ func (p ContactProfile) ColdStartAddressForm() string {
 	}
 }
 
+// AIRole is the owner-authored persona the AI plays when answering on the
+// owner's behalf in a chat ("менеджер", "техподдержка", любой выдуманный
+// персонаж).  The AI reproduces this role — not the owner himself.  Resolved
+// by the backend from ai_roles via chat_settings.ai_role_id and passed to the
+// Python service on every process-message request.
+type AIRole struct {
+	// Name is the short label the owner gave the role.
+	Name string `json:"name"`
+	// Description is the free-text persona description — the primary prompt material.
+	Description string `json:"description,omitempty"`
+	// SpeakingStyle describes how the role talks (lexicon, tone, message length).
+	SpeakingStyle string `json:"speaking_style,omitempty"`
+	// Goals describes what the role tries to achieve in conversations.
+	Goals string `json:"goals,omitempty"`
+	// Constraints describes what the role must not do or discuss.
+	Constraints string `json:"constraints,omitempty"`
+	// Context is owner-supplied reference material for the role (FAQ, pricing,
+	// docs — pasted or extracted from files in the Mini App). Injected into the
+	// draft prompt so the persona answers with that knowledge.
+	Context string `json:"context,omitempty"`
+	// CustomFields are owner-defined extra role attributes beyond the fixed
+	// fields above. Each carries a title, a "why it exists" description, and
+	// optional context; all are injected into the persona prompt.
+	CustomFields []AIRoleCustomField `json:"custom_fields,omitempty"`
+}
+
+// AIRoleCustomField is an owner-defined extra attribute on a role. Title and
+// Description are required; Context is optional reference text for that field.
+type AIRoleCustomField struct {
+	Title       string `json:"title"`
+	Description string `json:"description"`
+	Context     string `json:"context,omitempty"`
+}
+
 // UserSettings stores per-owner identity and behaviour preferences (User Layer).
 type UserSettings struct {
 	UserID             string   `json:"user_id"`
@@ -347,7 +427,8 @@ type UserSettings struct {
 // or the owner, stored in the Semantic Layer (semantic_facts table).
 type SemanticFact struct {
 	ID   int64  `json:"id"`
-	// ScopeKind: "chat" (visible in one chat) or "owner_global" (visible in all chats).
+	// ScopeKind is always "chat": memory is strictly per-chat (migration 011
+	// retired the owner_global scope).
 	ScopeKind string `json:"scope_kind"`
 	TenantID  string `json:"tenant_id"`
 	ChatID    string `json:"chat_id,omitempty"`
@@ -413,7 +494,13 @@ const (
 	PendingInputFeedback PendingInputType = "feedback"
 	// PendingInputAIRefine means the bot is waiting for an instruction for the AI to refine the draft.
 	PendingInputAIRefine PendingInputType = "ai_refine"
+	// PendingInputForgetAll means the bot is waiting for the confirmation phrase
+	// before erasing all tenant memory (§10.2 deletion contract).
+	PendingInputForgetAll PendingInputType = "forget_all"
 )
+
+// ForgetAllConfirmationPhrase must be typed verbatim to confirm /forget_all.
+const ForgetAllConfirmationPhrase = "УДАЛИТЬ ВСЁ"
 
 // PendingInput tracks that the bot is waiting for a free-text reply from the owner.
 type PendingInput struct {
@@ -422,6 +509,45 @@ type PendingInput struct {
 	Type      PendingInputType `json:"type"`
 	DraftID   string           `json:"draft_id"`
 	ExpiresAt time.Time        `json:"expires_at"`
+}
+
+// Transport values for NormalizedTelegramEvent.Transport.
+const (
+	// TransportBusiness marks events ingested via the Telegram Business webhook.
+	TransportBusiness = "business"
+	// TransportBot marks events ingested via a user-supplied bot (long polling).
+	TransportBot = "bot"
+)
+
+// IngestionMode selects which Telegram channel feeds a tenant's inbound pipeline.
+type IngestionMode string
+
+const (
+	// IngestionModeBot ingests only via the tenant's user-supplied bot.
+	IngestionModeBot IngestionMode = "bot"
+	// IngestionModePersonal ingests only via the Telegram Business webhook.
+	IngestionModePersonal IngestionMode = "personal"
+	// IngestionModeFull keeps both channels active.
+	IngestionModeFull IngestionMode = "full"
+)
+
+// ParseIngestionMode validates a raw mode string; ok is false for unknown values.
+func ParseIngestionMode(raw string) (IngestionMode, bool) {
+	switch IngestionMode(raw) {
+	case IngestionModeBot, IngestionModePersonal, IngestionModeFull:
+		return IngestionMode(raw), true
+	}
+	return "", false
+}
+
+// AllowsBot reports whether bot-transport events may be processed in this mode.
+func (m IngestionMode) AllowsBot() bool {
+	return m == IngestionModeBot || m == IngestionModeFull
+}
+
+// AllowsBusiness reports whether business-transport events may be processed in this mode.
+func (m IngestionMode) AllowsBusiness() bool {
+	return m == IngestionModePersonal || m == IngestionModeFull
 }
 
 // NormalizedTelegramEvent is the canonical inbound Telegram event.
@@ -438,10 +564,20 @@ type NormalizedTelegramEvent struct {
 	MessageText          string    `json:"message_text"`
 	MessageType          string    `json:"message_type"`
 	CreatedAt            time.Time `json:"created_at"`
+	// Transport identifies the ingestion channel ("business" or "bot").
+	// Empty means "business" so events stored before the field existed keep working.
+	Transport string `json:"transport,omitempty"`
+	// BotID is the Telegram bot identifier; set only when Transport == "bot".
+	BotID string `json:"bot_id,omitempty"`
 }
 
 // ReceiveIdempotencyKey returns the contract receive idempotency key.
+// update_id sequences are independent per source: business webhooks scope the
+// key by connection id, bot polling scopes it by bot id.
 func (e NormalizedTelegramEvent) ReceiveIdempotencyKey() string {
+	if e.Transport == TransportBot {
+		return formatInt64(e.TelegramUpdateID) + ":bot:" + e.BotID
+	}
 	return formatInt64(e.TelegramUpdateID) + ":" + e.BusinessConnectionID
 }
 
@@ -488,6 +624,9 @@ type AIProcessMessageRequest struct {
 	UserSettings    *UserSettings           `json:"user_settings,omitempty"`
 	// ActiveEpisode gives the AI awareness of the current open conversation episode.
 	ActiveEpisode   *ActiveEpisode          `json:"active_episode,omitempty"`
+	// AIRole is the persona assigned to this chat; nil means the default
+	// assistant persona (reply in the owner's observed style).
+	AIRole          *AIRole                 `json:"ai_role,omitempty"`
 }
 
 // TokenUsage contains model input and output token counts.
@@ -510,6 +649,15 @@ type AIProcessMessageResponse struct {
 	// toxicity, sensitive content, or schema-invalid output the repair attempt
 	// could not salvage.  Drafts are still returned; the bot UI annotates them.
 	Flagged      bool       `json:"flagged,omitempty"`
+	// OwnerNote is an owner-facing service note (e.g. the critical-risk warning).
+	// It is rendered on the owner's card only and must NEVER be sent to the
+	// contact; ResponseText stays empty when this is set (ARCH-1).
+	OwnerNote    string     `json:"owner_note,omitempty"`
+	// Options are AI-suggested short replies for Intent == "choice_question".
+	Options      []string   `json:"options,omitempty"`
+	// Topic is a 3-7 word label of the current conversation produced by the
+	// same draft call (replaces the per-message /ai/tag-topic call — ARCH-4).
+	Topic        string     `json:"topic,omitempty"`
 }
 
 // AuditEvent records the policy outcome for an inbound message.

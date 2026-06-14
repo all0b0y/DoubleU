@@ -146,6 +146,50 @@ func TestBotSenderReportsTelegramStatusError(t *testing.T) {
 	}
 }
 
+// TestBotSenderMarkdownFallback verifies that a Markdown send rejected by
+// Telegram (invalid entities in LLM output) is retried once as plain text so
+// the reply is never lost to a formatting error.
+func TestBotSenderMarkdownFallback(t *testing.T) {
+	var bodies []string
+	attempt := 0
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		data, _ := io.ReadAll(request.Body)
+		bodies = append(bodies, string(data))
+		attempt++
+		if attempt == 1 {
+			// First (Markdown) attempt fails as Telegram would on bad entities.
+			return &http.Response{
+				StatusCode: http.StatusBadRequest,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(`{"ok":false,"description":"can't parse entities"}`)),
+			}, nil
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"ok":true,"result":{"message_id":7}}`)),
+		}, nil
+	})}
+	sender := NewBotSender("token", client)
+
+	if err := sender.SendMessage(context.Background(), OutboundMessage{
+		ChatID:    "42",
+		Text:      "*bold* _broken",
+		ParseMode: "Markdown",
+	}); err != nil {
+		t.Fatalf("send with fallback: %v", err)
+	}
+	if attempt != 2 {
+		t.Fatalf("expected 2 attempts (markdown then plain), got %d", attempt)
+	}
+	if !strings.Contains(bodies[0], `"parse_mode":"Markdown"`) {
+		t.Fatalf("first attempt should carry parse_mode, body = %s", bodies[0])
+	}
+	if strings.Contains(bodies[1], "parse_mode") {
+		t.Fatalf("fallback attempt must drop parse_mode, body = %s", bodies[1])
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {

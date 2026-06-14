@@ -12,15 +12,12 @@ from typing import Callable, Any
 
 from .config.flags import FeatureFlags, load_from_env as load_flags_from_env
 from .contract_enums import LLMPurpose
-from .llm import MockLLMGateway, ModelRouter, OpenRouterLLMGateway, UnconfiguredLLMGateway
-from .llm_litellm import LiteLLMGateway
 from .observability.context import LLMCallContext, with_context
 from .observability.langfuse_sink import HttpUploader, LangfuseSink
 from .observability.trace import derive_trace_id, parse_traceparent
 from .safety.input import InputSafetyScanner
 from .safety.output import OutputSafetyScanner
 from .schemas import (
-    parse_draft_request,
     parse_embed_texts_request,
     parse_intent_request,
     parse_memory_request,
@@ -55,7 +52,6 @@ class AIHTTPHandler(BaseHTTPRequestHandler):
         """Handle AI service JSON requests."""
         routes: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
             "/ai/process-message": self._process_message,
-            "/ai/generate-draft": self._generate_draft,
             "/ai/classify-risk": self._classify_risk,
             "/ai/classify-intent": self._classify_intent,
             "/ai/extract-memory": self._extract_memory,
@@ -101,9 +97,6 @@ class AIHTTPHandler(BaseHTTPRequestHandler):
     def _process_message(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self.service.process_message(parse_process_message_request(payload)).to_dict()
 
-    def _generate_draft(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return self.service.generate_draft(parse_draft_request(payload)).to_dict()
-
     def _classify_risk(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self.service.classify_risk(parse_risk_request(payload)).to_dict()
 
@@ -132,7 +125,6 @@ class AIHTTPHandler(BaseHTTPRequestHandler):
     # observability layers will see in the call context.
     _PURPOSE_BY_PATH: dict[str, LLMPurpose] = {
         "/ai/process-message": LLMPurpose.DRAFT,
-        "/ai/generate-draft": LLMPurpose.DRAFT,
         "/ai/classify-risk": LLMPurpose.CLASSIFY,
         "/ai/classify-intent": LLMPurpose.CLASSIFY,
         "/ai/extract-memory": LLMPurpose.EXTRACT,
@@ -197,46 +189,29 @@ def create_service_from_env() -> tuple[AIService, bool, FeatureFlags]:
     """Create the service and report whether deterministic mock mode is active.
 
     Returns a ``(service, mock_llm, flags)`` tuple so callers can mount the
-    flags on the request handler for Phase 1+ safety gates.
+    flags on the request handler.  All generation runs through the pydantic-ai
+    :class:`AgentRuntime`: ``MOCK_LLM`` selects the deterministic TestModel,
+    otherwise the agents resolve OpenRouter-backed models from the environment.
+    The Phase 1/3 safety scanners and the Langfuse sink are built here (flag-
+    gated) and injected into the runtime.
     """
     flags = load_flags_from_env()
     mock_llm = os.getenv("MOCK_LLM", "true").lower() in ("1", "true", "yes", "on")
-    model = os.getenv("OPENROUTER_MODEL", "").strip()
     input_safety = InputSafetyScanner(flags=flags) if flags.safety_input_enabled else None
     output_safety = OutputSafetyScanner(flags=flags) if flags.safety_output_enabled else None
     sink = _build_langfuse_sink(flags)
-    if mock_llm:
-        gateway = MockLLMGateway()
-        router = ModelRouter(gateway, flags=flags, input_safety=input_safety, output_safety=output_safety, sink=sink)
-    elif flags.llm_gateway == "litellm":
-        gateway = LiteLLMGateway(
-            master_key=os.getenv("LITELLM_MASTER_KEY", ""),
-            base_url=os.getenv("LITELLM_BASE_URL", "http://litellm:4000"),
-            timeout_seconds=float(os.getenv("LITELLM_TIMEOUT_SECONDS", "30")),
-        )
-        router = ModelRouter(gateway, flags=flags, input_safety=input_safety, output_safety=output_safety, sink=sink)
-    elif os.getenv("OPENROUTER_API_KEY", "").strip() and model:
-        gateway = OpenRouterLLMGateway(
-            api_key=os.getenv("OPENROUTER_API_KEY", ""),
-            model=model,
-            fallback_model=os.getenv("OPENROUTER_FALLBACK_MODEL", ""),
-            base_url=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
-            app_name=os.getenv("OPENROUTER_APP_NAME", "DoubleU"),
-            app_url=os.getenv("OPENROUTER_APP_URL", ""),
-            timeout_seconds=float(os.getenv("OPENROUTER_TIMEOUT_SECONDS", "30")),
-        )
-        router = ModelRouter(gateway, fixed_model=model, flags=flags, input_safety=input_safety, output_safety=output_safety, sink=sink)
-    else:
-        gateway = UnconfiguredLLMGateway()
-        router = ModelRouter(gateway, flags=flags, input_safety=input_safety, output_safety=output_safety, sink=sink)
-    return build_service(router), mock_llm, flags
+    # Imported lazily so importing the HTTP module never hard-requires pydantic-ai.
+    from .agents import build_runtime
+
+    agents = build_runtime(input_safety=input_safety, output_safety=output_safety, sink=sink)
+    return build_service(agents), mock_llm, flags
 
 
 def _build_langfuse_sink(flags: FeatureFlags) -> LangfuseSink | None:
     """Instantiate a LangfuseSink with a live HTTP uploader when OBSERVABILITY_SINK=langfuse.
 
     Returns ``None`` when the sink is disabled or credentials are missing so
-    ModelRouter degrades to noop observability without changing call sites.
+    the agent runtime degrades to noop observability without changing call sites.
     """
     if flags.observability_sink != "langfuse":
         return None

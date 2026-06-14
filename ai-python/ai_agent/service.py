@@ -1,17 +1,23 @@
 """Application service for AI orchestration and policy decisions.
 
-This module owns :class:`AIService` — the thin orchestrator that wires
-classifiers, the prompt builder, the model router and the audit sink to the
-per-endpoint pipelines under :mod:`ai_agent.pipelines`.  Endpoint-specific
-logic (draft generation, typed extraction, embedding transport, summarization,
-greeting rules, policy thresholds) lives in those pipeline modules; this file
-should stay short.
+This module owns :class:`AIService` — the thin orchestrator that wires the
+deterministic classifiers and the pydantic-ai :class:`AgentRuntime` to the
+endpoints.  All LLM-bound work (draft, typed extraction, summarization, topic
+tagging, fact reranking) runs through the agent runtime; the deterministic
+classifiers (risk/intent/memory) and the policy thresholds stay in-process so
+the contract and the backend's DecisionEngine are unchanged.  Embedding
+transport is a direct provider call (not an LLM agent) and lives in its own
+pipeline module.
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 from uuid import NAMESPACE_URL, uuid5
+
+if TYPE_CHECKING:  # pydantic-ai is imported lazily by the HTTP factory
+    from .agents.runtime import AgentRuntime
 
 from .classifiers import (
     IntentClassifier,
@@ -19,18 +25,13 @@ from .classifiers import (
     RiskClassifier,
     TypedMemoryExtractor,
 )
-from .llm import ModelRouter
 from .pipelines import (
     decisions,
     draft,
     embedding,
-    extraction,
     intent,
     memory,
-    reranking,
     risk,
-    summarization,
-    topic,
 )
 from .schemas import (
     AIProcessMessageRequest,
@@ -39,8 +40,6 @@ from .schemas import (
     ChatSummaryRequest,
     ChatSummaryResponse,
     Decision,
-    DraftRequest,
-    DraftResponse,
     EmbedTextsRequest,
     EmbedTextsResponse,
     IntentRequest,
@@ -58,7 +57,6 @@ from .schemas import (
     TypedExtractionResponse,
     Usage,
 )
-from .security import PromptBuilder
 
 
 class InMemoryAuditSink:
@@ -80,30 +78,27 @@ class InMemoryAuditSink:
 class AIService:
     """Technical MVP AI orchestration service.
 
-    Holds the shared dependencies needed by every endpoint and delegates the
-    per-endpoint work to the modules in :mod:`ai_agent.pipelines`.  No LLM
-    transport, no prompt assembly, no policy thresholds live here directly —
-    they all go through the pipeline modules so each stage stays independently
-    testable.
+    Holds the deterministic classifiers and the agent runtime, and delegates
+    the per-endpoint work to them.  No LLM transport, prompt assembly or policy
+    thresholds live here directly — generation goes through the agents, policy
+    through :mod:`ai_agent.pipelines.decisions`.
     """
 
     def __init__(
         self,
-        router: ModelRouter,
+        agents: "AgentRuntime",
         risk_classifier: RiskClassifier | None = None,
         intent_classifier: IntentClassifier | None = None,
         memory_extractor: MemoryExtractor | None = None,
         typed_extractor: TypedMemoryExtractor | None = None,
-        prompt_builder: PromptBuilder | None = None,
         audit_sink: InMemoryAuditSink | None = None,
     ) -> None:
-        """Create an AI service with injected classifiers and model router."""
-        self._router = router
+        """Create an AI service backed by the pydantic-ai agent runtime."""
+        self._agents = agents
         self._risk_classifier = risk_classifier or RiskClassifier()
         self._intent_classifier = intent_classifier or IntentClassifier()
         self._memory_extractor = memory_extractor or MemoryExtractor()
         self._typed_extractor = typed_extractor or TypedMemoryExtractor()
-        self._prompt_builder = prompt_builder or PromptBuilder()
         self._audit_sink = audit_sink or InMemoryAuditSink()
 
     def health(self) -> dict[str, str]:
@@ -131,24 +126,12 @@ class AIService:
         return memory.extract_memory(self._memory_extractor, request)
 
     def extract_facts_typed(self, request: TypedExtractionRequest) -> TypedExtractionResponse:
-        """Extract typed, scoped facts from a message (deterministic + LLM)."""
-        return extraction.extract_facts_typed(
-            self._typed_extractor, self._prompt_builder, self._router, request
-        )
-
-    def generate_draft(self, request: DraftRequest) -> DraftResponse:
-        """Generate a draft reply through the model router and gateway."""
-        return draft.generate_draft(
-            self._router,
-            self._risk_classifier,
-            self._intent_classifier,
-            self._prompt_builder,
-            request,
-        )
+        """Extract typed, scoped facts from a message (deterministic + agent)."""
+        return self._agents.extract_facts_typed(self._typed_extractor, request)
 
     def summarize_chat(self, request: ChatSummaryRequest) -> ChatSummaryResponse:
         """Summarize chat messages while honoring ``no_summary`` privacy."""
-        return summarization.summarize_chat(self._router, self._prompt_builder, request)
+        return self._agents.summarize_chat(request)
 
     def embed_texts(self, request: EmbedTextsRequest) -> EmbedTextsResponse:
         """Generate embeddings for a batch of texts via the embedding pipeline."""
@@ -156,19 +139,22 @@ class AIService:
 
     def tag_topic(self, request: TopicTaggingRequest) -> TopicTaggingResponse:
         """Return a short topic label for the active conversation episode."""
-        return topic.tag_topic(self._prompt_builder, self._router, request)
+        return self._agents.tag_topic(request)
 
     def rerank_facts(self, request: RerankFactsRequest) -> RerankFactsResponse:
         """Rerank a set of candidate facts by relevance to a query."""
-        return reranking.rerank_facts(self._router, request)
+        return self._agents.rerank_facts(request)
 
     def process_message(self, request: AIProcessMessageRequest) -> AIProcessMessageResponse:
-        """Process a normalized Telegram event into an AI decision proposal."""
+        """Process a normalized Telegram event into an AI decision proposal.
+
+        Risk stays deterministic (charter: policy is backend-owned); intent and
+        confidence come from the structured draft output when the agent
+        produced it (ARCH-4), with the regex classifier + synthetic confidence
+        as the fallback.
+        """
         risk_response = self._risk_classifier.classify(request.event.message_text)
         intent_response = self._intent_classifier.classify(request.event.message_text)
-        confidence = decisions.confidence_for(
-            risk_response.risk_level, intent_response.confidence
-        )
         no_memory = PrivacyFlag.NO_MEMORY in request.chat_settings.privacy_flags
 
         # Synchronous memory extraction in the hot reply path is intentionally limited to
@@ -182,13 +168,18 @@ class AIService:
         memory_used = () if no_memory else extracted_facts
 
         try:
-            response_text, model_used, usage = draft.maybe_generate_response(
-                self._router,
-                self._prompt_builder,
-                request,
-                risk_response.risk_level,
-                risk_response.reasons,
+            outcome = self._agents.draft_outcome(
+                request, risk_response.risk_level, risk_response.reasons
             )
+            intent = outcome.intent or intent_response.intent
+            if outcome.confidence is not None:
+                confidence = decisions.combined_confidence(
+                    outcome.confidence, risk_response.risk_level
+                )
+            else:
+                confidence = decisions.confidence_for(
+                    risk_response.risk_level, intent_response.confidence
+                )
             decision = decisions.decide(
                 request.chat_settings.mode,
                 request.chat_settings.privacy_flags,
@@ -196,7 +187,8 @@ class AIService:
                 confidence,
             )
         except RuntimeError:
-            response_text, model_used, usage = "", "none", Usage()
+            outcome = draft.DraftOutcome(text="", model_used="none", usage=Usage())
+            intent = intent_response.intent
             decision = Decision.ERROR_FALLBACK
             confidence = 0.0
 
@@ -206,14 +198,17 @@ class AIService:
         flagged = current_context().output_flagged
         result = AIProcessMessageResponse(
             decision=decision,
-            response_text=response_text if decision in (Decision.DRAFT, Decision.AUTO_REPLY) else "",
+            response_text=outcome.text if decision in (Decision.DRAFT, Decision.AUTO_REPLY) else "",
             confidence=confidence,
             risk_level=risk_response.risk_level,
-            intent=intent_response.intent,
-            model_used=model_used,
-            usage=usage,
+            intent=intent,
+            model_used=outcome.model_used,
+            usage=outcome.usage,
             memory_used=memory_used,
             flagged=flagged,
+            owner_note=outcome.owner_note,
+            options=outcome.options,
+            topic=outcome.topic,
         )
         self._record_audit(request, result, ",".join(risk_response.reasons))
         return result
@@ -250,6 +245,9 @@ class AIService:
         )
 
 
-def build_service(router: ModelRouter, audit_sink: InMemoryAuditSink | None = None) -> AIService:
-    """Create an AI service instance from a model router."""
-    return AIService(router=router, audit_sink=audit_sink)
+def build_service(
+    agents: "AgentRuntime",
+    audit_sink: InMemoryAuditSink | None = None,
+) -> AIService:
+    """Create an AI service instance backed by the agent runtime."""
+    return AIService(agents=agents, audit_sink=audit_sink)

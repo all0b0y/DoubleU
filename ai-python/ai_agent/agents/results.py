@@ -1,0 +1,167 @@
+"""Typed agent outputs.
+
+These pydantic models ARE the output contract of each agent: pydantic-ai
+enforces the schema natively (tool-based structured output), which replaces
+the hand-written JSON-format prompt rules and the ``_parse_structured_reply``
+/ ``strip_code_fences`` salvage parsing of the legacy pipelines.  Validation
+that used to live in normalizer functions (intent whitelist, confidence
+clamping, fact-type enums, profile-field whitelist) is expressed as field
+types so a hallucinated value can never widen the contract.
+"""
+
+from __future__ import annotations
+
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field
+
+# Mirrors the regex classifier intents plus choice_question, which only the
+# LLM can produce (ARCH-2/ARCH-4).
+Intent = Literal[
+    "question",
+    "scheduling",
+    "commercial",
+    "acknowledgement",
+    "request",
+    "choice_question",
+    "general_message",
+]
+
+
+class DraftResult(BaseModel):
+    """Structured draft: reply + intent + options + confidence + topic (ARCH-4)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    reply: str = Field(
+        min_length=1,
+        description="Текст ответа собеседнику от лица владельца — только текст сообщения, без пояснений.",
+    )
+    intent: Intent = Field(
+        default="general_message",
+        description=(
+            "Интент последнего сообщения собеседника. choice_question — ТОЛЬКО если"
+            " собеседник предлагает выбор из явных альтернатив (обычно с «или» и вопросом)."
+        ),
+    )
+    options: tuple[str, ...] = Field(
+        default=(),
+        max_length=4,
+        description=(
+            "Для intent=choice_question — 2-4 коротких готовых ответа от лица владельца."
+            " Для остальных интентов — пустой список."
+        ),
+    )
+    confidence: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Самооценка 0..1: насколько reply уместно отправить автоматически без проверки"
+            " владельцем (учитывай неоднозначность вопроса и нехватку контекста)."
+        ),
+    )
+    topic: str = Field(
+        default="",
+        max_length=100,
+        description="Тема разговора — короткая именная группа в 3-7 словах.",
+    )
+
+
+class CriticVerdict(BaseModel):
+    """Reviewer verdict on a draft before it reaches the owner/contact."""
+
+    model_config = ConfigDict(frozen=True)
+
+    verdict: Literal["approve", "revise"] = Field(
+        description="approve — черновик можно отправлять как есть; revise — нужны правки.",
+    )
+    issues: tuple[str, ...] = Field(
+        default=(),
+        max_length=5,
+        description="Краткий список конкретных проблем черновика (пусто при approve).",
+    )
+    revised_reply: str = Field(
+        default="",
+        description="При verdict=revise — исправленный текст ответа; иначе пустая строка.",
+    )
+
+
+class ExtractedFact(BaseModel):
+    """One durable, long-lived fact extracted from the conversation."""
+
+    model_config = ConfigDict(frozen=True)
+
+    fact_text: str = Field(min_length=5, max_length=120)
+    fact_type: Literal[
+        "preference", "biographical", "commitment", "event", "relationship", "health", "taboo"
+    ] = "preference"
+    subject: Literal["contact", "owner", "relationship", "third_party"] = "contact"
+    confidence: float = Field(
+        default=0.75,
+        ge=0.0,
+        le=1.0,
+        description="≥0.8 только когда факт назван в сообщении явно и однозначно.",
+    )
+
+
+class ProfileSuggestionResult(BaseModel):
+    """Identity attribute of the CONTACT revealed explicitly by the message (MEM-4)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    field_name: Literal["relationship_type", "preferred_address", "language", "tone", "gender"]
+    suggested_value: str = Field(min_length=1, max_length=64)
+    rationale: str = Field(default="", max_length=120, description="Цитата-доказательство из сообщения.")
+
+
+class ExtractionResult(BaseModel):
+    """Full typed-extraction output: durable facts + contact-profile suggestions."""
+
+    model_config = ConfigDict(frozen=True)
+
+    facts: tuple[ExtractedFact, ...] = ()
+    profile_suggestions: tuple[ProfileSuggestionResult, ...] = ()
+
+
+class SummaryResult(BaseModel):
+    """Episode/chat summary with actionable follow-ups (ARCH-10)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    summary: str = Field(min_length=1, description="Краткая сводка переписки на русском.")
+    action_items: tuple[str, ...] = Field(
+        default=(), description="Конкретные обязательства и задачи, упомянутые в переписке."
+    )
+    recommendations: tuple[str, ...] = Field(
+        default=(), description="Проактивные рекомендации владельцу по этому чату."
+    )
+
+
+class TopicResult(BaseModel):
+    """Short topic label for the active conversation episode."""
+
+    model_config = ConfigDict(frozen=True)
+
+    topic: str = Field(
+        default="",
+        max_length=100,
+        description=(
+            "Тема разговора — короткая именная группа в 3-7 слов (например"
+            " «обсуждение договора», «планирование встречи»). Без кавычек и пояснений."
+        ),
+    )
+
+
+class RerankResult(BaseModel):
+    """Listwise cross-encoder verdict: candidate fact IDs, most relevant first."""
+
+    model_config = ConfigDict(frozen=True)
+
+    ranked_ids: tuple[int, ...] = Field(
+        default=(),
+        description=(
+            "ID фактов (числа после «ID=») в порядке убывания релевантности к запросу."
+            " Верни только реально релевантные; нерелевантные опусти."
+        ),
+    )

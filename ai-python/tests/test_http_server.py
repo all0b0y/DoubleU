@@ -5,9 +5,10 @@ from __future__ import annotations
 import unittest
 
 from ai_agent.http_server import make_handler
-from ai_agent.llm import MockLLMGateway, ModelRouter
 from ai_agent.observability.trace import derive_trace_id
 from ai_agent.service import AIService
+
+from agent_helpers import make_test_runtime
 
 
 class HTTPServerTests(unittest.TestCase):
@@ -15,7 +16,7 @@ class HTTPServerTests(unittest.TestCase):
 
     def setUp(self) -> None:
         """Create a bound handler instance without invoking socket setup."""
-        handler_class = make_handler(AIService(ModelRouter(MockLLMGateway())), True)
+        handler_class = make_handler(AIService(make_test_runtime()), True)
         self.handler = object.__new__(handler_class)
 
     def test_health_endpoint(self) -> None:
@@ -58,23 +59,25 @@ class HTTPServerTests(unittest.TestCase):
             },
         )
 
-        # Phase 3 added an optional "flagged" boolean to the contract.
+        # Phase 3 added "flagged"; ARCH-1/ARCH-4 added owner_note/options/topic.
         self.assertEqual(
             set(response),
             {
                 "decision", "response_text", "confidence", "risk_level", "intent",
                 "model_used", "usage", "memory_used", "flagged",
+                "owner_note", "options", "topic",
             },
         )
         self.assertEqual(response["decision"], "auto_reply")
         self.assertFalse(response["flagged"])
+        self.assertEqual(response["owner_note"], "")
 
 
 class TraceIDPropagationTests(unittest.TestCase):
     """Phase 0: trace_id is derived from event_id and stamped on audit rows."""
 
     def setUp(self) -> None:
-        handler_class = make_handler(AIService(ModelRouter(MockLLMGateway())), True)
+        handler_class = make_handler(AIService(make_test_runtime()), True)
         self.handler = object.__new__(handler_class)
 
     def test_audit_row_carries_derived_trace_id(self) -> None:

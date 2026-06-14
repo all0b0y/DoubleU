@@ -1,11 +1,13 @@
 # DoubleU — Memory Architecture & Data Design
 
-**Status:** Draft v3
+**Status:** v6 (синхронизирован с кодом и миграциями 001–016, 2026-06-11)
 **Audience:** Engineering, Data, Product
-**Scope:** Core memory subsystem — schema, lifecycle, retrieval, privacy, runtime state.
-**Out of scope:** Telegram Business webhook handling, model selection, billing, UI, AI-роли (отдельный документ при появлении).
+**Scope:** Core memory subsystem — schema, lifecycle, retrieval, privacy, runtime state, AI-роли.
+**Out of scope:** Telegram Business webhook handling, model selection, billing, UI.
 
 **Changelog:**
+- v6 (выравнивание с реальностью, MEM-12): эмбеддинги — `qwen/qwen3-embedding-8b`, `vector(4096)`, асинхронный embedding-worker в Go + halfvec-HNSW expression-индексы (миграция 015); `upsert_semantic_fact` v3 принимает **embedding кандидата параметром** и возвращает `(action, fact_id, superseded_fact_id)` (миграция 013) — PG эмбеддинги не генерирует; deletion contract §10.2 реализован (`ForgetChat`/`UnlearnFact`/`ForgetAll` + бот-команды `/forget`, `/forget_all`); suggestions flow §4.5 реализован (extraction → `contact_profile_suggestions` → accept/reject в боте, экспирация 14 дней); идемпотентность сводок — по пересечению периодов эпизода, не по дате (`summarizeEpisode` + daily-fallback по непокрытому окну); `messages.risk_level NOT NULL DEFAULT 'low'` (миграция 014); описаны подсистемы, появившиеся в коде после v5: temporal knowledge graph (`fact_relations`, 009), sleep-time consolidation (`consolidate_facts`, 010), embedding worker с nudge-каналом, topic из структурированного draft-ответа (ARCH-4), детерминированный cosine-rerank вместо LLM-reranker (ARCH-5), токен-бюджет контекста §8.1 (4000 ток.), runtime state `open_question_message_id`/`pending_owner_action` (MEM-5). Удалены из документа DDL `pending_global_health_facts` и процедуры global-health (наследие ≤v4). GRANT-защита прямых INSERT отложена до выделенной DB-роли — в коде DB-путь записи фактов идёт только через процедуру (MEM-11).
+- v5 (продуктовый разворот): **память строго per-chat** — scope `owner_global` упразднён (миграция 011 soft-delete'ит существующие глобальные факты, код их не пишет и не читает); **AI-роли** — вместо "цифровой копии владельца" система воспроизводит описанную владельцем персону (`ai_roles` + `chat_settings.ai_role_id`, §13); промпт перестроен role-first; очередь `pending_global_health_facts` удалена (health-факты — обычные chat-scoped с hard-include).
 - v3: добавлен runtime-state слой (`active_episodes`); concurrency protection в dedup (advisory lock + normalized_fact_hash UNIQUE); composite FK `source_message_id`; денормализация `tenant_id` в `fact_occurrences`; явный `CREATE EXTENSION vector`; mandatory confirmation flow для global health-фактов; 4-step backfill для `risk_level`.
 - v2: добавлен `scope_kind` (chat / owner_global); правило назначения scope и override; удалён глобальный стиль владельца.
 - v1: первая редакция.
@@ -14,7 +16,11 @@
 
 ## 0. Why this document exists
 
-Текущая реализация памяти **не работает как память**. Эмпирически на синтетическом датасете (1400 записей `memory_facts`):
+> **Историческая справка (v1, 2025).** Метрики ниже описывают давно удалённую
+> таблицу `memory_facts` — её не существует с clean-schema миграции 001.
+> Раздел сохранён как мотивация контрактов, не как описание текущего состояния.
+
+Реализация памяти на момент v1 **не работала как память**. Эмпирически на синтетическом датасете (1400 записей `memory_facts`):
 
 - 62% записей — дубликаты (524 уникальных из 1400).
 - 194 записи имеют рекурсивный префикс `[FACT] extracted: [FACT] extracted: ...` глубиной до 14 уровней — extractor читает свой output как input.
@@ -32,8 +38,8 @@
 
 1. **Память делится по роли в промпте, не по времени.** "Долгосрочная / краткосрочная" — продуктовый язык. Слои: User → Per-Chat Identity → Working → Runtime State → Episodic → Semantic.
 2. **Сырые сообщения — не память, а аудит.** Они в `messages`, не копируются в memory-таблицы как "факты".
-3. **Стиль общения — свойство пары (владелец, контакт).** Нет глобального baseline стиля. Каждый чат имеет свой стиль в `contact_profiles`.
-4. **Факты о владельце — кросс-чатные, факты о других — per-chat.** Единственный класс памяти, пересекающий границу чата. Фиксируется через `scope_kind`.
+3. **Стиль общения — свойство пары (роль, контакт).** Нет глобального baseline стиля. Каждый чат имеет свою назначенную AI-роль (§13) и свой стиль в `contact_profiles`.
+4. **Память строго per-chat. Общей памяти нет и не существует.** (v5) Каждый чат живёт со своей памятью: факт, наблюдённый в одном чате, никогда не виден в другом — включая факты о владельце. Ни один класс памяти не пересекает границу чата.
 5. **Runtime state ≠ persistent state.** Открытая тема, незавершённый вопрос — это runtime, живёт в `active_episodes`, удаляется при закрытии эпизода. Производные состояния (была ли пауза, здоровались ли) — это **запросы к messages**, не отдельные хранимые поля. Денормализация запрещена.
 6. **Provenance везде.** Каждая запись имеет источник (source_message_id, timestamp, кем подтверждена).
 7. **Dedup на write, защищённый от race.** Перед каждым insert в semantic-слой — semantic search + advisory lock + normalized_hash UNIQUE constraint как catch-net.
@@ -69,9 +75,13 @@
 │  episode_summaries                                              │
 └─────────────────────────────────────────────────────────────────┘
 ┌─────────────────────────────────────────────────────────────────┐
-│  SEMANTIC — атомарные факты, двухуровневый scope                │
-│  semantic_facts (scope=chat | owner_global)                     │
+│  SEMANTIC — атомарные факты, строго per-chat                    │
+│  semantic_facts (scope=chat — единственный scope, v5)           │
 │  fact_embeddings + fact_occurrences                              │
+└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│  AI ROLES — персоны для ответов (§13, v5)                       │
+│  ai_roles (библиотека) + chat_settings.ai_role_id (назначение)  │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -82,13 +92,14 @@
 | Краткосрочная память (день)  | Working + Runtime             | `messages` + `active_episodes`|
 | Долгосрочная (сводки)        | Episodic                      | `episode_summaries`           |
 | Факты о контакте             | Semantic (scope=chat)         | `semantic_facts`              |
-| Факты о владельце вообще     | Semantic (scope=owner_global) | `semantic_facts`              |
+| Факты о владельце в чате     | Semantic (scope=chat)         | `semantic_facts`              |
 | Карточка контакта            | Per-chat identity             | `contact_profiles`            |
+| AI-роль (персона) чата       | AI Roles (§13)                | `ai_roles` + `chat_settings`  |
 | Настройки владельца          | User layer                    | `user_settings`               |
 
 **Чего НЕТ намеренно:**
+- Общей (кросс-чатной) памяти в любом виде — scope `owner_global` упразднён в v5.
 - Глобального профиля стиля владельца (§16 — почему отклонено повторно).
-- Ролей / персонажей (§13).
 - `dialog_state` с булевыми флагами типа `greeted_today` (§6.2 — почему отклонено).
 
 ---
@@ -176,51 +187,37 @@ fact_type ENUM:
   taboo          -- "не обсуждать тему X"
 ```
 
-### 5.3. Scope: chat vs owner_global
+### 5.3. Scope: только chat (v5)
 
-**`scope_kind = 'chat'`** — факт привязан к chat_id, виден только в этом чате.
+**`scope_kind = 'chat'`** — единственный действующий scope. Факт привязан к chat_id и виден только в этом чате.
 
-**`scope_kind = 'owner_global'`** — факт о самом владельце, виден во всех чатах. Только `subject = 'owner'` может быть global.
+Scope `owner_global` упразднён в v5: память строго per-chat, кросс-чатных фактов не существует. Колонка `scope_kind` сохранена ради provenance soft-deleted legacy-строк (миграция 011), новые записи всегда `'chat'`.
 
 ### 5.4. Правило назначения scope (детерминированное)
 
 ```
-IF subject = 'owner' AND fact_type IN ('health', 'biographical'):
-    scope_kind = 'owner_global', chat_id = NULL
-    IF fact_type = 'health': требуется confirmation flow (§7.1)
-ELSE:
-    scope_kind = 'chat', chat_id = $current_chat_id
+scope_kind = 'chat', chat_id = $current_chat_id   -- всегда, без исключений
 ```
 
-Обоснование выбора `health` и `biographical`:
-- **health** — критичная информация. Цена пропуска выше цены ложного срабатывания.
-- **biographical** — устойчивые факты о владельце, релевантные в большинстве чатов.
-
-Остальные типы — контекстные, авто-глобализация даст шум.
+Go-бэкенд игнорирует любые scope-хинты от Python-сервиса (защита от
+галлюцинаций LLM и от legacy-клиентов, всё ещё присылающих `owner_global`).
+Health-факты больше не требуют confirmation flow: они chat-scoped и попадают
+только в контекст своего чата (hard-include §8.2); очередь
+`pending_global_health_facts` удалена.
 
 ### 5.5. Override владельца: ручное изменение scope
 
-**Promote `chat → owner_global`** (кнопка "Сделать глобальным"):
-- Только для `subject = 'owner'`.
-- `metadata.override_reason = 'manual_promote'`, `metadata.original_chat_id`.
-- audit_events: `fact_scope_changed`.
+Упразднено в v5 вместе с global-scope: единственный scope — `chat`,
+переводить факт некуда. Управление фактами сводится к удалению/правке
+текста факта (через suggestions flow).
 
-**Demote `owner_global → chat`** (кнопка "Только для этого чата"):
-- `metadata.override_reason = 'manual_demote'`, `metadata.original_scope = 'owner_global'`.
-- audit_events: `fact_scope_changed`.
+### 5.6. Конфликты фактов
 
-Обе операции обратимы.
-
-### 5.6. Конфликты chat-факта и global-факта
-
-Конфликт = два факта одного `fact_type`, одного `subject`, cosine similarity > 0.85.
-
-**Правило: chat побеждает global.** Global исключается из промпта. Лог в metadata промпта (для отладки): `[chat fact overrides global fact #12345]`.
+Конфликт = два факта одного `fact_type`, одного `subject`, cosine similarity > 0.85 **внутри одного чата**. Разрешается dedup-on-write (§5.8): новый факт supersede'ит старый. Межчатовых конфликтов не существует — память чатов не пересекается.
 
 ### 5.7. Поля semantic_facts
 
 Полный DDL — в §9. Ключевые инварианты (через CHECK):
-- `scope_kind='owner_global'` ⇒ `subject='owner' AND chat_id IS NULL`.
 - `scope_kind='chat'` ⇒ `chat_id IS NOT NULL`.
 - `fact_text` без префиксов `[FACT]`, `[EXTRACTED]`, `[OWNER STYLE]`.
 - `char_length(fact_text) BETWEEN 5 AND 200`.
@@ -230,21 +227,30 @@ ELSE:
 
 Защищён двумя независимыми механизмами:
 
-**Механизм 1: Advisory lock + semantic search в stored proc.**
+**Механизм 1: Advisory lock + semantic search в stored proc** (`upsert_semantic_fact` v3, миграция 013).
 ```
-1. pg_advisory_xact_lock(hashtext(tenant_id || ':' || chat_id || ':' || fact_type || ':' || subject))
-   — сериализует параллельные dedup в пределах одного (tenant, chat, type, subject).
-2. Сгенерировать embedding кандидата.
-3. SELECT top-1 по cosine WHERE scope_matches AND fact_type AND subject.
-4. similarity ≥ 0.97 → identical → fact_occurrences++ (idempotent).
-   0.85 ≤ similarity < 0.97 → similar → supersede + insert новый.
-   similarity < 0.85 → новый факт.
+0. Go-бэкенд синхронно эмбеддит кандидата (/ai/embed-texts, таймаут 5 с) и передаёт
+   вектор параметром p_embedding. PG эмбеддинги не генерирует; p_embedding=NULL
+   деградирует дедуп до hash-only (асинхронный worker доэмбеддит позже).
+1. pg_advisory_xact_lock(hashtextextended(tenant_id || ':' || scope || ':' || chat_id))
+   — сериализует параллельные dedup в пределах чата. Гранулярность сознательно
+   грубее, чем (type, subject): contention per-chat, lock транзакционный (§16.2).
+2. Tier 1: exact match по normalized_fact_hash → fact_occurrences++ → ('occurrence_added', id, NULL).
+3. Tier 2/3 (только при p_embedding IS NOT NULL): top-1 по cosine к p_embedding
+   WHERE тот же chat AND fact_type AND subject.
+   similarity ≥ 0.97 → identical → occurrence.
+   0.85 ≤ similarity < 0.97 → insert новый + у старого superseded_by_id=new, deleted_at=now()
+                              → ('superseded', new_id, old_id).
+   similarity < 0.85 → ('inserted', new_id, NULL); embedding кандидата пишется в
+                       fact_embeddings в той же транзакции.
+4. Возврат TABLE(action, fact_id, superseded_fact_id) — Go создаёт ребро
+   fact_relations(supersedes) из superseded_fact_id без дополнительного запроса.
 ```
 
 **Механизм 2: UNIQUE partial index по normalized_fact_hash как catch-net.**
-Даже если advisory lock пропустил (split brain, разные транзакции на разных нодах PG в будущем) — точный дубликат не пройдёт уникальный индекс. Stored proc обрабатывает unique_violation как "occurrence_added".
+Даже если advisory lock пропустил (split brain, разные транзакции на разных нодах PG в будущем) — точный дубликат не пройдёт уникальный индекс. Stored proc обрабатывает unique_violation как "occurrence_added_race".
 
-Это **defense in depth**: lock — оптимистично для семантических дубликатов, UNIQUE — гарантия для точных. Прямые INSERT в `semantic_facts` запрещены через GRANT.
+Это **defense in depth**: lock — оптимистично для семантических дубликатов, UNIQUE — гарантия для точных. В коде DB-путь записи фактов идёт исключительно через процедуру (`SaveSemanticFact` — только in-memory fallback при отсутствии DB); GRANT-защита от прямых INSERT отложена до появления выделенной DB-роли — подключение пока использует одну роль (см. §11 п.8).
 
 ---
 
@@ -302,35 +308,26 @@ ELSE:
   → policy_check (заполняет risk_level)
   → INSERT messages 
   → UPSERT active_episodes (создать или обновить запись)
-  → IF risk OK AND chat NOT in no_memory:
-      → extraction_job (async, batched 5-10 сообщений)
-          → LLM extract candidates (typed JSON output)
-          → validate (длина 5-200, type из enum, subject не пуст)
-          → assign scope (§5.4):
-              IF subject=owner AND fact_type='health':
-                  → INSERT в pending_global_health_facts (НЕ в semantic_facts!)
-                  → notify owner: "AI хочет добавить медицинский факт"
-                  → await accept/reject
-                  → IF accepted: упсёрт в semantic_facts через stored proc
-              ELIF subject=owner AND fact_type='biographical':
-                  scope_kind='owner_global', chat_id=NULL
-                  → upsert_semantic_fact(...)
-              ELSE:
-                  scope_kind='chat', chat_id=current
-                  → upsert_semantic_fact(...)
-          → IF target = contact_profile_field:
-              INSERT contact_profile_suggestions (NOT direct write)
-      → log в extraction_log
+  → IF risk OK AND chat NOT in no_memory AND message проходит pre-filter
+        (≥15 символов ИЛИ содержит цифру/имя — MEM-13; «ок»/«да» LLM не зовут):
+      → extraction_job (async, per-message + окно последних 5 сообщений
+        как контекст; батчинг по эпизодам — целевое состояние, гейтится
+        замером extraction_log, см. MEM-13 в memory_architecture_backlog.md)
+          → LLM extract candidates (typed JSON output:
+              {"facts": [...], "profile_suggestions": [...]})
+          → validate (Python-валидатор: fact_text 5-120 символов — строже
+            контрактных 200 сознательно, length-cap по промпту; type из enum,
+            subject не пуст)
+          → assign scope (§5.4, v5):
+              scope_kind='chat', chat_id=current   -- всегда
+              → embed кандидатов (батч, 5 с) → upsert_semantic_fact(..., p_embedding)
+          → profile_suggestions (whitelist полей + enum-значений):
+              INSERT contact_profile_suggestions (NOT direct write) →
+              карточка владельцу accept/reject; pending > 14 дней → expired
+      → log в extraction_log (health-тексты заменены на маркеры [health fact #id], §10.3)
 ```
 
-**Health-фактам нужно особое обращение:** global health-факт может повлиять на ответы в любом чате владельца, включая чувствительные контексты. Ложно-положительная экстракция ("AI решил, что у владельца диабет, потому что в чате обсуждалась диета") неприемлема. Поэтому:
-
-- `pending_global_health_facts` — отдельная таблица (не `semantic_facts` со статусом!).
-- Владельцу показывается UI-карточка с фактом, source-сообщением и явным выбором.
-- Только accepted попадает в `semantic_facts`.
-- Rejected попадает в `extraction_log` со статусом `rejected_by_owner` — для обучения extractor'а в будущем.
-
-Chat-scoped health-факты (про контакта) идут через обычный extraction без confirmation, иначе UX невыносим.
+**Health-факты** (v5): chat-scoped, как и всё остальное, поэтому ложно-положительная экстракция влияет максимум на один чат — тот, где факт прозвучал. Confirmation flow и таблица `pending_global_health_facts` удалены вместе с global-scope (миграция 011). В retrieval health-факты по-прежнему hard-include (§8.2) — внутри своего чата.
 
 **Запрещено** (физически — CHECK / GRANT, не "договорились"):
 - Передавать в extractor предыдущий output extractor'а.
@@ -338,7 +335,6 @@ Chat-scoped health-факты (про контакта) идут через об
 - Тексты длиной > 200 символов.
 - Прямой INSERT в `semantic_facts` минуя stored proc.
 - Прямой UPDATE `contact_profiles` от extractor'а.
-- INSERT global health-факта минуя `pending_global_health_facts`.
 
 ### 7.2. Жизнь (decay по типам)
 
@@ -356,8 +352,6 @@ Chat-scoped health-факты (про контакта) идут через об
 
 Факты не редактируются in-place. При противоречии: старый получает `superseded_by_id = new.id` + `deleted_at = now()`, новый — INSERT. Retrieval выдаёт только не-superseded и не-deleted.
 
-При scope override (§5.5) `superseded_by_id` не используется — это перемещение, не противоречие.
-
 ### 7.4. Смерть
 
 1. **Soft delete по expires_at** — фоновая job, retrieval исключает, 30 дней до hard delete.
@@ -367,13 +361,24 @@ Chat-scoped health-факты (про контакта) идут через об
 ### 7.5. Episodic summaries: границы эпизодов
 
 Эпизод закрывается при:
-- молчании > 6 часов,
-- 40 сообщений с момента последней summary,
-- topic_shift (опционально на v2).
+- молчании > 6 часов (`closeStaleEpisodes`, тикер 15 мин, `closure_reason='silence_gap'`),
+- 40 сообщений (`closure_reason='message_count'`),
+- topic_shift (опционально, не реализован).
 
-При закрытии: INSERT в `episode_summaries`, DELETE из `active_episodes`.
+При закрытии: `summarizeEpisode` берёт сообщения **реальных границ эпизода**
+(`started_at..last_message_at`, не календарных суток), пишет
+`period_start/end` = границы эпизода и заполняет `source_message_ids[]`
+реальными ID (provenance §6). Идемпотентность — по пересечению периодов
+(`EpisodeSummaryOverlaps`): два эпизода в один день дают две сводки, повторное
+закрытие того же — ни одной. Дополнительный слой — ежедневный fallback
+(`closure_reason='daily_summary'`, миграция 012 расширила CHECK): в полночь
+суммаризуется только окно дня, **не покрытое** ни одной сводкой
+(`LatestCoveredEnd`), закрывая случай «чат активен, но эпизод не закрылся до
+полуночи». Summary короче 50 символов логируется и пропускается (CHECK 50..1500);
+длиннее 1500 — обрезается. После записи embedding-worker получает nudge.
 
-Содержание summary: 3-6 предложений (тема, решения, commitments, тон), `period_start/end`, `source_message_ids[]`, `closure_reason`, `embedding`.
+Содержание summary: 3-6 предложений (тема, решения, commitments, тон) —
+структурированный вызов `{summary, action_items[], recommendations[]}` (ARCH-10).
 
 ---
 
@@ -403,35 +408,47 @@ Chat-scoped health-факты (про контакта) идут через об
    - SELECT top-3 episode_summaries WHERE chat_id=$X 
        AND period_end > now() - 30 days AND deleted_at IS NULL
 
-6. Semantic block (scope-aware):
+6. Semantic block (только этот чат, v5):
    - 6a: chat-факты — SELECT top-K WHERE scope_kind='chat' AND chat_id=$X
-   - 6b: global-факты — SELECT top-M WHERE scope_kind='owner_global'
-   - 6c: разрешение конфликтов (§5.6) — chat побеждает global
-   - 6d: hard-include всех taboo + health (с тем же conflict resolution)
+        (vector + BM25 → RRF fusion → детерминированный cosine-rerank в SQL
+         по embedding кандидатов, top-8; LLM-reranker /ai/rerank-facts из
+         горячего пути убран — ARCH-5, эндпоинт жив до cutover-замера)
+   - 6b: hard-include всех taboo + health этого чата (не вытесняются ранжированием)
 
-7. Compose prompt:
-   [System: персона, режим, дата]
-   [User: display_name, timezone, language]
+   Независимые чтения шагов 2-6 выполняются параллельно (errgroup-паттерн):
+   embed-вызов (~2-5 с) перекрывает DB-roundtrip'ы (ARCH-8).
+
+7. Compose prompt (role-first, v5):
+   [System: КТО ТЫ — ai_role чата: имя, описание, стиль речи, цели,
+            ограничения; без роли — дефолтная персона "ассистент владельца,
+            пиши в его стиле"]
+   [О владельце, от чьего имени идёт переписка: display_name, timezone, language]
    [Contact: имена, отношения, как обращаться, стиль для этого чата]
    [Chat context: о чём чат, что не обсуждать]
    [Runtime: open_question, current_topic, pending_owner_action, paused_hours]
-   [Owner global facts: ... (после фильтрации §5.6)]
-   [Chat facts: ...]
+   [Chat facts: ... — только факты этого чата]
    [Recent episodes: 1-3 summaries]
    [Conversation: последние 20 сообщений]
    [Incoming: текущее сообщение]
-   [Instruction]
+   [Instruction: приоритет — инструкция владельца > ограничения роли >
+                 описание/стиль роли > профиль контакта > переписка]
 ```
 
 ### 8.1. Token budget (8k context):
-- User + identity + chat settings + runtime: ~500
+- User + identity + chat settings + runtime + role: ~600
 - Chat-facts (5-8 × 30): ~200
-- Global-facts (3-5 × 30): ~150
 - Episodic (3 × 100): ~300
 - Working (20 × 30): ~600
 - Overhead: ~500
 
-Итого ~2.3k. При урезании: working (20→10) → episodic (3→1) → chat-facts (8→5) → global-facts (5→3). Identity, runtime, hard-include — не режутся.
+Итого ~2.2k. При урезании: working (20→10) → episodic (3→1) → chat-facts (8→5) → pending-drafts (→2). Identity, role, runtime, commitments, hard-include — не режутся.
+
+**Реализация (MEM-9/ARCH-15):** бюджет в Go (`conversationContext`) — оценка
+`len(text)/3` токенов, потолок `contextTokenBudget = 4000` на собранный
+memory-контекст (identity/role собираются на Python-стороне и сюда не входят);
+урезание строго в порядке выше, срабатывание логируется
+(`context budget trimming applied`). `paused_hours` инжектится строкой
+`[RUNTIME: paused_hours=N.N]` из `view_chat_paused_hours`.
 
 ### 8.2. Retrieval-веса
 - `taboo`, `health`: hard-include.
@@ -542,9 +559,11 @@ CREATE TABLE active_episodes (
   FOREIGN KEY (tenant_id, chat_id, open_question_message_id)
     REFERENCES messages(tenant_id, chat_id, source_message_id) ON DELETE SET NULL
 );
-CREATE INDEX ix_ae_stale ON active_episodes(last_message_at) 
-  WHERE last_message_at < now() - interval '6 hours';
 -- Индекс под фоновую job, которая закрывает залежавшиеся эпизоды.
+-- ВАЖНО: partial index с предикатом now() невозможен (now() не immutable) —
+-- 001 создаёт обычный индекс; predicate-вариант из ранних версий документа
+-- не создался бы вовсе.
+CREATE INDEX ix_ae_stale ON active_episodes(last_message_at);
 
 -- Derived views (производные состояния, без денормализации):
 CREATE OR REPLACE FUNCTION view_chat_paused_hours(p_tenant TEXT, p_chat TEXT)
@@ -585,19 +604,27 @@ CREATE TABLE episode_summaries (
   source_message_ids  TEXT[] NOT NULL,
   message_count       INT NOT NULL,
   closure_reason      TEXT NOT NULL CHECK (closure_reason IN
-                      ('silence_gap','message_count','topic_shift','manual')),
-  embedding           vector(1536),
+                      ('silence_gap','message_count','topic_shift','manual','daily_summary')),  -- 'daily_summary' добавлен миграцией 012
+  embedding           vector(4096),       -- qwen/qwen3-embedding-8b (миграция 003)
+  embedding_model     TEXT,               -- добавлена миграцией 012
   privacy_flags       JSONB NOT NULL DEFAULT '{}'::jsonb,
   deleted_at          TIMESTAMPTZ,
   created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX ix_es_chat ON episode_summaries(tenant_id, chat_id, period_end DESC)
   WHERE deleted_at IS NULL;
-CREATE INDEX ix_es_embedding ON episode_summaries
-  USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
+-- ANN: pgvector HNSW не поддерживает vector >2000 dims; миграция 015 создаёт
+-- expression-индекс по halfvec-касту (требует pgvector ≥ 0.7):
+CREATE INDEX ix_es_halfvec_hnsw ON episode_summaries
+  USING hnsw ((embedding::halfvec(4096)) halfvec_cosine_ops)
+  WHERE deleted_at IS NULL AND embedding IS NOT NULL;
 
 -- ============================================================
 -- SEMANTIC LAYER
+-- v5: DDL ниже — историческая схема 001. CHECK всё ещё допускает
+-- 'owner_global' (строки сохранены как soft-deleted provenance, миграция 011),
+-- но код пишет и читает ТОЛЬКО scope_kind='chat'. Таблица
+-- pending_global_health_facts удалена миграцией 011. Роли — в ai_roles (§13).
 -- ============================================================
 CREATE TABLE semantic_facts (
   id                BIGSERIAL PRIMARY KEY,
@@ -666,16 +693,22 @@ CREATE TABLE fact_embeddings (
   tenant_id         TEXT NOT NULL,
   scope_kind        TEXT NOT NULL CHECK (scope_kind IN ('chat','owner_global')),
   chat_id           TEXT,
-  embedding_model   TEXT NOT NULL,
-  embedding         vector(1536) NOT NULL,
+  embedding_model   TEXT NOT NULL DEFAULT 'qwen/qwen3-embedding-8b',
+  -- vector(4096) с миграции 003; NULLABLE: строка появляется при insert факта,
+  -- вектор пишет либо upsert_semantic_fact (если кандидат пришёл с embedding),
+  -- либо асинхронный embedding-worker (тикер 5 мин + nudge-канал при insert).
+  embedding         vector(4096),
   created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE INDEX ix_fe_vector ON fact_embeddings
-  USING ivfflat (embedding vector_cosine_ops) WITH (lists = 200);
+-- ANN (миграция 015, pgvector ≥ 0.7):
+CREATE INDEX ix_fe_halfvec_hnsw ON fact_embeddings
+  USING hnsw ((embedding::halfvec(4096)) halfvec_cosine_ops)
+  WHERE embedding IS NOT NULL;
 CREATE INDEX ix_fe_chat_scope ON fact_embeddings(tenant_id, chat_id) 
   WHERE scope_kind='chat';
-CREATE INDEX ix_fe_global_scope ON fact_embeddings(tenant_id) 
-  WHERE scope_kind='owner_global';
+-- Запросы ранжирования используют двухступенчатую схему: внутренний ANN-подзапрос
+-- упорядочивает чисто по cosine (только такую форму обслуживает HNSW-индекс) с
+-- oversample K×3, type-боусты пересортировывают снаружи (MEM-7).
 
 -- fact_occurrences с tenant_id (RLS-ready)
 CREATE TABLE fact_occurrences (
@@ -691,25 +724,23 @@ CREATE TABLE fact_occurrences (
 CREATE INDEX ix_fo_source ON fact_occurrences(tenant_id, source_message_id);
 CREATE INDEX ix_fo_fact ON fact_occurrences(fact_id);
 
+-- (v6: исторический DDL pending_global_health_facts удалён из документа —
+--  таблица не существует с миграции 011, health-факты chat-scoped.)
+
 -- ============================================================
--- PENDING GLOBAL HEALTH (confirmation queue)
+-- TEMPORAL KNOWLEDGE GRAPH (миграция 009, появился после v3)
 -- ============================================================
-CREATE TABLE pending_global_health_facts (
-  id                BIGSERIAL PRIMARY KEY,
-  tenant_id         TEXT NOT NULL,
-  chat_id           TEXT NOT NULL,         -- из какого чата извлечён
-  source_message_id TEXT NOT NULL,
-  fact_text         TEXT NOT NULL CHECK (char_length(fact_text) BETWEEN 5 AND 200),
-  confidence        REAL NOT NULL,
-  status            TEXT NOT NULL DEFAULT 'pending'
-                    CHECK (status IN ('pending','accepted','rejected','expired')),
-  created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
-  reviewed_at       TIMESTAMPTZ,
-  resulting_fact_id BIGINT REFERENCES semantic_facts(id),  -- если accepted
-  FOREIGN KEY (tenant_id, chat_id, source_message_id)
-    REFERENCES messages(tenant_id, chat_id, source_message_id) ON DELETE CASCADE
+CREATE TABLE fact_relations (
+  id             BIGSERIAL PRIMARY KEY,
+  tenant_id      TEXT NOT NULL,
+  fact_id_from   BIGINT NOT NULL REFERENCES semantic_facts(id) ON DELETE CASCADE,
+  fact_id_to     BIGINT NOT NULL REFERENCES semantic_facts(id) ON DELETE CASCADE,
+  relation_type  TEXT NOT NULL,  -- supersedes | fulfills | contradicts | updates | related
+  confidence     REAL,
+  UNIQUE (fact_id_from, fact_id_to, relation_type)
 );
-CREATE INDEX ix_pghf_pending ON pending_global_health_facts(tenant_id) WHERE status='pending';
+-- Ребро 'supersedes' создаёт Go из superseded_fact_id результата
+-- upsert_semantic_fact; view current_facts резолвит «текущую истину».
 
 -- ============================================================
 -- EXTRACTION LOG
@@ -739,179 +770,45 @@ CREATE OR REPLACE FUNCTION normalize_fact_text(p_text TEXT) RETURNS TEXT AS $$
     'sha256'), 'hex');
 $$ LANGUAGE sql IMMUTABLE;
 
-CREATE OR REPLACE FUNCTION upsert_semantic_fact(
-  p_tenant_id            TEXT,
-  p_scope_kind           TEXT,
-  p_chat_id              TEXT,
-  p_fact_text            TEXT,
-  p_fact_type            TEXT,
-  p_subject              TEXT,
-  p_confidence           REAL,
-  p_source               TEXT,
-  p_source_message_id    TEXT,
-  p_embedding            vector(1536),
-  p_similarity_threshold REAL DEFAULT 0.85
-) RETURNS TABLE (action TEXT, fact_id BIGINT) AS $$
-DECLARE
-  v_lock_key BIGINT;
-  v_existing_id BIGINT;
-  v_existing_similarity REAL;
-  v_new_id BIGINT;
-  v_hash TEXT;
-BEGIN
-  -- Защита от health-фактов мимо confirmation flow
-  IF p_scope_kind = 'owner_global' AND p_fact_type = 'health' THEN
-    RAISE EXCEPTION 'Global health facts must go through pending_global_health_facts';
-  END IF;
-
-  v_hash := normalize_fact_text(p_fact_text);
-  
-  -- Advisory lock на scope, чтобы сериализовать параллельный dedup
-  v_lock_key := hashtextextended(
-    p_tenant_id || ':' || p_scope_kind || ':' || COALESCE(p_chat_id, '') 
-    || ':' || p_fact_type || ':' || p_subject, 0);
-  PERFORM pg_advisory_xact_lock(v_lock_key);
-
-  -- Semantic search в пределах scope
-  IF p_scope_kind = 'owner_global' THEN
-    SELECT sf.id, 1 - (fe.embedding <=> p_embedding)
-      INTO v_existing_id, v_existing_similarity
-      FROM semantic_facts sf
-      JOIN fact_embeddings fe ON fe.fact_id = sf.id
-     WHERE sf.tenant_id = p_tenant_id
-       AND sf.scope_kind = 'owner_global'
-       AND sf.fact_type = p_fact_type AND sf.subject = p_subject
-       AND sf.deleted_at IS NULL AND sf.superseded_by_id IS NULL
-     ORDER BY fe.embedding <=> p_embedding LIMIT 1;
-  ELSE
-    SELECT sf.id, 1 - (fe.embedding <=> p_embedding)
-      INTO v_existing_id, v_existing_similarity
-      FROM semantic_facts sf
-      JOIN fact_embeddings fe ON fe.fact_id = sf.id
-     WHERE sf.tenant_id = p_tenant_id
-       AND sf.scope_kind = 'chat' AND sf.chat_id = p_chat_id
-       AND sf.fact_type = p_fact_type AND sf.subject = p_subject
-       AND sf.deleted_at IS NULL AND sf.superseded_by_id IS NULL
-     ORDER BY fe.embedding <=> p_embedding LIMIT 1;
-  END IF;
-
-  IF v_existing_similarity >= 0.97 THEN
-    INSERT INTO fact_occurrences(tenant_id, fact_id, source_message_id, chat_id)
-    VALUES (p_tenant_id, v_existing_id, p_source_message_id, 
-            COALESCE(p_chat_id, (SELECT chat_id FROM semantic_facts WHERE id = v_existing_id)))
-    ON CONFLICT DO NOTHING;
-    RETURN QUERY SELECT 'occurrence_added'::TEXT, v_existing_id;
-
-  ELSIF v_existing_similarity >= p_similarity_threshold THEN
-    BEGIN
-      INSERT INTO semantic_facts(
-        tenant_id, scope_kind, chat_id, fact_text, normalized_fact_hash,
-        fact_type, subject, confidence, source, source_message_id)
-      VALUES (p_tenant_id, p_scope_kind, p_chat_id, p_fact_text, v_hash,
-              p_fact_type, p_subject, p_confidence, p_source, p_source_message_id)
-      RETURNING id INTO v_new_id;
-    EXCEPTION WHEN unique_violation THEN
-      -- Catch-net сработал — точный дубликат уже существует
-      SELECT id INTO v_existing_id FROM semantic_facts
-       WHERE tenant_id=p_tenant_id AND scope_kind=p_scope_kind 
-         AND COALESCE(chat_id,'')=COALESCE(p_chat_id,'')
-         AND fact_type=p_fact_type AND subject=p_subject 
-         AND normalized_fact_hash=v_hash
-         AND deleted_at IS NULL AND superseded_by_id IS NULL;
-      INSERT INTO fact_occurrences(tenant_id, fact_id, source_message_id, chat_id)
-      VALUES (p_tenant_id, v_existing_id, p_source_message_id, COALESCE(p_chat_id, ''))
-      ON CONFLICT DO NOTHING;
-      RETURN QUERY SELECT 'occurrence_added_race'::TEXT, v_existing_id;
-      RETURN;
-    END;
-    INSERT INTO fact_embeddings(fact_id, tenant_id, scope_kind, chat_id, 
-                                embedding_model, embedding)
-    VALUES (v_new_id, p_tenant_id, p_scope_kind, p_chat_id, 
-            'text-embedding-3-small', p_embedding);
-    UPDATE semantic_facts SET superseded_by_id = v_new_id, deleted_at = now() 
-      WHERE id = v_existing_id;
-    RETURN QUERY SELECT 'superseded'::TEXT, v_new_id;
-
-  ELSE
-    BEGIN
-      INSERT INTO semantic_facts(
-        tenant_id, scope_kind, chat_id, fact_text, normalized_fact_hash,
-        fact_type, subject, confidence, source, source_message_id)
-      VALUES (p_tenant_id, p_scope_kind, p_chat_id, p_fact_text, v_hash,
-              p_fact_type, p_subject, p_confidence, p_source, p_source_message_id)
-      RETURNING id INTO v_new_id;
-    EXCEPTION WHEN unique_violation THEN
-      SELECT id INTO v_existing_id FROM semantic_facts
-       WHERE tenant_id=p_tenant_id AND scope_kind=p_scope_kind 
-         AND COALESCE(chat_id,'')=COALESCE(p_chat_id,'')
-         AND fact_type=p_fact_type AND subject=p_subject 
-         AND normalized_fact_hash=v_hash
-         AND deleted_at IS NULL AND superseded_by_id IS NULL;
-      INSERT INTO fact_occurrences(tenant_id, fact_id, source_message_id, chat_id)
-      VALUES (p_tenant_id, v_existing_id, p_source_message_id, COALESCE(p_chat_id, ''))
-      ON CONFLICT DO NOTHING;
-      RETURN QUERY SELECT 'occurrence_added_race'::TEXT, v_existing_id;
-      RETURN;
-    END;
-    INSERT INTO fact_embeddings(fact_id, tenant_id, scope_kind, chat_id, 
-                                embedding_model, embedding)
-    VALUES (v_new_id, p_tenant_id, p_scope_kind, p_chat_id, 
-            'text-embedding-3-small', p_embedding);
-    RETURN QUERY SELECT 'inserted'::TEXT, v_new_id;
-  END IF;
-END;
-$$ LANGUAGE plpgsql;
-
--- GRANTs
-REVOKE INSERT, UPDATE ON semantic_facts FROM app_role;
-REVOKE INSERT, UPDATE ON fact_embeddings FROM app_role;
-GRANT EXECUTE ON FUNCTION upsert_semantic_fact TO app_role;
-GRANT EXECUTE ON FUNCTION change_fact_scope TO app_role;
-GRANT EXECUTE ON FUNCTION accept_pending_health_fact TO app_role;
+-- Актуальная версия процедуры — миграция 013 (upsert_semantic_fact v3).
+-- Сигнатура (источник истины — файл миграции, не этот документ):
+CREATE FUNCTION upsert_semantic_fact(
+  p_tenant_id         TEXT,
+  p_scope_kind        TEXT,
+  p_chat_id           TEXT,
+  p_fact_text         TEXT,
+  p_fact_type         TEXT,
+  p_subject           TEXT,
+  p_confidence        REAL,
+  p_source            TEXT,
+  p_source_message_id TEXT,
+  p_expires_at        TIMESTAMPTZ DEFAULT NULL,
+  p_embedding         vector(4096) DEFAULT NULL,   -- embedding КАНДИДАТА от вызывающего
+  p_embedding_model   TEXT DEFAULT 'qwen/qwen3-embedding-8b'
+) RETURNS TABLE(action TEXT, fact_id BIGINT, superseded_fact_id BIGINT);
 ```
 
-### 9.2. Stored procedure для override scope
-(аналогично v2, без изменений — см. §5.5)
+Семантика — §5.8 (Механизм 1). Ключевые отличия от псевдокода ранних версий:
+- embedding кандидата приходит **параметром** (PG не умеет генерировать
+  эмбеддинги); `NULL` → hash-only дедуп;
+- advisory lock — на `(tenant, scope, chat)` без `(fact_type, subject)`:
+  сознательно более грубая гранулярность (§16.2), contention per-chat;
+- supersede атомарно ставит `deleted_at = now()` у старого факта (§7.3);
+- возврат `superseded_fact_id` избавил Go от follow-up запроса
+  (`FindSupersededFactID` удалён);
+- веток global-scope и global-health нет (v5);
+- при pgvector без `halfvec`/`vector` создаётся hash-only вариант процедуры
+  с параметром `FLOAT8[]` (тот же интерфейс для вызывающего).
 
-### 9.3. Stored procedure для accept health-факта
+**GRANT-защита (§11 п.8) — отложена.** Бэкенд подключается одной ролью;
+`app_role` не существует. Инвариант обеспечен в коде: DB-путь записи фактов
+идёт только через процедуру (`SaveSemanticFact` — in-memory fallback при
+`db == nil`). Полные REVOKE/GRANT — при появлении выделенной роли
+(MEM-11 в memory_architecture_backlog.md).
 
-```sql
-CREATE OR REPLACE FUNCTION accept_pending_health_fact(
-  p_pending_id  BIGINT,
-  p_embedding   vector(1536)
-) RETURNS BIGINT AS $$
-DECLARE
-  v_row RECORD;
-  v_new_fact_id BIGINT;
-BEGIN
-  SELECT * INTO v_row FROM pending_global_health_facts 
-   WHERE id = p_pending_id AND status = 'pending' FOR UPDATE;
-  IF NOT FOUND THEN
-    RAISE EXCEPTION 'Pending health fact not found or already processed';
-  END IF;
-  
-  -- Прямой INSERT минуя upsert_semantic_fact, т.к. она блокирует global health
-  INSERT INTO semantic_facts(
-    tenant_id, scope_kind, chat_id, fact_text, normalized_fact_hash,
-    fact_type, subject, confidence, source, source_message_id)
-  VALUES (v_row.tenant_id, 'owner_global', NULL, v_row.fact_text, 
-          normalize_fact_text(v_row.fact_text),
-          'health', 'owner', v_row.confidence, 'owner_confirmed', v_row.source_message_id)
-  RETURNING id INTO v_new_fact_id;
-  
-  INSERT INTO fact_embeddings(fact_id, tenant_id, scope_kind, chat_id, 
-                              embedding_model, embedding)
-  VALUES (v_new_fact_id, v_row.tenant_id, 'owner_global', NULL, 
-          'text-embedding-3-small', p_embedding);
-  
-  UPDATE pending_global_health_facts 
-     SET status='accepted', reviewed_at=now(), resulting_fact_id=v_new_fact_id
-   WHERE id=p_pending_id;
-  
-  RETURN v_new_fact_id;
-END;
-$$ LANGUAGE plpgsql;
-```
+### 9.2. (упразднено в v5 — override scope не существует, см. §5.5)
+
+### 9.3. (упразднено в v5 — health-confirmation flow удалён, см. §10.3)
 
 ---
 
@@ -919,38 +816,36 @@ $$ LANGUAGE plpgsql;
 
 ### 10.1. Privacy flags
 
-| Flag              | Эффект                                                              |
-|-------------------|---------------------------------------------------------------------|
-| `no_memory`       | Extraction не запускается. Chat-факты не создаются. Сводки не пишутся. Global-факты владельца, извлечённые из других чатов, остаются видны в этом чате (если не `no_global_facts`). |
-| `no_global_facts` | В этом чате не использовать global-факты владельца при retrieval.   |
-| `no_learning`     | Данные не идут в обучение модели. На retrieval не влияет.           |
-| `no_summaries`    | Episode summaries не создаются. Chat-факты создаются.               |
-| `private`         | mode=manual принудительно, авто-отправка заблокирована.             |
+Имена флагов — из frozen contract (`contract_enums`); v6 синхронизировал
+документ с кодом (`no_summary` в ед. числе, `no_training` вместо `no_learning`;
+`no_global_facts` упразднён вместе с global scope в v5).
 
-### 10.2. Deletion operations
+| Flag          | Эффект                                                              |
+|---------------|---------------------------------------------------------------------|
+| `no_memory`   | Extraction не запускается. Chat-факты не создаются. Сообщения не персистятся. |
+| `no_training` | Данные не идут в обучение модели. На retrieval не влияет.           |
+| `no_summary`  | Episode summaries не создаются. Chat-факты создаются.               |
+| `private`     | Авто-отправка заблокирована (decision никогда не auto_reply).       |
 
-| Операция                | Что делает                                                          |
-|-------------------------|---------------------------------------------------------------------|
-| `forget_chat`           | Hard delete: messages, message_states, episode_summaries, active_episodes, chat-факты, embeddings, occurrences, contact_profile, suggestions, extraction_log. Global-факты владельца НЕ удаляются. |
-| `forget_chat_with_globals` | То же + global-факты, извлечённые из messages этого чата (через source_message_id). |
-| `forget_all`            | Hard delete всего tenant'а. Cascade.                                |
-| `unlearn_fact`          | Hard delete конкретного факта + embedding + occurrences.            |
-| `export`                | JSONL экспорт всех таблиц. Async.                                   |
+### 10.2. Deletion operations (реализовано, MEM-2)
 
-Все deletion-операции пишут в `audit_events`.
+| Операция       | Что делает                                                          |
+|----------------|---------------------------------------------------------------------|
+| `forget_chat`  | `store.ForgetChat`: hard delete в одной транзакции — health-факты первыми (§10.3), затем все chat-факты (cascade: embeddings, occurrences, relations), episode_summaries, active_episodes, extraction_log, suggestions, contact_profile, draft_feedback, drafts, messages (cascade: states, audits). Чат и его настройки остаются. Бот: `/forget <N>` + inline-подтверждение. |
+| `forget_all`   | `store.ForgetAll`: hard delete всех данных tenant'а (chats cascade + connections, unclaimed, idempotency, user_settings, ai_roles). Бот: `/forget_all` + подтверждение фразой «УДАЛИТЬ ВСЁ». |
+| `unlearn_fact` | `store.UnlearnFact`: hard delete конкретного факта (cascade: embedding, occurrences, relations). |
+| `export`       | JSONL экспорт всех таблиц. Async. **Не реализован** — отдельная задача (см. memory_architecture_backlog.md, MEM-2). |
+
+Все deletion-операции пишут audit-запись в той же транзакции
+(`memory_forget_chat` / `memory_unlearn_fact` / `memory_forget_all`).
+Нюанс схемы: `audit_events` несёт NOT NULL FK на `messages` с ON DELETE
+CASCADE, поэтому audit-строка ссылается на синтетическое marker-сообщение,
+вставляемое после удалений в той же транзакции — иначе каскад удалил бы и сам
+audit. Атомарность транзакции сохраняет инвариант «нет удаления без audit».
 
 ### 10.3. Sensitive data: health-факты
 
-**Chat-scoped health** (о контакте) — обычный extraction без confirmation. Иначе UX невыносим.
-
-**Global health** (о владельце) — обязательный confirmation flow:
-1. Extractor создаёт запись в `pending_global_health_facts`.
-2. UI показывает alert с фактом, источником и кнопками Accept / Reject.
-3. Только Accept триггерит `accept_pending_health_fact` → запись в `semantic_facts`.
-4. Reject → status='rejected', логируется в extraction_log как обучающий сигнал.
-5. Pending факты с истёкшим TTL (например, 14 дней) → auto-expired.
-
-Прямой INSERT global health в `semantic_facts` минуя этот flow заблокирован в `upsert_semantic_fact` (см. §9.1).
+**v5:** все health-факты chat-scoped — обычный extraction без confirmation (ложно-положительная экстракция влияет максимум на один чат). Confirmation flow и `pending_global_health_facts` удалены вместе с global-scope.
 
 **Дополнительно для всех health-фактов:**
 - Не попадают в `extraction_log.raw_output` в открытом виде (только fact_id).
@@ -963,67 +858,78 @@ $$ LANGUAGE plpgsql;
 
 1. **Extractor:** убрать чтение собственного output. Источник — только `messages`.
 2. **Structured output:** требовать `subject` и `fact_type` в каждом extracted candidate.
-3. **Scope assignment:** детерминированно в application-коде (§5.4). Если subject=owner & fact_type=health → в `pending_global_health_facts`, не в `semantic_facts`.
-4. **Suggestions UI:** экран pending suggestions + экран pending health-confirmations.
-5. **Fact management UI:** карточка факта с promote/demote scope, показ scope в иконке.
+3. **Scope assignment (v5):** всегда `scope_kind='chat'` в application-коде (§5.4); хинты Python игнорируются.
+4. **Suggestions UI:** экран pending suggestions.
+5. **AI-роли (v5):** CRUD ролей + назначение на чат (бот-команды §13.3); резолв роли в `AIProcessMessageRequest.ai_role`; role-first промпт в Python.
 6. **Confidence-gates auto-mode:** не повышать до accepted_facts ≥ N AND filled_contact_profile_fields ≥ K.
 7. **Active episode handling:** на каждое incoming сообщение — upsert в `active_episodes` (создать или обновить last_message_at). Фоновая job каждые 15 минут проверяет `active_episodes WHERE last_message_at < now() - 6h` → materialize + delete.
 8. **Repository layer:** прямые INSERT/UPDATE в `semantic_facts` запрещены через GRANT.
 
 ---
 
-## 12. Migration plan
+## 12. Migration plan — выполнен / неприменим (v6)
 
-### Phase 1 — Stop the bleeding (день 0)
-1. Отключить запись `fact_type='extracted'` в `memory_facts`.
-2. Отключить запись system-промптов в `owner_style`.
-3. Forced dedup по exact match `fact_text` (-876 строк из 1400).
+План писался против таблицы `memory_facts`, которой больше нет: миграция 001 —
+clean schema, фазы 1 и 3 неприменимы. Текущий статус пунктов:
 
-### Phase 2 — Risk_level backfill (день 1)
-1. Убедиться, что `risk_level` сейчас nullable (он уже такой по факту).
-2. Запустить policy_check job на все existing messages WHERE risk_level IS NULL. Default результат при ошибке policy_check = `'safe'` (consciously — на existing dataset цена не учесть hidden risk низкая).
-3. Проверить: `SELECT COUNT(*) FROM messages WHERE risk_level IS NULL` = 0.
-4. `ALTER TABLE messages ALTER COLUMN risk_level SET NOT NULL;`
-
-### Phase 3 — Schema migration (неделя 1)
-1. `CREATE EXTENSION IF NOT EXISTS vector; CREATE EXTENSION IF NOT EXISTS pgcrypto;`
-2. Создать новые таблицы: `user_settings`, `contact_profile_suggestions`, `active_episodes`, `semantic_facts`, `fact_embeddings`, `fact_occurrences`, `pending_global_health_facts`, `episode_summaries`, `extraction_log`. Создать views и functions §6.2, §9.1, §9.3.
-3. Миграция `memory_facts` → `semantic_facts`:
-   - фильтр длины ≤ 200,
-   - исключение префиксов,
-   - все записи получают `scope_kind='chat'` (без авто-глобализации),
-   - `normalized_fact_hash` посчитать,
-   - `source='llm_extracted'`, `confidence=0.5`,
-   - конфликты UNIQUE indexa пропускаются (это desired behavior — дедуп).
-4. Бэкфилл embeddings реальной моделью (`text-embedding-3-small`).
-5. `memory_facts` → `memory_facts_deprecated`, read-only.
-
-### Phase 4 — New pipeline (неделя 2)
-1. Extractor с typed JSON output.
-2. Scope assignment + pending_global_health routing.
-3. Episode summarizer + active_episodes management.
-4. Suggestions flow в UI (contact + health).
-5. Repository layer с stored proc, REVOKE прямых INSERT'ов.
-
-### Phase 5 — Override UI и cleanup (неделя 3-4)
-1. UI для promote/demote scope.
-2. UI для accept/reject health-confirmations.
-3. Удалить `memory_facts_deprecated`.
-4. Метрики: % дубликатов на write (advisory lock эффективность), % unique_violation на race (catch-net срабатывает), % accepted health-suggestions, % промоутов, retrieval latency p95.
+- **Phase 2 (risk_level NOT NULL)** — ✅ выполнено миграцией 014
+  (`UPDATE ... SET 'low' WHERE NULL` + `SET DEFAULT 'low'` + `SET NOT NULL`;
+  inbound-сообщение персистится до AI-классификации, поэтому дефолт сознательный).
+- **Phase 4 (typed extractor, episode summarizer, suggestions flow)** — ✅
+  реализовано (extraction.py typed JSON, `summarizeEpisode`, suggestions
+  §4.5 / MEM-4 с бот-карточками accept/reject).
+- **Phase 5.4 (метрики write-path)** — частично: действия upsert'а
+  (inserted / occurrence_added / superseded / rejected) возвращаются и
+  логируются; counters в observability — TODO (MEM-10).
+- **GRANT/REVOKE** — отложено до выделенной DB-роли (§9.1, MEM-11).
 
 ---
 
-## 13. Расширяемость под роли (без реализации сейчас)
+## 13. AI-роли (реализовано в v5)
 
-`scope_kind` сейчас имеет два значения. При появлении ролей — добавится третье `'role'` + колонка `scope_role_id` + таблица `roles`. Существующие данные не мигрируют. Retrieval-логика расширяется одной веткой. Conflict resolution: `chat > role > global`.
+**Продуктовый разворот.** Раньше цель была "спародировать владельца и стать его цифровой копией". Теперь система воспроизводит **роль** — персону, которую владелец описал сам: "мой менеджер", "техподдержка", любой выдуманный персонаж. ИИ отвечает в чатах от лица владельца, выступая в назначенной роли. Один владелец ведёт разные чаты в разных амплуа.
 
-**Чего не делать сейчас:** создавать пустую таблицу `roles`, добавлять nullable `role_id` в `semantic_facts`, закладывать role detection в LLM-промпт.
+### 13.1. Модель данных
+
+```
+ai_roles (миграция 011):
+  id               BIGSERIAL PK
+  tenant_id        → tenants
+  name             UNIQUE per tenant ("Менеджер Алексея")
+  description      свободное описание персоны — главный материал промпта
+  speaking_style   как роль говорит (лексика, тон, длина)
+  goals            чего роль добивается в переписке
+  constraints_text чего роль не делает / о чём молчит
+
+chat_settings.ai_role_id BIGINT NULL → ai_roles(id) ON DELETE SET NULL
+```
+
+Роль — библиотечная сущность: создаётся один раз, назначается на любое число чатов. `ai_role_id IS NULL` = роль не задана → дефолтная персона "ассистент владельца" (legacy-поведение цифровой копии, теперь просто fallback).
+
+### 13.2. Доставка в промпт
+
+Бэкенд резолвит роль чата и кладёт объект `ai_role {name, description, speaking_style, goals, constraints}` в `AIProcessMessageRequest`. Python собирает role-first system prompt: блок «КТО ТЫ В ЭТОМ ЧАТЕ» — идентичность говорящего; стиль роли важнее наблюдённого стиля владельца; при пустом `speaking_style` per-chat стиль владельца служит подсказкой. Приоритет: инструкция владельца > ограничения роли > описание роли > профиль контакта > переписка.
+
+### 13.3. Владение и UI
+
+Роли создаёт только владелец (бот-команды `/role_create`, `/roles`, `/role_assign`, `/role`, `/role_clear`). AI не имеет права создавать или править роли — это identity-данные, как `contact_profiles` (§4.5).
+
+### 13.4. Роли и память
+
+Память остаётся строго per-chat и привязана к чату, **не к роли**: переназначение роли не переносит и не стирает память чата. Факты, накопленные в чате, продолжают подаваться в контекст независимо от того, какая роль отвечает.
 
 ---
 
 ## 14. Когда переезжать с pgvector на Qdrant
 
-Триггеры: > 10M активных facts, p95 latency > 200ms, нужен HNSW или hybrid search.
+Триггер «нужен HNSW» из ранних версий уже наступил и решён внутри pgvector:
+halfvec-HNSW expression-индексы (миграция 015, MEM-7). Hybrid search тоже
+закрыт на PG-стороне (BM25 + RRF, миграция 008). Актуальные триггеры переезда:
+
+- > 10M активных facts на tenant-наборе;
+- p95 retrieval latency > 200 ms на ANN-запросах при прогретых индексах;
+- потребность в фильтрованном ANN, который halfvec-HNSW не тянет
+  (высокоселективные предикаты поверх миллионов векторов).
 
 Переезжают: `fact_embeddings`, `episode_summaries.embedding`. PG остаётся source of truth, Qdrant — индекс.
 
@@ -1036,13 +942,13 @@ $$ LANGUAGE plpgsql;
 | Дефект                                                | Защита                                                     |
 |-------------------------------------------------------|------------------------------------------------------------|
 | Рекурсивный префикс `[FACT] extracted: ...`           | CHECK `fact_text NOT LIKE '[FACT]%'`                       |
-| Сырое сообщение как факт                              | CHECK длины ≤ 200, REVOKE direct INSERT                    |
+| Сырое сообщение как факт                              | CHECK длины ≤ 200; DB-путь записи только через stored proc (GRANT — после выделенной роли, MEM-11) |
 | System-промпт в `owner_style`                         | Нет таблицы owner_style                                    |
 | Семантические дубликаты                               | Stored proc + advisory lock + cosine similarity > 0.97     |
 | Точные дубликаты при race                             | UNIQUE partial index на normalized_fact_hash               |
-| AI пишет напрямую в contact_profiles                  | REVOKE UPDATE; только через suggestions accept             |
-| AI пишет global health-факт без подтверждения         | RAISE EXCEPTION в upsert_semantic_fact для (owner_global, health) |
-| Global-факт про контакта                              | CHECK `scope_kind != 'owner_global' OR subject='owner'`    |
+| AI пишет напрямую в contact_profiles                  | Extraction-путь пишет только в suggestions; профиль меняет лишь ResolveSuggestion(accept) с whitelist полей (MEM-4) |
+| Факт утекает в чужой чат (общая память)               | v5: код пишет/читает только scope='chat'; legacy owner_global soft-deleted (011) |
+| AI создаёт или правит роль                            | Нет write-пути: ai_roles меняются только бот-командами владельца |
 | Chat-факт без chat_id                                 | CHECK + composite FK                                       |
 | Удалили сообщение → факты с битым source              | ON DELETE SET NULL + cascade soft-delete                   |
 | Денормализованный `greeted_today` рассинхронизирован  | Нет такого поля — derived view поверх messages             |
@@ -1053,11 +959,10 @@ $$ LANGUAGE plpgsql;
 ## 16. Open questions + отклонённые предложения
 
 ### 16.1. Открытые
-1. **Cross-chat facts по telegram_user_id** — контакт пишет в два разных чата владельца. Сейчас факты разделены по chat_id. Обсудить при появлении ролей.
-2. **Multi-language facts** — нормализация на `user_settings.primary_language` при extraction.
-3. **Commitment updates** — supersede или отдельный тип `commitment_update`?
-4. **Auto-suggestion демоушна** — если владелец последовательно нарушает global-факт в чате, AI предлагает demote. Через suggestions, не автоматика.
-5. **RLS включение** — триггер: первый paying customer / B2B.
+1. **Multi-language facts** — нормализация на `user_settings.primary_language` при extraction.
+2. **Commitment updates** — supersede или отдельный тип `commitment_update`?
+3. **RLS включение** — триггер: первый paying customer / B2B.
+4. **Шаблоны ролей** — преднастроенные роли ("менеджер", "поддержка") для быстрого старта; смежно с Marketplace из Iteration 2.
 
 ### 16.2. Отклонённые предложения (с обоснованием)
 
@@ -1072,26 +977,58 @@ $$ LANGUAGE plpgsql;
 
 ---
 
+## 17. Подсистемы, реализованные сверх исходного дизайна (v6)
+
+Появились в коде после v5 и теперь являются частью контракта:
+
+1. **Temporal knowledge graph** (миграция 009): `fact_relations` с типами
+   supersedes / fulfills / contradicts / updates / related; view `current_facts`
+   резолвит «текущую истину» цепочки supersession. Ребро `supersedes` создаёт
+   Go из `superseded_fact_id` результата upsert'а.
+2. **Sleep-time consolidation** (миграция 010): nightly worker (02:00 UTC)
+   вызывает `consolidate_facts(tenant)` — чистка expired/superseded, схлопывание
+   глубоких цепочек. Там же экспирируются pending-suggestions старше 14 дней.
+3. **Embedding worker**: тикер 5 минут + nudge-канал — `saveTypedFacts` будит
+   воркер сразу после вставки фактов (ARCH-12), новые факты не ждут тика.
+   Write-path дедуп получает embedding кандидата синхронно (батч, 5 с таймаут).
+4. **Topic из структурированного draft-ответа** (ARCH-4): `/ai/process-message`
+   возвращает `{reply, intent, options, confidence, topic, owner_note}`; topic
+   пишется в `active_episodes.current_topic` без отдельного LLM-вызова.
+   `/ai/tag-topic` остаётся для эпизодных воркеров.
+5. **Runtime state lifecycle** (MEM-5): `open_question_message_id` ставится по
+   intent=question/choice_question при decision=draft/ask_owner;
+   `pending_owner_action` — по типу решения; оба сбрасываются
+   (`ClearEpisodeRuntimeState`) при owner-ответе или успешной отправке.
+6. **Детерминированный rerank** (ARCH-5): финальное упорядочивание фактов —
+   косинус в SQL по fused-кандидатам (`RankFactsByCosine`), hard-include не
+   вытесняются; listwise-LLM `/ai/rerank-facts` из горячего пути убран
+   (эндпоинт жив до cutover-замера).
+7. **Webhook-очередь** (ARCH-7): приём и обработка разделены — HTTP ACK сразу,
+   обработка в шардированном по чату пуле воркеров (порядок per chat);
+   fire-and-forget LLM-задачи (extraction, summarize) — через общий семафор.
+
+---
+
 ## Appendix A. Глоссарий
-- **User layer / Per-chat identity / Working / Runtime state / Episodic / Semantic** — слои памяти (§2).
-- **Scope (chat / owner_global)** — границы видимости факта.
-- **Promote / Demote** — ручной перевод scope владельцем.
+- **User layer / Per-chat identity / Working / Runtime state / Episodic / Semantic / AI Roles** — слои памяти (§2).
+- **Scope (chat)** — границы видимости факта; единственный scope с v5.
+- **AI-роль** — описанная владельцем персона, от лица которой ИИ отвечает в чате (§13).
+- **Дефолтная персона** — fallback без назначенной роли: "ассистент владельца, пиши в его стиле".
 - **Dedup-on-write** — проверка дубликата перед insert (advisory lock + UNIQUE catch-net).
 - **Supersede** — замена старого факта новым.
-- **Hard-include** — taboo + health всегда в промпте.
+- **Hard-include** — taboo + health всегда в промпте (в пределах своего чата).
 - **Suggestion** — pending изменение в profile.
-- **Confirmation flow** — owner-approval для sensitive фактов (global health).
 - **Active episode** — открытый, не закрытый в summary эпизод.
 - **Derived view** — SQL function поверх messages для производных состояний.
 
 ## Appendix B. Не делать
+- ❌ Возвращать кросс-чатную (общую) память в любом виде — включая owner_global.
 - ❌ Возвращать глобальный стиль владельца.
 - ❌ Денормализовать "греетинги / паузы / pending" в булевы.
-- ❌ Расширять `scope_kind` без явного дизайна.
-- ❌ Позволять AI менять `scope_kind` напрямую.
-- ❌ Записывать global health-факт без confirmation.
+- ❌ Позволять AI создавать или менять `ai_roles` — только владелец.
+- ❌ Привязывать semantic_facts к роли вместо чата.
 - ❌ Создавать пустые таблицы "на будущее".
 - ❌ Прямые INSERT в `semantic_facts` минуя stored proc.
-- ❌ AI-роли / маркетплейс ролей в текущей итерации.
+- ❌ Маркетплейс ролей в текущей итерации (Iteration 2).
 - ❌ Повышать default mode до auto для новых чатов.
 - ❌ LLM решает о scope.

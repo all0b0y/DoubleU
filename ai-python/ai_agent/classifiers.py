@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import re
-from typing import TYPE_CHECKING
 
 from .schemas import (
     IntentResponse,
@@ -18,26 +17,62 @@ from .security import contains_prompt_injection
 
 
 class RiskClassifier:
-    """Classify message risk using deterministic MVP policy rules."""
+    """Classify message risk using deterministic MVP policy rules.
 
-    # Profanity patterns (Russian and English common words).
-    _PROFANITY_RU = (
-        "хуй", "пизд", "ебл", "ёбл", "еблан", "залуп", "пиздец", "бля", "блядь",
-        "сука", "пидор", "пидар", "мудак", "ёб", "заеб", "наеб", "выеб", "охуе",
-        "ахуе", "ахуел", "ахуела", "охуел", "охуела", "ебать", "уёб",
+    All keyword matching is word-prefix anchored (``\\b`` + stem) instead of raw
+    substring search: bare substrings produced false CRITICAL/HIGH hits on
+    innocent Russian words («страх»→«трах», «корабля»→«бля», «анализ»→«анал»),
+    which blocked auto-reply and spammed the owner with manual-handling cards.
+    """
+
+    # Profanity stems (Russian and English), word-prefix anchored.
+    _PROFANITY_RE = re.compile(
+        r"\b(?:ху[йеёи]|пизд|ебл|ёбл|еблан|залуп|бля|сука|пидор|пидар|мудак|"
+        r"ёб|заеб|наеб|выеб|охуе|ахуе|ебат|ебан|уёб|"
+        r"fuck|shit|asshole|bitch|cunt|dick|pussy)",
+        re.IGNORECASE,
     )
-    _PROFANITY_EN = ("fuck", "shit", "asshole", "bitch", "cunt", "dick", "pussy")
 
-    # Sexual content patterns.
-    _SEXUAL = (
-        "секс", "трах", "отсос", "минет", "куни", "анал", "эро", "порно",
-        "голый", "голая", "раздевай", "раздевись", "покажи грудь", "покажи попу",
-        "sex", "nude", "porn", "blowjob", "erotic", "naked", "horny",
+    # Sexual content stems, word-prefix anchored. Lookaheads keep common
+    # innocent words out: «анализ/аналитика/аналог», «куница».
+    _SEXUAL_RE = re.compile(
+        r"\b(?:секс|трах|отсос|минет|куни(?!ц)|анал(?!из|ит|ог)|эротик|порно|"
+        r"гол(?:ый|ая)|раздева|покажи грудь|покажи попу|"
+        r"sex|nude|porn|blowjob|erotic|naked|horny)",
+        re.IGNORECASE,
+    )
+
+    # Credentials / payment-instrument requests (RU + EN): critical.
+    _CREDENTIALS_RE = re.compile(
+        r"\b(?:password|passcode|2fa|verification code|card number|ssn|cvv|"
+        r"парол|пин-?код|код подтверждения|смс-?код|номер карты|секретн\w* слово)",
+        re.IGNORECASE,
+    )
+
+    # Financial commitments (RU + EN): high.
+    _FINANCIAL_RE = re.compile(
+        r"\b(?:wire transfer|bank account|refund|invoice|payment|crypto|"
+        r"перевод денег|оплат|предоплат|счёт на оплату|счет на оплату|"
+        r"возврат денег|крипт)",
+        re.IGNORECASE,
+    )
+
+    # Legal / contractual topics (RU + EN): high.
+    _LEGAL_RE = re.compile(
+        r"\b(?:contract|lawsuit|legal|signature|nda|liability|"
+        r"договор|контракт|подпис|юрист|претензи|неустойк|расторж)",
+        re.IGNORECASE,
+    )
+
+    # Urgency / escalation signals (RU + EN): medium.
+    _URGENCY_RE = re.compile(
+        r"\b(?:urgent|asap|deadline|complaint|angry|escalate|"
+        r"срочно|дедлайн|жалоб|эскалац|как можно скорее)",
+        re.IGNORECASE,
     )
 
     def classify(self, message_text: str) -> RiskResponse:
         """Return a risk level and concise reasons for the supplied message."""
-        text = message_text.lower()
         reasons: list[str] = []
         level = RiskLevel.LOW
 
@@ -46,28 +81,28 @@ class RiskClassifier:
             level = RiskLevel.HIGH
 
         # Profanity/obscene language: high risk — owner should decide how to respond.
-        if _contains_any(text, self._PROFANITY_RU + self._PROFANITY_EN):
+        if self._PROFANITY_RE.search(message_text):
             reasons.append("profanity_or_obscene_language")
             level = _max_risk(level, RiskLevel.HIGH)
 
         # Sexual content: critical — must be handled manually by owner.
-        if _contains_any(text, self._SEXUAL):
+        if self._SEXUAL_RE.search(message_text):
             reasons.append("sexual_content")
             level = _max_risk(level, RiskLevel.CRITICAL)
 
-        if _contains_any(text, ("password", "passcode", "2fa", "verification code", "card number", "ssn")):
+        if self._CREDENTIALS_RE.search(message_text):
             reasons.append("sensitive_credentials_or_financial_data")
             level = _max_risk(level, RiskLevel.CRITICAL)
 
-        if _contains_any(text, ("wire transfer", "bank account", "refund", "invoice", "payment", "crypto")):
+        if self._FINANCIAL_RE.search(message_text):
             reasons.append("financial_commitment")
             level = _max_risk(level, RiskLevel.HIGH)
 
-        if _contains_any(text, ("contract", "lawsuit", "legal", "signature", "nda", "liability")):
+        if self._LEGAL_RE.search(message_text):
             reasons.append("legal_or_contractual_topic")
             level = _max_risk(level, RiskLevel.HIGH)
 
-        if _contains_any(text, ("urgent", "asap", "deadline", "complaint", "angry", "escalate")):
+        if self._URGENCY_RE.search(message_text):
             reasons.append("time_sensitive_or_escalation")
             level = _max_risk(level, RiskLevel.MEDIUM)
 
@@ -78,20 +113,51 @@ class RiskClassifier:
 
 
 class IntentClassifier:
-    """Classify user-message intent using deterministic MVP rules."""
+    """Classify user-message intent using deterministic MVP rules.
+
+    Keyword matching is word-boundary anchored (substring search mislabeled
+    «booking»→"ok") and covers Russian alongside English — without the Russian
+    keywords every RU message fell to ``general_message`` (0.72), which made
+    the auto-reply confidence gate unreachable for the product's main language.
+    """
+
+    _QUESTION_RE = re.compile(
+        r"\b(?:what|when|where|how|can you|could you|"
+        r"что|когда|где|как|почему|сколько|можешь|можете)\b",
+        re.IGNORECASE,
+    )
+    _SCHEDULING_RE = re.compile(
+        r"\b(?:meeting|call|schedule|tomorrow|today|calendar|"
+        r"встреч|созвон|звонок|завтра|сегодня|расписани|перенес)",
+        re.IGNORECASE,
+    )
+    _COMMERCIAL_RE = re.compile(
+        r"\b(?:price|quote|invoice|payment|cost|refund|"
+        r"цен[аыу]|стоимост|стоит|оплат|счёт|счет|возврат)",
+        re.IGNORECASE,
+    )
+    _ACK_RE = re.compile(
+        r"\b(?:thanks|thank you|ok|okay|great|sounds good|"
+        r"спасибо|благодарю|ок|окей|хорошо|отлично|договорились|понял|поняла)\b",
+        re.IGNORECASE,
+    )
+    _REQUEST_RE = re.compile(
+        r"\b(?:please|send|share|need|make|prepare|"
+        r"пожалуйста|пришли|отправь|скинь|нужно|надо|сделай|подготовь)",
+        re.IGNORECASE,
+    )
 
     def classify(self, message_text: str) -> IntentResponse:
         """Return a best-effort intent label and confidence."""
-        text = message_text.lower()
-        if "?" in message_text or _contains_any(text, ("what", "when", "where", "how", "can you", "could you")):
+        if "?" in message_text or self._QUESTION_RE.search(message_text):
             return IntentResponse(intent="question", confidence=0.86)
-        if _contains_any(text, ("meeting", "call", "schedule", "tomorrow", "today", "calendar")):
+        if self._SCHEDULING_RE.search(message_text):
             return IntentResponse(intent="scheduling", confidence=0.88)
-        if _contains_any(text, ("price", "quote", "invoice", "payment", "cost", "refund")):
+        if self._COMMERCIAL_RE.search(message_text):
             return IntentResponse(intent="commercial", confidence=0.84)
-        if _contains_any(text, ("thanks", "thank you", "ok", "great", "sounds good")):
+        if self._ACK_RE.search(message_text):
             return IntentResponse(intent="acknowledgement", confidence=0.82)
-        if _contains_any(text, ("please", "send", "share", "need", "make", "prepare")):
+        if self._REQUEST_RE.search(message_text):
             return IntentResponse(intent="request", confidence=0.8)
         return IntentResponse(intent="general_message", confidence=0.72)
 
@@ -118,11 +184,11 @@ class MemoryExtractor:
 
 
 class TypedMemoryExtractor:
-    """Extract typed, scoped facts from a message using deterministic rules.
+    """Extract typed facts from a message using deterministic rules.
 
-    Each candidate is classified into a fact_type, subject, and scope_kind per
-    the design §5.4 routing rules so the Go backend can persist them without
-    hard-coded defaults.
+    Each candidate is classified into a fact_type and subject.  Memory is
+    strictly per-chat, so every fact is chat-scoped; the Go backend enforces
+    the same invariant on write.
 
     This extractor is intentionally deterministic and fast (no LLM round-trip).
     LLM-powered extraction is handled by the service._extract_facts_llm_typed
@@ -145,9 +211,12 @@ class TypedMemoryExtractor:
         r"like|dislike|люблю|не люблю)\b",
         re.IGNORECASE,
     )
+    # Bare prepositions («к», "by") are intentionally excluded: they match
+    # nearly every Russian/English sentence and flooded semantic_facts with
+    # bogus commitment rows at confidence 0.72.
     _COMMITMENT_PATTERNS = re.compile(
         r"\b(i will|я сделаю|я пришлю|i'll send|i'll do|пришлю|отправлю|"
-        r"обещаю|promise|deadline|дедлайн|к|by)\b",
+        r"обещаю|promise|deadline|дедлайн)\b",
         re.IGNORECASE,
     )
 
@@ -162,14 +231,17 @@ class TypedMemoryExtractor:
 
         facts: list[TypedFact] = []
 
-        # Health facts about the owner are global-scope and need confirmation.
+        # Health facts about the CONTACT: extraction only ever runs on contact
+        # messages (owner-authored messages exit the pipeline earlier with
+        # owner_message_observed), so first-person health statements belong to
+        # the contact (ARCH-11). Chat-scoped and hard-included on retrieval (§8.2).
         for match in self._HEALTH_PATTERNS.finditer(message_text):
             sentence = _surrounding_sentence(message_text, match.start())
             facts.append(TypedFact(
                 fact_text=sentence,
                 fact_type="health",
-                subject="owner",
-                scope_kind="owner_global",
+                subject="contact",
+                scope_kind="chat",
                 confidence=0.70,
             ))
 
@@ -195,13 +267,16 @@ class TypedMemoryExtractor:
                 confidence=0.75,
             ))
 
-        # Commitments made by the owner.
+        # Commitments made by the CONTACT («я пришлю договор» in a contact
+        # message is the contact's obligation, not the owner's). Mislabelling
+        # them as owner commitments fed foreign obligations into the prompt as
+        # the owner's own via OpenCommitments (ARCH-11).
         for match in self._COMMITMENT_PATTERNS.finditer(message_text):
             sentence = _surrounding_sentence(message_text, match.start())
             facts.append(TypedFact(
                 fact_text=sentence,
                 fact_type="commitment",
-                subject="owner",
+                subject="contact",
                 scope_kind="chat",
                 confidence=0.72,
             ))
@@ -229,10 +304,6 @@ def _surrounding_sentence(text: str, match_start: int, max_len: int = 120) -> st
     if len(sentence) > max_len:
         sentence = sentence[:max_len].rstrip()
     return sentence if sentence else text[match_start:match_start + max_len].strip()
-
-
-def _contains_any(text: str, needles: tuple[str, ...]) -> bool:
-    return any(needle in text for needle in needles)
 
 
 def _max_risk(left: RiskLevel, right: RiskLevel) -> RiskLevel:

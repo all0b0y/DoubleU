@@ -20,16 +20,16 @@ class FeatureFlags:
     """Snapshot of the runtime feature flag state.
 
     Mirrors ``backend-go/internal/config/flags.go`` so Go and Python switch on
-    the same env variables.  ``shadow_mode_only`` and ``cutover`` jointly drive
-    Phase 5 cutover semantics (see docs/cutover-runbook.md).
+    the same env variables.  ``llm_gateway`` still routes embedding calls
+    through the LiteLLM proxy (see :mod:`ai_agent.pipelines.embedding`); the
+    safety and observability flags gate the Phase 1/3 scanners and the Langfuse
+    sink injected into the agent runtime.
     """
 
     safety_input_enabled: bool = False
     safety_output_enabled: bool = False
     llm_gateway: GatewayKind = "none"
     observability_sink: ObservabilitySink = "none"
-    shadow_mode_only: bool = False
-    cutover: bool = False
 
 
 def _bool(value: str | None) -> bool:
@@ -57,6 +57,4 @@ def load_from_env() -> FeatureFlags:
         safety_output_enabled=_bool(os.getenv("SAFETY_OUTPUT_ENABLED")),
         llm_gateway=_gateway(os.getenv("LLM_GATEWAY")),
         observability_sink=_sink(os.getenv("OBSERVABILITY_SINK")),
-        shadow_mode_only=_bool(os.getenv("SHADOW_MODE_ONLY")),
-        cutover=_bool(os.getenv("CUTOVER")),
     )

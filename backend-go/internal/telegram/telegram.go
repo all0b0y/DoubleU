@@ -24,7 +24,11 @@ type OutboundMessage struct {
 	ReplyToMessageID     string // when set, sends as a Telegram reply to this message_id
 	DecisionID           string
 	Text                 string
-	ReplyMarkup          ReplyMarkup
+	// ParseMode enables Telegram text formatting ("Markdown", "MarkdownV2",
+	// "HTML"). LLM output is not guaranteed to be valid markup, so senders fall
+	// back to a plain-text resend when Telegram rejects the entities.
+	ParseMode   string
+	ReplyMarkup ReplyMarkup
 }
 
 // Sender sends recipient-facing messages and answers inline button callbacks.
@@ -125,6 +129,9 @@ func (s *BotSender) sendMessageBody(message OutboundMessage) map[string]any {
 		"chat_id": message.ChatID,
 		"text":    message.Text,
 	}
+	if message.ParseMode != "" {
+		body["parse_mode"] = message.ParseMode
+	}
 	if message.BusinessConnectionID != "" {
 		body["business_connection_id"] = message.BusinessConnectionID
 	}
@@ -135,6 +142,20 @@ func (s *BotSender) sendMessageBody(message OutboundMessage) map[string]any {
 		body["reply_parameters"] = map[string]any{"message_id": replyID}
 	}
 	return body
+}
+
+// sendWithParseModeFallback posts sendMessage and, when Telegram rejects the
+// request for a message that asked for formatting (typically "can't parse
+// entities" — LLM output is not guaranteed valid markup), retries once as
+// plain text so the reply is never lost to a formatting error.
+func (s *BotSender) sendWithParseModeFallback(ctx context.Context, message OutboundMessage) ([]byte, error) {
+	raw, err := s.sendMessageRaw(ctx, s.sendMessageBody(message))
+	if err != nil && message.ParseMode != "" {
+		plain := message
+		plain.ParseMode = ""
+		return s.sendMessageRaw(ctx, s.sendMessageBody(plain))
+	}
+	return raw, err
 }
 
 // sendMessageRaw posts a sendMessage request and returns the raw response body.
@@ -167,7 +188,7 @@ func (s *BotSender) SendMessage(ctx context.Context, message OutboundMessage) er
 	if s.token == "" {
 		return fmt.Errorf("telegram bot token is empty")
 	}
-	_, err := s.sendMessageRaw(ctx, s.sendMessageBody(message))
+	_, err := s.sendWithParseModeFallback(ctx, message)
 	return err
 }
 
@@ -208,7 +229,7 @@ func (s *BotSender) SendMessageGetID(ctx context.Context, message OutboundMessag
 	if s.token == "" {
 		return "", fmt.Errorf("telegram bot token is empty")
 	}
-	raw, err := s.sendMessageRaw(ctx, s.sendMessageBody(message))
+	raw, err := s.sendWithParseModeFallback(ctx, message)
 	if err != nil {
 		return "", err
 	}
@@ -497,6 +518,53 @@ func NormalizeUpdate(payload []byte, tenantHint string, now time.Time) (contract
 		MessageType:          messageType,
 		CreatedAt:            createdAt,
 	}, nil
+}
+
+// NormalizeBotUpdate converts a getUpdates payload received via a user-supplied
+// bot into the frozen normalized event. Unlike NormalizeUpdate it does not
+// require business_connection_id — the tenant is already known from the bot
+// registration. Returns ok=false for updates without a message body (the
+// poller requests only "message" updates, but Telegram may still deliver
+// service payloads after an allowed_updates change).
+func NormalizeBotUpdate(payload []byte, botID int64, tenantID string, now time.Time) (contracts.NormalizedTelegramEvent, bool, error) {
+	var update telegramUpdate
+	if err := json.Unmarshal(payload, &update); err != nil {
+		return contracts.NormalizedTelegramEvent{}, false, err
+	}
+	if update.UpdateID == nil {
+		return contracts.NormalizedTelegramEvent{}, false, fmt.Errorf("missing update_id")
+	}
+	message := update.Message
+	if message == nil {
+		return contracts.NormalizedTelegramEvent{}, false, nil
+	}
+	createdAt := now
+	if message.Date > 0 {
+		createdAt = time.Unix(message.Date, 0).UTC()
+	}
+	sourceMessageID := strconv.FormatInt(message.MessageID, 10)
+	chatDisplayName := message.Chat.DisplayName()
+	if chatDisplayName == "" {
+		chatDisplayName = message.From.DisplayName()
+	}
+	bot := strconv.FormatInt(botID, 10)
+	return contracts.NormalizedTelegramEvent{
+		// update_id sequences are per-bot, so both the event id and the receive
+		// idempotency key derived from it must be scoped by bot id.
+		EventID:          fmt.Sprintf("%d:bot:%s:%s", *update.UpdateID, bot, sourceMessageID),
+		TenantID:         tenantID,
+		ChatID:           strconv.FormatInt(message.Chat.ID, 10),
+		ChatDisplayName:  chatDisplayName,
+		ChatType:         message.Chat.Type,
+		TelegramUpdateID: *update.UpdateID,
+		SourceMessageID:  sourceMessageID,
+		SenderID:         strconv.FormatInt(message.From.ID, 10),
+		MessageText:      firstNonEmpty(message.Text, message.Caption),
+		MessageType:      detectMessageType(message),
+		CreatedAt:        createdAt,
+		Transport:        contracts.TransportBot,
+		BotID:            bot,
+	}, true, nil
 }
 
 type telegramUpdate struct {

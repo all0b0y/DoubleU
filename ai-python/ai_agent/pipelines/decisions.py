@@ -9,7 +9,16 @@ from ..schemas import ChatMode, Decision, PrivacyFlag, RiskLevel
 # policy is reviewable in one place rather than scattered through the service.
 SEMI_AUTO_MIN = 0.85
 AUTO_MIN = 0.92
-#TODO
+
+# Deterministic ceilings on confidence per risk level.  The LLM never raises
+# them: a self-assessed confidence is always capped by the risk classifier so
+# the policy in :func:`decide` cannot auto-reply on risky messages.
+_RISK_CAPS = {
+    RiskLevel.CRITICAL: 0.35,
+    RiskLevel.HIGH: 0.55,
+    RiskLevel.MEDIUM: 0.84,
+    RiskLevel.LOW: 0.96,
+}
 
 def decide(
     mode: ChatMode,
@@ -42,13 +51,25 @@ def decide(
 def confidence_for(risk_level: RiskLevel, intent_confidence: float) -> float:
     """Combine risk and intent confidence into a single 0–1 score.
 
-    Higher risk levels cap the achievable confidence so the policy in
-    :func:`decide` can never auto-reply on uncertain risky messages.
+    Synthetic fallback used when the LLM did not return a valid self-assessed
+    confidence (see :func:`combined_confidence`).  Higher risk levels cap the
+    achievable confidence so the policy in :func:`decide` can never auto-reply
+    on uncertain risky messages.
     """
     if risk_level == RiskLevel.CRITICAL:
-        return 0.35
+        return _RISK_CAPS[RiskLevel.CRITICAL]
     if risk_level == RiskLevel.HIGH:
-        return 0.55
+        return _RISK_CAPS[RiskLevel.HIGH]
     if risk_level == RiskLevel.MEDIUM:
-        return min(0.84, intent_confidence)
-    return min(0.96, intent_confidence + 0.1)
+        return min(_RISK_CAPS[RiskLevel.MEDIUM], intent_confidence)
+    return min(_RISK_CAPS[RiskLevel.LOW], intent_confidence + 0.1)
+
+
+def combined_confidence(llm_confidence: float, risk_level: RiskLevel) -> float:
+    """Combine the LLM self-assessed confidence with the deterministic risk cap.
+
+    ``final = min(llm_confidence, risk_cap)`` — the model can lower confidence
+    below the cap (e.g. when unsure how to answer) but never exceed it, keeping
+    risk policy on the deterministic classifier (charter: policy is backend's).
+    """
+    return min(max(llm_confidence, 0.0), _RISK_CAPS.get(risk_level, _RISK_CAPS[RiskLevel.LOW]))

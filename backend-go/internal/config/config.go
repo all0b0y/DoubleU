@@ -20,6 +20,10 @@ type Config struct {
 	TelegramAutoSetup     bool
 	ReplyDelay            time.Duration // typing debounce: wait before calling AI
 	MiniAppDir            string        // directory of Mini App static files to serve
+	// IngestionModeDefault applies to tenants without an explicit ingestion_mode:
+	// "bot" (user-supplied bot, default while the Business path is shelved),
+	// "personal" (Telegram Business webhook) or "full" (both).
+	IngestionModeDefault string
 }
 
 // Load reads configuration from environment variables.
@@ -55,6 +59,7 @@ func Load() Config {
 		TelegramAutoSetup:     boolValue(os.Getenv("TELEGRAM_AUTO_SETUP")),
 		ReplyDelay:            replyDelay,
 		MiniAppDir:            valueOrDefault(os.Getenv("MINIAPP_DIR"), "./miniapp"),
+		IngestionModeDefault:  valueOrDefault(os.Getenv("INGESTION_MODE_DEFAULT"), "bot"),
 	}
 }
 

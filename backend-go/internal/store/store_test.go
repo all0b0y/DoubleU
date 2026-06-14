@@ -32,6 +32,33 @@ func TestRepositoryStateAndIdempotency(t *testing.T) {
 	}
 }
 
+// TestAIRoleCustomFieldsRoundTrip verifies custom fields survive save/update
+// and come back attached to the role on every read path.
+func TestAIRoleCustomFieldsRoundTrip(t *testing.T) {
+	repo := NewRepository()
+	fields := []contracts.AIRoleCustomField{
+		{Title: "Часы работы", Description: "когда отвечаем", Context: "9-18 пн-пт"},
+		{Title: "Доставка", Description: "условия"},
+	}
+	saved := repo.SaveAIRole(AIRoleRecord{TenantID: "t", Name: "Менеджер", Description: "d", CustomFields: fields})
+	if saved.ID == 0 {
+		t.Fatal("role not saved")
+	}
+
+	got, ok := repo.AIRoleByID("t", saved.ID)
+	if !ok || len(got.CustomFields) != 2 || got.CustomFields[0].Title != "Часы работы" || got.CustomFields[0].Context != "9-18 пн-пт" {
+		t.Fatalf("custom fields not round-tripped: %+v", got.CustomFields)
+	}
+
+	got.CustomFields = []contracts.AIRoleCustomField{{Title: "Только одно", Description: "осталось"}}
+	if !repo.UpdateAIRole(got) {
+		t.Fatal("update failed")
+	}
+	if after, _ := repo.AIRoleByID("t", saved.ID); len(after.CustomFields) != 1 || after.CustomFields[0].Title != "Только одно" {
+		t.Fatalf("custom fields not updated: %+v", after.CustomFields)
+	}
+}
+
 func TestRepositoryMessagesAuditsAndDrafts(t *testing.T) {
 	repository := NewRepository()
 	event := contracts.NormalizedTelegramEvent{EventID: "e1", TenantID: "t", ChatID: "c", SourceMessageID: "m"}
@@ -161,5 +188,71 @@ func TestRepositoryOwnerCanClaimUnboundBusinessChat(t *testing.T) {
 	}
 	if tenantID, ok := repository.TenantForBusinessConnection("bc-1"); !ok || tenantID != "tenant:user:77" {
 		t.Fatalf("tenant binding = %s ok=%v", tenantID, ok)
+	}
+}
+
+// TestUpsertSemanticFactInMemoryHashDedup verifies the MEM-1 fallback contract:
+// without a DB, two upserts of the same normalised text yield one stored fact —
+// the second call reports an occurrence instead of inserting a duplicate.
+func TestUpsertSemanticFactInMemoryHashDedup(t *testing.T) {
+	repo := NewRepository()
+	fact := SemanticFactRecord{
+		TenantID: "t", ScopeKind: "chat", ChatID: "c",
+		FactText: "Предпочитает звонки после обеда",
+		FactType: "preference", Subject: "contact", Confidence: 0.8,
+	}
+
+	first := repo.UpsertSemanticFact(fact, nil)
+	if first.Action != "inserted" || first.FactID == 0 {
+		t.Fatalf("first upsert = %+v, want inserted with ID", first)
+	}
+	// Same fact, different spacing/case → same normalised key.
+	fact.FactText = "предпочитает  звонки после обеда"
+	second := repo.UpsertSemanticFact(fact, nil)
+	if second.Action != "occurrence_added" {
+		t.Fatalf("second upsert = %+v, want occurrence_added", second)
+	}
+	if got := len(repo.SemanticFacts("t", "c", 10)); got != 1 {
+		t.Fatalf("stored facts = %d, want 1", got)
+	}
+
+	// Different fact_type with the same text must NOT dedup (§5.6).
+	fact.FactType = "commitment"
+	third := repo.UpsertSemanticFact(fact, nil)
+	if third.Action != "inserted" {
+		t.Fatalf("third upsert = %+v, want inserted (different fact_type)", third)
+	}
+}
+
+// TestRecentMessagesUsesPerChatIndex verifies the ARCH-13 in-memory index:
+// messages from other chats do not leak in and chronological order holds.
+func TestRecentMessagesUsesPerChatIndex(t *testing.T) {
+	repo := NewRepository()
+	base := time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC)
+	for i := 0; i < 5; i++ {
+		repo.SaveMessage(contracts.NormalizedTelegramEvent{
+			EventID: "e" + string(rune('a'+i)), TenantID: "t", ChatID: "c",
+			SourceMessageID: "m" + string(rune('a'+i)),
+			MessageText:     "msg", CreatedAt: base.Add(time.Duration(i) * time.Minute),
+		})
+	}
+	repo.SaveMessage(contracts.NormalizedTelegramEvent{
+		EventID: "other", TenantID: "t", ChatID: "other-chat",
+		SourceMessageID: "x", MessageText: "leak", CreatedAt: base,
+	})
+
+	got := repo.RecentMessages("t", "c", 3)
+	if len(got) != 3 {
+		t.Fatalf("len = %d, want 3", len(got))
+	}
+	for i := 1; i < len(got); i++ {
+		if got[i].Event.CreatedAt.Before(got[i-1].Event.CreatedAt) {
+			t.Fatalf("messages out of order")
+		}
+	}
+	for _, m := range got {
+		if m.Event.ChatID != "c" {
+			t.Fatalf("message from another chat leaked: %+v", m.Event)
+		}
 	}
 }

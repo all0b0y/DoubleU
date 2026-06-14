@@ -49,6 +49,15 @@ type chatListItem struct {
 	DraftCount   int      `json:"draft_count"`
 	LastMessage  string   `json:"last_message,omitempty"`
 	LastSeenAt   string   `json:"last_seen_at,omitempty"`
+	AIRoleID     int64    `json:"ai_role_id,omitempty"`
+	AIRoleName   string   `json:"ai_role_name,omitempty"`
+	// Transport is the channel the chat's messages arrive through: "bot"
+	// (tenant's own bot) or "business" (personal messages via Business API).
+	Transport string `json:"transport"`
+	// Claimed is false while a chat is still staged for owner decision. The Mini
+	// App keeps unclaimed personal chats in "предложения" until claimed so the
+	// AI never engages a contact the owner has not approved.
+	Claimed bool `json:"claimed"`
 }
 
 func (s *Server) apiChats(w http.ResponseWriter, r *http.Request) {
@@ -69,7 +78,11 @@ func (s *Server) apiChats(w http.ResponseWriter, r *http.Request) {
 			lastMsg = truncateText(msgs[0].Event.MessageText, 80)
 		}
 		flags := privacyFlagsToStrings(settings.PrivacyFlags)
-		items = append(items, chatListItem{
+		transport := chat.Transport
+		if transport == "" {
+			transport = contracts.TransportBusiness
+		}
+		item := chatListItem{
 			ChatID:       chat.ChatID,
 			DisplayName:  chat.DisplayName,
 			Mode:         string(settings.Mode),
@@ -77,7 +90,14 @@ func (s *Server) apiChats(w http.ResponseWriter, r *http.Request) {
 			DraftCount:   pending,
 			LastMessage:  lastMsg,
 			LastSeenAt:   chat.LastSeenAt.UTC().Format("2006-01-02T15:04:05Z"),
-		})
+			Transport:    transport,
+			Claimed:      s.service.Repository().IsChatClaimed(tenantID, chat.ChatID),
+		}
+		if role, ok := s.service.Repository().AIRoleForChat(tenantID, chat.ChatID); ok {
+			item.AIRoleID = role.ID
+			item.AIRoleName = role.Name
+		}
+		items = append(items, item)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"chats": items})
 }
@@ -173,6 +193,34 @@ func (s *Server) apiMessages(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"messages": items})
 }
 
+// apiSendMessage delivers an owner-authored reply through the chat's own bot,
+// stores it as context the AI will use, and discards pending AI drafts.
+func (s *Server) apiSendMessage(w http.ResponseWriter, r *http.Request) {
+	tenantID := tenantFromContext(r.Context())
+	chatID := r.PathValue("chat_id")
+	if chatID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing chat_id"})
+		return
+	}
+	defer r.Body.Close()
+	var req struct {
+		Text string `json:"text"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	if strings.TrimSpace(req.Text) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "text is required"})
+		return
+	}
+	if err := s.service.ManualSend(r.Context(), tenantID, chatID, req.Text); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "sent"})
+}
+
 func (s *Server) apiDrafts(w http.ResponseWriter, r *http.Request) {
 	tenantID := tenantFromContext(r.Context())
 	chatID := r.PathValue("chat_id")
@@ -261,12 +309,17 @@ func (s *Server) apiGetChatSettings(w http.ResponseWriter, r *http.Request) {
 	for _, m := range modes {
 		modeStrs = append(modeStrs, string(m))
 	}
+	var aiRole any
+	if role, ok := s.service.Repository().AIRoleForChat(tenantID, chatID); ok {
+		aiRole = map[string]any{"id": role.ID, "name": role.Name}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"chat_id":         chatID,
 		"mode":            string(settings.Mode),
 		"privacy_flags":   privacyFlagsToStrings(settings.PrivacyFlags),
 		"available_modes": modeStrs,
 		"context_score":   s.service.Repository().ContextScoreForChat(tenantID, chatID),
+		"ai_role":         aiRole,
 	})
 }
 

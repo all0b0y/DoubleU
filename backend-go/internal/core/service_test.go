@@ -130,6 +130,46 @@ func TestHandleTelegramWebhookAutoReplyAndDuplicateAudit(t *testing.T) {
 	}
 }
 
+// TestHandleTelegramWebhookSendsAssignedAIRole verifies the role contract:
+// the persona assigned to the chat reaches the Python AI service on every
+// process-message request, and an unassigned chat sends no role at all.
+func TestHandleTelegramWebhookSendsAssignedAIRole(t *testing.T) {
+	repository := store.NewRepository()
+	repository.SaveChatSettings(contracts.ChatSettings{TenantID: "tenant-1", ChatID: "42", Mode: contracts.ChatModeAuto})
+	repository.SaveChat(store.ChatRecord{TenantID: "tenant-1", ChatID: "42"})
+	role := repository.SaveAIRole(store.AIRoleRecord{
+		TenantID:    "tenant-1",
+		Name:        "Техподдержка",
+		Description: "Вежливый сотрудник поддержки, отвечает от лица владельца",
+		Constraints: "не обещать возвраты",
+	})
+	repository.AssignAIRoleToChat("tenant-1", "42", role.ID)
+	ai := &fakeAI{response: contracts.AIProcessMessageResponse{
+		Decision:     contracts.DecisionAutoReply,
+		ResponseText: "hello",
+		Confidence:   0.99,
+		RiskLevel:    contracts.RiskLow,
+	}}
+	service := newTestService(repository, ai, &fakeSender{})
+
+	if _, err := service.HandleTelegramWebhook(context.Background(), telegramPayload(1003, "bc-1", 42, 7, "hi"), "tenant-1"); err != nil {
+		t.Fatalf("webhook: %v", err)
+	}
+	got := ai.lastRequest.AIRole
+	if got == nil || got.Name != "Техподдержка" || got.Constraints != "не обещать возвраты" {
+		t.Fatalf("ai_role in request = %+v", got)
+	}
+
+	// A chat without an assigned role must not carry a persona.
+	repository.AssignAIRoleToChat("tenant-1", "42", 0)
+	if _, err := service.HandleTelegramWebhook(context.Background(), telegramPayload(1004, "bc-1", 42, 8, "ещё вопрос"), "tenant-1"); err != nil {
+		t.Fatalf("second webhook: %v", err)
+	}
+	if ai.lastRequest.AIRole != nil {
+		t.Fatalf("expected no ai_role after clear, got %+v", ai.lastRequest.AIRole)
+	}
+}
+
 func TestHandleTelegramWebhookDisabledAuditsWithoutAI(t *testing.T) {
 	repository := store.NewRepository()
 	repository.SaveChatSettings(contracts.ChatSettings{TenantID: "tenant-1", ChatID: "42", Mode: contracts.ChatModeDisabled})
@@ -758,9 +798,15 @@ func TestEndToEndSmokePipeline(t *testing.T) {
 }
 
 func newTestService(repository *store.Repository, ai aiclient.Client, sender telegram.Sender) *Service {
-	return NewService(repository, ai, sender, WithClock(func() time.Time {
-		return time.Unix(1700000000, 0).UTC()
-	}))
+	return NewService(repository, ai, sender,
+		WithClock(func() time.Time {
+			return time.Unix(1700000000, 0).UTC()
+		}),
+		// The legacy suite exercises the Business webhook path; "full" keeps
+		// both channels active so those scenarios stay covered while the
+		// production default is "bot".
+		WithDefaultIngestionMode(contracts.IngestionModeFull),
+	)
 }
 
 // fakeFeedbackSender records every owner-feedback score emitted by the
@@ -797,6 +843,7 @@ func TestOwnerApprovalSendsLangfuseScore(t *testing.T) {
 	service := NewService(repository, ai, &fakeSender{},
 		WithClock(func() time.Time { return time.Unix(1700000000, 0).UTC() }),
 		WithOwnerFeedbackSender(feedback),
+		WithDefaultIngestionMode(contracts.IngestionModeFull),
 	)
 
 	inbound, err := service.HandleTelegramWebhook(context.Background(), telegramPayload(2001, "bc-1", 42, 11, "hi"), "tenant-1")
@@ -832,6 +879,537 @@ func TestOwnerApprovalSendsLangfuseScore(t *testing.T) {
 	}
 }
 
+// TestCriticalRiskWarningNeverReachesContact verifies the ARCH-1 contract:
+// a critical-risk message produces an owner-facing warning card with no
+// sendable text, and no approval callback can deliver anything to the contact.
+func TestCriticalRiskWarningNeverReachesContact(t *testing.T) {
+	repository := store.NewRepository()
+	repository.SaveChatSettings(contracts.ChatSettings{TenantID: "tenant-1", ChatID: "42", Mode: contracts.ChatModeAuto})
+	repository.SaveChat(store.ChatRecord{TenantID: "tenant-1", ChatID: "42"})
+	ai := &fakeAI{response: contracts.AIProcessMessageResponse{
+		Decision:   contracts.DecisionAskOwner,
+		RiskLevel:  contracts.RiskCritical,
+		Confidence: 0.35,
+		OwnerNote:  "⚠️ Сообщение интимного характера. ИИ не формирует ответ — ответьте вручную.",
+	}}
+	sender := &fakeSender{}
+	service := newTestService(repository, ai, sender)
+
+	inbound, err := service.HandleTelegramWebhook(context.Background(), telegramPayload(7001, "bc-1", 42, 7, "критичное сообщение"), "tenant-1")
+	if err != nil {
+		t.Fatalf("webhook: %v", err)
+	}
+	if inbound.Decision != contracts.DecisionAskOwner || inbound.DraftID == "" {
+		t.Fatalf("inbound = %+v", inbound)
+	}
+	draft, ok := repository.Draft(inbound.DraftID)
+	if !ok {
+		t.Fatalf("warning draft not found")
+	}
+	if draft.DraftType != "warning" || strings.TrimSpace(draft.ResponseText) != "" {
+		t.Fatalf("warning draft = type %q, text %q; want empty warning draft", draft.DraftType, draft.ResponseText)
+	}
+
+	// Every sending/mutating callback must fail; reject must succeed.
+	for i, action := range []contracts.ApprovalAction{
+		contracts.ApprovalApprove,
+		contracts.ApprovalEdit,
+		contracts.ApprovalRegenerate,
+		contracts.ApprovalAIRefine,
+		contracts.ApprovalMakeShorter,
+	} {
+		_, err := service.HandleApprovalCallback(context.Background(), contracts.ApprovalCallbackPayload{
+			Action:         action,
+			TenantID:       "tenant-1",
+			ChatID:         "42",
+			DraftID:        inbound.DraftID,
+			EditedText:     "owner text",
+			IdempotencyKey: "warn-cb-" + intString(int64(i)),
+		})
+		if err == nil {
+			t.Fatalf("action %s on warning card must be rejected", action)
+		}
+	}
+	if repository.SendCount() != 0 {
+		t.Fatalf("warning text was sent to contact: send count = %d", repository.SendCount())
+	}
+	reject, err := service.HandleApprovalCallback(context.Background(), contracts.ApprovalCallbackPayload{
+		Action:         contracts.ApprovalReject,
+		TenantID:       "tenant-1",
+		ChatID:         "42",
+		DraftID:        inbound.DraftID,
+		IdempotencyKey: "warn-cb-reject",
+	})
+	if err != nil || reject.Status != string(store.DraftRejected) {
+		t.Fatalf("reject on warning card: status=%s err=%v", reject.Status, err)
+	}
+}
+
+// TestChoiceQuestionUsesStructuredOptions verifies the ARCH-4 contract: when
+// the AI labels the message choice_question and supplies options, the backend
+// builds a question card from those options (not from response_text lines).
+func TestChoiceQuestionUsesStructuredOptions(t *testing.T) {
+	repository := store.NewRepository()
+	repository.SaveChatSettings(contracts.ChatSettings{TenantID: "tenant-1", ChatID: "42", Mode: contracts.ChatModeManual})
+	repository.SaveChat(store.ChatRecord{TenantID: "tenant-1", ChatID: "42"})
+	ai := &fakeAI{response: contracts.AIProcessMessageResponse{
+		Decision:     contracts.DecisionDraft,
+		ResponseText: "Могу в понедельник.",
+		Intent:       "choice_question",
+		Options:      []string{"Понедельник", "Вторник"},
+		Confidence:   0.7,
+		RiskLevel:    contracts.RiskLow,
+	}}
+	service := newTestService(repository, ai, &fakeSender{})
+
+	inbound, err := service.HandleTelegramWebhook(context.Background(), telegramPayload(7002, "bc-1", 42, 7, "Понедельник или вторник?"), "tenant-1")
+	if err != nil {
+		t.Fatalf("webhook: %v", err)
+	}
+	draft, ok := repository.Draft(inbound.DraftID)
+	if !ok {
+		t.Fatalf("question draft not found")
+	}
+	if draft.DraftType != "question" || len(draft.SuggestedOptions) != 2 || draft.SuggestedOptions[0] != "Понедельник" {
+		t.Fatalf("question draft = %+v", draft)
+	}
+}
+
+// TestStructuredTopicUpdatesActiveEpisode verifies that the topic carried by
+// the structured process-message response lands in the active episode (ARCH-4
+// replacement for the per-message tag-topic call).
+func TestStructuredTopicUpdatesActiveEpisode(t *testing.T) {
+	repository := store.NewRepository()
+	repository.SaveChatSettings(contracts.ChatSettings{TenantID: "tenant-1", ChatID: "42", Mode: contracts.ChatModeManual})
+	repository.SaveChat(store.ChatRecord{TenantID: "tenant-1", ChatID: "42"})
+	ai := &fakeAI{response: contracts.AIProcessMessageResponse{
+		Decision:     contracts.DecisionDraft,
+		ResponseText: "draft",
+		Confidence:   0.8,
+		RiskLevel:    contracts.RiskLow,
+		Topic:        "обсуждение сроков поставки",
+	}}
+	service := newTestService(repository, ai, &fakeSender{})
+
+	if _, err := service.HandleTelegramWebhook(context.Background(), telegramPayload(7003, "bc-1", 42, 7, "когда поставка?"), "tenant-1"); err != nil {
+		t.Fatalf("webhook: %v", err)
+	}
+	ep, ok := repository.ActiveEpisodeByChat("tenant-1", "42")
+	if !ok {
+		t.Fatalf("active episode missing")
+	}
+	if ep.CurrentTopic != "обсуждение сроков поставки" {
+		t.Fatalf("current_topic = %q", ep.CurrentTopic)
+	}
+}
+
+// slowAI delays each ProcessMessage call to simulate a slow LLM provider.
+type slowAI struct {
+	fakeAI
+	delay time.Duration
+}
+
+func (f *slowAI) ProcessMessage(ctx context.Context, request contracts.AIProcessMessageRequest) (contracts.AIProcessMessageResponse, error) {
+	time.Sleep(f.delay)
+	return f.fakeAI.ProcessMessage(ctx, request)
+}
+
+// TestEnqueueWebhookAcksFastWithSlowAI verifies the ARCH-7 contract: enqueueing
+// a webhook returns immediately even when the AI takes seconds, and the update
+// is still fully processed by the worker pool afterwards.
+func TestEnqueueWebhookAcksFastWithSlowAI(t *testing.T) {
+	repository := store.NewRepository()
+	repository.SaveChatSettings(contracts.ChatSettings{TenantID: "tenant-1", ChatID: "42", Mode: contracts.ChatModeManual})
+	repository.SaveChat(store.ChatRecord{TenantID: "tenant-1", ChatID: "42"})
+	ai := &slowAI{
+		fakeAI: fakeAI{response: contracts.AIProcessMessageResponse{
+			Decision:     contracts.DecisionDraft,
+			ResponseText: "draft",
+			Confidence:   0.9,
+			RiskLevel:    contracts.RiskLow,
+		}},
+		delay: 1500 * time.Millisecond,
+	}
+	service := newTestService(repository, ai, &fakeSender{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	service.StartWebhookWorkers(ctx)
+
+	start := time.Now()
+	service.EnqueueTelegramWebhook(telegramPayload(8001, "bc-1", 42, 7, "привет"), "tenant-1")
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("enqueue blocked for %s; webhook ACK must not wait for the AI", elapsed)
+	}
+
+	// The worker must still complete processing: a draft eventually appears.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if drafts := repository.DraftsForChat("tenant-1", "42"); len(drafts) > 0 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("queued webhook was never processed")
+}
+
+// TestConversationContextRespectsTokenBudget verifies the §8.1/MEM-9 contract:
+// oversized contexts are trimmed deterministically (messages first), runtime
+// header lines survive any budget, and the paused_hours flag is injected.
+func TestConversationContextRespectsTokenBudget(t *testing.T) {
+	repository := store.NewRepository()
+	repository.SaveChat(store.ChatRecord{TenantID: "tenant-1", ChatID: "42"})
+	long := strings.Repeat("очень длинное сообщение для переполнения бюджета токенов ", 30)
+	base := time.Date(2026, 6, 11, 9, 0, 0, 0, time.UTC)
+	for i := 0; i < 20; i++ {
+		repository.SaveMessage(contracts.NormalizedTelegramEvent{
+			EventID:         fmt.Sprintf("e%d", i),
+			TenantID:        "tenant-1",
+			ChatID:          "42",
+			SourceMessageID: fmt.Sprintf("m%d", i),
+			MessageText:     long,
+			CreatedAt:       base.Add(time.Duration(i) * time.Minute),
+		})
+	}
+	service := newTestService(repository, &fakeAI{}, &fakeSender{})
+
+	event := contracts.NormalizedTelegramEvent{
+		TenantID: "tenant-1", ChatID: "42", SourceMessageID: "current", MessageText: "вопрос",
+	}
+	parts := service.conversationContext(context.Background(), event, "", 20)
+
+	messageLines := 0
+	pausedSeen := false
+	for _, p := range parts {
+		if strings.HasPrefix(p, "[2026-") {
+			messageLines++
+		}
+		if strings.HasPrefix(p, "[RUNTIME: paused_hours=") {
+			pausedSeen = true
+		}
+	}
+	if messageLines > 10 {
+		t.Fatalf("budget trimming did not cap messages: %d lines", messageLines)
+	}
+	if !pausedSeen {
+		t.Fatalf("paused_hours runtime line missing from context")
+	}
+}
+
+// TestProfileSuggestionLifecycle verifies the §4.5/MEM-4 contract: a staged
+// suggestion never touches the profile by itself, accept applies exactly one
+// field, reject applies nothing, and a duplicate pending suggestion is dropped.
+func TestProfileSuggestionLifecycle(t *testing.T) {
+	repository := store.NewRepository()
+	repository.SaveChat(store.ChatRecord{TenantID: "tenant:user:99", ChatID: "42"})
+
+	id := repository.SaveProfileSuggestion(store.ProfileSuggestionRecord{
+		TenantID: "tenant:user:99", ChatID: "42",
+		FieldName: "relationship_type", SuggestedValue: "professional",
+		Rationale: "обсуждают рабочие задачи",
+	})
+	if id == 0 {
+		t.Fatalf("suggestion not staged")
+	}
+	// Duplicate pending suggestion for the same field is dropped.
+	if dup := repository.SaveProfileSuggestion(store.ProfileSuggestionRecord{
+		TenantID: "tenant:user:99", ChatID: "42",
+		FieldName: "relationship_type", SuggestedValue: "professional",
+	}); dup != 0 {
+		t.Fatalf("duplicate pending suggestion staged: id=%d", dup)
+	}
+	// Whitelist: a non-profile field never reaches the table.
+	if bad := repository.SaveProfileSuggestion(store.ProfileSuggestionRecord{
+		TenantID: "tenant:user:99", ChatID: "42",
+		FieldName: "notes; DROP TABLE", SuggestedValue: "x",
+	}); bad != 0 {
+		t.Fatalf("non-whitelisted field staged: id=%d", bad)
+	}
+	// Staging alone must not modify the profile.
+	if profile, _ := repository.ContactProfile("tenant:user:99", "42"); profile.RelationshipType != "" {
+		t.Fatalf("suggestion wrote to profile without accept: %+v", profile)
+	}
+
+	if err := repository.ResolveSuggestion("tenant:user:99", id, true); err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	profile, _ := repository.ContactProfile("tenant:user:99", "42")
+	if profile.RelationshipType != "professional" {
+		t.Fatalf("accepted suggestion not applied: %+v", profile)
+	}
+	if got := len(repository.PendingSuggestions("tenant:user:99", "42")); got != 0 {
+		t.Fatalf("pending after resolve = %d", got)
+	}
+
+	// Reject path: value is not applied.
+	id2 := repository.SaveProfileSuggestion(store.ProfileSuggestionRecord{
+		TenantID: "tenant:user:99", ChatID: "42",
+		FieldName: "tone", SuggestedValue: "formal",
+	})
+	if err := repository.ResolveSuggestion("tenant:user:99", id2, false); err != nil {
+		t.Fatalf("reject: %v", err)
+	}
+	if profile, _ := repository.ContactProfile("tenant:user:99", "42"); profile.Tone != "" {
+		t.Fatalf("rejected suggestion applied: %+v", profile)
+	}
+}
+
+// TestForgetChatErasesMemoryButKeepsOtherChats verifies the §10.2/MEM-2
+// contract end-to-end on the in-memory repository: after the confirmed forget
+// flow, every memory artifact of the chat is gone while another chat's facts
+// survive, and the destructive action never runs without confirmation.
+func TestForgetChatErasesMemoryButKeepsOtherChats(t *testing.T) {
+	repository := store.NewRepository()
+	repository.SaveChat(store.ChatRecord{TenantID: "tenant:user:99", ChatID: "42"})
+	repository.SaveChat(store.ChatRecord{TenantID: "tenant:user:99", ChatID: "77"})
+	repository.SaveMessage(contracts.NormalizedTelegramEvent{
+		EventID: "e1", TenantID: "tenant:user:99", ChatID: "42", SourceMessageID: "m1",
+		MessageText: "секретная история", CreatedAt: time.Now(),
+	})
+	repository.UpsertSemanticFact(store.SemanticFactRecord{
+		TenantID: "tenant:user:99", ScopeKind: "chat", ChatID: "42",
+		FactText: "у него диабет", FactType: "health", Subject: "contact", Confidence: 0.8,
+	}, nil)
+	repository.UpsertSemanticFact(store.SemanticFactRecord{
+		TenantID: "tenant:user:99", ScopeKind: "chat", ChatID: "77",
+		FactText: "любит краткие ответы", FactType: "preference", Subject: "contact", Confidence: 0.8,
+	}, nil)
+
+	service := newTestService(repository, &fakeAI{}, &fakeSender{})
+
+	// /forget only asks for confirmation — nothing is deleted yet.
+	resp := service.botLayer.HandleCommand(telegram.BotCommandUpdate{
+		Command: "/forget", Arguments: "1", SenderID: "99", ChatID: "99",
+	}, "tenant:user:99")
+	if resp.Reason != "forget_confirmation_requested" {
+		t.Fatalf("reason = %s", resp.Reason)
+	}
+	if got := len(repository.SemanticFacts("tenant:user:99", "42", 10)); got != 1 {
+		t.Fatalf("facts deleted before confirmation: %d", got)
+	}
+
+	if err := repository.ForgetChat("tenant:user:99", "42"); err != nil {
+		t.Fatalf("forget chat: %v", err)
+	}
+	if got := len(repository.SemanticFacts("tenant:user:99", "42", 10)); got != 0 {
+		t.Fatalf("facts survived forget: %d", got)
+	}
+	if got := len(repository.RecentMessages("tenant:user:99", "42", 10)); got != 0 {
+		t.Fatalf("messages survived forget: %d", got)
+	}
+	if got := len(repository.SemanticFacts("tenant:user:99", "77", 10)); got != 1 {
+		t.Fatalf("other chat's facts touched: %d", got)
+	}
+}
+
+// TestForgetAllRequiresExactPhrase verifies that full erasure runs only on the
+// verbatim confirmation phrase (§10.2).
+func TestForgetAllRequiresExactPhrase(t *testing.T) {
+	repository := store.NewRepository()
+	repository.SaveChat(store.ChatRecord{TenantID: "tenant:user:99", ChatID: "42"})
+	repository.UpsertSemanticFact(store.SemanticFactRecord{
+		TenantID: "tenant:user:99", ScopeKind: "chat", ChatID: "42",
+		FactText: "важный факт о собеседнике", FactType: "preference", Subject: "contact", Confidence: 0.8,
+	}, nil)
+	service := newTestService(repository, &fakeAI{}, &fakeSender{})
+
+	service.botLayer.HandleCommand(telegram.BotCommandUpdate{
+		Command: "/forget_all", SenderID: "99", ChatID: "99",
+	}, "tenant:user:99")
+
+	// Wrong phrase cancels.
+	service.handleOwnerMessage(context.Background(), telegram.OwnerMessageUpdate{
+		SenderID: "99", ChatID: "99", MessageID: "om1", Text: "удалить всё",
+	})
+	if got := len(repository.SemanticFacts("tenant:user:99", "42", 10)); got != 1 {
+		t.Fatalf("data deleted on wrong phrase: %d facts", got)
+	}
+
+	// Exact phrase erases.
+	service.botLayer.HandleCommand(telegram.BotCommandUpdate{
+		Command: "/forget_all", SenderID: "99", ChatID: "99",
+	}, "tenant:user:99")
+	service.handleOwnerMessage(context.Background(), telegram.OwnerMessageUpdate{
+		SenderID: "99", ChatID: "99", MessageID: "om2", Text: contracts.ForgetAllConfirmationPhrase,
+	})
+	if got := len(repository.SemanticFacts("tenant:user:99", "42", 10)); got != 0 {
+		t.Fatalf("facts survived forget_all: %d", got)
+	}
+	if got := len(repository.ChatsForTenant("tenant:user:99")); got != 0 {
+		t.Fatalf("chats survived forget_all: %d", got)
+	}
+}
+
+// TestEpisodeRuntimeStateLifecycle verifies the §6.2/MEM-5 contract: a contact
+// question awaiting a draft sets open_question/pending_owner_action, and an
+// approved (sent) reply resets both. message_count is not inflated by the
+// runtime write.
+func TestEpisodeRuntimeStateLifecycle(t *testing.T) {
+	repository := store.NewRepository()
+	repository.SaveChatSettings(contracts.ChatSettings{TenantID: "tenant-1", ChatID: "42", Mode: contracts.ChatModeManual})
+	repository.SaveChat(store.ChatRecord{TenantID: "tenant-1", ChatID: "42"})
+	ai := &fakeAI{response: contracts.AIProcessMessageResponse{
+		Decision:     contracts.DecisionDraft,
+		ResponseText: "draft",
+		Intent:       "question",
+		Confidence:   0.8,
+		RiskLevel:    contracts.RiskLow,
+		Topic:        "сроки поставки",
+	}}
+	service := newTestService(repository, ai, &fakeSender{})
+
+	inbound, err := service.HandleTelegramWebhook(context.Background(), telegramPayload(9001, "bc-1", 42, 7, "Когда будет поставка?"), "tenant-1")
+	if err != nil {
+		t.Fatalf("webhook: %v", err)
+	}
+	ep, ok := repository.ActiveEpisodeByChat("tenant-1", "42")
+	if !ok {
+		t.Fatalf("active episode missing")
+	}
+	if ep.OpenQuestionMsgID != "7" {
+		t.Fatalf("open_question_message_id = %q, want \"7\"", ep.OpenQuestionMsgID)
+	}
+	if ep.PendingOwnerAction == "" {
+		t.Fatalf("pending_owner_action not set for a draft decision")
+	}
+	if ep.MessageCount != 1 {
+		t.Fatalf("message_count inflated by runtime write: %d", ep.MessageCount)
+	}
+
+	// Approving the draft sends the reply and must reset the runtime state.
+	if _, err := service.HandleApprovalCallback(context.Background(), contracts.ApprovalCallbackPayload{
+		Action:         contracts.ApprovalApprove,
+		TenantID:       "tenant-1",
+		ChatID:         "42",
+		DraftID:        inbound.DraftID,
+		IdempotencyKey: "runtime-approve",
+	}); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	ep, _ = repository.ActiveEpisodeByChat("tenant-1", "42")
+	if ep.OpenQuestionMsgID != "" || ep.PendingOwnerAction != "" {
+		t.Fatalf("runtime state not cleared after send: %+v", ep)
+	}
+}
+
+// summarizingAI is a fakeAI that also answers SummarizeChat with a fixed
+// summary long enough to satisfy the episode_summaries content CHECK (≥50).
+type summarizingAI struct {
+	fakeAI
+	summaries int
+}
+
+func (f *summarizingAI) SummarizeChat(ctx context.Context, request contracts.ChatSummaryRequest) (contracts.ChatSummaryResponse, error) {
+	f.summaries++
+	return contracts.ChatSummaryResponse{
+		Summary: "Обсуждали сроки поставки и условия договора; собеседник ждёт счёт в пятницу.",
+	}, nil
+}
+
+// TestEpisodeSummariesPerEpisodeIdempotency verifies the MEM-6 contract:
+// two episodes closed on the same day produce two summaries with real episode
+// bounds and provenance; re-closing the same episode adds nothing; the daily
+// fallback does not duplicate covered windows.
+func TestEpisodeSummariesPerEpisodeIdempotency(t *testing.T) {
+	repository := store.NewRepository()
+	repository.SaveChat(store.ChatRecord{TenantID: "tenant-1", ChatID: "42"})
+	ai := &summarizingAI{}
+	service := newTestService(repository, ai, &fakeSender{})
+	ctx := context.Background()
+
+	day := time.Date(2026, 6, 11, 0, 0, 0, 0, time.UTC)
+	seed := func(start time.Time, prefix string) {
+		for i := 0; i < 3; i++ {
+			repository.SaveMessage(contracts.NormalizedTelegramEvent{
+				EventID: prefix + "-e" + intString(int64(i)), TenantID: "tenant-1", ChatID: "42",
+				SourceMessageID: prefix + "-m" + intString(int64(i)),
+				MessageText:     "содержательное сообщение для сводки",
+				CreatedAt:       start.Add(time.Duration(i) * time.Minute),
+			})
+		}
+	}
+	morningStart, morningEnd := day.Add(10*time.Hour), day.Add(10*time.Hour+2*time.Minute)
+	eveningStart, eveningEnd := day.Add(18*time.Hour), day.Add(18*time.Hour+2*time.Minute)
+	seed(morningStart, "am")
+	seed(eveningStart, "pm")
+
+	service.summarizeEpisode(ctx, "tenant-1", "42", morningStart, morningEnd, "message_count")
+	service.summarizeEpisode(ctx, "tenant-1", "42", eveningStart, eveningEnd, "silence_gap")
+	if got := len(repository.EpisodeSummaries("tenant-1", "42", 10)); got != 2 {
+		t.Fatalf("summaries after two episode closes = %d, want 2 (second episode of the day must not be lost)", got)
+	}
+
+	// Re-closing the same episode is idempotent (period overlap).
+	service.summarizeEpisode(ctx, "tenant-1", "42", morningStart, morningEnd, "message_count")
+	if got := len(repository.EpisodeSummaries("tenant-1", "42", 10)); got != 2 {
+		t.Fatalf("duplicate episode close created a summary: %d", got)
+	}
+
+	// Daily fallback: everything fact-bearing is covered; the uncovered tail
+	// has no messages → no duplicate.
+	service.summarizeChatDay(ctx, "tenant-1", "42", day, "daily_summary")
+	if got := len(repository.EpisodeSummaries("tenant-1", "42", 10)); got != 2 {
+		t.Fatalf("daily fallback duplicated covered summaries: %d", got)
+	}
+
+	// Provenance: episode bounds and source IDs are real, not day bounds.
+	for _, sm := range repository.EpisodeSummaries("tenant-1", "42", 10) {
+		if sm.PeriodEnd.Sub(sm.PeriodStart) > time.Hour {
+			t.Fatalf("summary period looks like a day, not an episode: %v..%v", sm.PeriodStart, sm.PeriodEnd)
+		}
+	}
+}
+
+// TestRedactHealthFactsRemovesPlainText verifies the §10.3/MEM-8 contract:
+// health-fact texts never reach extraction_log.raw_output in the clear, while
+// ordinary facts stay readable for diagnostics.
+func TestRedactHealthFactsRemovesPlainText(t *testing.T) {
+	raw := `[{"fact_text":"у него диабет второго типа","fact_type":"health"},` +
+		`{"fact_text":"любит краткие ответы","fact_type":"preference"}]`
+	facts := []aiclient.TypedFact{
+		{FactText: "у него диабет второго типа", FactType: "health"},
+		{FactText: "любит краткие ответы", FactType: "preference"},
+	}
+
+	got := redactHealthFacts(raw, facts, map[string]int64{"у него диабет второго типа": 42})
+
+	if strings.Contains(got, "диабет") {
+		t.Fatalf("health text leaked into raw_output: %s", got)
+	}
+	if !strings.Contains(got, "[health fact #42]") {
+		t.Fatalf("fact_id marker missing: %s", got)
+	}
+	if !strings.Contains(got, "любит краткие ответы") {
+		t.Fatalf("ordinary fact must stay readable: %s", got)
+	}
+}
+
+// TestFinalizeFactOrderKeepsHardIncludesAndLimit verifies the ARCH-5 contract:
+// taboo/health facts always survive final ordering, the result respects the
+// limit, and without a query vector the pre-ranked (RRF) order is preserved.
+func TestFinalizeFactOrderKeepsHardIncludesAndLimit(t *testing.T) {
+	svc := newTestService(store.NewRepository(), &fakeAI{}, &fakeSender{})
+	facts := make([]store.SemanticFactRecord, 0, 12)
+	facts = append(facts, store.SemanticFactRecord{ID: 100, FactType: "taboo", FactText: "не обсуждать цену"})
+	for i := int64(1); i <= 10; i++ {
+		facts = append(facts, store.SemanticFactRecord{ID: i, FactType: "preference", FactText: "fact"})
+	}
+
+	out := svc.finalizeFactOrder("tenant-1", facts, nil, 8)
+
+	if len(out) != 8 {
+		t.Fatalf("len = %d, want 8", len(out))
+	}
+	if out[0].ID != 100 {
+		t.Fatalf("hard-include fact displaced: first ID = %d", out[0].ID)
+	}
+	// Remaining slots keep RRF order 1..7.
+	for i := int64(1); i <= 7; i++ {
+		if out[i].ID != i {
+			t.Fatalf("RRF order broken at %d: got ID %d", i, out[i].ID)
+		}
+	}
+}
+
 func telegramPayload(updateID int64, businessConnectionID string, chatID, messageID int64, text string) []byte {
 	return []byte(`{
 		"update_id": ` + intString(updateID) + `,
@@ -851,13 +1429,15 @@ func intString(value int64) string {
 }
 
 type fakeAI struct {
-	response contracts.AIProcessMessageResponse
-	err      error
-	calls    int
+	response    contracts.AIProcessMessageResponse
+	err         error
+	calls       int
+	lastRequest contracts.AIProcessMessageRequest
 }
 
 func (f *fakeAI) ProcessMessage(ctx context.Context, request contracts.AIProcessMessageRequest) (contracts.AIProcessMessageResponse, error) {
 	f.calls++
+	f.lastRequest = request
 	return f.response, f.err
 }
 
@@ -888,45 +1468,38 @@ func (f *fakeSender) DeleteMessage(ctx context.Context, chatID, messageID string
 	return nil
 }
 
-// TestSaveTypedFactsConfidenceGate verifies the owner_global promotion gate:
-// a biographical fact about the owner must not be promoted to owner_global when
-// confidence is below ownerGlobalMinConfidence, and must be promoted when above.
-func TestSaveTypedFactsConfidenceGate(t *testing.T) {
+// TestSaveTypedFactsAlwaysChatScoped verifies the per-chat memory invariant:
+// every extracted fact — including owner-subject facts the Python service may
+// hint as global — is persisted chat-scoped and never leaks into other chats.
+func TestSaveTypedFactsAlwaysChatScoped(t *testing.T) {
 	event := contracts.NormalizedTelegramEvent{
 		TenantID:        "tenant:user:99",
 		ChatID:          "chat-42",
 		SourceMessageID: "m1",
 	}
 
-	t.Run("low_confidence_stays_chat_scoped", func(t *testing.T) {
-		repo := store.NewRepository()
-		svc := newTestService(repo, &fakeAI{}, &fakeSender{})
-		svc.saveTypedFacts(event, []aiclient.TypedFact{
-			{FactText: "owner-bio-fact", FactType: "biographical", Subject: "owner",
-				ScopeKind: "owner_global", Confidence: 0.7},
-		})
-		global := repo.GlobalSemanticFacts(event.TenantID, 10)
-		chat := repo.SemanticFacts(event.TenantID, event.ChatID, 10)
-		if len(global) != 0 {
-			t.Errorf("expected 0 owner_global facts, got %d", len(global))
-		}
-		if len(chat) == 0 {
-			t.Error("expected fact stored as chat-scoped, got none")
-		}
+	repo := store.NewRepository()
+	svc := newTestService(repo, &fakeAI{}, &fakeSender{})
+	svc.saveTypedFacts(event, []aiclient.TypedFact{
+		{FactText: "owner-bio-fact", FactType: "biographical", Subject: "owner",
+			ScopeKind: "owner_global", Confidence: 0.95},
+		{FactText: "любит краткие ответы", FactType: "preference", Subject: "contact",
+			Confidence: 0.8},
 	})
 
-	t.Run("high_confidence_promotes_to_owner_global", func(t *testing.T) {
-		repo := store.NewRepository()
-		svc := newTestService(repo, &fakeAI{}, &fakeSender{})
-		svc.saveTypedFacts(event, []aiclient.TypedFact{
-			{FactText: "owner-bio-fact", FactType: "biographical", Subject: "owner",
-				ScopeKind: "owner_global", Confidence: 0.85},
-		})
-		global := repo.GlobalSemanticFacts(event.TenantID, 10)
-		if len(global) == 0 {
-			t.Error("expected fact promoted to owner_global, got none")
+	chat := repo.SemanticFacts(event.TenantID, event.ChatID, 10)
+	if len(chat) != 2 {
+		t.Fatalf("expected 2 chat-scoped facts, got %d", len(chat))
+	}
+	for _, f := range chat {
+		if f.ScopeKind != "chat" || f.ChatID != event.ChatID {
+			t.Errorf("fact %q stored with scope %q chat %q; want chat scope in source chat",
+				f.FactText, f.ScopeKind, f.ChatID)
 		}
-	})
+	}
+	if got := len(repo.SemanticFacts(event.TenantID, "other-chat", 10)); got != 0 {
+		t.Errorf("fact leaked into another chat: got %d facts there", got)
+	}
 }
 
 // TestSaveTypedFactsOutcomeSkipCounting verifies the observability summary:

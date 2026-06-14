@@ -1,7 +1,7 @@
 """Output safety scanner pipeline (Phase 3).
 
-Sits inside :class:`ai_agent.llm.ModelRouter` after the gateway returns.  Per
-purpose (see :mod:`ai_agent.safety.policies`) it:
+Invoked by :class:`ai_agent.agents.runtime.AgentRuntime` after an agent run
+returns.  Per purpose (see :mod:`ai_agent.safety.policies`) it:
 
 * ``Deanonymize`` — substitutes placeholders back to their original values
   using :attr:`LLMCallContext.redactions`.  Hallucinated placeholders trigger

@@ -44,6 +44,18 @@ def contains_prompt_injection(text: str) -> bool:
         "jailbreak",
         "reveal your instructions",
         "do not follow",
+        # Russian equivalents — the product's primary language.
+        "игнорируй предыдущие",
+        "игнорируй все предыдущие",
+        "забудь предыдущие",
+        "забудь все инструкции",
+        "системный промпт",
+        "системные инструкции",
+        "ты теперь",
+        "новые инструкции",
+        "раскрой свои инструкции",
+        "покажи свои инструкции",
+        "не следуй инструкциям",
     )
     return any(pattern in normalized for pattern in patterns)
 

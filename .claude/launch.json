@@ -1,0 +1,12 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "backend-miniapp",
+      "runtimeExecutable": "sh",
+      "runtimeArgs": ["-c", "cd backend-go && BACKEND_HTTP_ADDR=:8089 MINIAPP_DIR=../miniapp REPLY_DELAY_SECONDS=0 go run ./cmd/backend"],
+      "port": 8089,
+      "autoPort": false
+    }
+  ]
+}
