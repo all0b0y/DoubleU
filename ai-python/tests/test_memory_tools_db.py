@@ -90,6 +90,61 @@ def test_save_fact_goes_through_upsert_and_dedupes(scope) -> None:
     assert any("МГУ" in fact for fact in found)
 
 
+def test_search_facts_surfaces_superseded_history(scope) -> None:
+    """Graph read-path (#3): semantic search returns the current fact AND the
+    fact it superseded, inline as history. The older fact is soft-deleted (as
+    consolidation leaves it) and only reachable via the fact_relations edge —
+    exactly the temporal walk the read-path must perform."""
+    from ai_agent.agents.deps import AgentDeps
+    from ai_agent.agents.memory_tools import search_facts
+
+    tenant_id, chat_id = scope
+    vector = "[" + ",".join(["0.01"] * 4096) + "]"
+
+    async def setup_and_search(pool):
+        new_id = await pool.fetchval(
+            """INSERT INTO semantic_facts
+                   (tenant_id, scope_kind, chat_id, fact_text, fact_type, subject,
+                    confidence, source, normalized_fact_hash)
+               VALUES ($1,'chat',$2,'отправил договор в пятницу','commitment','contact',
+                       0.95,'llm_extracted', md5('отправил договор '||$1))
+               RETURNING id""",
+            tenant_id, chat_id,
+        )
+        old_id = await pool.fetchval(
+            """INSERT INTO semantic_facts
+                   (tenant_id, scope_kind, chat_id, fact_text, fact_type, subject,
+                    confidence, source, normalized_fact_hash, superseded_by_id, deleted_at)
+               VALUES ($1,'chat',$2,'обещал прислать договор','commitment','contact',
+                       0.9,'llm_extracted', md5('обещал договор '||$1), $3, now())
+               RETURNING id""",
+            tenant_id, chat_id, new_id,
+        )
+        await pool.execute(
+            """INSERT INTO fact_embeddings
+                   (fact_id, tenant_id, scope_kind, chat_id, embedding_model, embedding)
+               VALUES ($1,$2,'chat',$3,'test',$4::vector)""",
+            new_id, tenant_id, chat_id, vector,
+        )
+        await pool.execute(
+            """INSERT INTO fact_relations
+                   (tenant_id, fact_id_from, fact_id_to, relation_type, confidence)
+               VALUES ($1,$2,$3,'supersedes',0.95)""",
+            tenant_id, old_id, new_id,
+        )
+
+        async def embedder(query: str):
+            return [0.01] * 4096
+
+        ctx = SimpleNamespace(
+            deps=AgentDeps(tenant_id=tenant_id, chat_id=chat_id, pool=pool, embedder=embedder)
+        )
+        return await search_facts(ctx, "обещал прислать договор")
+
+    found = run_tool(setup_and_search)
+    assert found == ["[commitment] отправил договор в пятницу ← ранее: обещал прислать договор"]
+
+
 def test_suggest_profile_update_stages_pending_once(scope) -> None:
     from ai_agent.agents.memory_tools import suggest_profile_update
 

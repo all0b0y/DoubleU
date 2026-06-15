@@ -16,7 +16,12 @@ from pydantic_ai.messages import ModelResponse, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from ai_agent.agents.deps import AgentDeps
-from ai_agent.agents.memory_tools import save_fact, search_facts, suggest_profile_update
+from ai_agent.agents.memory_tools import (
+    _format_fact_chains,
+    save_fact,
+    search_facts,
+    suggest_profile_update,
+)
 from ai_agent.agents.runtime import AgentRuntime
 from ai_agent.observability.context import LLMCallContext, with_context
 from ai_agent.schemas import (
@@ -281,11 +286,12 @@ class _CapturingPool:
         return self.rows
 
 
-def test_search_facts_uses_vector_branch_when_embedder_present() -> None:
-    """#1: with an embedder wired, search runs semantic (<=>) retrieval — the
-    query 'обещал прислать договор' must reach a fact with no shared words."""
+def test_search_facts_uses_graph_branch_when_embedder_present() -> None:
+    """#1+#3: with an embedder wired, search runs the semantic graph read-path —
+    the query 'обещал прислать договор' must reach a fact with no shared words."""
     pool = _CapturingPool(
-        [{"fact_text": "контракт будет отправлен к пятнице", "fact_type": "commitment", "confidence": 0.9}]
+        [{"id": 1, "fact_text": "контракт будет отправлен к пятнице",
+          "fact_type": "commitment", "root_id": 1, "depth": 0}]
     )
 
     async def fake_embedder(query: str) -> list[float]:
@@ -294,7 +300,24 @@ def test_search_facts_uses_vector_branch_when_embedder_present() -> None:
     ctx = SimpleNamespace(deps=AgentDeps(tenant_id="t", chat_id="c", pool=pool, embedder=fake_embedder))
     out = asyncio.run(search_facts(ctx, "обещал прислать договор"))
     assert out == ["[commitment] контракт будет отправлен к пятнице"]
-    assert any("<=>" in q for q in pool.queries), "embedder present → vector branch must run"
+    query = pool.queries[0]
+    assert "<=>" in query, "embedder present → vector branch must run"
+    assert "fact_relations" in query, "vector branch must walk the temporal graph"
+
+
+def test_format_fact_chains_renders_evolution() -> None:
+    """#3: a current fact with prior versions renders the 'было → стало' history;
+    a fact with no history renders exactly like the flat path."""
+    rows = [
+        {"id": 10, "fact_text": "отправил договор", "fact_type": "commitment", "root_id": 10, "depth": 0},
+        {"id": 9, "fact_text": "обещал прислать договор", "fact_type": "commitment", "root_id": 10, "depth": 1},
+        {"id": 3, "fact_text": "живёт в Москве", "fact_type": "biographical", "root_id": 3, "depth": 0},
+    ]
+    out = _format_fact_chains(rows)
+    assert out == [
+        "[commitment] отправил договор ← ранее: обещал прислать договор",
+        "[biographical] живёт в Москве",
+    ]
 
 
 def test_search_facts_falls_back_to_lexical_without_usable_embedding() -> None:
