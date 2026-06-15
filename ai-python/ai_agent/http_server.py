@@ -25,6 +25,7 @@ from .schemas import (
     parse_rerank_facts_request,
     parse_risk_request,
     parse_summary_request,
+    parse_synthesize_pattern_request,
     parse_topic_tagging_request,
     parse_typed_extraction_request,
 )
@@ -60,6 +61,7 @@ class AIHTTPHandler(BaseHTTPRequestHandler):
             "/ai/summarize-chat": self._summarize_chat,
             "/ai/tag-topic": self._tag_topic,
             "/ai/rerank-facts": self._rerank_facts,
+            "/ai/synthesize-pattern": self._synthesize_pattern,
         }
         route = routes.get(self.path)
         if route is None:
@@ -121,6 +123,9 @@ class AIHTTPHandler(BaseHTTPRequestHandler):
     def _rerank_facts(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self.service.rerank_facts(parse_rerank_facts_request(payload)).to_dict()
 
+    def _synthesize_pattern(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self.service.synthesize_pattern(parse_synthesize_pattern_request(payload)).to_dict()
+
     # _PURPOSE_BY_PATH maps each endpoint to the LLMPurpose tag the safety /
     # observability layers will see in the call context.
     _PURPOSE_BY_PATH: dict[str, LLMPurpose] = {
@@ -133,6 +138,7 @@ class AIHTTPHandler(BaseHTTPRequestHandler):
         "/ai/summarize-chat": LLMPurpose.SUMMARIZE,
         "/ai/tag-topic": LLMPurpose.EXTRACT,
         "/ai/rerank-facts": LLMPurpose.EXTRACT,
+        "/ai/synthesize-pattern": LLMPurpose.EXTRACT,
     }
 
     def _build_call_context(self, payload: dict[str, Any]) -> tuple[str, LLMCallContext]:

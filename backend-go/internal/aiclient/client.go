@@ -33,6 +33,12 @@ type ChatSummarizer interface {
 	SummarizeChat(ctx context.Context, request contracts.ChatSummaryRequest) (contracts.ChatSummaryResponse, error)
 }
 
+// PatternSynthesizer is optionally implemented by AI clients that can condense a
+// cluster of related facts into one durable behaviour pattern (reflection, #5).
+type PatternSynthesizer interface {
+	SynthesizePattern(ctx context.Context, request contracts.SynthesizePatternRequest) (contracts.SynthesizePatternResponse, error)
+}
+
 // MemoryExtractionRequest is sent to the Python AI service for async fact extraction.
 type MemoryExtractionRequest struct {
 	MessageText  string   `json:"message_text"`

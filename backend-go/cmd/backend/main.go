@@ -113,6 +113,7 @@ func main() {
 		core.WithBotSenderProvider(botManager),
 		core.WithDefaultIngestionMode(ingestionDefault),
 		core.WithAIMemorySource(string(flags.AIMemorySource)),
+		core.WithReflectionMode(string(flags.ReflectionMode)),
 	)
 	server := httpapi.NewServer(service,
 		httpapi.WithHub(hub),

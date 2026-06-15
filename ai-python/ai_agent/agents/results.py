@@ -138,6 +138,34 @@ class SummaryResult(BaseModel):
     )
 
 
+class PatternResult(BaseModel):
+    """A durable behavioural pattern synthesised from a cluster of facts (#5).
+
+    ``pattern`` is intentionally allowed to be empty: when the facts do not
+    support a stable, non-obvious pattern the model must return "" so the
+    backend writes nothing rather than inventing an insight.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    pattern: str = Field(
+        default="",
+        max_length=200,
+        description=(
+            "Устойчивый поведенческий паттерн контакта в 1 фразе (например"
+            " «регулярно перегружен работой, часто в стрессе»). Пустая строка —"
+            " если факты НЕ образуют устойчивого паттерна. Не выдумывай."
+        ),
+    )
+    subject: Literal["contact", "owner", "relationship", "third_party"] = "contact"
+    confidence: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description="Уверенность 0..1 в том, что это устойчивый паттерн, а не разовость.",
+    )
+
+
 class TopicResult(BaseModel):
     """Short topic label for the active conversation episode."""
 

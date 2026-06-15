@@ -53,6 +53,8 @@ from ..schemas import (
     RerankFactsRequest,
     RerankFactsResponse,
     RiskLevel,
+    SynthesizePatternRequest,
+    SynthesizePatternResponse,
     TopicTaggingRequest,
     TopicTaggingResponse,
     TypedExtractionRequest,
@@ -68,6 +70,7 @@ from .results import (
     CriticVerdict,
     DraftResult,
     ExtractionResult,
+    PatternResult,
     RerankResult,
     SummaryResult,
     TopicResult,
@@ -169,6 +172,16 @@ _RERANK_INSTRUCTIONS = (
     " facts — it is fine to return fewer than the candidates."
 )
 
+_PATTERN_INSTRUCTIONS = (
+    "Тебе дан кластер связанных фактов об одном собеседнике. Сформулируй ОДИН"
+    " устойчивый поведенческий паттерн контакта — обобщение, которое останется"
+    " верным и через недели (например «регулярно перегружен работой, часто в"
+    " стрессе»). Пиши кратко, по-русски, одной фразой, без префиксов и кавычек."
+    " Если факты НЕ образуют устойчивого паттерна (разовые, противоречивые или"
+    " слишком разнородные) — верни pattern='' (пустую строку). Не выдумывай и не"
+    " повторяй один факт как «паттерн»."
+)
+
 
 class AgentRuntime:
     """Owns the agents, the event-loop thread, safety/observability and the pool."""
@@ -188,6 +201,7 @@ class AgentRuntime:
         summary_model: object | None = None,
         topic_model: object | None = None,
         rerank_model: object | None = None,
+        pattern_model: object | None = None,
         query_embedder_factory: Callable[[], EmbedderCallable] | None = None,
     ) -> None:
         """Build agents and start the loop thread.
@@ -260,6 +274,13 @@ class AgentRuntime:
             deps_type=AgentDeps,
             output_type=RerankResult,
             instructions=_RERANK_INSTRUCTIONS,
+            retries=1,
+        )
+        self._pattern_agent: Agent[AgentDeps, PatternResult] = Agent(
+            pattern_model or build_model(AgentTask.REFLECT),
+            deps_type=AgentDeps,
+            output_type=PatternResult,
+            instructions=_PATTERN_INSTRUCTIONS,
             retries=1,
         )
 
@@ -740,6 +761,59 @@ class AgentRuntime:
         """Return candidate facts in their original order, truncated to top_k."""
         ids = tuple(int(f["id"]) for f in request.facts)[: request.top_k]
         return RerankFactsResponse(ranked_ids=ids, model_used=model_used)
+
+    # --------------------------------------------------------------- reflect
+
+    def synthesize_pattern(self, request: SynthesizePatternRequest) -> SynthesizePatternResponse:
+        """Synthesise one durable behaviour pattern from a fact cluster (#5).
+
+        Stateless by design: the backend owns clustering and persistence; this
+        only turns a cluster of fact texts into a single pattern phrase. The
+        ``no_memory`` flag blocks it, and an empty ``pattern`` means the cluster
+        carried no durable signal, so the backend writes nothing.
+        """
+        if PrivacyFlag.NO_MEMORY in request.privacy_flags:
+            return SynthesizePatternResponse(
+                pattern="", subject="contact", confidence=0.0,
+                model_used="none", usage=Usage(), blocked_by_privacy=True,
+            )
+        if not request.cluster_facts:
+            return SynthesizePatternResponse(
+                pattern="", subject="contact", confidence=0.0, model_used="none", usage=Usage()
+            )
+        ctx = current_context()
+        try:
+            result, usage = self._run(self._synthesize_pattern_async(request, ctx))
+        except Exception as exc:  # noqa: BLE001 — reflection is best-effort, never fatal
+            logger.warning("pattern synthesis failed", extra={"error": str(exc)})
+            return SynthesizePatternResponse(
+                pattern="", subject="contact", confidence=0.0, model_used="error", usage=Usage()
+            )
+        return SynthesizePatternResponse(
+            pattern=result.pattern.strip(),
+            subject=result.subject,
+            confidence=result.confidence,
+            model_used=model_name_for(AgentTask.REFLECT) or "test-model",
+            usage=usage,
+        )
+
+    async def _synthesize_pattern_async(
+        self, request: SynthesizePatternRequest, ctx: LLMCallContext
+    ) -> tuple[PatternResult, Usage]:
+        facts_block = "\n".join(f"- {f}" for f in request.cluster_facts if f.strip())
+        content = f"[КЛАСТЕР ФАКТОВ О СОБЕСЕДНИКЕ]\n{facts_block}"
+        # Fact texts derive from untrusted contact messages: wrap them like the
+        # extraction path so any embedded instruction stays inert.
+        _, user_payload = self._prompt_builder.build("", content, ())
+        _, user_payload = self._scan_input("", user_payload, ModelTask.EXTRACT_FACTS, ctx)
+        deps = AgentDeps(tenant_id=request.tenant_id, chat_id=request.chat_id)
+        result = await self._pattern_agent.run(user_payload, deps=deps)
+        usage = self._usage_of(result)
+        self._record_run(
+            ctx, AgentTask.REFLECT, "", user_payload,
+            result.output.pattern, usage, request.privacy_flags,
+        )
+        return result.output, usage
 
 
 def build_runtime(

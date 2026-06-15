@@ -73,6 +73,31 @@ class HTTPServerTests(unittest.TestCase):
         self.assertEqual(response["owner_note"], "")
 
 
+    def test_synthesize_pattern_endpoint_matches_contract_shape(self) -> None:
+        """The synthesize-pattern route parses the request and returns the frozen shape."""
+        response = self.handler._synthesize_pattern(
+            {
+                "cluster_facts": ["опять завал на работе", "устал", "не успеваю"],
+                "tenant_id": "tenant-1",
+                "chat_id": "chat-1",
+                "privacy_flags": [],
+            }
+        )
+        self.assertEqual(
+            set(response),
+            {"pattern", "subject", "confidence", "model_used", "usage", "blocked_by_privacy"},
+        )
+        self.assertFalse(response["blocked_by_privacy"])
+
+    def test_synthesize_pattern_respects_no_memory(self) -> None:
+        """no_memory chats must never be reflected on."""
+        response = self.handler._synthesize_pattern(
+            {"cluster_facts": ["a", "b", "c"], "privacy_flags": ["no_memory"]}
+        )
+        self.assertTrue(response["blocked_by_privacy"])
+        self.assertEqual(response["pattern"], "")
+
+
 class TraceIDPropagationTests(unittest.TestCase):
     """Phase 0: trace_id is derived from event_id and stamped on audit rows."""
 

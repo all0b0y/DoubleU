@@ -64,6 +64,19 @@ func (c *HTTPClient) SummarizeChat(ctx context.Context, request contracts.ChatSu
 	return response, nil
 }
 
+// SynthesizePattern condenses a cluster of related facts into one behaviour
+// pattern via the Python AI service (sleep-time reflection, #5).
+func (c *HTTPClient) SynthesizePattern(ctx context.Context, request contracts.SynthesizePatternRequest) (contracts.SynthesizePatternResponse, error) {
+	var response contracts.SynthesizePatternResponse
+	if c.baseURL == "" {
+		return response, fmt.Errorf("ai base url is empty")
+	}
+	if err := c.postJSON(ctx, "/ai/synthesize-pattern", request, &response); err != nil {
+		return response, err
+	}
+	return response, nil
+}
+
 // ExtractMemory calls the Python AI /ai/extract-memory endpoint to extract facts from a message.
 // This is designed for async use: callers should fire-and-forget via a goroutine.
 func (c *HTTPClient) ExtractMemory(ctx context.Context, request MemoryExtractionRequest) (MemoryExtractionResponse, error) {

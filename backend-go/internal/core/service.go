@@ -148,6 +148,10 @@ type Service struct {
 	// access) and Go must skip its own write path to avoid double writes.
 	// Default "go" keeps the legacy flow (AI_MEMORY_SOURCE flag).
 	aiMemorySource string
+	// reflectionMode gates sleep-time reflection in the nightly worker:
+	// "off" (default), "shadow" (synthesise + log, no write), "enabled" (write
+	// behavior_pattern facts). Set via REFLECTION_MODE (#5).
+	reflectionMode string
 	// summaryCache memoises on-demand chat summaries so repeated requests do not
 	// re-call the LLM (and re-bill) when nothing new was said. Keyed by
 	// "tenant:chat"; the entry's marker invalidates it as soon as a new message
@@ -279,6 +283,14 @@ func WithDefaultIngestionMode(mode contracts.IngestionMode) Option {
 func WithAIMemorySource(source string) Option {
 	return func(service *Service) {
 		service.aiMemorySource = source
+	}
+}
+
+// WithReflectionMode sets sleep-time reflection behaviour: "off" (default),
+// "shadow" (synthesise + log only) or "enabled" (write behavior_pattern facts).
+func WithReflectionMode(mode string) Option {
+	return func(service *Service) {
+		service.reflectionMode = mode
 	}
 }
 
@@ -3367,10 +3379,150 @@ func (s *Service) StartConsolidationWorker(ctx context.Context) {
 					s.logger.Info("stale profile suggestions expired",
 						"tenant_id", tenantID, "count", expired)
 				}
+				// Sleep-time reflection: after cleanup, synthesise high-level
+				// behaviour patterns from clusters of recent facts (#5). Off by
+				// default; bounded by candidate selection.
+				s.runReflection(ctx, tenantID)
 			}
 		case <-ctx.Done():
 			return
 		}
+	}
+}
+
+// Reflection (sleep-time insight generation, #5) tunables.
+const (
+	reflectionWindow      = 30 * 24 * time.Hour // only cluster facts this recent
+	reflectionMinFacts    = 3                   // min recent facts for a chat to qualify
+	reflectionMinCluster  = 3                   // min facts in a cluster to synthesise from
+	reflectionMaxSim      = 0.85                // cosine similarity threshold for an edge
+	reflectionConfidence  = 0.5                 // modest confidence for an inferred pattern
+	reflectionTTL         = 60 * 24 * time.Hour // unreinforced patterns decay
+	reflectionMaxClusters = 3                   // cap synthesis calls per chat per run
+)
+
+// runReflection generates behaviour patterns for a tenant's eligible chats.
+// No-op unless REFLECTION_MODE is shadow|enabled and the AI client can synthesise.
+func (s *Service) runReflection(ctx context.Context, tenantID string) {
+	if s.reflectionMode != "shadow" && s.reflectionMode != "enabled" {
+		return
+	}
+	if _, ok := s.ai.(aiclient.PatternSynthesizer); !ok {
+		return
+	}
+	since := s.now().Add(-reflectionWindow)
+	for _, chatID := range s.repository.ReflectionCandidateChats(tenantID, since, reflectionMinFacts) {
+		s.reflectChat(ctx, tenantID, chatID)
+	}
+}
+
+// clusterByPairs groups fact ids into connected components from similarity edges
+// (union-find). Only multi-member components are returned, in deterministic order.
+func clusterByPairs(pairs []store.FactPair) [][]int64 {
+	parent := make(map[int64]int64)
+	var find func(int64) int64
+	find = func(x int64) int64 {
+		p, ok := parent[x]
+		if !ok {
+			parent[x] = x
+			return x
+		}
+		if p != x {
+			parent[x] = find(p)
+		}
+		return parent[x]
+	}
+	for _, pr := range pairs {
+		ra, rb := find(pr.IDA), find(pr.IDB)
+		if ra != rb {
+			parent[ra] = rb
+		}
+	}
+	groups := make(map[int64][]int64)
+	for id := range parent {
+		root := find(id)
+		groups[root] = append(groups[root], id)
+	}
+	var clusters [][]int64
+	for _, members := range groups {
+		if len(members) >= 2 {
+			sort.Slice(members, func(i, j int) bool { return members[i] < members[j] })
+			clusters = append(clusters, members)
+		}
+	}
+	sort.Slice(clusters, func(i, j int) bool { return clusters[i][0] < clusters[j][0] })
+	return clusters
+}
+
+// reflectChat clusters a chat's recent facts and, for each cluster of at least
+// reflectionMinCluster facts, asks the AI service to synthesise one durable
+// behaviour pattern. In "shadow" mode the pattern is only logged; in "enabled"
+// mode it is embedded and written as a behavior_pattern fact (#5). Idempotent
+// across runs: upsert dedup (hash + cosine) collapses a repeated pattern.
+func (s *Service) reflectChat(ctx context.Context, tenantID, chatID string) {
+	synth, ok := s.ai.(aiclient.PatternSynthesizer)
+	if !ok {
+		return
+	}
+	since := s.now().Add(-reflectionWindow)
+	clusters := clusterByPairs(s.repository.SimilarFactPairs(tenantID, chatID, since, reflectionMaxSim))
+	processed := 0
+	for _, cluster := range clusters {
+		if len(cluster) < reflectionMinCluster || processed >= reflectionMaxClusters {
+			continue
+		}
+		texts := s.repository.SemanticFactTextsByIDs(tenantID, cluster)
+		facts := make([]string, 0, len(cluster))
+		for _, id := range cluster {
+			if t := texts[id]; t != "" {
+				facts = append(facts, t)
+			}
+		}
+		if len(facts) < reflectionMinCluster {
+			continue
+		}
+		processed++
+		resp, err := synth.SynthesizePattern(ctx, contracts.SynthesizePatternRequest{
+			ClusterFacts: facts,
+			TenantID:     tenantID,
+			ChatID:       chatID,
+		})
+		if err != nil {
+			s.logger.Warn("pattern synthesis failed",
+				"tenant_id", tenantID, "chat_id", chatID, "error", err)
+			continue
+		}
+		pattern := strings.TrimSpace(resp.Pattern)
+		if pattern == "" || resp.BlockedByPrivacy {
+			continue
+		}
+		if s.reflectionMode != "enabled" {
+			// shadow: record the candidate for eval, write nothing.
+			s.logger.Info("reflection pattern (shadow)",
+				"tenant_id", tenantID, "chat_id", chatID,
+				"pattern", pattern, "cluster_size", len(facts))
+			continue
+		}
+		subject := resp.Subject
+		if subject == "" {
+			subject = "contact"
+		}
+		expiresAt := s.now().Add(reflectionTTL)
+		embedding := embeddingAt(s.embedCandidates([]string{pattern}), 0)
+		result := s.repository.UpsertSemanticFact(store.SemanticFactRecord{
+			TenantID:   tenantID,
+			ScopeKind:  "chat",
+			ChatID:     chatID,
+			FactText:   pattern,
+			FactType:   "behavior_pattern",
+			Subject:    subject,
+			Confidence: reflectionConfidence,
+			Source:     "llm_reflected",
+			ExpiresAt:  &expiresAt,
+		}, embedding)
+		s.logger.Info("reflection pattern written",
+			"tenant_id", tenantID, "chat_id", chatID,
+			"action", result.Action, "pattern", pattern)
 	}
 }
 

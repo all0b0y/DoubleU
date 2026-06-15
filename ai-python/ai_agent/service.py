@@ -51,6 +51,8 @@ from .schemas import (
     RerankFactsResponse,
     RiskRequest,
     RiskResponse,
+    SynthesizePatternRequest,
+    SynthesizePatternResponse,
     TopicTaggingRequest,
     TopicTaggingResponse,
     TypedExtractionRequest,
@@ -144,6 +146,10 @@ class AIService:
     def rerank_facts(self, request: RerankFactsRequest) -> RerankFactsResponse:
         """Rerank a set of candidate facts by relevance to a query."""
         return self._agents.rerank_facts(request)
+
+    def synthesize_pattern(self, request: SynthesizePatternRequest) -> SynthesizePatternResponse:
+        """Synthesise a behaviour pattern from a fact cluster (sleep-time reflection)."""
+        return self._agents.synthesize_pattern(request)
 
     def process_message(self, request: AIProcessMessageRequest) -> AIProcessMessageResponse:
         """Process a normalized Telegram event into an AI decision proposal.

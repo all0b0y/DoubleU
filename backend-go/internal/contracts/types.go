@@ -705,6 +705,27 @@ type ChatSummaryResponse struct {
 	BlockedByPrivacy bool       `json:"blocked_by_privacy"`
 }
 
+// SynthesizePatternRequest asks the AI service to condense a cluster of related
+// facts into one durable behaviour pattern (sleep-time reflection, #5).
+type SynthesizePatternRequest struct {
+	ClusterFacts []string     `json:"cluster_facts"`
+	TenantID     string       `json:"tenant_id"`
+	ChatID       string       `json:"chat_id"`
+	PrivacyFlags PrivacyFlags `json:"privacy_flags"`
+	TraceID      string       `json:"trace_id,omitempty"`
+}
+
+// SynthesizePatternResponse carries the synthesised pattern. An empty Pattern
+// means the cluster held no durable signal and nothing should be written.
+type SynthesizePatternResponse struct {
+	Pattern          string     `json:"pattern"`
+	Subject          string     `json:"subject"`
+	Confidence       float64    `json:"confidence"`
+	ModelUsed        string     `json:"model_used"`
+	Usage            TokenUsage `json:"usage"`
+	BlockedByPrivacy bool       `json:"blocked_by_privacy"`
+}
+
 // ContextScore computes a 0–100 richness score for a chat based on available knowledge.
 // It is used to determine which autonomy modes are unlocked for this chat.
 // Scoring accounts for the richer ContactProfile schema: style fields add additional weight.

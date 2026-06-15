@@ -2038,6 +2038,109 @@ func (r *Repository) AvailableModesForChat(tenantID, chatID string) []contracts.
 	return contracts.UnlockedModesForScore(r.ContextScoreForChat(tenantID, chatID))
 }
 
+// FactPair is one pair of similar facts (an edge for reflection clustering).
+type FactPair struct {
+	IDA int64
+	IDB int64
+}
+
+// ReflectionCandidateChats returns chat ids for a tenant that have at least
+// minFacts active facts created since `since` and do NOT carry the no_memory
+// privacy flag — the chats worth running sleep-time reflection on (#5).
+// Read-only; returns nil on error or without a DB.
+func (r *Repository) ReflectionCandidateChats(tenantID string, since time.Time, minFacts int) []string {
+	if r.db == nil {
+		return nil
+	}
+	rows, err := r.db.Query(
+		`SELECT sf.chat_id
+		   FROM semantic_facts sf
+		   LEFT JOIN chat_settings cs
+		     ON cs.tenant_id = sf.tenant_id AND cs.chat_id = sf.chat_id
+		  WHERE sf.tenant_id = $1
+		    AND sf.scope_kind = 'chat'
+		    AND sf.deleted_at IS NULL AND sf.superseded_by_id IS NULL
+		    AND sf.created_at >= $2
+		    AND NOT ('no_memory' = ANY(COALESCE(cs.privacy_flags, ARRAY[]::public.privacy_flag[])::text[]))
+		  GROUP BY sf.chat_id
+		 HAVING count(*) >= $3`,
+		tenantID, since, minFacts,
+	)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var chats []string
+	for rows.Next() {
+		var chatID string
+		if rows.Scan(&chatID) == nil {
+			chats = append(chats, chatID)
+		}
+	}
+	return chats
+}
+
+// SimilarFactPairs returns pairs of a chat's active recent facts whose embeddings
+// are within (1-minSim) cosine distance — the edges the reflection clusterer
+// groups (#5). Only facts that have embeddings participate. Read-only.
+func (r *Repository) SimilarFactPairs(tenantID, chatID string, since time.Time, minSim float64) []FactPair {
+	if r.db == nil {
+		return nil
+	}
+	maxDist := 1.0 - minSim
+	rows, err := r.db.Query(
+		`SELECT a.fact_id, b.fact_id
+		   FROM fact_embeddings a
+		   JOIN fact_embeddings b
+		     ON b.tenant_id = a.tenant_id AND b.chat_id = a.chat_id AND a.fact_id < b.fact_id
+		   JOIN semantic_facts sfa ON sfa.id = a.fact_id
+		     AND sfa.deleted_at IS NULL AND sfa.superseded_by_id IS NULL AND sfa.created_at >= $3
+		   JOIN semantic_facts sfb ON sfb.id = b.fact_id
+		     AND sfb.deleted_at IS NULL AND sfb.superseded_by_id IS NULL AND sfb.created_at >= $3
+		  WHERE a.tenant_id = $1 AND a.chat_id = $2
+		    AND (a.embedding <=> b.embedding) < $4`,
+		tenantID, chatID, since, maxDist,
+	)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var pairs []FactPair
+	for rows.Next() {
+		var p FactPair
+		if rows.Scan(&p.IDA, &p.IDB) == nil {
+			pairs = append(pairs, p)
+		}
+	}
+	return pairs
+}
+
+// SemanticFactTextsByIDs returns id→fact_text for the given fact ids of a tenant,
+// scoped defensively to the tenant. Used to materialise reflection clusters (#5).
+func (r *Repository) SemanticFactTextsByIDs(tenantID string, ids []int64) map[int64]string {
+	out := make(map[int64]string, len(ids))
+	if r.db == nil || len(ids) == 0 {
+		return out
+	}
+	rows, err := r.db.Query(
+		`SELECT id, fact_text FROM semantic_facts
+		  WHERE tenant_id = $1 AND id = ANY($2)`,
+		tenantID, pq.Array(ids),
+	)
+	if err != nil {
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		var text string
+		if rows.Scan(&id, &text) == nil {
+			out[id] = text
+		}
+	}
+	return out
+}
+
 // ============================================================
 // Semantic Layer (semantic_facts table)
 // ============================================================

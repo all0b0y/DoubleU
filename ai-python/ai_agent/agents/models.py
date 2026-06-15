@@ -31,6 +31,7 @@ class AgentTask(str, Enum):
     SUMMARIZE = "summarize"
     TOPIC = "topic"
     RERANK = "rerank"
+    REFLECT = "reflect"
 
 
 # Per-task env override and its fallback chain. Every task degrades to
@@ -43,6 +44,7 @@ _TASK_ENV = {
     AgentTask.SUMMARIZE: "MODEL_CHEAP",
     AgentTask.TOPIC: "MODEL_CHEAP",
     AgentTask.RERANK: "MODEL_CHEAP",
+    AgentTask.REFLECT: "MODEL_CHEAP",
 }
 
 

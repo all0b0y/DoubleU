@@ -34,6 +34,7 @@ from ai_agent.schemas import (
     PrivacyFlag,
     RerankFactsRequest,
     RiskLevel,
+    SynthesizePatternRequest,
     TopicTaggingRequest,
     TypedExtractionRequest,
 )
@@ -303,6 +304,46 @@ def test_search_facts_uses_graph_branch_when_embedder_present() -> None:
     query = pool.queries[0]
     assert "<=>" in query, "embedder present → vector branch must run"
     assert "fact_relations" in query, "vector branch must walk the temporal graph"
+
+
+def test_synthesize_pattern_returns_pattern() -> None:
+    """#5: a cluster of related facts is condensed into one durable pattern."""
+    runtime = make_runtime(
+        pattern_model=structured(
+            {"pattern": "регулярно перегружен работой", "subject": "contact", "confidence": 0.6}
+        )
+    )
+    resp = runtime.synthesize_pattern(
+        SynthesizePatternRequest(
+            cluster_facts=("опять завал на работе", "устал, ничего не успеваю", "снова перерабатываю"),
+            tenant_id="t",
+            chat_id="c",
+        )
+    )
+    assert resp.pattern == "регулярно перегружен работой"
+    assert resp.subject == "contact"
+    assert not resp.blocked_by_privacy
+
+
+def test_synthesize_pattern_blocks_no_memory() -> None:
+    """#5: reflection respects no_memory — no synthesis for those chats."""
+    runtime = make_runtime()
+    resp = runtime.synthesize_pattern(
+        SynthesizePatternRequest(cluster_facts=("a", "b", "c"), privacy_flags=(PrivacyFlag.NO_MEMORY,))
+    )
+    assert resp.blocked_by_privacy and resp.pattern == ""
+
+
+def test_synthesize_pattern_empty_when_no_durable_signal() -> None:
+    """#5: when the model finds no durable pattern it returns '' and the backend
+    writes nothing (no invented insight)."""
+    runtime = make_runtime(
+        pattern_model=structured({"pattern": "", "subject": "contact", "confidence": 0.0})
+    )
+    resp = runtime.synthesize_pattern(
+        SynthesizePatternRequest(cluster_facts=("a", "b", "c"), tenant_id="t", chat_id="c")
+    )
+    assert resp.pattern == ""
 
 
 def test_format_fact_chains_renders_evolution() -> None:

@@ -436,6 +436,37 @@ class ChatSummaryResponse(JsonDataclass):
     recommendations: tuple[str, ...] = field(default_factory=tuple)
 
 
+@dataclass(frozen=True)
+class SynthesizePatternRequest(JsonDataclass):
+    """Request body for `/ai/synthesize-pattern` (sleep-time reflection).
+
+    ``cluster_facts`` is one cluster of semantically-related facts the backend
+    found; the service returns a single durable behavioural pattern (or empty).
+    """
+
+    cluster_facts: tuple[str, ...] = field(default_factory=tuple)
+    tenant_id: str = ""
+    chat_id: str = ""
+    privacy_flags: tuple[PrivacyFlag, ...] = field(default_factory=tuple)
+    trace_id: str = ""
+
+
+@dataclass(frozen=True)
+class SynthesizePatternResponse(JsonDataclass):
+    """Response body for `/ai/synthesize-pattern`.
+
+    ``pattern`` is empty when the facts do not form a durable pattern — the
+    backend then writes nothing.
+    """
+
+    pattern: str
+    subject: str
+    confidence: float
+    model_used: str
+    usage: Usage
+    blocked_by_privacy: bool = False
+
+
 def parse_process_message_request(payload: dict[str, Any]) -> AIProcessMessageRequest:
     """Parse a process-message JSON object into a typed request."""
     event = payload.get("event") or {}
@@ -549,6 +580,22 @@ def parse_summary_request(payload: dict[str, Any]) -> ChatSummaryRequest:
         messages = tuple(str(message) for message in raw_messages)
     return ChatSummaryRequest(
         messages=messages,
+        privacy_flags=_parse_privacy_flags(payload.get("privacy_flags", [])),
+        trace_id=str(payload.get("trace_id", "")),
+    )
+
+
+def parse_synthesize_pattern_request(payload: dict[str, Any]) -> SynthesizePatternRequest:
+    """Parse a synthesize-pattern JSON object into a typed request."""
+    raw_facts = payload.get("cluster_facts") or []
+    if isinstance(raw_facts, str):
+        cluster_facts = (raw_facts,)
+    else:
+        cluster_facts = tuple(str(fact) for fact in raw_facts)
+    return SynthesizePatternRequest(
+        cluster_facts=cluster_facts,
+        tenant_id=str(payload.get("tenant_id", "")),
+        chat_id=str(payload.get("chat_id", "")),
         privacy_flags=_parse_privacy_flags(payload.get("privacy_flags", [])),
         trace_id=str(payload.get("trace_id", "")),
     )
