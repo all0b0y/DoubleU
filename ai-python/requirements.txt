@@ -12,7 +12,9 @@
 # langfuse==2.*
 
 pydantic==2.*
-pydantic-ai-slim[openai]==1.*
+# [mcp] adds the `mcp` package so the draft agent can attach per-role MCP
+# toolsets (HTTP/SSE) at request time (#7); degrades to memory-only when absent.
+pydantic-ai-slim[openai,mcp]==1.*
 asyncpg==0.31.*
 pgvector==0.*
 

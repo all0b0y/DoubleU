@@ -2441,6 +2441,79 @@ func (r *Repository) AIRoleByID(tenantID string, roleID int64) (AIRoleRecord, bo
 	return role, true
 }
 
+// RoleMCPServers returns the enabled MCP servers a role may call, with each
+// server's per-role tool allow-list (#7). Read-only; nil without a DB.
+func (r *Repository) RoleMCPServers(roleID int64) []contracts.MCPServerSpec {
+	if r.db == nil {
+		return nil
+	}
+	rows, err := r.db.Query(
+		`SELECT s.name, s.transport, s.url, COALESCE(s.auth_header,''), a.allowed_tools
+		   FROM role_mcp_access a
+		   JOIN mcp_servers s ON s.id = a.mcp_server_id
+		  WHERE a.role_id = $1 AND s.enabled`,
+		roleID,
+	)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var specs []contracts.MCPServerSpec
+	for rows.Next() {
+		var spec contracts.MCPServerSpec
+		var allowed pq.StringArray
+		if rows.Scan(&spec.Name, &spec.Transport, &spec.URL, &spec.AuthHeader, &allowed) == nil {
+			spec.AllowedTools = []string(allowed)
+			specs = append(specs, spec)
+		}
+	}
+	return specs
+}
+
+// SaveMCPServer upserts a tenant's MCP server (by tenant+name) and returns its
+// id. Minimal seeding helper; owner-facing registration is deferred (#7).
+func (r *Repository) SaveMCPServer(tenantID, name, transport, url, authHeader string) int64 {
+	if r.db == nil {
+		return 0
+	}
+	var id int64
+	err := r.db.QueryRow(
+		`INSERT INTO mcp_servers (tenant_id, name, transport, url, auth_header)
+		 VALUES ($1,$2,$3,$4, NULLIF($5,''))
+		 ON CONFLICT (tenant_id, name)
+		 DO UPDATE SET transport = EXCLUDED.transport, url = EXCLUDED.url,
+		               auth_header = EXCLUDED.auth_header, enabled = true
+		 RETURNING id`,
+		tenantID, name, transport, url, authHeader,
+	).Scan(&id)
+	if err != nil {
+		r.logWriteError("save_mcp_server", tenantID, "", err)
+		return 0
+	}
+	return id
+}
+
+// SetRoleMCPAccess grants a role access to a server with an optional tool
+// allow-list (nil/empty = all tools). Minimal seeding helper (#7).
+func (r *Repository) SetRoleMCPAccess(roleID, serverID int64, allowedTools []string) {
+	if r.db == nil {
+		return
+	}
+	var allowed any
+	if len(allowedTools) > 0 {
+		allowed = pq.Array(allowedTools)
+	}
+	_, err := r.db.Exec(
+		`INSERT INTO role_mcp_access (role_id, mcp_server_id, allowed_tools)
+		 VALUES ($1,$2,$3)
+		 ON CONFLICT (role_id, mcp_server_id) DO UPDATE SET allowed_tools = EXCLUDED.allowed_tools`,
+		roleID, serverID, allowed,
+	)
+	if err != nil {
+		r.logWriteError("set_role_mcp_access", "", "", err)
+	}
+}
+
 // UpdateAIRole rewrites an existing role addressed by ID. Unlike SaveAIRole
 // (which upserts by tenant+name and would create a second role on rename),
 // this is the rename-safe path. Returns false when the role does not exist.

@@ -29,6 +29,7 @@ import asyncio
 import logging
 import os
 import threading
+import warnings
 from typing import Awaitable, Callable, Sequence, TypeVar
 
 import asyncpg
@@ -44,6 +45,7 @@ from ..safety.input import InputSafetyScanner
 from ..safety.output import OutputSafetyScanner
 from ..schemas import (
     AIProcessMessageRequest,
+    AIRoleData,
     ChatSummaryRequest,
     ChatSummaryResponse,
     EmbedTextsRequest,
@@ -411,6 +413,52 @@ class AgentRuntime:
         except Exception as exc:  # noqa: BLE001 — single conversion point to the contract error
             raise RuntimeError(f"agent draft failed: {exc}") from exc
 
+    def _resolve_mcp_toolsets(
+        self, ai_role: AIRoleData | None, privacy_flags: tuple[PrivacyFlag, ...]
+    ) -> list:
+        """Build the per-request MCP toolsets a role is allowed to use (#7).
+
+        Degrade-safe: returns ``[]`` (unchanged draft behaviour) when the role
+        declares no servers, the ``mcp`` package is absent, or the chat is
+        privacy-restricted — an MCP tool could exfiltrate chat content, so
+        ``no_memory``/``private`` chats never get external tools. Each server is
+        wrapped in a FilteredToolset enforcing the role's tool allow-list
+        (deny-by-default when ``allowed_tools`` is set).
+        """
+        if ai_role is None or not ai_role.mcp_servers:
+            return []
+        if PrivacyFlag.NO_MEMORY in privacy_flags or PrivacyFlag.PRIVATE in privacy_flags:
+            return []
+        try:
+            from pydantic_ai.mcp import MCPServerSSE, MCPServerStreamableHTTP
+        except ImportError:
+            logger.warning("ai_role declares MCP servers but the `mcp` package is not installed")
+            return []
+        from pydantic_ai.toolsets import FilteredToolset
+
+        toolsets: list = []
+        for spec in ai_role.mcp_servers:
+            if not spec.url:
+                continue
+            headers = {"Authorization": spec.auth_header} if spec.auth_header else None
+            # MCPServerSSE/StreamableHTTP take url+headers directly with only the
+            # `mcp` package. The non-deprecated MCPToolset needs an extra
+            # `fastmcp` dependency, not worth pulling for this seam — migrate when
+            # real servers onboard (backlog). Silence the v2 deprecation locally.
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", DeprecationWarning)
+                if spec.transport == "sse":
+                    server = MCPServerSSE(url=spec.url, headers=headers)
+                else:
+                    server = MCPServerStreamableHTTP(url=spec.url, headers=headers)
+            if spec.allowed_tools:
+                allowed = frozenset(spec.allowed_tools)
+                server = FilteredToolset(
+                    server, lambda ctx, td, allowed=allowed: td.name in allowed
+                )
+            toolsets.append(server)
+        return toolsets
+
     async def _draft_async(
         self, request: AIProcessMessageRequest, risk_level: RiskLevel, ctx: LLMCallContext
     ) -> draft_pipeline.DraftOutcome:
@@ -430,10 +478,12 @@ class AgentRuntime:
             system_instruction=system_prompt,
             pool=await self._get_pool(),
         )
+        mcp_toolsets = self._resolve_mcp_toolsets(request.ai_role, privacy_flags)
         result = await self._draft_agent.run(
             user_payload,
             deps=deps,
             usage_limits=UsageLimits(tool_calls_limit=_DRAFT_TOOL_CALLS_LIMIT),
+            toolsets=mcp_toolsets,
         )
         drafted: DraftResult = result.output
         total = self._usage_of(result)

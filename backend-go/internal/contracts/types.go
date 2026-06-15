@@ -397,6 +397,21 @@ type AIRole struct {
 	// fields above. Each carries a title, a "why it exists" description, and
 	// optional context; all are injected into the persona prompt.
 	CustomFields []AIRoleCustomField `json:"custom_fields,omitempty"`
+	// MCPServers are the external MCP toolsets this role may call (#7). Resolved
+	// from role_mcp_access + mcp_servers; empty means the role has no tools.
+	MCPServers []MCPServerSpec `json:"mcp_servers,omitempty"`
+}
+
+// MCPServerSpec is one MCP server a role may call, with its per-role tool
+// allow-list. Sent to the (internal) Python AI service, which opens the
+// connection. AllowedTools empty = every tool the server exposes; non-empty =
+// only those (deny-by-default). AuthHeader is an optional Authorization value.
+type MCPServerSpec struct {
+	Name         string   `json:"name"`
+	Transport    string   `json:"transport"` // "http" (streamable) or "sse"
+	URL          string   `json:"url"`
+	AuthHeader   string   `json:"auth_header,omitempty"`
+	AllowedTools []string `json:"allowed_tools,omitempty"`
 }
 
 // AIRoleCustomField is an owner-defined extra attribute on a role. Title and

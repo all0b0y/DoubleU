@@ -32,6 +32,8 @@ from ai_agent.schemas import (
     FeedbackItem,
     NormalizedTelegramEvent,
     PrivacyFlag,
+    AIRoleData,
+    MCPServerSpecData,
     RerankFactsRequest,
     RiskLevel,
     SynthesizePatternRequest,
@@ -344,6 +346,42 @@ def test_synthesize_pattern_empty_when_no_durable_signal() -> None:
         SynthesizePatternRequest(cluster_facts=("a", "b", "c"), tenant_id="t", chat_id="c")
     )
     assert resp.pattern == ""
+
+
+def test_resolve_mcp_toolsets_empty_cases() -> None:
+    """#7: MCP attaches nothing when there is no role, no servers, or the chat is
+    privacy-restricted (external tools could exfiltrate chat content)."""
+    runtime = make_runtime()
+    assert runtime._resolve_mcp_toolsets(None, ()) == []
+    assert runtime._resolve_mcp_toolsets(AIRoleData(name="r"), ()) == []
+    role = AIRoleData(name="r", mcp_servers=(MCPServerSpecData(name="s", url="https://x/mcp"),))
+    assert runtime._resolve_mcp_toolsets(role, (PrivacyFlag.NO_MEMORY,)) == []
+
+
+def test_resolve_mcp_toolsets_builds_and_filters() -> None:
+    """#7: a declared server becomes a toolset; an allow-list wraps it in a
+    FilteredToolset that exposes only the permitted tools (deny-by-default)."""
+    from pydantic_ai.mcp import MCPServerStreamableHTTP
+    from pydantic_ai.toolsets import FilteredToolset
+
+    runtime = make_runtime()
+    role = AIRoleData(
+        name="r",
+        mcp_servers=(
+            MCPServerSpecData(name="open", transport="http", url="https://x/mcp"),
+            MCPServerSpecData(name="scoped", transport="http", url="https://y/mcp",
+                              allowed_tools=("search",)),
+        ),
+    )
+    toolsets = runtime._resolve_mcp_toolsets(role, ())
+    assert len(toolsets) == 2
+    # No allow-list → raw MCP server toolset.
+    assert isinstance(toolsets[0], MCPServerStreamableHTTP)
+    # Allow-list → FilteredToolset that permits only "search".
+    scoped = toolsets[1]
+    assert isinstance(scoped, FilteredToolset)
+    assert scoped.filter_func(None, SimpleNamespace(name="search")) is True
+    assert scoped.filter_func(None, SimpleNamespace(name="delete")) is False
 
 
 def test_format_fact_chains_renders_evolution() -> None:

@@ -133,6 +133,22 @@ class AIRoleCustomFieldData(JsonDataclass):
 
 
 @dataclass(frozen=True)
+class MCPServerSpecData(JsonDataclass):
+    """One MCP server a role may call, with its per-role tool allow-list (#7).
+
+    ``allowed_tools`` empty means every tool the server exposes is allowed; a
+    non-empty tuple restricts the role to exactly those tools (deny-by-default).
+    ``auth_header`` is an optional Authorization header value for the server.
+    """
+
+    name: str = ""
+    transport: str = "http"  # "http" (streamable) or "sse"
+    url: str = ""
+    auth_header: str = ""
+    allowed_tools: tuple[str, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
 class AIRoleData(JsonDataclass):
     """Owner-authored AI persona assigned to the chat.
 
@@ -152,6 +168,8 @@ class AIRoleData(JsonDataclass):
     context: str = ""
     # Owner-defined extra fields beyond the fixed ones above.
     custom_fields: tuple[AIRoleCustomFieldData, ...] = field(default_factory=tuple)
+    # MCP servers this role may call (#7); empty means no external tools.
+    mcp_servers: tuple[MCPServerSpecData, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)
@@ -649,7 +667,36 @@ def _parse_ai_role(raw: Any) -> AIRoleData | None:
         constraints=str(raw.get("constraints", "")).strip(),
         context=str(raw.get("context", "")).strip(),
         custom_fields=_parse_role_custom_fields(raw.get("custom_fields")),
+        mcp_servers=_parse_mcp_servers(raw.get("mcp_servers")),
     )
+
+
+def _parse_mcp_servers(raw: Any) -> tuple[MCPServerSpecData, ...]:
+    """Parse the optional mcp_servers list; entries without a url are dropped."""
+    if not isinstance(raw, list):
+        return ()
+    servers: list[MCPServerSpecData] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url", "")).strip()
+        if not url:
+            continue
+        transport = str(item.get("transport", "http")).strip().lower()
+        if transport not in ("http", "sse"):
+            transport = "http"
+        allowed = item.get("allowed_tools")
+        allowed_tools = tuple(str(t) for t in allowed) if isinstance(allowed, list) else ()
+        servers.append(
+            MCPServerSpecData(
+                name=str(item.get("name", "")).strip(),
+                transport=transport,
+                url=url,
+                auth_header=str(item.get("auth_header", "")).strip(),
+                allowed_tools=allowed_tools,
+            )
+        )
+    return tuple(servers)
 
 
 def _parse_role_custom_fields(raw: Any) -> tuple[AIRoleCustomFieldData, ...]:
