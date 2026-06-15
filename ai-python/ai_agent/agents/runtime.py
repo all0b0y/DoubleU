@@ -29,22 +29,24 @@ import asyncio
 import logging
 import os
 import threading
-from typing import Awaitable, TypeVar
+from typing import Awaitable, Callable, Sequence, TypeVar
 
 import asyncpg
-from pydantic_ai import Agent, RunContext
+from pydantic_ai import Agent, RunContext, UsageLimits
 
 from ..classifiers import TypedMemoryExtractor
 from ..observability.context import LLMCallContext, current_context
 from ..observability.langfuse_sink import LangfuseSink
 from ..observability.results import SafetyBlocked
 from ..pipelines import draft as draft_pipeline
+from ..pipelines.embedding import embed_texts
 from ..safety.input import InputSafetyScanner
 from ..safety.output import OutputSafetyScanner
 from ..schemas import (
     AIProcessMessageRequest,
     ChatSummaryRequest,
     ChatSummaryResponse,
+    EmbedTextsRequest,
     ModelTask,
     PrivacyFlag,
     ProfileSuggestion,
@@ -75,10 +77,51 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
+# Async query-embedding callable shape expected by AgentDeps.embedder.
+EmbedderCallable = Callable[[str], Awaitable[Sequence[float] | None]]
+
 # A draft is reviewed by the critic when risk is elevated or the draft's own
 # confidence is below this bar; low-risk confident drafts skip the extra call.
 _CRITIC_CONFIDENCE_BAR = 0.6
 _CRITIC_RISKS = (RiskLevel.MEDIUM, RiskLevel.HIGH)
+
+# Upper bound on memory tool-calls the draft agent may make in one run. The
+# draft agent owns a 6-tool memory toolset and would otherwise loop unbounded
+# (ReAct failure mode). The cap counts TOTAL calls, not repeats, so it must sit
+# above one legitimate full sweep of the toolset; 8 leaves margin for a re-query
+# while still terminating pathological loops (which run into the dozens).
+_DRAFT_TOOL_CALLS_LIMIT = 8
+
+
+def _build_query_embedder() -> EmbedderCallable:
+    """Build a per-run, memoized async embedder over the sync embed transport.
+
+    A fresh closure (and cache) is created for each agent run so repeated
+    ``search_facts`` tool-calls within one run reuse a single embed call and the
+    cache never outlives the request. Embedding is best-effort: any failure (no
+    credentials, transport error, empty vector) yields ``None`` so the memory
+    tool transparently falls back to lexical (ILIKE) search.
+    """
+    cache: dict[str, Sequence[float] | None] = {}
+
+    async def embed(query: str) -> Sequence[float] | None:
+        key = query.strip()
+        if not key:
+            return None
+        if key in cache:
+            return cache[key]
+        try:
+            # embed_texts is sync (urllib); run off the event loop so the agent
+            # loop is never blocked on the network round-trip.
+            resp = await asyncio.to_thread(embed_texts, EmbedTextsRequest(texts=(key,)))
+            vector = resp.embeddings[0] if resp.embeddings else ()
+            result: Sequence[float] | None = tuple(vector) if vector else None
+        except Exception:  # noqa: BLE001 — embedding is best-effort, fall back to text search
+            result = None
+        cache[key] = result
+        return result
+
+    return embed
 
 # Number of recent messages topic tagging includes as context.
 _TOPIC_MAX_HISTORY = 5
@@ -145,6 +188,7 @@ class AgentRuntime:
         summary_model: object | None = None,
         topic_model: object | None = None,
         rerank_model: object | None = None,
+        query_embedder_factory: Callable[[], EmbedderCallable] | None = None,
     ) -> None:
         """Build agents and start the loop thread.
 
@@ -161,6 +205,9 @@ class AgentRuntime:
         self._output_safety = output_safety
         self._sink = sink
         self._pool: asyncpg.Pool | None = None
+        # Builds a fresh per-request embedder; None keeps memory tools on the
+        # lexical fallback (preserved behaviour for direct callers and tests).
+        self._query_embedder_factory = query_embedder_factory
 
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(
@@ -250,6 +297,7 @@ class AgentRuntime:
             source_message_id=source_message_id,
             system_instruction=system_instruction,
             pool=pool,
+            embedder=self._query_embedder_factory() if self._query_embedder_factory else None,
         )
 
     # ----------------------------------------------------------- safety/sink
@@ -361,7 +409,11 @@ class AgentRuntime:
             system_instruction=system_prompt,
             pool=await self._get_pool(),
         )
-        result = await self._draft_agent.run(user_payload, deps=deps)
+        result = await self._draft_agent.run(
+            user_payload,
+            deps=deps,
+            usage_limits=UsageLimits(tool_calls_limit=_DRAFT_TOOL_CALLS_LIMIT),
+        )
         drafted: DraftResult = result.output
         total = self._usage_of(result)
         model_used = model_name_for(AgentTask.DRAFT) or "test-model"
@@ -369,8 +421,9 @@ class AgentRuntime:
         text = drafted.reply
         confidence = drafted.confidence
         if risk_level in _CRITIC_RISKS or confidence < _CRITIC_CONFIDENCE_BAR:
+            feedback_hint = draft_pipeline.build_feedback_hint(request.feedback_context)
             text, confidence, critic_usage = await self._review_draft(
-                deps, request.event.message_text, drafted, ctx, privacy_flags
+                deps, request.event.message_text, drafted, ctx, privacy_flags, feedback_hint
             )
             total = Usage(
                 input_tokens=total.input_tokens + critic_usage.input_tokens,
@@ -400,12 +453,17 @@ class AgentRuntime:
         drafted: DraftResult,
         ctx: LLMCallContext,
         privacy_flags: tuple[PrivacyFlag, ...],
+        feedback_hint: str = "",
     ) -> tuple[str, float, Usage]:
         """Run the critic; returns (final_text, final_confidence, usage).
 
         A revision halves the surviving confidence: a draft the critic had to
         fix must not auto-send on the strength of its original self-score.
         Critic failures keep the original draft — review is best-effort.
+
+        ``feedback_hint`` carries the same owner-feedback anti-examples the draft
+        agent saw, so the critic can flag a reply written in a style the owner
+        has already rejected (self-correction grounded in past outcomes).
         """
         review_payload = (
             "Сообщение собеседника:\n"
@@ -413,6 +471,8 @@ class AgentRuntime:
             "Черновик ответа от лица владельца:\n"
             f"{drafted.reply}"
         )
+        if feedback_hint:
+            review_payload += "\n\n" + feedback_hint
         try:
             review = await self._critic_agent.run(review_payload, deps=deps)
         except Exception as exc:  # noqa: BLE001 — critic is advisory, never fatal
@@ -707,9 +767,15 @@ def build_runtime(
     database_url = ""
     if os.getenv("AI_MEMORY_SOURCE", "go").strip().lower() == "python":
         database_url = os.getenv("DATABASE_URL", "").strip()
+    # Wire the semantic query-embedder unless running in deterministic mock mode
+    # (no embedding backend there). Memory tools then run real vector search and
+    # only fall back to lexical ILIKE when an embed call yields nothing.
+    mock_llm = os.getenv("MOCK_LLM", "true").strip().lower() in ("1", "true", "yes", "on")
+    embedder_factory = None if mock_llm else _build_query_embedder
     return AgentRuntime(
         database_url=database_url,
         input_safety=input_safety,
         output_safety=output_safety,
         sink=sink,
+        query_embedder_factory=embedder_factory,
     )

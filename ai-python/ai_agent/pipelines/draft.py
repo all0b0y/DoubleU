@@ -113,7 +113,7 @@ def build_draft_prompt(
         () if PrivacyFlag.NO_MEMORY in request.chat_settings.privacy_flags
         else request.memory_context
     )
-    feedback_hint = _build_feedback_hint(request.feedback_context)
+    feedback_hint = build_feedback_hint(request.feedback_context)
     owner_instruction, current_draft, owner_style_facts, clean_memory = _split_memory_context(raw_memory)
     base_instruction = _compose_base_instruction(
         clean_memory=clean_memory,
@@ -476,8 +476,12 @@ def _format_owner_identity(user_settings: UserSettingsData | None) -> str:
     return "О владельце, от чьего имени идёт переписка (справочно): " + "; ".join(bits)
 
 
-def _build_feedback_hint(feedback_context: tuple) -> str:
-    """Build a natural-language hint from past owner feedback for the prompt."""
+def build_feedback_hint(feedback_context: tuple) -> str:
+    """Build a natural-language hint from past owner feedback for the prompt.
+
+    Shared by the draft path (baked into the system instruction) and the critic
+    path (so the reviewer also knows which phrasings the owner has rejected).
+    """
     if not feedback_context:
         return ""
     approved = [f.response_text for f in feedback_context if f.rating == "up" and f.response_text]

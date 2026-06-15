@@ -24,6 +24,7 @@ from ai_agent.schemas import (
     ChatMode,
     ChatSettings,
     ChatSummaryRequest,
+    FeedbackItem,
     NormalizedTelegramEvent,
     PrivacyFlag,
     RerankFactsRequest,
@@ -266,3 +267,92 @@ def test_draft_run_records_generation_to_sink() -> None:
     assert sink.generations, "agent run must record a generation when a sink is wired"
     assert sink.generations[0]["trace_id"] == "trace-1"
     assert "usage" in sink.generations[0]
+
+
+class _CapturingPool:
+    """Minimal async pool stand-in that records the SQL it is asked to run."""
+
+    def __init__(self, rows: list[dict]) -> None:
+        self.rows = rows
+        self.queries: list[str] = []
+
+    async def fetch(self, query: str, *args: object) -> list[dict]:
+        self.queries.append(query)
+        return self.rows
+
+
+def test_search_facts_uses_vector_branch_when_embedder_present() -> None:
+    """#1: with an embedder wired, search runs semantic (<=>) retrieval — the
+    query 'обещал прислать договор' must reach a fact with no shared words."""
+    pool = _CapturingPool(
+        [{"fact_text": "контракт будет отправлен к пятнице", "fact_type": "commitment", "confidence": 0.9}]
+    )
+
+    async def fake_embedder(query: str) -> list[float]:
+        return [0.1, 0.2, 0.3]
+
+    ctx = SimpleNamespace(deps=AgentDeps(tenant_id="t", chat_id="c", pool=pool, embedder=fake_embedder))
+    out = asyncio.run(search_facts(ctx, "обещал прислать договор"))
+    assert out == ["[commitment] контракт будет отправлен к пятнице"]
+    assert any("<=>" in q for q in pool.queries), "embedder present → vector branch must run"
+
+
+def test_search_facts_falls_back_to_lexical_without_usable_embedding() -> None:
+    """#1: no embedder, or an embedder that yields nothing, degrades to ILIKE."""
+    no_embedder = _CapturingPool([{"fact_text": "X", "fact_type": "event", "confidence": 0.5}])
+    ctx = SimpleNamespace(deps=AgentDeps(tenant_id="t", chat_id="c", pool=no_embedder))
+    asyncio.run(search_facts(ctx, "договор"))
+    assert any("ILIKE" in q for q in no_embedder.queries)
+    assert all("<=>" not in q for q in no_embedder.queries)
+
+    empty_embed = _CapturingPool([{"fact_text": "X", "fact_type": "event", "confidence": 0.5}])
+
+    async def yields_none(query: str) -> None:
+        return None
+
+    ctx2 = SimpleNamespace(deps=AgentDeps(tenant_id="t", chat_id="c", pool=empty_embed, embedder=yields_none))
+    asyncio.run(search_facts(ctx2, "договор"))
+    assert any("ILIKE" in q for q in empty_embed.queries), "empty embedding must fall back to lexical"
+
+
+def test_draft_tool_call_budget_stops_runaway_loop() -> None:
+    """#2: a model that never finalises and only calls tools must terminate via
+    the tool-call budget instead of looping forever — surfaced as the standard
+    error-fallback contract (RuntimeError)."""
+
+    def always_calls_tool(messages, info: AgentInfo) -> ModelResponse:
+        return ModelResponse(parts=[ToolCallPart(tool_name="search_facts", args={"query": "x"})])
+
+    runtime = make_runtime(draft_model=FunctionModel(always_calls_tool))
+    with pytest.raises(RuntimeError):
+        runtime.draft_outcome(process_request(), RiskLevel.LOW)
+
+
+def test_critic_receives_owner_feedback_hint() -> None:
+    """#4: the critic's payload includes the owner's rejected-style anti-examples
+    so it can catch a draft written in a style the owner has already refused."""
+    captured: dict[str, str] = {}
+
+    def critic_capture(messages, info: AgentInfo) -> ModelResponse:
+        text = ""
+        for message in messages:
+            for part in getattr(message, "parts", []):
+                content = getattr(part, "content", None)
+                if isinstance(content, str):
+                    text += content
+        captured["payload"] = text
+        return ModelResponse(
+            parts=[ToolCallPart(tool_name="final_result",
+                                args={"verdict": "approve", "issues": [], "revised_reply": ""})]
+        )
+
+    runtime = make_runtime(critic_model=FunctionModel(critic_capture))
+    base = process_request("про оплату")
+    request = AIProcessMessageRequest(
+        request_id=base.request_id,
+        event=base.event,
+        chat_settings=base.chat_settings,
+        feedback_context=(FeedbackItem(rating="down", response_text="Дам вам скидку 50%!"),),
+    )
+    runtime.draft_outcome(request, RiskLevel.MEDIUM)  # MEDIUM risk forces the critic
+    assert "скидку 50%" in captured.get("payload", ""), "owner feedback must reach the critic"
