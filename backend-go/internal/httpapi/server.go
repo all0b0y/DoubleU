@@ -210,9 +210,14 @@ func (s *Server) telegramWebhook(w http.ResponseWriter, r *http.Request) {
 	tenantHint := r.Header.Get("X-Tenant-ID")
 	// Ack immediately so Telegram does not retry within the 60s window.
 	// Processing goes through the per-chat ordered worker pool (ARCH-7); the
-	// duplicate-receive gate inside ensures re-deliveries are dropped.
-	w.WriteHeader(http.StatusOK)
-	s.service.EnqueueTelegramWebhook(raw, tenantHint)
+	// duplicate-receive gate inside ensures re-deliveries are dropped. When the
+	// shard and overflow queues are both saturated the update is shed with 429
+	// so Telegram backs off and retries instead of us growing goroutines.
+	if s.service.EnqueueTelegramWebhook(raw, tenantHint) {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	w.WriteHeader(http.StatusTooManyRequests)
 }
 
 func (s *Server) approvalCallback(w http.ResponseWriter, r *http.Request) {

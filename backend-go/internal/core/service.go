@@ -15,6 +15,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/time/rate"
+
 	"doubleu/backend-go/internal/aiclient"
 	"doubleu/backend-go/internal/bot"
 	"doubleu/backend-go/internal/contracts"
@@ -120,6 +122,16 @@ type Service struct {
 	// asyncLLM bounds concurrent fire-and-forget LLM tasks (extraction,
 	// episode summarisation) so a message burst cannot become a request storm.
 	asyncLLM chan struct{}
+	// tenantLimiters gives each tenant its own token bucket over the shared
+	// asyncLLM pool so one noisy tenant cannot starve the others (fair-share,
+	// ARCH-7). Keyed by tenant id -> *rate.Limiter; built lazily.
+	tenantLimiters sync.Map
+	tenantRate     rate.Limit // sustained async-LLM tasks/sec per tenant
+	tenantBurst    int        // burst allowance per tenant
+	// webhookOverflow is a bounded spill queue: updates that cannot enter their
+	// ordered shard land here instead of spawning unbounded goroutines. When it
+	// too is full the enqueue is shed (HTTP 429) and Telegram retries.
+	webhookOverflow chan webhookJob
 	// embedNudge wakes the embedding worker right after new facts are inserted
 	// (ARCH-12) instead of waiting for the next 5-minute tick, closing the
 	// retrieval blind spot for fresh facts. Buffered(1): coalesces bursts.
@@ -178,12 +190,22 @@ type webhookJob struct {
 const (
 	// webhookWorkerCount is the number of ordered processing shards (ARCH-7).
 	webhookWorkerCount = 4
-	// webhookQueueDepth bounds each shard's backlog; overflow degrades to a
-	// direct goroutine so updates are never dropped.
+	// webhookQueueDepth bounds each shard's backlog; overflow spills to the
+	// bounded overflow pool rather than spawning unbounded goroutines.
 	webhookQueueDepth = 256
+	// webhookOverflowDepth bounds the shared spill queue used when a shard is
+	// full; beyond it the service sheds load (429) and relies on Telegram retry.
+	webhookOverflowDepth = 512
+	// webhookOverflowWorkers drain the overflow queue. Ordering is not preserved
+	// here (it is the overload path), but idempotency keys make reprocessing safe.
+	webhookOverflowWorkers = 4
 	// maxAsyncLLMConcurrency caps simultaneous fire-and-forget LLM calls
 	// (typed extraction, message-limit summarisation) across all chats.
 	maxAsyncLLMConcurrency = 8
+	// defaultTenantAsyncRate / defaultTenantAsyncBurst bound a single tenant's
+	// share of the async-LLM pool: 5 tasks/sec sustained, bursts up to 8.
+	defaultTenantAsyncRate  = rate.Limit(5)
+	defaultTenantAsyncBurst = 8
 )
 
 // OwnerFeedbackSender is implemented by observability.ScoreSender; the
@@ -260,6 +282,19 @@ func WithAIMemorySource(source string) Option {
 	}
 }
 
+// WithTenantAsyncRate sets the per-tenant fair-share limit on async-LLM tasks
+// (sustained tasks/sec and burst). Zero values keep the defaults.
+func WithTenantAsyncRate(r rate.Limit, burst int) Option {
+	return func(service *Service) {
+		if r > 0 {
+			service.tenantRate = r
+		}
+		if burst > 0 {
+			service.tenantBurst = burst
+		}
+	}
+}
+
 // NewService creates a backend core service.
 func NewService(repository *store.Repository, ai aiclient.Client, sender telegram.Sender, options ...Option) *Service {
 	if repository == nil {
@@ -279,6 +314,8 @@ func NewService(repository *store.Repository, ai aiclient.Client, sender telegra
 		asyncLLM:             make(chan struct{}, maxAsyncLLMConcurrency),
 		embedNudge:           make(chan struct{}, 1),
 		defaultIngestionMode: contracts.IngestionModeBot,
+		tenantRate:           defaultTenantAsyncRate,
+		tenantBurst:          defaultTenantAsyncBurst,
 	}
 	for _, option := range options {
 		option(service)
@@ -296,23 +333,31 @@ func (s *Service) StartWebhookWorkers(ctx context.Context) {
 		s.workersMu.Unlock()
 		return
 	}
+	drain := func(jobs <-chan webhookJob) {
+		for {
+			select {
+			case job := <-jobs:
+				if _, err := s.HandleTelegramWebhook(ctx, job.payload, job.tenantHint); err != nil {
+					s.logger.Error("async webhook processing failed", "error", err)
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
 	workers := make([]chan webhookJob, webhookWorkerCount)
 	for i := range workers {
 		workers[i] = make(chan webhookJob, webhookQueueDepth)
-		go func(jobs <-chan webhookJob) {
-			for {
-				select {
-				case job := <-jobs:
-					if _, err := s.HandleTelegramWebhook(ctx, job.payload, job.tenantHint); err != nil {
-						s.logger.Error("async webhook processing failed", "error", err)
-					}
-				case <-ctx.Done():
-					return
-				}
-			}
-		}(workers[i])
+		go drain(workers[i])
+	}
+	// Bounded overflow pool: a fixed set of workers drains the shared spill
+	// queue, replacing the old unbounded one-goroutine-per-update fallback.
+	overflow := make(chan webhookJob, webhookOverflowDepth)
+	for i := 0; i < webhookOverflowWorkers; i++ {
+		go drain(overflow)
 	}
 	s.webhookWorkers = workers
+	s.webhookOverflow = overflow
 	s.workersMu.Unlock()
 }
 
@@ -322,28 +367,40 @@ func (s *Service) StartWebhookWorkers(ctx context.Context) {
 // routed to the same shard to preserve per-chat ordering; non-chat updates
 // (commands, callbacks) have no ordering requirement and spread round-robin
 // via the hash of the raw payload.
-func (s *Service) EnqueueTelegramWebhook(payload []byte, tenantHint string) {
+//
+// Returns false only when both the shard and the bounded overflow pool are
+// saturated; the caller should then answer 429 so Telegram retries the update
+// (idempotency keys make the eventual reprocessing safe). This replaces the old
+// unbounded one-goroutine-per-update fallback that could OOM under burst.
+func (s *Service) EnqueueTelegramWebhook(payload []byte, tenantHint string) bool {
 	s.workersMu.RLock()
 	workers := s.webhookWorkers
+	overflow := s.webhookOverflow
 	s.workersMu.RUnlock()
 	if workers == nil {
 		go func() {
 			_, _ = s.HandleTelegramWebhook(context.Background(), payload, tenantHint)
 		}()
-		return
+		return true
 	}
 	job := webhookJob{payload: payload, tenantHint: tenantHint}
 	shard := webhookShard(payload, tenantHint)
 	select {
 	case workers[shard] <- job:
+		return true
 	default:
-		// Shard backlog full: degrade to a direct goroutine rather than block
-		// the HTTP handler or drop the update. Ordering may suffer under this
-		// overload, but idempotency keys make reprocessing safe.
-		s.logger.Warn("webhook shard queue full, processing out of band", "shard", shard)
-		go func() {
-			_, _ = s.HandleTelegramWebhook(context.Background(), payload, tenantHint)
-		}()
+		// Shard backlog full: spill to the bounded overflow pool. Per-chat
+		// ordering may be lost under this overload, but reprocessing is safe.
+		select {
+		case overflow <- job:
+			s.logger.Warn("webhook shard full, spilled to overflow pool", "shard", shard)
+			return true
+		default:
+			// Overflow saturated too: shed load. Telegram retries within its
+			// window, so the update is deferred, not lost.
+			s.logger.Warn("webhook queues saturated, shedding update", "shard", shard)
+			return false
+		}
 	}
 }
 
@@ -367,10 +424,29 @@ func webhookShard(payload []byte, tenantHint string) int {
 	return int(h.Sum32() % webhookWorkerCount)
 }
 
+// tenantLimiter returns the token bucket for a tenant, creating it on first use.
+func (s *Service) tenantLimiter(tenantID string) *rate.Limiter {
+	if v, ok := s.tenantLimiters.Load(tenantID); ok {
+		return v.(*rate.Limiter)
+	}
+	v, _ := s.tenantLimiters.LoadOrStore(tenantID, rate.NewLimiter(s.tenantRate, s.tenantBurst))
+	return v.(*rate.Limiter)
+}
+
 // runAsyncLLMTask executes fn in the background under the shared LLM
 // concurrency cap (ARCH-7): the goroutine is cheap, but the LLM call inside
 // fn waits for a slot so bursts cannot fan out into a request storm.
-func (s *Service) runAsyncLLMTask(fn func()) {
+//
+// A per-tenant token bucket gates entry first, so one noisy tenant cannot take
+// every slot and starve the others (fair-share). These tasks are best-effort
+// background work (fact extraction, summarisation), so when a tenant exceeds
+// its rate the task is dropped rather than queued — a later message re-triggers
+// the same extraction, and the daily summariser backstops episode summaries.
+func (s *Service) runAsyncLLMTask(tenantID string, fn func()) {
+	if tenantID != "" && !s.tenantLimiter(tenantID).Allow() {
+		s.logger.Warn("async LLM task shed: tenant rate exceeded", "tenant_id", tenantID)
+		return
+	}
 	go func() {
 		s.asyncLLM <- struct{}{}
 		defer func() { <-s.asyncLLM }()
@@ -654,7 +730,7 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 			)
 			startedAt, closedAt := ep.StartedAt, ep.LastMessageAt
 			tenantID, chatID := event.TenantID, event.ChatID
-			s.runAsyncLLMTask(func() {
+			s.runAsyncLLMTask(event.TenantID, func() {
 				s.summarizeEpisode(context.Background(), tenantID, chatID, startedAt, closedAt, "message_count")
 			})
 		}
@@ -933,7 +1009,7 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 			if len(recentTexts) > 5 {
 				recentTexts = recentTexts[len(recentTexts)-5:]
 			}
-			s.runAsyncLLMTask(func() {
+			s.runAsyncLLMTask(event.TenantID, func() {
 				extractCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 				defer cancel()
 				start := s.now()
@@ -983,7 +1059,7 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 				})
 			})
 		} else if extractor, ok := s.ai.(aiclient.MemoryExtractor); ok {
-			s.runAsyncLLMTask(func() {
+			s.runAsyncLLMTask(event.TenantID, func() {
 				extractCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 				defer cancel()
 				resp, err := extractor.ExtractMemory(extractCtx, aiclient.MemoryExtractionRequest{
@@ -1555,7 +1631,7 @@ func (s *Service) processPassive(ctx context.Context, event contracts.Normalized
 		return
 	}
 	if typedExtractor, ok := s.ai.(aiclient.TypedMemoryExtractor); ok {
-		s.runAsyncLLMTask(func() {
+		s.runAsyncLLMTask(event.TenantID, func() {
 			extractCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 			start := s.now()
@@ -1594,7 +1670,7 @@ func (s *Service) processPassive(ctx context.Context, event contracts.Normalized
 			})
 		})
 	} else if extractor, ok := s.ai.(aiclient.MemoryExtractor); ok {
-		s.runAsyncLLMTask(func() {
+		s.runAsyncLLMTask(event.TenantID, func() {
 			extractCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 			resp, err := extractor.ExtractMemory(extractCtx, aiclient.MemoryExtractionRequest{
