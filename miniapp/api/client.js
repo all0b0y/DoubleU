@@ -66,11 +66,11 @@ export const api = {
   userSettings:     ()            => request('GET',   '/api/v1/settings/user'),
   saveUserSettings: (data)        => request('PUT',   '/api/v1/settings/user', data),
 
-  // Bot ingestion (user-supplied bot)
-  getBot:        ()       => request('GET',    '/api/v1/bots'),
-  registerBot:   (token)  => request('POST',   '/api/v1/bots', { token }),
-  setBotRole:    (roleId) => request('PUT',    '/api/v1/bots/role', { role_id: roleId }),
-  disconnectBot: ()       => request('DELETE', '/api/v1/bots'),
+  // Bot ingestion (user-supplied bots — a tenant may connect several)
+  bots:          ()              => request('GET',    '/api/v1/bots'),
+  registerBot:   (token)         => request('POST',   '/api/v1/bots', { token }),
+  setBotRole:    (botId, roleId) => request('PUT',    `/api/v1/bots/${botId}/role`, { role_id: roleId }),
+  disconnectBot: (botId)         => request('DELETE', `/api/v1/bots/${botId}`),
 };
 
 /** Open an SSE stream; returns the EventSource. Caller owns closing it. */

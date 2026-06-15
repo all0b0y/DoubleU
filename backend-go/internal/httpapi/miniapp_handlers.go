@@ -163,7 +163,8 @@ func (s *Server) apiMessages(w http.ResponseWriter, r *http.Request) {
 		SenderID    string `json:"sender_id"`
 		SenderName  string `json:"sender_name"`
 		Direction   string `json:"direction"`
-		Label       string `json:"label,omitempty"` // set only for DoubleU-sent messages
+		Label       string `json:"label,omitempty"`  // set only for DoubleU-sent messages
+		Source      string `json:"source,omitempty"` // owner messages: "app" (sent via DoubleU) | "telegram" (typed to the bot directly)
 		CreatedAt   string `json:"created_at"`
 	}
 	items := make([]msgItem, 0, len(msgs))
@@ -171,12 +172,21 @@ func (s *Server) apiMessages(w http.ResponseWriter, r *http.Request) {
 		direction := "incoming"
 		senderName := contactName
 		label := ""
+		source := ""
 		if m.Event.SenderID == ownerUserID {
 			direction = "outgoing"
 			senderName = "Вы"
-			// Look up whether this message was sent through DoubleU.
+			// Distinguish replies sent through DoubleU (a draft was sent, or the
+			// app's manual-send path stamped an "out:" event id) from messages the
+			// owner typed straight to the bot in Telegram — so the bot is usable
+			// for personal needs without the two looking identical.
 			if draft, ok := s.service.Repository().DraftBySentMessageID(tenantID, chatID, m.Event.SourceMessageID); ok {
 				label = doubleULabel(draft.ActionHistory)
+				source = "app"
+			} else if strings.HasPrefix(m.Event.EventID, "out:") {
+				source = "app"
+			} else {
+				source = "telegram"
 			}
 		}
 		items = append(items, msgItem{
@@ -187,6 +197,7 @@ func (s *Server) apiMessages(w http.ResponseWriter, r *http.Request) {
 			SenderName:  senderName,
 			Direction:   direction,
 			Label:       label,
+			Source:      source,
 			CreatedAt:   m.Event.CreatedAt.UTC().Format("2006-01-02T15:04:05Z"),
 		})
 	}

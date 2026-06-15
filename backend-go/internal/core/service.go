@@ -10,6 +10,7 @@ import (
 	"hash/fnv"
 	"log/slog"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -135,13 +136,37 @@ type Service struct {
 	// access) and Go must skip its own write path to avoid double writes.
 	// Default "go" keeps the legacy flow (AI_MEMORY_SOURCE flag).
 	aiMemorySource string
+	// summaryCache memoises on-demand chat summaries so repeated requests do not
+	// re-call the LLM (and re-bill) when nothing new was said. Keyed by
+	// "tenant:chat"; the entry's marker invalidates it as soon as a new message
+	// lands, so a returned summary is always accurate for the current timeline.
+	summaryCache sync.Map // chatKey -> summaryCacheEntry
 }
 
-// BotSenderProvider resolves the outbound sender bound to a tenant's
-// user-supplied bot. Implemented by botservice.Manager; the interface keeps
-// core decoupled from the polling transport.
+// summaryCacheEntry is one memoised chat summary plus the message-timeline
+// marker it was generated for.
+type summaryCacheEntry struct {
+	marker   string
+	resp     contracts.ChatSummaryResponse
+	msgCount int
+}
+
+// summaryMarker fingerprints a message timeline. It changes whenever a new
+// message is appended (length grows or the latest event id differs), which is
+// exactly when a cached summary must be regenerated.
+func summaryMarker(messages []store.MessageRecord) string {
+	if len(messages) == 0 {
+		return "0"
+	}
+	return fmt.Sprintf("%d:%s", len(messages), messages[len(messages)-1].Event.EventID)
+}
+
+// BotSenderProvider resolves the outbound sender bound to one of a tenant's
+// user-supplied bots. Implemented by botservice.Manager; the interface keeps
+// core decoupled from the polling transport. botID selects which bot answers
+// (a tenant may own several); the reply leaves through that exact bot.
 type BotSenderProvider interface {
-	SenderFor(tenantID string) (telegram.Sender, bool)
+	SenderFor(tenantID, botID string) (telegram.Sender, bool)
 }
 
 // webhookJob is one queued Telegram update awaiting async processing.
@@ -1368,13 +1393,29 @@ func (s *Service) aiRoleFor(tenantID, chatID string) *contracts.AIRole {
 // Non-bot chats keep the legacy per-chat role assignment.
 func (s *Service) resolveRole(tenantID, chatID string) (store.AIRoleRecord, bool) {
 	if s.repository.ChatTransport(tenantID, chatID) == contracts.TransportBot {
-		bot, ok := s.repository.UserBotByTenant(tenantID)
+		// The chat id is namespaced by bot, so the governing bot — and its role —
+		// is recoverable from the chat alone (multi-bot: each bot its own role).
+		bot, ok := s.botForChat(tenantID, chatID)
 		if !ok || bot.AIRoleID == 0 {
 			return store.AIRoleRecord{}, false
 		}
 		return s.repository.AIRoleByID(tenantID, bot.AIRoleID)
 	}
 	return s.repository.AIRoleForChat(tenantID, chatID)
+}
+
+// botForChat resolves the bot that owns a bot-transport chat from the bot id
+// embedded in its namespaced chat id.
+func (s *Service) botForChat(tenantID, chatID string) (store.UserBotRecord, bool) {
+	botIDStr, _, ok := contracts.ParseBotChatID(chatID)
+	if !ok {
+		return store.UserBotRecord{}, false
+	}
+	botID, err := strconv.ParseInt(botIDStr, 10, 64)
+	if err != nil {
+		return store.UserBotRecord{}, false
+	}
+	return s.repository.UserBotByID(tenantID, botID)
 }
 
 // feedbackContext returns recent draft feedback for this chat to send to the AI.
@@ -1812,6 +1853,16 @@ func (s *Service) SummarizeChat(ctx context.Context, tenantID, chatID string) (c
 	if len(texts) == 0 {
 		return contracts.ChatSummaryResponse{}, 0, ErrSummaryNoMessages
 	}
+
+	// Serve a cached summary when the timeline is unchanged since it was made.
+	cacheKey := tenantID + ":" + chatID
+	marker := summaryMarker(messages)
+	if v, ok := s.summaryCache.Load(cacheKey); ok {
+		if entry := v.(summaryCacheEntry); entry.marker == marker {
+			return entry.resp, entry.msgCount, nil
+		}
+	}
+
 	summarizer, ok := s.ai.(aiclient.ChatSummarizer)
 	if !ok {
 		return contracts.ChatSummaryResponse{}, len(texts), fmt.Errorf("summarizer not available")
@@ -1820,6 +1871,9 @@ func (s *Service) SummarizeChat(ctx context.Context, tenantID, chatID string) (c
 		Messages:     texts,
 		PrivacyFlags: settings.PrivacyFlags,
 	})
+	if err == nil && summ.Summary != "" {
+		s.summaryCache.Store(cacheKey, summaryCacheEntry{marker: marker, resp: summ, msgCount: len(texts)})
+	}
 	return summ, len(texts), err
 }
 
@@ -2290,8 +2344,11 @@ func (s *Service) sendRecipient(ctx context.Context, event contracts.NormalizedT
 		return "", nil
 	}
 	msg := telegram.OutboundMessage{
-		TenantID:             event.TenantID,
-		ChatID:               event.ChatID,
+		TenantID: event.TenantID,
+		// Address Telegram with the RAW chat id: bot-transport chat ids are
+		// namespaced ("bot:{botID}:{rawID}") for identity, but the wire id must
+		// be the bare Telegram chat id. Business transport ids pass through.
+		ChatID:               contracts.RawChatID(event.ChatID),
 		BusinessConnectionID: event.BusinessConnectionID,
 		SourceMessageID:      event.SourceMessageID,
 		ReplyToMessageID:     event.SourceMessageID,
@@ -2331,7 +2388,16 @@ func (s *Service) recipientSender(event contracts.NormalizedTelegramEvent) (tele
 	if s.botSenders == nil {
 		return nil, fmt.Errorf("bot transport reply for tenant %s: no bot sender provider configured", event.TenantID)
 	}
-	sender, ok := s.botSenders.SenderFor(event.TenantID)
+	// Reply through the exact bot the message arrived on. The bot id is on the
+	// event; reconstructed events (approval callbacks) recover it from the
+	// namespaced chat id.
+	botID := event.BotID
+	if botID == "" {
+		if id, _, ok := contracts.ParseBotChatID(event.ChatID); ok {
+			botID = id
+		}
+	}
+	sender, ok := s.botSenders.SenderFor(event.TenantID, botID)
 	if !ok {
 		return nil, fmt.Errorf("bot transport reply for tenant %s: no active bot registered", event.TenantID)
 	}

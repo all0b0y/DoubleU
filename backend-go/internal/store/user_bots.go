@@ -7,6 +7,8 @@ package store
 
 import (
 	"database/sql"
+	"sort"
+	"strconv"
 
 	"doubleu/backend-go/internal/contracts"
 )
@@ -28,27 +30,37 @@ type UserBotRecord struct {
 	AIRoleID int64
 }
 
-// SaveUserBot registers or replaces the tenant's bot (one bot per tenant).
+// botStoreKey is the in-memory map key for a single bot registration. A tenant
+// may now own several bots, so the key combines tenant and bot id; "#" never
+// occurs in a tenant id ("tenant:user:…") or a numeric bot id.
+func botStoreKey(tenantID string, botID int64) string {
+	return tenantID + "#" + strconv.FormatInt(botID, 10)
+}
+
+// SaveUserBot registers or updates one of the tenant's bots. A tenant may own
+// several bots; the row is identified by the globally-unique bot_id (DB upsert
+// on bot_id), so saving never disturbs the tenant's other bots.
 func (r *Repository) SaveUserBot(record UserBotRecord) {
 	if record.Status == "" {
 		record.Status = "active"
 	}
+	key := botStoreKey(record.TenantID, record.BotID)
 	r.mu.Lock()
-	// Preserve the bot's role across re-registration: the DB upsert below leaves
+	// Preserve this bot's role across re-registration: the DB upsert below leaves
 	// ai_role_id untouched, so the in-memory path must match (the RegisterBot
 	// caller never carries the role).
-	if existing, ok := r.userBots[record.TenantID]; ok && record.AIRoleID == 0 {
+	if existing, ok := r.userBots[key]; ok && record.AIRoleID == 0 {
 		record.AIRoleID = existing.AIRoleID
 	}
-	r.userBots[record.TenantID] = record
+	r.userBots[key] = record
 	r.mu.Unlock()
 	if r.db != nil {
 		r.ensureTenant(record.TenantID, "")
 		_, err := r.db.Exec(
 			`INSERT INTO user_bots (tenant_id, bot_id, bot_username, token, status, last_update_offset)
 			 VALUES ($1, $2, $3, $4, $5, $6)
-			 ON CONFLICT (tenant_id) DO UPDATE SET
-			   bot_id             = EXCLUDED.bot_id,
+			 ON CONFLICT (bot_id) DO UPDATE SET
+			   tenant_id          = EXCLUDED.tenant_id,
 			   bot_username       = EXCLUDED.bot_username,
 			   token              = EXCLUDED.token,
 			   status             = EXCLUDED.status,
@@ -65,42 +77,80 @@ func (r *Repository) SaveUserBot(record UserBotRecord) {
 	}
 }
 
-// SetUserBotRole binds a role to the tenant's bot (roleID 0 clears it). Updates
+// SetUserBotRole binds a role to one specific bot (roleID 0 clears it). Updates
 // only ai_role_id so it never clobbers token/offset/status; kept separate from
 // SaveUserBot so re-registering the bot preserves the chosen role.
-func (r *Repository) SetUserBotRole(tenantID string, roleID int64) {
+func (r *Repository) SetUserBotRole(tenantID string, botID, roleID int64) {
+	key := botStoreKey(tenantID, botID)
 	r.mu.Lock()
-	if rec, ok := r.userBots[tenantID]; ok {
+	if rec, ok := r.userBots[key]; ok {
 		rec.AIRoleID = roleID
-		r.userBots[tenantID] = rec
+		r.userBots[key] = rec
 	}
 	r.mu.Unlock()
 	if r.db != nil {
 		_, err := r.db.Exec(
-			`UPDATE user_bots SET ai_role_id = NULLIF($2, 0), updated_at = now() WHERE tenant_id = $1`,
-			tenantID, roleID)
+			`UPDATE user_bots SET ai_role_id = NULLIF($3, 0), updated_at = now() WHERE tenant_id = $1 AND bot_id = $2`,
+			tenantID, botID, roleID)
 		r.logWriteError("set_user_bot_role", tenantID, "", err)
 	}
 }
 
-// UserBotByTenant returns the tenant's registered bot.
-func (r *Repository) UserBotByTenant(tenantID string) (UserBotRecord, bool) {
+// scanUserBot reads one user_bots row (with role) from a row scanner.
+func scanUserBot(sc rowScanner) (UserBotRecord, bool) {
+	var rec UserBotRecord
+	var roleID sql.NullInt64
+	if err := sc.Scan(&rec.TenantID, &rec.BotID, &rec.BotUsername, &rec.Token, &rec.Status, &rec.LastUpdateOffset, &roleID); err != nil {
+		return UserBotRecord{}, false
+	}
+	rec.AIRoleID = roleID.Int64
+	return rec, true
+}
+
+const userBotColumns = `tenant_id, bot_id, bot_username, token, status, last_update_offset, COALESCE(ai_role_id, 0)`
+
+// UserBotByID returns one specific bot of the tenant.
+func (r *Repository) UserBotByID(tenantID string, botID int64) (UserBotRecord, bool) {
 	if r.db != nil {
 		row := r.db.QueryRow(
-			`SELECT tenant_id, bot_id, bot_username, token, status, last_update_offset, COALESCE(ai_role_id, 0)
-			   FROM user_bots WHERE tenant_id = $1`, tenantID)
-		var rec UserBotRecord
-		var roleID sql.NullInt64
-		if err := row.Scan(&rec.TenantID, &rec.BotID, &rec.BotUsername, &rec.Token, &rec.Status, &rec.LastUpdateOffset, &roleID); err == nil {
-			rec.AIRoleID = roleID.Int64
-			return rec, true
-		}
-		return UserBotRecord{}, false
+			`SELECT `+userBotColumns+` FROM user_bots WHERE tenant_id = $1 AND bot_id = $2`, tenantID, botID)
+		return scanUserBot(row)
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	rec, ok := r.userBots[tenantID]
+	rec, ok := r.userBots[botStoreKey(tenantID, botID)]
 	return rec, ok
+}
+
+// UserBotsByTenant returns every bot the tenant owns, ordered by bot id for a
+// stable UI listing.
+func (r *Repository) UserBotsByTenant(tenantID string) []UserBotRecord {
+	if r.db != nil {
+		rows, err := r.db.Query(
+			`SELECT `+userBotColumns+` FROM user_bots WHERE tenant_id = $1 ORDER BY bot_id`, tenantID)
+		if err != nil {
+			r.logWriteError("list_tenant_bots", tenantID, "", err)
+			return nil
+		}
+		defer rows.Close()
+		var out []UserBotRecord
+		for rows.Next() {
+			if rec, ok := scanUserBot(rows); ok {
+				out = append(out, rec)
+			}
+		}
+		return out
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]UserBotRecord, 0)
+	for _, rec := range r.userBots {
+		if rec.TenantID == tenantID {
+			out = append(out, rec)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].BotID < out[j].BotID })
+	return out
 }
 
 // ActiveUserBots returns every bot with status "active" — the set the polling
@@ -138,10 +188,10 @@ func (r *Repository) ActiveUserBots() []UserBotRecord {
 // UpdateUserBotOffset persists the poller's getUpdates progress for one bot.
 func (r *Repository) UpdateUserBotOffset(botID int64, offset int64) {
 	r.mu.Lock()
-	for tenantID, rec := range r.userBots {
+	for key, rec := range r.userBots {
 		if rec.BotID == botID {
 			rec.LastUpdateOffset = offset
-			r.userBots[tenantID] = rec
+			r.userBots[key] = rec
 			break
 		}
 	}
@@ -158,10 +208,10 @@ func (r *Repository) UpdateUserBotOffset(botID int64, offset int64) {
 // (e.g. the poller marks a bot "invalid" after Telegram rejects its token).
 func (r *Repository) UpdateUserBotStatus(botID int64, status string) {
 	r.mu.Lock()
-	for tenantID, rec := range r.userBots {
+	for key, rec := range r.userBots {
 		if rec.BotID == botID {
 			rec.Status = status
-			r.userBots[tenantID] = rec
+			r.userBots[key] = rec
 			break
 		}
 	}
@@ -174,13 +224,14 @@ func (r *Repository) UpdateUserBotStatus(botID int64, status string) {
 	}
 }
 
-// DeleteUserBot removes the tenant's bot registration.
-func (r *Repository) DeleteUserBot(tenantID string) {
+// DeleteUserBot removes one specific bot registration of the tenant, leaving the
+// tenant's other bots untouched.
+func (r *Repository) DeleteUserBot(tenantID string, botID int64) {
 	r.mu.Lock()
-	delete(r.userBots, tenantID)
+	delete(r.userBots, botStoreKey(tenantID, botID))
 	r.mu.Unlock()
 	if r.db != nil {
-		_, err := r.db.Exec(`DELETE FROM user_bots WHERE tenant_id = $1`, tenantID)
+		_, err := r.db.Exec(`DELETE FROM user_bots WHERE tenant_id = $1 AND bot_id = $2`, tenantID, botID)
 		r.logWriteError("delete_user_bot", tenantID, "", err)
 	}
 }

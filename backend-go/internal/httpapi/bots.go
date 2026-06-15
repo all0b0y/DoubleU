@@ -12,6 +12,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"doubleu/backend-go/internal/contracts"
@@ -22,7 +23,7 @@ import (
 // (implemented by botservice.Manager).
 type BotManager interface {
 	RegisterBot(ctx context.Context, tenantID, token string) (store.UserBotRecord, error)
-	DisconnectBot(tenantID string)
+	DisconnectBot(tenantID string, botID int64)
 	Refresh(tenantID string)
 }
 
@@ -65,18 +66,27 @@ func (s *Server) botStatusFor(record store.UserBotRecord, connected bool) botSta
 	return payload
 }
 
-// apiGetBot returns the tenant's bot registration status.
-func (s *Server) apiGetBot(w http.ResponseWriter, r *http.Request) {
+// apiListBots returns all of the tenant's bot registrations.
+func (s *Server) apiListBots(w http.ResponseWriter, r *http.Request) {
 	tenantID := tenantFromContext(r.Context())
-	record, ok := s.service.Repository().UserBotByTenant(tenantID)
-	writeJSON(w, http.StatusOK, s.botStatusFor(record, ok))
+	records := s.service.Repository().UserBotsByTenant(tenantID)
+	bots := make([]botStatusPayload, 0, len(records))
+	for _, rec := range records {
+		bots = append(bots, s.botStatusFor(rec, true))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"bots": bots})
 }
 
-// apiSetBotRole binds a role to the tenant's bot (role_id 0 clears it). The role
+// apiSetBotRole binds a role to one specific bot (role_id 0 clears it). The role
 // then governs every bot-transport chat of that bot.
 func (s *Server) apiSetBotRole(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 	tenantID := tenantFromContext(r.Context())
+	botID, err := strconv.ParseInt(r.PathValue("bot_id"), 10, 64)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid bot_id"})
+		return
+	}
 	var payload struct {
 		RoleID int64 `json:"role_id"`
 	}
@@ -84,9 +94,9 @@ func (s *Server) apiSetBotRole(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	record, ok := s.service.Repository().UserBotByTenant(tenantID)
+	record, ok := s.service.Repository().UserBotByID(tenantID, botID)
 	if !ok {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "no bot connected"})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "no such bot"})
 		return
 	}
 	if payload.RoleID != 0 {
@@ -95,10 +105,10 @@ func (s *Server) apiSetBotRole(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	s.service.Repository().SetUserBotRole(tenantID, payload.RoleID)
+	s.service.Repository().SetUserBotRole(tenantID, botID, payload.RoleID)
 	record.AIRoleID = payload.RoleID
 	if s.hub != nil {
-		// Bot role governs every bot chat — refresh open chat lists/settings.
+		// Bot role governs every chat of that bot — refresh open chat lists/settings.
 		s.hub.Broadcast(tenantID, "chats_updated", map[string]any{"reason": "bot_role_changed"})
 	}
 	writeJSON(w, http.StatusOK, s.botStatusFor(record, true))
@@ -132,15 +142,20 @@ func (s *Server) apiRegisterBot(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.botStatusFor(record, true))
 }
 
-// apiDisconnectBot stops polling and removes the tenant's bot registration.
+// apiDisconnectBot stops polling and removes one specific bot of the tenant.
 func (s *Server) apiDisconnectBot(w http.ResponseWriter, r *http.Request) {
 	if s.bots == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "bot ingestion is not configured"})
 		return
 	}
 	tenantID := tenantFromContext(r.Context())
-	s.bots.DisconnectBot(tenantID)
-	writeJSON(w, http.StatusOK, botStatusPayload{})
+	botID, err := strconv.ParseInt(r.PathValue("bot_id"), 10, 64)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid bot_id"})
+		return
+	}
+	s.bots.DisconnectBot(tenantID, botID)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "disconnected"})
 }
 
 // apiGetIngestionMode returns the tenant's effective ingestion mode.

@@ -1305,6 +1305,46 @@ func (f *summarizingAI) SummarizeChat(ctx context.Context, request contracts.Cha
 	}, nil
 }
 
+// TestSummarizeChatCaches verifies the on-demand summary is memoised: a second
+// request over the same timeline reuses the cached result (no extra LLM call),
+// while a new message invalidates the cache and forces a fresh summary.
+func TestSummarizeChatCaches(t *testing.T) {
+	repository := store.NewRepository()
+	repository.SaveChat(store.ChatRecord{TenantID: "tenant-1", ChatID: "42"})
+	ai := &summarizingAI{}
+	service := newTestService(repository, ai, &fakeSender{})
+	ctx := context.Background()
+
+	save := func(id string) {
+		repository.SaveMessage(contracts.NormalizedTelegramEvent{
+			EventID: id, TenantID: "tenant-1", ChatID: "42",
+			SourceMessageID: id, MessageText: "содержательное сообщение для сводки",
+			CreatedAt: time.Now(),
+		})
+	}
+	save("e1")
+	save("e2")
+
+	if _, _, err := service.SummarizeChat(ctx, "tenant-1", "42"); err != nil {
+		t.Fatalf("first summarize: %v", err)
+	}
+	if _, _, err := service.SummarizeChat(ctx, "tenant-1", "42"); err != nil {
+		t.Fatalf("second summarize: %v", err)
+	}
+	if ai.summaries != 1 {
+		t.Fatalf("cached second request must not re-call the LLM: got %d calls, want 1", ai.summaries)
+	}
+
+	// A new message changes the timeline marker → cache miss → fresh summary.
+	save("e3")
+	if _, _, err := service.SummarizeChat(ctx, "tenant-1", "42"); err != nil {
+		t.Fatalf("third summarize: %v", err)
+	}
+	if ai.summaries != 2 {
+		t.Fatalf("new message must invalidate cache: got %d calls, want 2", ai.summaries)
+	}
+}
+
 // TestEpisodeSummariesPerEpisodeIdempotency verifies the MEM-6 contract:
 // two episodes closed on the same day produce two summaries with real episode
 // bounds and provenance; re-closing the same episode adds nothing; the daily

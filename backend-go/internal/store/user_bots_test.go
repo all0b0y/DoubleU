@@ -12,7 +12,7 @@ func TestUserBotLifecycle(t *testing.T) {
 	repo := NewRepository()
 
 	repo.SaveUserBot(UserBotRecord{TenantID: "tenant:user:77", BotID: 555, BotUsername: "helper_bot", Token: "secret"})
-	bot, ok := repo.UserBotByTenant("tenant:user:77")
+	bot, ok := repo.UserBotByID("tenant:user:77", 555)
 	if !ok || bot.Status != "active" || bot.BotID != 555 {
 		t.Fatalf("unexpected saved bot: %+v ok=%v", bot, ok)
 	}
@@ -21,7 +21,7 @@ func TestUserBotLifecycle(t *testing.T) {
 	}
 
 	repo.UpdateUserBotOffset(555, 1042)
-	if bot, _ = repo.UserBotByTenant("tenant:user:77"); bot.LastUpdateOffset != 1042 {
+	if bot, _ = repo.UserBotByID("tenant:user:77", 555); bot.LastUpdateOffset != 1042 {
 		t.Fatalf("offset = %d, want 1042", bot.LastUpdateOffset)
 	}
 
@@ -30,8 +30,8 @@ func TestUserBotLifecycle(t *testing.T) {
 		t.Fatalf("active bots after invalidation = %d, want 0", got)
 	}
 
-	repo.DeleteUserBot("tenant:user:77")
-	if _, ok := repo.UserBotByTenant("tenant:user:77"); ok {
+	repo.DeleteUserBot("tenant:user:77", 555)
+	if _, ok := repo.UserBotByID("tenant:user:77", 555); ok {
 		t.Fatal("bot must be gone after delete")
 	}
 }
@@ -45,20 +45,54 @@ func TestSetUserBotRole(t *testing.T) {
 	repo := NewRepository()
 	repo.SaveUserBot(UserBotRecord{TenantID: "tenant:user:77", BotID: 555, BotUsername: "helper_bot", Token: "secret"})
 
-	repo.SetUserBotRole("tenant:user:77", 9)
-	if bot, _ := repo.UserBotByTenant("tenant:user:77"); bot.AIRoleID != 9 {
+	repo.SetUserBotRole("tenant:user:77", 555, 9)
+	if bot, _ := repo.UserBotByID("tenant:user:77", 555); bot.AIRoleID != 9 {
 		t.Fatalf("bot role = %d, want 9", bot.AIRoleID)
 	}
 
 	// Re-registering the same bot (new offset) must preserve the chosen role.
 	repo.SaveUserBot(UserBotRecord{TenantID: "tenant:user:77", BotID: 555, BotUsername: "helper_bot", Token: "secret2", LastUpdateOffset: 5})
-	if bot, _ := repo.UserBotByTenant("tenant:user:77"); bot.AIRoleID != 9 {
+	if bot, _ := repo.UserBotByID("tenant:user:77", 555); bot.AIRoleID != 9 {
 		t.Fatalf("bot role after re-register = %d, want 9", bot.AIRoleID)
 	}
 
-	repo.SetUserBotRole("tenant:user:77", 0)
-	if bot, _ := repo.UserBotByTenant("tenant:user:77"); bot.AIRoleID != 0 {
+	repo.SetUserBotRole("tenant:user:77", 555, 0)
+	if bot, _ := repo.UserBotByID("tenant:user:77", 555); bot.AIRoleID != 0 {
 		t.Fatalf("bot role after clear = %d, want 0", bot.AIRoleID)
+	}
+}
+
+// TestMultipleBotsPerTenant is the multi-bot store contract: a tenant owns
+// several bots at once, each with an independent role, and removing one leaves
+// the others intact.
+func TestMultipleBotsPerTenant(t *testing.T) {
+	repo := NewRepository()
+	repo.SaveUserBot(UserBotRecord{TenantID: "tenant:user:77", BotID: 111, BotUsername: "a", Token: "t1"})
+	repo.SaveUserBot(UserBotRecord{TenantID: "tenant:user:77", BotID: 222, BotUsername: "b", Token: "t2"})
+
+	if got := len(repo.UserBotsByTenant("tenant:user:77")); got != 2 {
+		t.Fatalf("tenant bots = %d, want 2", got)
+	}
+
+	// Per-bot role is independent — setting one must not touch the other.
+	repo.SetUserBotRole("tenant:user:77", 111, 9)
+	if b, _ := repo.UserBotByID("tenant:user:77", 111); b.AIRoleID != 9 {
+		t.Fatalf("bot 111 role = %d, want 9", b.AIRoleID)
+	}
+	if b, _ := repo.UserBotByID("tenant:user:77", 222); b.AIRoleID != 0 {
+		t.Fatalf("bot 222 role = %d, want 0 (independent)", b.AIRoleID)
+	}
+
+	// Deleting one bot leaves the other registered.
+	repo.DeleteUserBot("tenant:user:77", 111)
+	if _, ok := repo.UserBotByID("tenant:user:77", 111); ok {
+		t.Fatal("bot 111 must be gone after delete")
+	}
+	if _, ok := repo.UserBotByID("tenant:user:77", 222); !ok {
+		t.Fatal("bot 222 must remain after deleting 111")
+	}
+	if got := len(repo.UserBotsByTenant("tenant:user:77")); got != 1 {
+		t.Fatalf("remaining bots = %d, want 1", got)
 	}
 }
 

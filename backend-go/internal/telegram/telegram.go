@@ -551,9 +551,13 @@ func NormalizeBotUpdate(payload []byte, botID int64, tenantID string, now time.T
 	return contracts.NormalizedTelegramEvent{
 		// update_id sequences are per-bot, so both the event id and the receive
 		// idempotency key derived from it must be scoped by bot id.
-		EventID:          fmt.Sprintf("%d:bot:%s:%s", *update.UpdateID, bot, sourceMessageID),
-		TenantID:         tenantID,
-		ChatID:           strconv.FormatInt(message.Chat.ID, 10),
+		EventID: fmt.Sprintf("%d:bot:%s:%s", *update.UpdateID, bot, sourceMessageID),
+		TenantID: tenantID,
+		// Bot-transport chat identity is namespaced by bot id so a tenant's two
+		// bots talking to the SAME Telegram user resolve to two distinct chats.
+		// The raw Telegram chat id is recoverable via contracts.RawChatID for
+		// outbound sends. Personal/business transport keeps the raw id (above).
+		ChatID:           contracts.BotChatID(bot, strconv.FormatInt(message.Chat.ID, 10)),
 		ChatDisplayName:  chatDisplayName,
 		ChatType:         message.Chat.Type,
 		TelegramUpdateID: *update.UpdateID,

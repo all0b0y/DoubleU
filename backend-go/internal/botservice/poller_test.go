@@ -161,7 +161,7 @@ func TestPollerDeliversUpdatesAndAdvancesOffset(t *testing.T) {
 		t.Fatalf("idempotency key = %q, want 100:bot:555", key)
 	}
 	// Offset persisted past the last delivered update.
-	bot, ok := repo.UserBotByTenant("tenant:user:77")
+	bot, ok := repo.UserBotByID("tenant:user:77", 555)
 	if !ok || bot.LastUpdateOffset != 102 {
 		t.Fatalf("persisted offset = %d, want 102", bot.LastUpdateOffset)
 	}
@@ -213,7 +213,7 @@ func TestPollerStopsOnInvalidToken(t *testing.T) {
 
 	deadline := time.After(2 * time.Second)
 	for {
-		bot, _ := repo.UserBotByTenant("tenant:user:77")
+		bot, _ := repo.UserBotByID("tenant:user:77", 555)
 		if bot.Status == "invalid" {
 			return
 		}
@@ -253,10 +253,10 @@ func TestRegisterBotValidatesTokenAndStartsPolling(t *testing.T) {
 	}
 
 	// SenderFor exposes the per-tenant outbound sender.
-	if _, ok := manager.SenderFor("tenant:user:77"); !ok {
+	if _, ok := manager.SenderFor("tenant:user:77", "555"); !ok {
 		t.Fatal("expected sender for registered tenant")
 	}
-	if _, ok := manager.SenderFor("tenant:user:99"); ok {
+	if _, ok := manager.SenderFor("tenant:user:99", "555"); ok {
 		t.Fatal("unexpected sender for unknown tenant")
 	}
 

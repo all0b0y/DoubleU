@@ -295,10 +295,10 @@ export function renderRoleEdit(navigate, roleId) {
     btn.textContent = '…'; btn.disabled = true;
     try {
       if (isNew) {
-        const created = await api.createRole(data);
+        await api.createRole(data);
         twa?.HapticFeedback?.notificationOccurred('success');
-        // Land on the edit screen so the user can keep refining the role.
-        navigate(`/roles/${created.id}`);
+        // Return to the full roles list after creating.
+        navigate('/roles');
       } else {
         await api.updateRole(roleId, data);
         twa?.HapticFeedback?.notificationOccurred('success');

@@ -1,11 +1,7 @@
 import { api } from '/miniapp/api/client.js';
+import { catImg } from '/miniapp/components/glyphs.js';
 
 const twa = window.Telegram?.WebApp;
-
-function initials(name) {
-  if (!name) return '?';
-  return name.split(/\s+/).map(w => w[0]).join('').slice(0, 2).toUpperCase();
-}
 
 export function renderAddChat(navigate) {
   const el = document.createElement('div');
@@ -62,7 +58,7 @@ export function renderAddChat(navigate) {
     list.innerHTML = filtered.map(c => `
       <div class="contact-item" data-id="${c.chat_id}">
         <div class="contact-check ${selected.has(c.chat_id) ? 'checked' : ''}" data-id="${c.chat_id}"></div>
-        <div class="avatar avatar-sm">${initials(c.display_name)}</div>
+        <div class="avatar avatar-sm avatar-cat">${catImg(c.chat_id)}</div>
         <div style="flex:1;min-width:0">
           <div style="font-size:14px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${c.display_name || c.chat_id}</div>
         </div>

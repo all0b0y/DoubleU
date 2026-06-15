@@ -15,7 +15,7 @@ type fakeBotSenders struct {
 	sender *fakeSender
 }
 
-func (f *fakeBotSenders) SenderFor(tenantID string) (telegram.Sender, bool) {
+func (f *fakeBotSenders) SenderFor(tenantID, botID string) (telegram.Sender, bool) {
 	if f.sender == nil {
 		return nil, false
 	}
@@ -67,7 +67,8 @@ func TestHandleBotMessageCreatesDraft(t *testing.T) {
 	if result.Decision != contracts.DecisionDraft || result.DraftID == "" {
 		t.Fatalf("expected draft decision with id, got %+v", result)
 	}
-	if got := repository.ChatTransport("tenant:user:77", "42"); got != contracts.TransportBot {
+	// The chat is stored under its bot-namespaced id.
+	if got := repository.ChatTransport("tenant:user:77", contracts.BotChatID("555", "42")); got != contracts.TransportBot {
 		t.Fatalf("chat transport = %q, want bot", got)
 	}
 	if ai.calls != 1 {
@@ -83,7 +84,8 @@ func TestHandleBotMessageCreatesDraft(t *testing.T) {
 // leaves through the tenant's own bot, not the control bot.
 func TestHandleBotMessageAutoReplyUsesBotSender(t *testing.T) {
 	repository := store.NewRepository()
-	repository.SaveChatSettings(contracts.ChatSettings{TenantID: "tenant:user:77", ChatID: "42", Mode: contracts.ChatModeAuto})
+	// Auto mode is configured on the bot-namespaced chat id.
+	repository.SaveChatSettings(contracts.ChatSettings{TenantID: "tenant:user:77", ChatID: contracts.BotChatID("555", "42"), Mode: contracts.ChatModeAuto})
 	ai := &fakeAI{response: contracts.AIProcessMessageResponse{
 		Decision:     contracts.DecisionAutoReply,
 		ResponseText: "автоответ",
@@ -113,6 +115,46 @@ func TestHandleBotMessageAutoReplyUsesBotSender(t *testing.T) {
 	}
 	if len(controlSender.sent) != 0 {
 		t.Fatalf("control bot must not send the contact-facing reply, got %+v", controlSender.sent)
+	}
+}
+
+// TestTwoBotsSameUserAreIsolated is the multi-bot isolation contract: when a
+// tenant's two bots both talk to the SAME Telegram user, the bot-namespaced
+// chat ids keep their messages and drafts completely separate — no bleed.
+func TestTwoBotsSameUserAreIsolated(t *testing.T) {
+	repository := store.NewRepository()
+	ai := &fakeAI{response: contracts.AIProcessMessageResponse{
+		Decision: contracts.DecisionDraft, ResponseText: "ответ", Confidence: 0.9, RiskLevel: contracts.RiskLow,
+	}}
+	service := newTestService(repository, ai, &fakeSender{})
+
+	at := time.Unix(1700000000, 0).UTC()
+	ev1, _, _ := telegram.NormalizeBotUpdate(botUpdatePayload(9001, 42, 7, "к боту А"), 555, "tenant:user:77", at)
+	ev2, _, _ := telegram.NormalizeBotUpdate(botUpdatePayload(9002, 42, 8, "к боту Б"), 666, "tenant:user:77", at)
+	if _, err := service.HandleBotMessage(context.Background(), ev1); err != nil {
+		t.Fatalf("bot A message: %v", err)
+	}
+	if _, err := service.HandleBotMessage(context.Background(), ev2); err != nil {
+		t.Fatalf("bot B message: %v", err)
+	}
+
+	chatA := contracts.BotChatID("555", "42")
+	chatB := contracts.BotChatID("666", "42")
+	if chatA == chatB {
+		t.Fatal("two bots talking to the same user must yield distinct chat ids")
+	}
+
+	if msgs := repository.RecentMessages("tenant:user:77", chatA, 10); len(msgs) != 1 || msgs[0].Event.MessageText != "к боту А" {
+		t.Fatalf("chat A must hold only bot A's message, got %+v", msgs)
+	}
+	if msgs := repository.RecentMessages("tenant:user:77", chatB, 10); len(msgs) != 1 || msgs[0].Event.MessageText != "к боту Б" {
+		t.Fatalf("chat B must hold only bot B's message, got %+v", msgs)
+	}
+	if d := repository.DraftsForChat("tenant:user:77", chatA); len(d) != 1 {
+		t.Fatalf("chat A drafts = %d, want 1", len(d))
+	}
+	if d := repository.DraftsForChat("tenant:user:77", chatB); len(d) != 1 {
+		t.Fatalf("chat B drafts = %d, want 1", len(d))
 	}
 }
 

@@ -123,10 +123,10 @@ func (s *Server) routes() {
 
 	// Bot ingestion settings (UI is the configuration surface; the bot is the
 	// communication channel).
-	s.mux.HandleFunc("GET /api/v1/bots", s.tmaAuth(s.apiGetBot))
+	s.mux.HandleFunc("GET /api/v1/bots", s.tmaAuth(s.apiListBots))
 	s.mux.HandleFunc("POST /api/v1/bots", s.tmaAuth(s.apiRegisterBot))
-	s.mux.HandleFunc("PUT /api/v1/bots/role", s.tmaAuth(s.apiSetBotRole))
-	s.mux.HandleFunc("DELETE /api/v1/bots", s.tmaAuth(s.apiDisconnectBot))
+	s.mux.HandleFunc("PUT /api/v1/bots/{bot_id}/role", s.tmaAuth(s.apiSetBotRole))
+	s.mux.HandleFunc("DELETE /api/v1/bots/{bot_id}", s.tmaAuth(s.apiDisconnectBot))
 	s.mux.HandleFunc("GET /api/v1/settings/ingestion-mode", s.tmaAuth(s.apiGetIngestionMode))
 	s.mux.HandleFunc("PUT /api/v1/settings/ingestion-mode", s.tmaAuth(s.apiSetIngestionMode))
 

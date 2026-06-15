@@ -281,8 +281,8 @@ export function renderMe(navigate) {
       goBtn.textContent = '…'; goBtn.disabled = true;
       try {
         await api.forgetAll(input.value.trim());
-        // Everything is gone, including the connection — restart onboarding.
-        navigate('/onboarding');
+        // Everything is gone, including the connection — return to the splash.
+        navigate('/');
       } catch (err) {
         twa?.showAlert(`Ошибка: ${err.message}`);
         goBtn.textContent = 'Удалить всё навсегда'; goBtn.disabled = false;
