@@ -78,23 +78,29 @@ func (DecisionEngine) Decide(settings contracts.ChatSettings, proposal contracts
 	if settings.PrivacyFlags.Contains(contracts.PrivacyPrivate) {
 		return contracts.DecisionDraft, "private_chat_blocks_auto_reply"
 	}
+	// AUTO mode: the owner explicitly opts into unsupervised replies and accepts
+	// the risk, so the confidence gate is removed — every low-risk message
+	// auto-sends (owner decision, 2026-06-16). MEDIUM/HIGH/CRITICAL risk already
+	// returned a draft/ask_owner above, so only low risk reaches here. The empty
+	// guard keeps a model that produced no text from sending a blank message.
+	if settings.Mode == contracts.ChatModeAuto {
+		if strings.TrimSpace(proposal.ResponseText) == "" {
+			return contracts.DecisionDraft, "auto_mode_no_reply_text"
+		}
+		return contracts.DecisionAutoReply, "auto_mode_low_risk_send"
+	}
+	// SEMI-AUTO (and any other mode) still defer to the AI's auto-reply request
+	// and the confidence threshold: send only when the model is confident.
 	if proposal.Decision != contracts.DecisionAutoReply {
 		return contracts.DecisionDraft, "ai_did_not_request_auto_reply"
 	}
-	switch settings.Mode {
-	case contracts.ChatModeSemiAuto:
+	if settings.Mode == contracts.ChatModeSemiAuto {
 		if proposal.Confidence >= contracts.SemiAutoMinConfidence {
 			return contracts.DecisionAutoReply, "semi_auto_confidence_met"
 		}
 		return contracts.DecisionDraft, "semi_auto_confidence_below_threshold"
-	case contracts.ChatModeAuto:
-		if proposal.Confidence >= contracts.AutoMinConfidence {
-			return contracts.DecisionAutoReply, "auto_confidence_met"
-		}
-		return contracts.DecisionDraft, "auto_confidence_below_threshold"
-	default:
-		return contracts.DecisionDraft, "safe_default_draft"
 	}
+	return contracts.DecisionDraft, "safe_default_draft"
 }
 
 // Service coordinates Telegram inbound handling, AI calls, audit, and approvals.
@@ -752,9 +758,11 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 		s.notify(event.TenantID, "new_message", map[string]any{"chat_id": event.ChatID})
 	}
 	s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StatePolicyChecked)
-	if isOwnerAuthoredMessage(event, ownerID) {
+	if isOwnerSideMessage(event, ownerID, event.Transport) {
 		// The owner replied themselves: the open question is answered and no
-		// owner action is pending any more (§6.2 lifecycle, MEM-5).
+		// owner action is pending any more (§6.2 lifecycle, MEM-5). On bot
+		// transport this only fires for synthetic system messages — a human
+		// (incl. the owner testing the bot) is a contact the AI answers.
 		s.repository.ClearEpisodeRuntimeState(event.TenantID, event.ChatID)
 		s.repository.AppendAudit(s.auditEvent(event, contracts.DecisionObserve, "owner_message_observed"))
 		s.logger.Info("owner-authored business message stored as context without ai reply",
@@ -868,6 +876,7 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 		s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateFailed)
 		s.repository.AppendAudit(s.auditEvent(event, contracts.DecisionErrorFallback, "ai_process_error:"+err.Error()))
 		s.logger.Error("ai analysis failed", "tenant_id", event.TenantID, "chat_id", event.ChatID, "error", err)
+		s.notifyAIError(event)
 		return InboundResult{Event: event, Decision: contracts.DecisionErrorFallback, Reason: "ai_process_error"}, nil
 	}
 	s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateAIGenerated)
@@ -995,6 +1004,10 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 		s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateIgnored)
 	case contracts.DecisionErrorFallback:
 		s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateFailed)
+		// The AI produced no usable reply (transient model failure). Tell the
+		// owner so the thinking indicator resolves into a retry notice instead of
+		// silently vanishing, which reads as the bot being dead.
+		s.notifyAIError(event)
 	}
 	s.repository.AppendAudit(s.auditEvent(event, decision, reason))
 
@@ -1282,6 +1295,11 @@ func (s *Service) conversationContextAndMessages(ctx context.Context, event cont
 	}
 
 	// Working layer: recent raw messages from this chat (oldest first).
+	// Transport is chat-fixed; resolve it once so OWNER/CONTACT labelling matches
+	// the bot-vs-business identity rule (see isOwnerSideMessage). On bot transport
+	// the human's messages — even the owner's — are CONTACT, and only the bot's
+	// own replies ("out:" events) are OWNER.
+	transport := s.repository.ChatTransport(event.TenantID, event.ChatID)
 	messageLines := make([]string, 0, len(records))
 	for _, record := range records {
 		if record.Event.SourceMessageID == event.SourceMessageID {
@@ -1292,7 +1310,7 @@ func (s *Service) conversationContextAndMessages(ctx context.Context, event cont
 			continue
 		}
 		role := "CONTACT"
-		if isOwnerAuthoredMessage(record.Event, ownerID) {
+		if isOwnerSideMessage(record.Event, ownerID, transport) {
 			role = "OWNER"
 		}
 		msgDate := record.Event.CreatedAt.UTC().Format("2006-01-02 15:04")
@@ -1873,6 +1891,37 @@ func (s *Service) saveTypedFacts(event contracts.NormalizedTelegramEvent, facts 
 
 func isOwnerAuthoredMessage(event contracts.NormalizedTelegramEvent, ownerID string) bool {
 	return ownerID != "" && event.SenderID == ownerID
+}
+
+// notifyAIError pushes a real-time error notice to connected Mini App clients so
+// a failed AI turn surfaces as a retryable message rather than the thinking
+// indicator disappearing with nothing in its place.
+func (s *Service) notifyAIError(event contracts.NormalizedTelegramEvent) {
+	if s.notify == nil {
+		return
+	}
+	s.notify(event.TenantID, "ai_error", map[string]any{
+		"chat_id": event.ChatID,
+		"message": "ИИ не смог сформировать ответ. Попробуйте отправить сообщение ещё раз.",
+	})
+}
+
+// isOwnerSideMessage reports whether a message belongs to the owner's side of
+// the conversation — i.e. it should be treated as written on the owner's behalf
+// (suppress an AI reply, label OWNER in the AI context, render "outgoing" in the
+// Mini App). The rule depends on transport:
+//
+//   - business: the bot acts AS the owner's own Telegram account, so anything
+//     the owner typed (SenderID == ownerID) is owner-side.
+//   - bot: the bot is a SEPARATE identity. A human DMing the bot — including the
+//     owner testing their own bot — is an incoming contact the AI must answer.
+//     Only system-emitted messages (synthetic "out:" events: auto-replies,
+//     approved drafts, app/manual sends) are owner-side.
+func isOwnerSideMessage(event contracts.NormalizedTelegramEvent, ownerID, transport string) bool {
+	if transport == contracts.TransportBot {
+		return strings.HasPrefix(event.EventID, "out:")
+	}
+	return isOwnerAuthoredMessage(event, ownerID)
 }
 
 func anonymousChatName(chatID string) string {

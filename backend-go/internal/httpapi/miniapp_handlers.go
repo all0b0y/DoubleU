@@ -167,27 +167,36 @@ func (s *Server) apiMessages(w http.ResponseWriter, r *http.Request) {
 		Source      string `json:"source,omitempty"` // owner messages: "app" (sent via DoubleU) | "telegram" (typed to the bot directly)
 		CreatedAt   string `json:"created_at"`
 	}
+	// Transport decides what counts as an outgoing (owner-side) message. On bot
+	// transport the bot is a separate identity: only system-sent messages
+	// (DoubleU replies / approved drafts / app sends) are outgoing, while a human
+	// DMing the bot — including the owner testing it — is an incoming contact.
+	// On business transport the bot speaks as the owner's own account, so
+	// anything the owner typed is outgoing.
+	botTransport := s.service.Repository().ChatTransport(tenantID, chatID) == contracts.TransportBot
 	items := make([]msgItem, 0, len(msgs))
 	for _, m := range msgs {
 		direction := "incoming"
 		senderName := contactName
 		label := ""
 		source := ""
-		if m.Event.SenderID == ownerUserID {
+		// Distinguish replies sent through DoubleU (a draft was sent, or the
+		// app's manual-send path stamped an "out:" event id) from messages the
+		// owner typed straight to the bot in Telegram — so the bot is usable
+		// for personal needs without the two looking identical.
+		if draft, ok := s.service.Repository().DraftBySentMessageID(tenantID, chatID, m.Event.SourceMessageID); ok {
 			direction = "outgoing"
 			senderName = "Вы"
-			// Distinguish replies sent through DoubleU (a draft was sent, or the
-			// app's manual-send path stamped an "out:" event id) from messages the
-			// owner typed straight to the bot in Telegram — so the bot is usable
-			// for personal needs without the two looking identical.
-			if draft, ok := s.service.Repository().DraftBySentMessageID(tenantID, chatID, m.Event.SourceMessageID); ok {
-				label = doubleULabel(draft.ActionHistory)
-				source = "app"
-			} else if strings.HasPrefix(m.Event.EventID, "out:") {
-				source = "app"
-			} else {
-				source = "telegram"
-			}
+			label = doubleULabel(draft.ActionHistory)
+			source = "app"
+		} else if strings.HasPrefix(m.Event.EventID, "out:") {
+			direction = "outgoing"
+			senderName = "Вы"
+			source = "app"
+		} else if !botTransport && m.Event.SenderID == ownerUserID {
+			direction = "outgoing"
+			senderName = "Вы"
+			source = "telegram"
 		}
 		items = append(items, msgItem{
 			ID:          m.Event.SourceMessageID,
