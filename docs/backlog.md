@@ -2,6 +2,23 @@
 
 ---
 
+## Bug Backlog
+
+- **Stale contract seed against consolidated schema** — `infra/seed/001_contract_scenarios.sql`
+  still `INSERT`s into tables that the consolidated schema
+  (`infra/migrations/100_clean_schema_v2.sql`) dropped/renamed:
+  `assistant_profiles` (now `ai_roles`), `memory_facts` (now `semantic_facts`),
+  `memory_embeddings` (now `fact_embeddings`), and `summaries` (now
+  `episode_summaries`). The static no-docker checks in
+  `scripts/migration-seed-smoke.sh` and `scripts/contract-security-tests.sh`
+  only grep for string presence, so they pass — but the **docker path** of the
+  smoke test actually loads the seed and will fail with `ON_ERROR_STOP=1`.
+  Fix: rewrite the seed to match the new table/column shapes and re-verify with
+  docker (`scripts/migration-seed-smoke.sh`). Larger than the script-path fix
+  and not verifiable without docker, hence backlogged.
+
+---
+
 ## AI / Backend Architecture Backlog
 
 **✅ ВЫПОЛНЕН (2026-06-11)** — все 15 задач ARCH-1…ARCH-15 реализованы, статус и остаточные

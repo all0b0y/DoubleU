@@ -11,7 +11,7 @@ import re
 root = Path(".")
 readme = (root / "contracts" / "README.md").read_text()
 openapi = (root / "contracts" / "openapi.yaml").read_text()
-migration = (root / "infra" / "migrations" / "001_core_schema.sql").read_text()
+migration = (root / "infra" / "migrations" / "100_clean_schema_v2.sql").read_text()
 seed = (root / "infra" / "seed" / "001_contract_scenarios.sql").read_text()
 
 expected = {
@@ -43,17 +43,23 @@ for group, values in expected.items():
         if value not in migration:
             raise SystemExit(f"migration missing {group} value {value}")
 
+# Table names as of the consolidated schema (100_clean_schema_v2.sql). The
+# clean schema schema-qualifies tables with `public.` and renamed the memory
+# tables: memory_facts -> semantic_facts, memory_embeddings -> fact_embeddings,
+# summaries -> episode_summaries.
 required_tables = [
     "audit_events",
     "message_states",
-    "memory_facts",
-    "memory_embeddings",
-    "summaries",
+    "semantic_facts",
+    "fact_embeddings",
+    "episode_summaries",
     "idempotency_records",
     "chat_settings",
 ]
 for table in required_tables:
-    match = re.search(rf"CREATE TABLE IF NOT EXISTS {table} \((.*?)\n\);", migration, re.S)
+    match = re.search(
+        rf"CREATE TABLE IF NOT EXISTS public\.{table} \((.*?)\n\);", migration, re.S
+    )
     if not match:
         raise SystemExit(f"migration missing table {table}")
     body = match.group(1)
