@@ -61,6 +61,9 @@ export function renderMe(navigate) {
 
   let settings = {};
   let roles = [];
+  // The me-screen bot section is single-bot; with multibot we show the tenant's
+  // first bot. Kept here so the role-picker handler (in wire()) has its bot id.
+  let currentBot = { connected: false };
 
   function personalConnectionHTML(me) {
     const status = me?.connection?.status || 'not_found';
@@ -213,7 +216,7 @@ export function renderMe(navigate) {
     el.querySelector('#f-bot-role')?.addEventListener('change', async (e) => {
       twa?.HapticFeedback?.selectionChanged();
       try {
-        await api.setBotRole(Number(e.target.value));
+        await api.setBotRole(currentBot.bot_id, Number(e.target.value));
         twa?.HapticFeedback?.notificationOccurred('success');
       } catch (err) {
         twa?.HapticFeedback?.notificationOccurred('error');
@@ -292,14 +295,15 @@ export function renderMe(navigate) {
 
   async function load() {
     try {
-      const [me, settingsData, suggestionsData, botData, rolesData] = await Promise.all([
+      const [me, settingsData, suggestionsData, botsData, rolesData] = await Promise.all([
         api.me(), api.userSettings(), api.suggestions(),
-        api.getBot().catch(() => ({ connected: false })),
+        api.bots().catch(() => ({ bots: [] })),
         api.roles().catch(() => ({ roles: [] })),
       ]);
       settings = settingsData || {};
       roles = rolesData.roles || [];
-      renderContent(me, suggestionsData.suggestions || [], botData || { connected: false });
+      currentBot = (botsData.bots && botsData.bots[0]) || { connected: false };
+      renderContent(me, suggestionsData.suggestions || [], currentBot);
     } catch (err) {
       el.querySelector('#me-scroll').innerHTML = `
         <div class="empty-state"><div class="empty-icon">⚠️</div><div class="empty-subtitle">${esc(err.message)}</div></div>`;
