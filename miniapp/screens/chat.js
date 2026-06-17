@@ -144,12 +144,14 @@ export function renderChat(navigate, chatId) {
   function showThinkingIndicator() {
     const list = el.querySelector('#msg-list');
     if (list.querySelector('#ai-thinking-indicator')) return;
+    el.querySelector('#ai-error-notice')?.remove(); // a fresh turn supersedes a prior error
     const phrase = THINKING_PHRASES[Math.floor(Math.random() * THINKING_PHRASES.length)];
     const div = document.createElement('div');
     div.id = 'ai-thinking-indicator';
-    div.className = 'msg-bubble msg-out';
-    div.style.cssText = 'opacity:0.65;font-style:italic;';
-    div.innerHTML = `<p class="msg-text" style="color:var(--hint)">${phrase}</p>`;
+    div.className = 'ai-thinking';
+    div.innerHTML =
+      `<span class="ai-thinking-text">${phrase}</span>` +
+      `<span class="ai-thinking-dots"><span></span><span></span><span></span></span>`;
     const inner = list.querySelector('.msg-list-inner');
     (inner || list).appendChild(div);
     list.scrollTop = list.scrollHeight;
@@ -157,6 +159,21 @@ export function renderChat(navigate, chatId) {
 
   function hideThinkingIndicator() {
     el.querySelector('#ai-thinking-indicator')?.remove();
+  }
+
+  // Replace the thinking indicator with a retryable error notice when an AI
+  // turn fails, so it never just disappears with nothing in its place.
+  function showAIError(message) {
+    hideThinkingIndicator();
+    const list = el.querySelector('#msg-list');
+    el.querySelector('#ai-error-notice')?.remove();
+    const div = document.createElement('div');
+    div.id = 'ai-error-notice';
+    div.className = 'ai-error';
+    div.textContent = message || 'ИИ не смог сформировать ответ. Попробуйте ещё раз.';
+    const inner = list.querySelector('.msg-list-inner');
+    (inner || list).appendChild(div);
+    list.scrollTop = list.scrollHeight;
   }
 
   // ── Avatar (issue 3) ──────────────────────────────────────────────────────
@@ -498,9 +515,10 @@ export function renderChat(navigate, chatId) {
     draft_status: (d) => {
       if (currentDrafts.find(x => x.draft_id === d.draft_id)) loadChatData();
     },
-    new_message:  (d) => { if (d.chat_id === chatId) loadChatData(); },
+    new_message:  (d) => { if (d.chat_id === chatId) { el.querySelector('#ai-error-notice')?.remove(); loadChatData(); } },
     ai_thinking:  (d) => { if (d.chat_id === chatId) showThinkingIndicator(); },
     ai_done:      (d) => { if (d.chat_id === chatId) hideThinkingIndicator(); },
+    ai_error:     (d) => { if (d.chat_id === chatId) showAIError(d.message); },
     chat_role_changed: (d) => { if (d.chat_id === chatId) loadChatMeta(); },
   });
 

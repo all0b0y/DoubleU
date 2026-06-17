@@ -266,6 +266,60 @@ html, body {
 .msg-footer-du   { font-size: 9px; color: var(--accent-light); }
 .msg-footer-time { font-size: 9px; color: var(--accent-light); }
 
+/* ── AI thinking indicator ──
+   Distinct from message bubbles: a left-aligned matcha pill with animated
+   typing dots, so it reads clearly as "the AI is working" in every chat mode. */
+.ai-thinking {
+  align-self: flex-start;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 78%;
+  margin: 2px 0;
+  padding: 8px 12px;
+  background: var(--accent-soft);
+  border: 1px solid var(--accent);
+  border-radius: 16px 16px 16px 4px;
+  animation: aiThinkingIn 160ms ease;
+}
+@keyframes aiThinkingIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.ai-thinking-text {
+  font-size: 12px;
+  color: var(--accent-hover);
+  font-weight: 500;
+}
+.ai-thinking-dots { display: inline-flex; gap: 3px; }
+.ai-thinking-dots span {
+  width: 5px; height: 5px; border-radius: 50%;
+  background: var(--accent);
+  animation: aiDot 1s infinite ease-in-out;
+}
+.ai-thinking-dots span:nth-child(2) { animation-delay: 0.16s; }
+.ai-thinking-dots span:nth-child(3) { animation-delay: 0.32s; }
+@keyframes aiDot {
+  0%, 80%, 100% { opacity: 0.3; transform: translateY(0); }
+  40%           { opacity: 1;   transform: translateY(-3px); }
+}
+
+/* ── AI error notice ──
+   Shown in place of the thinking indicator when an AI turn fails, so the owner
+   sees a retryable message instead of the indicator vanishing silently. */
+.ai-error {
+  align-self: center;
+  max-width: 90%;
+  margin: 6px 0;
+  padding: 8px 12px;
+  background: var(--danger-soft);
+  border: 1px solid var(--danger);
+  border-radius: 12px;
+  font-size: 12px;
+  color: var(--danger);
+  text-align: center;
+}
+
 /* ── Draft panel ── */
 .draft-panel {
   padding: 10px 12px calc(10px + var(--inset-bottom, 0px));
