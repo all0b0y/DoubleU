@@ -266,6 +266,37 @@ func TestBotMessageDuplicateScopedByBot(t *testing.T) {
 	}
 }
 
+// TestOwnerDMToOwnBotGetsAIReply is the bot-transport counterpart to
+// TestOwnerBusinessMessageIsStoredWithoutAIReply: when the owner DMs their OWN
+// bot (the bot is a separate identity, so the owner is just a user testing it),
+// the message must NOT be suppressed as owner-authored — the AI answers it like
+// any contact. The owner's Telegram id (77) equals the chat/sender id here.
+func TestOwnerDMToOwnBotGetsAIReply(t *testing.T) {
+	repository := store.NewRepository()
+	ai := &fakeAI{response: contracts.AIProcessMessageResponse{
+		Decision:     contracts.DecisionDraft,
+		ResponseText: "черновик ответа",
+		Confidence:   0.9,
+		RiskLevel:    contracts.RiskLow,
+	}}
+	service := newTestService(repository, ai, &fakeSender{})
+
+	// from.id == chat.id == 77 == the owner's own Telegram id (tenant:user:77).
+	result, err := service.HandleBotMessage(context.Background(), botEvent(t, 9400, 77, 16, "привет, бот"))
+	if err != nil {
+		t.Fatalf("bot message: %v", err)
+	}
+	if result.Reason == "owner_message_observed" || result.Decision == contracts.DecisionObserve {
+		t.Fatalf("owner DM to own bot must not be observed as owner-authored, got %+v", result)
+	}
+	if ai.calls != 1 {
+		t.Fatalf("ai must answer the owner's DM to the bot, calls = %d", ai.calls)
+	}
+	if result.DraftID == "" {
+		t.Fatalf("expected a reply draft for the owner's DM, got %+v", result)
+	}
+}
+
 // TestApprovalApproveSendsThroughBotTransport verifies the owner's approve on
 // a bot-transport draft routes the reply through the user bot even though the
 // callback path reconstructs a minimal event without transport metadata.

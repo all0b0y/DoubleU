@@ -61,6 +61,33 @@ class ServicePolicyTests(unittest.TestCase):
         self.assertTrue(response.response_text)
         self.assertEqual(len(self.audit_sink.events()), 1)
 
+    def test_auto_mode_sends_even_below_old_confidence_bar(self) -> None:
+        """Auto mode has no confidence gate: a low-risk reply auto-sends even when
+        the model's self-assessed confidence (here 0.8) is below the old 0.92 bar.
+
+        The owner opts into unsupervised replies in auto mode and accepts the risk
+        (owner decision, 2026-06-16). Risk gates still protect medium/high/critical.
+        """
+        response = self.service.process_message(
+            _process_request(mode=ChatMode.AUTO, text="Спасибо, понял")
+        )
+
+        self.assertEqual(response.risk_level, RiskLevel.LOW)
+        self.assertLess(response.confidence, 0.92)
+        self.assertEqual(response.decision, Decision.AUTO_REPLY)
+        self.assertTrue(response.response_text)
+
+    def test_semi_auto_below_threshold_still_drafts(self) -> None:
+        """Semi-auto keeps the confidence gate: the same low-confidence low-risk
+        reply that auto-sends in AUTO mode must fall back to a draft in SEMI_AUTO."""
+        response = self.service.process_message(
+            _process_request(mode=ChatMode.SEMI_AUTO, text="Спасибо, понял")
+        )
+
+        self.assertEqual(response.risk_level, RiskLevel.LOW)
+        self.assertLess(response.confidence, 0.85)
+        self.assertEqual(response.decision, Decision.DRAFT)
+
     def test_no_memory_and_private_force_draft_without_memory_context(self) -> None:
         """Private chats must not auto-reply and no_memory must suppress memory use."""
         response = self.service.process_message(

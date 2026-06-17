@@ -72,8 +72,11 @@ func TestDecisionEngineContractCombinations(t *testing.T) {
 						if privacy.Contains(contracts.PrivacyPrivate) {
 							t.Fatalf("auto_reply allowed for private chat")
 						}
-						if proposed != contracts.DecisionAutoReply {
-							t.Fatalf("auto_reply allowed without AI auto proposal")
+						// SEMI_AUTO still defers to the AI's auto-reply request; AUTO
+						// does not — the owner accepted unsupervised replies, so a
+						// low-risk message auto-sends regardless of the AI proposal.
+						if mode == contracts.ChatModeSemiAuto && proposed != contracts.DecisionAutoReply {
+							t.Fatalf("semi-auto auto_reply allowed without AI auto proposal")
 						}
 					}
 					if risk == contracts.RiskCritical && proposed != contracts.DecisionIgnore && proposed != contracts.DecisionErrorFallback && mode != contracts.ChatModeDisabled && mode != contracts.ChatModeSilent {

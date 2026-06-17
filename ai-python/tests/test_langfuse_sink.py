@@ -124,6 +124,10 @@ class BatchItemTests(unittest.TestCase):
         self.assertEqual(body["model"], "draft-primary")
         self.assertEqual(body["usage"]["input"], 10)
         self.assertAlmostEqual(body["calculatedTotalCost"], 0.001)
+        # Langfuse rejects an observation without a body id (400) — this is the
+        # field whose absence silently dropped every app generation.
+        self.assertEqual(body["id"], item["id"])
+        self.assertTrue(body["id"])
 
     def test_span_maps_to_span_create(self) -> None:
         event = _SinkEvent(kind="span", payload={"trace_id": "t2", "name": "input_safety", "passed": True})
@@ -131,6 +135,8 @@ class BatchItemTests(unittest.TestCase):
         self.assertEqual(item["type"], "span-create")
         self.assertEqual(item["body"]["name"], "input_safety")
         self.assertEqual(item["body"]["traceId"], "t2")
+        self.assertEqual(item["body"]["id"], item["id"])
+        self.assertTrue(item["body"]["id"])
 
     def test_trace_maps_to_trace_create_with_body_id(self) -> None:
         event = _SinkEvent(kind="trace", payload={"trace_id": "t3", "name": "draft", "tenant_id": "u1"})
@@ -144,6 +150,8 @@ class BatchItemTests(unittest.TestCase):
         item = _to_batch_item(event)
         self.assertEqual(item["type"], "score-create")
         self.assertEqual(item["body"]["value"], 1.0)
+        self.assertEqual(item["body"]["id"], item["id"])
+        self.assertTrue(item["body"]["id"])
 
     def test_unknown_kind_returns_none(self) -> None:
         event = _SinkEvent(kind="unknown", payload={})

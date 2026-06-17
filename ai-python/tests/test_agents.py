@@ -256,9 +256,11 @@ class _FakeSink:
     def __init__(self) -> None:
         self.generations: list[dict] = []
         self.traces: list[str] = []
+        self.trace_payloads: list[dict] = []
 
     def record_trace(self, trace_id, payload):
         self.traces.append(trace_id)
+        self.trace_payloads.append(payload)
 
     def record_span(self, trace_id, name, payload):
         pass
@@ -275,6 +277,30 @@ def test_draft_run_records_generation_to_sink() -> None:
     assert sink.generations, "agent run must record a generation when a sink is wired"
     assert sink.generations[0]["trace_id"] == "trace-1"
     assert "usage" in sink.generations[0]
+
+
+def test_record_decision_relabels_trace_with_outcome() -> None:
+    """The request trace must be re-labelled with the final decision so an
+    auto-sent reply is distinguishable from an owner draft (it is opened under
+    the generic 'draft' generation purpose otherwise)."""
+    sink = _FakeSink()
+    runtime = make_runtime(sink=sink)
+    with with_context(LLMCallContext(trace_id="trace-1", tenant_id="tenant:user:77")):
+        runtime.record_decision("auto_reply", "general_message", 0.8)
+    assert sink.trace_payloads, "record_decision must emit a trace event"
+    payload = sink.trace_payloads[-1]
+    assert payload["name"] == "auto_reply"
+    assert payload["decision"] == "auto_reply"
+    assert payload["intent"] == "general_message"
+
+
+def test_record_decision_noops_without_trace_id() -> None:
+    """No trace id (direct callers / tests) must not raise or emit."""
+    sink = _FakeSink()
+    runtime = make_runtime(sink=sink)
+    with with_context(LLMCallContext(trace_id="")):
+        runtime.record_decision("draft", "general_message", 0.5)
+    assert sink.trace_payloads == []
 
 
 class _CapturingPool:
