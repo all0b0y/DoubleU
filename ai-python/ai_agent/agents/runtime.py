@@ -380,6 +380,35 @@ class AgentRuntime:
             usage={"input_tokens": usage.input_tokens, "output_tokens": usage.output_tokens},
         )
 
+    def record_decision(self, decision: str, intent: str, confidence: float) -> None:
+        """Re-label the request trace with the FINAL policy decision.
+
+        The trace is opened during the draft step under the LLM *purpose*, which
+        is always ``"draft"`` (the generation step drafts text regardless of what
+        happens to it). Without this, an auto-sent reply is indistinguishable
+        from an owner draft in Langfuse — every interaction shows as ``draft``.
+        Langfuse upserts traces by id, so re-emitting the trace with the decision
+        as its name (and in metadata) corrects the label and adds the outcome,
+        intent and confidence as filterable fields. No-op when the sink or
+        trace_id is absent so direct callers and tests are unaffected.
+        """
+        if self._sink is None:
+            return
+        ctx = current_context()
+        if not ctx.trace_id:
+            return
+        self._sink.record_trace(
+            ctx.trace_id,
+            {
+                "name": decision,
+                "tenant_id": ctx.tenant_id or None,
+                "purpose": ctx.purpose.value if ctx.purpose else None,
+                "decision": decision,
+                "intent": intent,
+                "confidence": confidence,
+            },
+        )
+
     @staticmethod
     def _usage_of(result: object) -> Usage:
         """Normalize a pydantic-ai run usage into the contract ``Usage``."""

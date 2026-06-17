@@ -216,6 +216,10 @@ class AIService:
             options=outcome.options,
             topic=outcome.topic,
         )
+        # Label the Langfuse trace with the actual decision so an auto-sent reply
+        # is distinguishable from an owner draft (the trace is opened under the
+        # generic "draft" generation purpose otherwise).
+        self._agents.record_decision(decision.value, intent or "", confidence)
         self._record_audit(request, result, ",".join(risk_response.reasons))
         return result
 
