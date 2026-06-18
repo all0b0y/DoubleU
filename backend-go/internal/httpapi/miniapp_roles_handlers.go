@@ -23,14 +23,16 @@ const roleCustomFieldMaxRunes = 5000
 
 // roleJSON is the wire shape of an AI role in the Mini App API.
 type roleJSON struct {
-	ID            int64                        `json:"id"`
-	Name          string                       `json:"name"`
-	Description   string                       `json:"description"`
-	SpeakingStyle string                       `json:"speaking_style"`
-	Goals         string                       `json:"goals"`
-	Constraints   string                       `json:"constraints"`
-	Context       string                       `json:"context"`
-	CustomFields  []contracts.AIRoleCustomField `json:"custom_fields"`
+	ID                    int64                         `json:"id"`
+	Name                  string                        `json:"name"`
+	Description           string                        `json:"description"`
+	SpeakingStyle         string                        `json:"speaking_style"`
+	Goals                 string                        `json:"goals"`
+	Constraints           string                        `json:"constraints"`
+	Context               string                        `json:"context"`
+	CustomFields          []contracts.AIRoleCustomField `json:"custom_fields"`
+	RichFormattingEnabled *bool                         `json:"rich_formatting_enabled"`
+	StreamingEnabled      *bool                         `json:"streaming_enabled"`
 }
 
 func roleToJSON(role store.AIRoleRecord) roleJSON {
@@ -40,27 +42,31 @@ func roleToJSON(role store.AIRoleRecord) roleJSON {
 		fields = []contracts.AIRoleCustomField{}
 	}
 	return roleJSON{
-		ID:            role.ID,
-		Name:          role.Name,
-		Description:   role.Description,
-		SpeakingStyle: role.SpeakingStyle,
-		Goals:         role.Goals,
-		Constraints:   role.Constraints,
-		Context:       role.Context,
-		CustomFields:  fields,
+		ID:                    role.ID,
+		Name:                  role.Name,
+		Description:           role.Description,
+		SpeakingStyle:         role.SpeakingStyle,
+		Goals:                 role.Goals,
+		Constraints:           role.Constraints,
+		Context:               role.Context,
+		CustomFields:          fields,
+		RichFormattingEnabled: cloneBoolPtr(role.RichFormattingEnabled),
+		StreamingEnabled:      cloneBoolPtr(role.StreamingEnabled),
 	}
 }
 
 // roleRequest is the create/update payload; field trimming happens here so the
 // store always receives normalised values.
 type roleRequest struct {
-	Name          string                        `json:"name"`
-	Description   string                        `json:"description"`
-	SpeakingStyle string                        `json:"speaking_style"`
-	Goals         string                        `json:"goals"`
-	Constraints   string                        `json:"constraints"`
-	Context       string                        `json:"context"`
-	CustomFields  []contracts.AIRoleCustomField `json:"custom_fields"`
+	Name                  string                        `json:"name"`
+	Description           string                        `json:"description"`
+	SpeakingStyle         string                        `json:"speaking_style"`
+	Goals                 string                        `json:"goals"`
+	Constraints           string                        `json:"constraints"`
+	Context               string                        `json:"context"`
+	CustomFields          []contracts.AIRoleCustomField `json:"custom_fields"`
+	RichFormattingEnabled optionalBoolPatch             `json:"rich_formatting_enabled"`
+	StreamingEnabled      optionalBoolPatch             `json:"streaming_enabled"`
 }
 
 func (req *roleRequest) normalize() {
@@ -141,14 +147,16 @@ func (s *Server) apiCreateRole(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	role := s.service.Repository().SaveAIRole(store.AIRoleRecord{
-		TenantID:      tenantID,
-		Name:          req.Name,
-		Description:   req.Description,
-		SpeakingStyle: req.SpeakingStyle,
-		Goals:         req.Goals,
-		Constraints:   req.Constraints,
-		Context:       req.Context,
-		CustomFields:  req.CustomFields,
+		TenantID:              tenantID,
+		Name:                  req.Name,
+		Description:           req.Description,
+		SpeakingStyle:         req.SpeakingStyle,
+		Goals:                 req.Goals,
+		Constraints:           req.Constraints,
+		Context:               req.Context,
+		CustomFields:          req.CustomFields,
+		RichFormattingEnabled: req.RichFormattingEnabled.Apply(nil),
+		StreamingEnabled:      req.StreamingEnabled.Apply(nil),
 	})
 	if role.ID == 0 {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to save role"})
@@ -175,7 +183,8 @@ func (s *Server) apiUpdateRole(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": msg})
 		return
 	}
-	if _, ok := s.service.Repository().AIRoleByID(tenantID, roleID); !ok {
+	existing, ok := s.service.Repository().AIRoleByID(tenantID, roleID)
+	if !ok {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "role not found"})
 		return
 	}
@@ -185,15 +194,17 @@ func (s *Server) apiUpdateRole(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	role := store.AIRoleRecord{
-		ID:            roleID,
-		TenantID:      tenantID,
-		Name:          req.Name,
-		Description:   req.Description,
-		SpeakingStyle: req.SpeakingStyle,
-		Goals:         req.Goals,
-		Constraints:   req.Constraints,
-		Context:       req.Context,
-		CustomFields:  req.CustomFields,
+		ID:                    roleID,
+		TenantID:              tenantID,
+		Name:                  req.Name,
+		Description:           req.Description,
+		SpeakingStyle:         req.SpeakingStyle,
+		Goals:                 req.Goals,
+		Constraints:           req.Constraints,
+		Context:               req.Context,
+		CustomFields:          req.CustomFields,
+		RichFormattingEnabled: req.RichFormattingEnabled.Apply(existing.RichFormattingEnabled),
+		StreamingEnabled:      req.StreamingEnabled.Apply(existing.StreamingEnabled),
 	}
 	if !s.service.Repository().UpdateAIRole(role) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to update role"})
@@ -487,6 +498,7 @@ func (s *Server) apiGetUserSettings(w http.ResponseWriter, r *http.Request) {
 			DefaultModeForNewChats: "manual",
 			LearningEnabled:        true,
 			RichFormattingEnabled:  true,
+			StreamingEnabled:       false,
 			LanguageForDrafts:      "auto",
 		}
 	}
@@ -504,6 +516,7 @@ func (s *Server) apiSaveUserSettings(w http.ResponseWriter, r *http.Request) {
 		DefaultModeForNewChats string `json:"default_mode_for_new_chats"`
 		LearningEnabled        *bool  `json:"learning_enabled"`
 		RichFormattingEnabled  *bool  `json:"rich_formatting_enabled"`
+		StreamingEnabled       *bool  `json:"streaming_enabled"`
 		LanguageForDrafts      string `json:"language_for_drafts"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -518,6 +531,7 @@ func (s *Server) apiSaveUserSettings(w http.ResponseWriter, r *http.Request) {
 			DefaultModeForNewChats: "manual",
 			LearningEnabled:        true,
 			RichFormattingEnabled:  true,
+			StreamingEnabled:       false,
 			LanguageForDrafts:      "auto",
 		}
 	}
@@ -542,6 +556,9 @@ func (s *Server) apiSaveUserSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.RichFormattingEnabled != nil {
 		settings.RichFormattingEnabled = *req.RichFormattingEnabled
+	}
+	if req.StreamingEnabled != nil {
+		settings.StreamingEnabled = *req.StreamingEnabled
 	}
 	if req.LanguageForDrafts != "" {
 		if req.LanguageForDrafts != "auto" && req.LanguageForDrafts != "primary" {

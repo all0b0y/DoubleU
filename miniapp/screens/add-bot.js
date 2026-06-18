@@ -6,6 +6,32 @@ function esc(str) {
   return String(str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
+function nullableBoolMode(value) {
+  if (value === true) return 'on';
+  if (value === false) return 'off';
+  return 'inherit';
+}
+
+function modeToNullableBool(mode) {
+  if (mode === 'on') return true;
+  if (mode === 'off') return false;
+  return null;
+}
+
+function deliverySelectHTML(id, label, hint, value) {
+  const mode = nullableBoolMode(value);
+  return `
+    <div class="field-group">
+      <div class="field-label">${label}</div>
+      <select class="field-select" id="${id}">
+        <option value="inherit" ${mode === 'inherit' ? 'selected' : ''}>наследовать</option>
+        <option value="on" ${mode === 'on' ? 'selected' : ''}>включено</option>
+        <option value="off" ${mode === 'off' ? 'selected' : ''}>выключено</option>
+      </select>
+      <div style="font-size:11px;color:var(--muted);line-height:1.4;margin-top:6px;">${hint}</div>
+    </div>`;
+}
+
 /**
  * Connect a new Telegram bot. A tenant may connect several, so this is always
  * the token-entry form (managing an existing bot lives in renderBotSettings).
@@ -151,6 +177,17 @@ export function renderBotSettings(navigate, botId) {
       </div>`;
   }
 
+  function deliverySectionHTML(bot) {
+    return `
+      <div class="st-section">
+        <p class="st-section-label">формат ответов</p>
+        <div class="st-card" style="padding:14px;display:flex;flex-direction:column;gap:14px;">
+          ${deliverySelectHTML('bs-rich-formatting', 'rich-форматирование', 'таблицы, списки и код в ответах роли', bot.rich_formatting_enabled)}
+          ${deliverySelectHTML('bs-streaming', 'потоковый AI-режим', 'псевдо-стриминг готового безопасного ответа', bot.streaming_enabled)}
+        </div>
+      </div>`;
+  }
+
   function render(bot, roles) {
     el.querySelector('#bs-sub').textContent = `@${bot.bot_username || bot.bot_id}`;
     let activeRoleId = bot.ai_role?.id || 0;
@@ -167,6 +204,7 @@ export function renderBotSettings(navigate, botId) {
           </div>
         </div>
         <div id="bs-role-section">${roleSectionHTML(roles, activeRoleId)}</div>
+        <div id="bs-delivery-section">${deliverySectionHTML(bot)}</div>
         <div class="st-section">
           <div class="st-card">
             <div class="st-row st-row-danger" id="btn-disconnect">
@@ -202,6 +240,27 @@ export function renderBotSettings(navigate, botId) {
       });
     }
     wireRolePicker();
+
+    function wireDeliveryControls() {
+      ['#bs-rich-formatting', '#bs-streaming'].forEach(selector => {
+        el.querySelector(selector)?.addEventListener('change', async () => {
+          twa?.HapticFeedback?.selectionChanged();
+          try {
+            bot = await api.updateBotSettings(bot.bot_id, {
+              rich_formatting_enabled: modeToNullableBool(el.querySelector('#bs-rich-formatting').value),
+              streaming_enabled:       modeToNullableBool(el.querySelector('#bs-streaming').value),
+            });
+            twa?.HapticFeedback?.notificationOccurred('success');
+          } catch (err) {
+            twa?.HapticFeedback?.notificationOccurred('error');
+            twa?.showAlert(`Ошибка: ${err.message}`);
+            el.querySelector('#bs-delivery-section').innerHTML = deliverySectionHTML(bot);
+            wireDeliveryControls();
+          }
+        });
+      });
+    }
+    wireDeliveryControls();
 
     el.querySelector('#btn-disconnect').addEventListener('click', () => {
       twa?.HapticFeedback?.impactOccurred('medium');

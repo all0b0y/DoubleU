@@ -28,6 +28,9 @@ type UserBotRecord struct {
 	// (migration 102); 0 means the default assistant persona. Managed via
 	// SetUserBotRole, not SaveUserBot, so re-register/offset writes preserve it.
 	AIRoleID int64
+	// Nil delivery toggles inherit role/owner defaults; non-nil values override them.
+	RichFormattingEnabled *bool
+	StreamingEnabled      *bool
 }
 
 // botStoreKey is the in-memory map key for a single bot registration. A tenant
@@ -49,8 +52,16 @@ func (r *Repository) SaveUserBot(record UserBotRecord) {
 	// Preserve this bot's role across re-registration: the DB upsert below leaves
 	// ai_role_id untouched, so the in-memory path must match (the RegisterBot
 	// caller never carries the role).
-	if existing, ok := r.userBots[key]; ok && record.AIRoleID == 0 {
-		record.AIRoleID = existing.AIRoleID
+	if existing, ok := r.userBots[key]; ok {
+		if record.AIRoleID == 0 {
+			record.AIRoleID = existing.AIRoleID
+		}
+		if record.RichFormattingEnabled == nil {
+			record.RichFormattingEnabled = cloneBoolPtr(existing.RichFormattingEnabled)
+		}
+		if record.StreamingEnabled == nil {
+			record.StreamingEnabled = cloneBoolPtr(existing.StreamingEnabled)
+		}
 	}
 	r.userBots[key] = record
 	r.mu.Unlock()
@@ -96,18 +107,49 @@ func (r *Repository) SetUserBotRole(tenantID string, botID, roleID int64) {
 	}
 }
 
+// SetUserBotDeliverySettings stores nullable per-bot delivery overrides. Nil
+// means the bot inherits the governing role/owner setting.
+func (r *Repository) SetUserBotDeliverySettings(tenantID string, botID int64, richFormatting, streaming *bool) {
+	key := botStoreKey(tenantID, botID)
+	r.mu.Lock()
+	if rec, ok := r.userBots[key]; ok {
+		rec.RichFormattingEnabled = cloneBoolPtr(richFormatting)
+		rec.StreamingEnabled = cloneBoolPtr(streaming)
+		r.userBots[key] = rec
+	}
+	r.mu.Unlock()
+	if r.db != nil {
+		_, err := r.db.Exec(
+			`UPDATE user_bots
+			    SET rich_formatting_enabled = $3,
+			        streaming_enabled = $4,
+			        updated_at = now()
+			  WHERE tenant_id = $1 AND bot_id = $2`,
+			tenantID, botID, nullableBoolArg(richFormatting), nullableBoolArg(streaming),
+		)
+		r.logWriteError("set_user_bot_delivery_settings", tenantID, "", err)
+	}
+}
+
 // scanUserBot reads one user_bots row (with role) from a row scanner.
 func scanUserBot(sc rowScanner) (UserBotRecord, bool) {
 	var rec UserBotRecord
 	var roleID sql.NullInt64
-	if err := sc.Scan(&rec.TenantID, &rec.BotID, &rec.BotUsername, &rec.Token, &rec.Status, &rec.LastUpdateOffset, &roleID); err != nil {
+	var richFormatting sql.NullBool
+	var streaming sql.NullBool
+	if err := sc.Scan(
+		&rec.TenantID, &rec.BotID, &rec.BotUsername, &rec.Token, &rec.Status, &rec.LastUpdateOffset,
+		&roleID, &richFormatting, &streaming,
+	); err != nil {
 		return UserBotRecord{}, false
 	}
 	rec.AIRoleID = roleID.Int64
+	rec.RichFormattingEnabled = boolPtrFromNull(richFormatting)
+	rec.StreamingEnabled = boolPtrFromNull(streaming)
 	return rec, true
 }
 
-const userBotColumns = `tenant_id, bot_id, bot_username, token, status, last_update_offset, COALESCE(ai_role_id, 0)`
+const userBotColumns = `tenant_id, bot_id, bot_username, token, status, last_update_offset, COALESCE(ai_role_id, 0), rich_formatting_enabled, streaming_enabled`
 
 // UserBotByID returns one specific bot of the tenant.
 func (r *Repository) UserBotByID(tenantID string, botID int64) (UserBotRecord, bool) {

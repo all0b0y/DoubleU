@@ -25,8 +25,10 @@ func TestBotsListAndPerBotRole(t *testing.T) {
 	}
 	var list struct {
 		Bots []struct {
-			BotID  int64 `json:"bot_id"`
-			AIRole *struct {
+			BotID                 int64 `json:"bot_id"`
+			RichFormattingEnabled *bool `json:"rich_formatting_enabled"`
+			StreamingEnabled      *bool `json:"streaming_enabled"`
+			AIRole                *struct {
 				ID int64 `json:"id"`
 			} `json:"ai_role"`
 		} `json:"bots"`
@@ -34,6 +36,9 @@ func TestBotsListAndPerBotRole(t *testing.T) {
 	decodeBody(t, res, &list)
 	if len(list.Bots) != 2 {
 		t.Fatalf("bots = %d, want 2", len(list.Bots))
+	}
+	if list.Bots[0].RichFormattingEnabled != nil || list.Bots[0].StreamingEnabled != nil {
+		t.Fatalf("bot delivery settings must inherit by default: %+v", list.Bots[0])
 	}
 
 	// Bind the role to bot 111 only.
@@ -47,5 +52,29 @@ func TestBotsListAndPerBotRole(t *testing.T) {
 	}
 	if b, _ := repo.UserBotByID(testTenant, 222); b.AIRoleID != 0 {
 		t.Fatalf("bot 222 role = %d, want 0 (untouched)", b.AIRoleID)
+	}
+
+	// Delivery settings patch must not disturb the bound role.
+	res = miniappRequest(t, server, http.MethodPut, "/api/v1/bots/111/role",
+		`{"rich_formatting_enabled":false,"streaming_enabled":true}`)
+	if res.Code != http.StatusOK {
+		t.Fatalf("set delivery status = %d body=%s", res.Code, res.Body.String())
+	}
+	var updated struct {
+		AIRole *struct {
+			ID int64 `json:"id"`
+		} `json:"ai_role"`
+		RichFormattingEnabled *bool `json:"rich_formatting_enabled"`
+		StreamingEnabled      *bool `json:"streaming_enabled"`
+	}
+	decodeBody(t, res, &updated)
+	if updated.AIRole == nil || updated.AIRole.ID != role.ID {
+		t.Fatalf("bot role changed while updating delivery settings: %+v", updated.AIRole)
+	}
+	if updated.RichFormattingEnabled == nil || *updated.RichFormattingEnabled || updated.StreamingEnabled == nil || !*updated.StreamingEnabled {
+		t.Fatalf("bot delivery settings response = %+v", updated)
+	}
+	if b, _ := repo.UserBotByID(testTenant, 111); b.AIRoleID != role.ID || b.RichFormattingEnabled == nil || *b.RichFormattingEnabled || b.StreamingEnabled == nil || !*b.StreamingEnabled {
+		t.Fatalf("bot 111 after delivery patch = %+v", b)
 	}
 }

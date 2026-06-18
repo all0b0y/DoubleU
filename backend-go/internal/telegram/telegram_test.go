@@ -137,7 +137,10 @@ func TestBotSenderSendRichMessageBuildsBody(t *testing.T) {
 	var requestPath string
 	var body map[string]any
 	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
-		data, _ := io.ReadAll(request.Body)
+		data, err := io.ReadAll(request.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
 		requestPath = request.URL.Path
 		if err := json.Unmarshal(data, &body); err != nil {
 			t.Fatalf("decode body: %v", err)
@@ -210,6 +213,42 @@ func TestBotSenderSendRichMessageReportsTelegramStatusError(t *testing.T) {
 
 	if _, err := sender.SendRichMessage(context.Background(), OutboundMessage{ChatID: "42", Text: "hello"}); err == nil {
 		t.Fatalf("expected status error")
+	}
+}
+
+func TestBotSenderSendRichMessageDraftBuildsBody(t *testing.T) {
+	var requestPath string
+	var body map[string]any
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		data, _ := io.ReadAll(request.Body)
+		requestPath = request.URL.Path
+		if err := json.Unmarshal(data, &body); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"ok":true,"result":{"message_id":99}}`)),
+		}, nil
+	})}
+	sender := NewBotSender("token", client)
+
+	err := sender.SendRichMessageDraft(context.Background(), "42", 12345, "<tg-thinking>Thinking…</tg-thinking>")
+	if err != nil {
+		t.Fatalf("send rich draft: %v", err)
+	}
+	if !strings.Contains(requestPath, "/sendRichMessageDraft") {
+		t.Fatalf("request path = %s", requestPath)
+	}
+	if body["chat_id"] != float64(42) || body["draft_id"] != float64(12345) {
+		t.Fatalf("body = %#v", body)
+	}
+	rich, ok := body["rich_message"].(map[string]any)
+	if !ok || rich["markdown"] != "<tg-thinking>Thinking…</tg-thinking>" {
+		t.Fatalf("rich_message = %#v", body["rich_message"])
+	}
+	if _, ok := body["business_connection_id"]; ok {
+		t.Fatalf("draft body must not include business_connection_id: %#v", body)
 	}
 }
 

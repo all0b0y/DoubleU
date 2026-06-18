@@ -910,7 +910,7 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 	result := InboundResult{Event: event, Decision: decision, Reason: reason}
 	switch decision {
 	case contracts.DecisionAutoReply:
-		sentMsgID, err := s.sendRecipient(ctx, event, event.EventID, proposal.ResponseText, proposal.TextFormat)
+		sentMsgID, err := s.sendRecipient(ctx, event, event.EventID, proposal.ResponseText, proposal.TextFormat, true)
 		if err != nil {
 			s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateFailed)
 			s.repository.AppendAudit(s.auditEvent(event, contracts.DecisionErrorFallback, "send_error:"+err.Error()))
@@ -2157,7 +2157,7 @@ func (s *Service) HandleApprovalCallback(ctx context.Context, payload contracts.
 			ChatID:               draft.ChatID,
 			BusinessConnectionID: draft.BusinessConnectionID,
 			SourceMessageID:      draft.SourceMessageID,
-		}, draft.DecisionID, draft.ResponseText, draft.TextFormat)
+		}, draft.DecisionID, draft.ResponseText, draft.TextFormat, false)
 		if err != nil {
 			s.repository.AppendState(draft.TenantID, draft.ChatID, draft.SourceMessageID, contracts.StateFailed)
 			return ApprovalResult{}, err
@@ -2471,7 +2471,7 @@ func (s *Service) notifyDraftStatus(draft store.DraftRecord) {
 }
 
 // sendRecipient sends a reply to the contact and returns the Telegram message_id of the sent message.
-func (s *Service) sendRecipient(ctx context.Context, event contracts.NormalizedTelegramEvent, decisionID, text string, textFormat contracts.TextFormat) (string, error) {
+func (s *Service) sendRecipient(ctx context.Context, event contracts.NormalizedTelegramEvent, decisionID, text string, textFormat contracts.TextFormat, allowStreaming bool) (string, error) {
 	key := contracts.SendIdempotencyKey(event.TenantID, event.ChatID, event.SourceMessageID, decisionID)
 	duplicate := s.repository.MarkSend(store.SendRecord{
 		Key:             key,
@@ -2502,42 +2502,185 @@ func (s *Service) sendRecipient(ctx context.Context, event contracts.NormalizedT
 		return "", err
 	}
 	if textFormat.Normalize() == contracts.TextFormatRich {
-		if !s.richFormattingEnabled(event.TenantID) {
+		deliverySettings := s.deliverySettingsFor(event)
+		if !deliverySettings.RichFormattingEnabled {
 			return sendMessage(ctx, sender, msg)
 		}
-		if richSender, ok := sender.(interface {
+		if allowStreaming && deliverySettings.StreamingEnabled && s.richDraftStreamingAllowedFor(event) {
+			return s.sendStreamingRichRecipient(ctx, sender, msg)
+		}
+		return s.sendRichRecipient(ctx, sender, msg)
+	}
+	return sendMessage(ctx, sender, msg)
+}
+
+type deliverySettings struct {
+	RichFormattingEnabled bool
+	StreamingEnabled      bool
+}
+
+func (s *Service) deliverySettingsFor(event contracts.NormalizedTelegramEvent) deliverySettings {
+	settings := deliverySettings{RichFormattingEnabled: true}
+	if userSettings, ok := s.repository.UserSettings(event.TenantID); ok {
+		settings.RichFormattingEnabled = userSettings.RichFormattingEnabled
+		settings.StreamingEnabled = userSettings.StreamingEnabled
+	}
+	if role, ok := s.resolveRole(event.TenantID, event.ChatID); ok {
+		settings.RichFormattingEnabled = applyScopedBool(settings.RichFormattingEnabled, role.RichFormattingEnabled)
+		settings.StreamingEnabled = applyScopedBool(settings.StreamingEnabled, role.StreamingEnabled)
+	}
+	if bot, ok := s.botForDeliverySettings(event); ok {
+		settings.RichFormattingEnabled = applyScopedBool(settings.RichFormattingEnabled, bot.RichFormattingEnabled)
+		settings.StreamingEnabled = applyScopedBool(settings.StreamingEnabled, bot.StreamingEnabled)
+	}
+	return settings
+}
+
+func (s *Service) richOwnerDraftCardEnabled(event contracts.NormalizedTelegramEvent, draft store.DraftRecord) bool {
+	return draft.TextFormat.Normalize() == contracts.TextFormatRich && s.deliverySettingsFor(event).RichFormattingEnabled
+}
+
+func (s *Service) sendOwnerCard(ctx context.Context, msg telegram.OutboundMessage, rich bool) (string, error) {
+	if rich {
+		if richSender, ok := s.sender.(interface {
 			SendRichMessage(context.Context, telegram.OutboundMessage) (string, error)
 		}); ok {
 			msgID, err := richSender.SendRichMessage(ctx, msg)
 			if err == nil {
 				return msgID, nil
 			}
-			s.logger.Warn("telegram rich send failed; falling back to HTML",
-				"tenant_id", event.TenantID,
-				"chat_id", event.ChatID,
-				"decision_id", decisionID,
+			s.logger.Warn("telegram owner rich card send failed; falling back to plain",
+				"tenant_id", msg.TenantID,
+				"chat_id", msg.ChatID,
+				"decision_id", msg.DecisionID,
 				"error", err,
 			)
-		} else {
-			s.logger.Warn("telegram rich sender unavailable; falling back to HTML",
-				"tenant_id", event.TenantID,
-				"chat_id", event.ChatID,
-				"decision_id", decisionID,
-			)
 		}
-		msg.Text = html.EscapeString(text)
-		msg.ParseMode = "HTML"
-		return sendMessage(ctx, sender, msg)
 	}
-	return sendMessage(ctx, sender, msg)
+	if idSender, ok := s.sender.(interface {
+		SendMessageGetID(context.Context, telegram.OutboundMessage) (string, error)
+	}); ok {
+		return idSender.SendMessageGetID(ctx, msg)
+	}
+	return "", s.sender.SendMessage(ctx, msg)
 }
 
-func (s *Service) richFormattingEnabled(tenantID string) bool {
-	settings, ok := s.repository.UserSettings(tenantID)
-	if !ok {
-		return true
+const richStreamingThinkingMarkdown = "<tg-thinking>Thinking…</tg-thinking>"
+
+func (s *Service) richDraftStreamingAllowedFor(event contracts.NormalizedTelegramEvent) bool {
+	if event.BusinessConnectionID != "" {
+		return false
 	}
-	return settings.RichFormattingEnabled
+	transport := event.Transport
+	if transport == "" {
+		transport = s.repository.ChatTransport(event.TenantID, event.ChatID)
+	}
+	if transport != contracts.TransportBot {
+		return false
+	}
+	chatID := contracts.RawChatID(event.ChatID)
+	parsedChatID, err := strconv.ParseInt(chatID, 10, 64)
+	return err == nil && parsedChatID > 0
+}
+
+func (s *Service) sendStreamingRichRecipient(ctx context.Context, sender telegram.Sender, msg telegram.OutboundMessage) (string, error) {
+	draftSender, ok := sender.(interface {
+		SendRichMessageDraft(context.Context, string, int64, string) error
+	})
+	if !ok {
+		s.logger.Warn("telegram rich draft sender unavailable; skipping draft preview",
+			"tenant_id", msg.TenantID,
+			"chat_id", msg.ChatID,
+			"decision_id", msg.DecisionID,
+		)
+		return s.sendRichRecipient(ctx, sender, msg)
+	}
+	s.sendRichDraftPreview(ctx, draftSender, msg)
+	return s.sendRichRecipient(ctx, sender, msg)
+}
+
+func (s *Service) sendRichDraftPreview(ctx context.Context, sender interface {
+	SendRichMessageDraft(context.Context, string, int64, string) error
+}, msg telegram.OutboundMessage) {
+	draftID := richDraftID(msg)
+	for _, markdown := range richDraftFrames(msg.Text) {
+		if err := sender.SendRichMessageDraft(ctx, msg.ChatID, draftID, markdown); err != nil {
+			s.logger.Warn("telegram rich draft send failed; continuing with final send",
+				"tenant_id", msg.TenantID,
+				"chat_id", msg.ChatID,
+				"decision_id", msg.DecisionID,
+				"draft_id", draftID,
+				"error", err,
+			)
+			return
+		}
+	}
+}
+
+func richDraftFrames(finalMarkdown string) []string {
+	frames := []string{richStreamingThinkingMarkdown}
+	runes := []rune(finalMarkdown)
+	if len(runes) > 120 {
+		frames = append(frames, string(runes[:len(runes)/2]))
+	}
+	if finalMarkdown != "" {
+		frames = append(frames, finalMarkdown)
+	}
+	return frames
+}
+
+func richDraftID(msg telegram.OutboundMessage) int64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(msg.TenantID + "\x00" + msg.ChatID + "\x00" + msg.SourceMessageID + "\x00" + msg.DecisionID)) // hash.Hash never returns an error.
+	id := int64(h.Sum64() & 0x7fffffffffffffff)
+	if id == 0 {
+		return 1
+	}
+	return id
+}
+
+func (s *Service) sendRichRecipient(ctx context.Context, sender telegram.Sender, msg telegram.OutboundMessage) (string, error) {
+	if richSender, ok := sender.(interface {
+		SendRichMessage(context.Context, telegram.OutboundMessage) (string, error)
+	}); ok {
+		msgID, err := richSender.SendRichMessage(ctx, msg)
+		if err == nil {
+			return msgID, nil
+		}
+		s.logger.Warn("telegram rich send failed; falling back to HTML",
+			"tenant_id", msg.TenantID,
+			"chat_id", msg.ChatID,
+			"decision_id", msg.DecisionID,
+			"error", err,
+		)
+	} else {
+		s.logger.Warn("telegram rich sender unavailable; falling back to HTML",
+			"tenant_id", msg.TenantID,
+			"chat_id", msg.ChatID,
+			"decision_id", msg.DecisionID,
+		)
+	}
+	fallback := msg
+	fallback.Text = html.EscapeString(msg.Text)
+	fallback.ParseMode = "HTML"
+	return sendMessage(ctx, sender, fallback)
+}
+
+func (s *Service) botForDeliverySettings(event contracts.NormalizedTelegramEvent) (store.UserBotRecord, bool) {
+	if event.BotID != "" {
+		botID, err := strconv.ParseInt(event.BotID, 10, 64)
+		if err == nil {
+			return s.repository.UserBotByID(event.TenantID, botID)
+		}
+	}
+	return s.botForChat(event.TenantID, event.ChatID)
+}
+
+func applyScopedBool(current bool, override *bool) bool {
+	if override == nil {
+		return current
+	}
+	return *override
 }
 
 func sendMessage(ctx context.Context, sender telegram.Sender, msg telegram.OutboundMessage) (string, error) {
@@ -2695,17 +2838,15 @@ func (s *Service) sendWarningToOwner(ctx context.Context, event contracts.Normal
 		Text:            bot.WarningCardText(event.MessageText, ownerNote, event.ChatDisplayName),
 		ReplyMarkup:     bot.WarningKeyboard(draft.DraftID),
 	}
-	if idSender, ok := s.sender.(interface {
-		SendMessageGetID(context.Context, telegram.OutboundMessage) (string, error)
-	}); ok {
-		msgID, err := idSender.SendMessageGetID(ctx, msg)
-		if err == nil && msgID != "" {
-			draft.OwnerChatID = ownerChatID
-			draft.OwnerMessageID = msgID
-			s.repository.UpdateDraft(draft)
-		}
-	} else {
-		_ = s.sender.SendMessage(ctx, msg)
+	msgID, err := s.sendOwnerCard(ctx, msg, false)
+	if err != nil {
+		s.logger.Warn("failed to deliver warning card to owner", "tenant_id", event.TenantID, "draft_id", draft.DraftID, "error", err)
+		return
+	}
+	if msgID != "" {
+		draft.OwnerChatID = ownerChatID
+		draft.OwnerMessageID = msgID
+		s.repository.UpdateDraft(draft)
 	}
 }
 
@@ -2768,18 +2909,15 @@ func (s *Service) sendDraftToOwner(ctx context.Context, event contracts.Normaliz
 		Text:            cardText,
 		ReplyMarkup:     keyboard,
 	}
-	// If the sender can return a message ID, store it so the card can be deleted later.
-	if idSender, ok := s.sender.(interface {
-		SendMessageGetID(context.Context, telegram.OutboundMessage) (string, error)
-	}); ok {
-		msgID, err := idSender.SendMessageGetID(ctx, msg)
-		if err == nil && msgID != "" {
-			draft.OwnerChatID = ownerChatID
-			draft.OwnerMessageID = msgID
-			s.repository.UpdateDraft(draft)
-		}
-	} else {
-		_ = s.sender.SendMessage(ctx, msg)
+	msgID, err := s.sendOwnerCard(ctx, msg, s.richOwnerDraftCardEnabled(event, draft))
+	if err != nil {
+		s.logger.Warn("failed to deliver draft card to owner", "tenant_id", event.TenantID, "draft_id", draft.DraftID, "error", err)
+		return
+	}
+	if msgID != "" {
+		draft.OwnerChatID = ownerChatID
+		draft.OwnerMessageID = msgID
+		s.repository.UpdateDraft(draft)
 	}
 }
 
@@ -3192,7 +3330,7 @@ func (s *Service) ManualSend(ctx context.Context, tenantID, chatID, text string)
 	sentMsgID, err := s.sendRecipient(ctx, contracts.NormalizedTelegramEvent{
 		TenantID: tenantID,
 		ChatID:   chatID,
-	}, decisionID, text, contracts.TextFormatPlain)
+	}, decisionID, text, contracts.TextFormatPlain, false)
 	if err != nil {
 		return err
 	}
@@ -3758,17 +3896,15 @@ func (s *Service) sendQuestionToOwner(ctx context.Context, event contracts.Norma
 		Text:            cardText,
 		ReplyMarkup:     keyboard,
 	}
-	if idSender, ok := s.sender.(interface {
-		SendMessageGetID(context.Context, telegram.OutboundMessage) (string, error)
-	}); ok {
-		msgID, err := idSender.SendMessageGetID(ctx, msg)
-		if err == nil && msgID != "" {
-			draft.OwnerChatID = ownerChatID
-			draft.OwnerMessageID = msgID
-			s.repository.UpdateDraft(draft)
-		}
-	} else {
-		_ = s.sender.SendMessage(ctx, msg)
+	msgID, err := s.sendOwnerCard(ctx, msg, false)
+	if err != nil {
+		s.logger.Warn("failed to deliver question card to owner", "tenant_id", event.TenantID, "draft_id", draft.DraftID, "error", err)
+		return
+	}
+	if msgID != "" {
+		draft.OwnerChatID = ownerChatID
+		draft.OwnerMessageID = msgID
+		s.repository.UpdateDraft(draft)
 	}
 }
 
@@ -3802,7 +3938,7 @@ func (s *Service) handleChoiceOption(ctx context.Context, event contracts.Normal
 	if err != nil {
 		s.logger.Error("choice option: ai hint failed, sending option text directly", "error", err, "draft_id", draftID)
 		srcEvent := s.resolveSourceEvent(draft)
-		_, _ = s.sendRecipient(ctx, srcEvent, draft.DecisionID+":choice_fallback", optionText, contracts.TextFormatPlain)
+		_, _ = s.sendRecipient(ctx, srcEvent, draft.DecisionID+":choice_fallback", optionText, contracts.TextFormatPlain, false)
 		return InboundResult{Event: event, Decision: contracts.DecisionAutoReply, Reason: "choice_fallback_sent", DraftID: draftID}
 	}
 
@@ -3813,7 +3949,7 @@ func (s *Service) handleChoiceOption(ctx context.Context, event contracts.Normal
 	}
 	srcEvent := s.resolveSourceEvent(newDraft)
 	if settings.Mode == contracts.ChatModeAuto {
-		_, _ = s.sendRecipient(ctx, srcEvent, newDraft.DecisionID, newDraft.ResponseText, newDraft.TextFormat)
+		_, _ = s.sendRecipient(ctx, srcEvent, newDraft.DecisionID, newDraft.ResponseText, newDraft.TextFormat, true)
 		s.saveOutgoingMessage(srcEvent, ownerID, "", newDraft.ResponseText, newDraft.DecisionID, newDraft.TextFormat)
 		if s.notify != nil {
 			s.notify(newDraft.TenantID, "new_message", map[string]any{"chat_id": newDraft.ChatID})

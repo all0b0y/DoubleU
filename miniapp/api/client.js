@@ -70,6 +70,7 @@ export const api = {
   bots:          ()              => request('GET',    '/api/v1/bots'),
   registerBot:   (token)         => request('POST',   '/api/v1/bots', { token }),
   setBotRole:    (botId, roleId) => request('PUT',    `/api/v1/bots/${botId}/role`, { role_id: roleId }),
+  updateBotSettings: (botId, data) => request('PUT',  `/api/v1/bots/${botId}/role`, data),
   disconnectBot: (botId)         => request('DELETE', `/api/v1/bots/${botId}`),
 };
 

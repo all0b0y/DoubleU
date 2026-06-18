@@ -57,6 +57,9 @@ func TestRoleLifecycle(t *testing.T) {
 	if created.ID == 0 || created.Name != "Менеджер" {
 		t.Fatalf("created role = %+v", created)
 	}
+	if created.RichFormattingEnabled != nil || created.StreamingEnabled != nil {
+		t.Fatalf("new role must inherit delivery settings by default: %+v", created)
+	}
 
 	// Duplicate name → 409.
 	res = miniappRequest(t, server, http.MethodPost, "/api/v1/roles", `{"name":"менеджер","description":"дубль"}`)
@@ -130,6 +133,43 @@ func TestRoleLifecycle(t *testing.T) {
 	}
 	if _, ok := repo.AIRoleForChat(testTenant, "42"); ok {
 		t.Fatalf("chat still has a role after role deletion")
+	}
+}
+
+func TestRoleDeliverySettingsRoundTrip(t *testing.T) {
+	repo := store.NewRepository()
+	server := NewServer(core.NewService(repo, nil, nil))
+
+	res := miniappRequest(t, server, http.MethodPost, "/api/v1/roles",
+		`{"name":"Поддержка","description":"Отвечает по FAQ","rich_formatting_enabled":false,"streaming_enabled":true}`)
+	if res.Code != http.StatusOK {
+		t.Fatalf("create status = %d body=%s", res.Code, res.Body.String())
+	}
+	var created roleJSON
+	decodeBody(t, res, &created)
+	if created.RichFormattingEnabled == nil || *created.RichFormattingEnabled || created.StreamingEnabled == nil || !*created.StreamingEnabled {
+		t.Fatalf("created delivery settings = %+v", created)
+	}
+
+	// Old clients that omit new fields must not clobber already saved delivery settings.
+	res = miniappRequest(t, server, http.MethodPut, fmt.Sprintf("/api/v1/roles/%d", created.ID),
+		`{"name":"Поддержка","description":"Отвечает по FAQ","speaking_style":"коротко"}`)
+	if res.Code != http.StatusOK {
+		t.Fatalf("update status = %d body=%s", res.Code, res.Body.String())
+	}
+	role, ok := repo.AIRoleByID(testTenant, created.ID)
+	if !ok || role.RichFormattingEnabled == nil || *role.RichFormattingEnabled || role.StreamingEnabled == nil || !*role.StreamingEnabled {
+		t.Fatalf("delivery settings after legacy update = %+v ok=%v", role, ok)
+	}
+
+	res = miniappRequest(t, server, http.MethodPut, fmt.Sprintf("/api/v1/roles/%d", created.ID),
+		`{"name":"Поддержка","description":"Отвечает по FAQ","rich_formatting_enabled":null,"streaming_enabled":false}`)
+	if res.Code != http.StatusOK {
+		t.Fatalf("clear status = %d body=%s", res.Code, res.Body.String())
+	}
+	decodeBody(t, res, &created)
+	if created.RichFormattingEnabled != nil || created.StreamingEnabled == nil || *created.StreamingEnabled {
+		t.Fatalf("delivery settings after clear/update = %+v", created)
 	}
 }
 
@@ -283,12 +323,12 @@ func TestUserSettingsRoundTrip(t *testing.T) {
 	res := miniappRequest(t, server, http.MethodGet, "/api/v1/settings/user", "")
 	var got contracts.UserSettings
 	decodeBody(t, res, &got)
-	if got.DefaultModeForNewChats != "manual" || !got.LearningEnabled || !got.RichFormattingEnabled {
+	if got.DefaultModeForNewChats != "manual" || !got.LearningEnabled || !got.RichFormattingEnabled || got.StreamingEnabled {
 		t.Fatalf("defaults = %+v", got)
 	}
 
 	res = miniappRequest(t, server, http.MethodPut, "/api/v1/settings/user",
-		`{"display_name":"Алексей","bio":"продакт","default_mode_for_new_chats":"semi_auto","learning_enabled":false,"rich_formatting_enabled":false,"language_for_drafts":"primary"}`)
+		`{"display_name":"Алексей","bio":"продакт","default_mode_for_new_chats":"semi_auto","learning_enabled":false,"rich_formatting_enabled":false,"streaming_enabled":true,"language_for_drafts":"primary"}`)
 	if res.Code != http.StatusOK {
 		t.Fatalf("save status = %d body=%s", res.Code, res.Body.String())
 	}
@@ -296,7 +336,7 @@ func TestUserSettingsRoundTrip(t *testing.T) {
 	res = miniappRequest(t, server, http.MethodGet, "/api/v1/settings/user", "")
 	decodeBody(t, res, &got)
 	if got.DisplayName != "Алексей" || got.DefaultModeForNewChats != "semi_auto" ||
-		got.LearningEnabled || got.RichFormattingEnabled || got.LanguageForDrafts != "primary" {
+		got.LearningEnabled || got.RichFormattingEnabled || !got.StreamingEnabled || got.LanguageForDrafts != "primary" {
 		t.Fatalf("round-trip settings = %+v", got)
 	}
 

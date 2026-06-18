@@ -7,6 +7,10 @@ import (
 	"doubleu/backend-go/internal/contracts"
 )
 
+func testBoolPtr(value bool) *bool {
+	return &value
+}
+
 func TestRepositoryStateAndIdempotency(t *testing.T) {
 	repository := NewRepository()
 	settings := contracts.ChatSettings{TenantID: "t", ChatID: "c", Mode: contracts.ChatModeAuto}
@@ -56,6 +60,33 @@ func TestAIRoleCustomFieldsRoundTrip(t *testing.T) {
 	}
 	if after, _ := repo.AIRoleByID("t", saved.ID); len(after.CustomFields) != 1 || after.CustomFields[0].Title != "Только одно" {
 		t.Fatalf("custom fields not updated: %+v", after.CustomFields)
+	}
+}
+
+func TestAIRoleDeliverySettingsRoundTrip(t *testing.T) {
+	repo := NewRepository()
+	saved := repo.SaveAIRole(AIRoleRecord{
+		TenantID:              "t",
+		Name:                  "Менеджер",
+		Description:           "d",
+		RichFormattingEnabled: testBoolPtr(false),
+		StreamingEnabled:      testBoolPtr(true),
+	})
+	if saved.ID == 0 {
+		t.Fatal("role not saved")
+	}
+	got, ok := repo.AIRoleByID("t", saved.ID)
+	if !ok || got.RichFormattingEnabled == nil || *got.RichFormattingEnabled || got.StreamingEnabled == nil || !*got.StreamingEnabled {
+		t.Fatalf("delivery settings not round-tripped: %+v ok=%v", got, ok)
+	}
+	got.RichFormattingEnabled = nil
+	got.StreamingEnabled = testBoolPtr(false)
+	if !repo.UpdateAIRole(got) {
+		t.Fatal("update failed")
+	}
+	after, _ := repo.AIRoleByID("t", saved.ID)
+	if after.RichFormattingEnabled != nil || after.StreamingEnabled == nil || *after.StreamingEnabled {
+		t.Fatalf("delivery settings not updated: %+v", after)
 	}
 }
 

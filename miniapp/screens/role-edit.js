@@ -6,13 +6,28 @@ function esc(str) {
   return String(str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
+function nullableBoolMode(value) {
+  if (value === true) return 'on';
+  if (value === false) return 'off';
+  return 'inherit';
+}
+
+function modeToNullableBool(mode) {
+  if (mode === 'on') return true;
+  if (mode === 'off') return false;
+  return null;
+}
+
 /**
  * Create (roleId == null) or edit a role. The five labeled fields map 1:1 to
  * the ai_roles columns — a guided replacement for the old pipe-syntax command.
  */
 export function renderRoleEdit(navigate, roleId) {
   const isNew = roleId === null;
-  let role = { name: '', description: '', speaking_style: '', goals: '', constraints: '', context: '', custom_fields: [] };
+  let role = {
+    name: '', description: '', speaking_style: '', goals: '', constraints: '',
+    context: '', custom_fields: [], rich_formatting_enabled: null, streaming_enabled: null,
+  };
   // Owner-defined extra fields (title + why + optional context), edited live.
   let customFields = [];
 
@@ -64,6 +79,31 @@ export function renderRoleEdit(navigate, roleId) {
         <div class="field-label">${label}${required ? ' *' : ''}</div>
         ${input}
         <div style="font-size:11px;color:var(--muted);line-height:1.4;">${hint}</div>
+      </div>`;
+  }
+
+  function deliverySelectHTML(id, label, hint, value) {
+    const mode = nullableBoolMode(value);
+    return `
+      <div class="field-group">
+        <div class="field-label">${label}</div>
+        <select class="field-select" id="${id}">
+          <option value="inherit" ${mode === 'inherit' ? 'selected' : ''}>наследовать</option>
+          <option value="on" ${mode === 'on' ? 'selected' : ''}>включено</option>
+          <option value="off" ${mode === 'off' ? 'selected' : ''}>выключено</option>
+        </select>
+        <div style="font-size:11px;color:var(--muted);line-height:1.4;margin-top:6px;">${hint}</div>
+      </div>`;
+  }
+
+  function deliverySettingsHTML() {
+    return `
+      <div class="st-section">
+        <p class="st-section-label">формат ответов</p>
+        <div class="st-card" style="padding:14px;display:flex;flex-direction:column;gap:14px;">
+          ${deliverySelectHTML('f-rich-formatting', 'rich-форматирование', 'таблицы, списки и код в ответах этой роли', role.rich_formatting_enabled)}
+          ${deliverySelectHTML('f-streaming', 'потоковый AI-режим', 'псевдо-стриминг готового безопасного ответа', role.streaming_enabled)}
+        </div>
       </div>`;
   }
 
@@ -161,6 +201,8 @@ export function renderRoleEdit(navigate, roleId) {
           ${fieldHTML('f-constraints', 'ограничения', 'Что роли нельзя делать или обсуждать. Необязательно.', role.constraints,
             { textarea: true, placeholder: 'Не обещать скидки, не обсуждать конкурентов…' })}
         </div>
+
+        ${deliverySettingsHTML()}
 
         <div class="st-section">
           <p class="st-section-label">материалы роли (контекст)</p>
@@ -274,6 +316,8 @@ export function renderRoleEdit(navigate, roleId) {
       constraints:    el.querySelector('#f-constraints')?.value.trim() || '',
       context:        el.querySelector('#f-context')?.value.trim() || '',
       custom_fields:  cleaned,
+      rich_formatting_enabled: modeToNullableBool(el.querySelector('#f-rich-formatting')?.value),
+      streaming_enabled:       modeToNullableBool(el.querySelector('#f-streaming')?.value),
     };
     if (!data.name) {
       twa?.HapticFeedback?.notificationOccurred('error');

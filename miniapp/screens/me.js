@@ -179,6 +179,17 @@ export function renderMe(navigate) {
                 <div class="toggle-knob"></div>
               </label>
             </div>
+            <div class="st-row" style="padding:0;cursor:default;">
+              <div class="st-row-body">
+                <p class="st-row-title">потоковый AI-режим</p>
+                <p class="st-row-desc">показывать набор готового ответа</p>
+              </div>
+              <label class="toggle">
+                <input type="checkbox" id="f-streaming" ${settings.streaming_enabled ? 'checked' : ''}>
+                <div class="toggle-track"></div>
+                <div class="toggle-knob"></div>
+              </label>
+            </div>
           </div>
           <div style="padding:10px 0 0;">
             <button class="btn btn-secondary" id="btn-save-me">Сохранить</button>
@@ -269,6 +280,7 @@ export function renderMe(navigate) {
           language_for_drafts:        el.querySelector('#f-draft-lang').value,
           learning_enabled:           el.querySelector('#f-learning').checked,
           rich_formatting_enabled:    el.querySelector('#f-rich-formatting').checked,
+          streaming_enabled:          el.querySelector('#f-streaming').checked,
         });
         twa?.HapticFeedback?.notificationOccurred('success');
         btn.textContent = '✓ Сохранено';

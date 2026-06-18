@@ -237,6 +237,9 @@ type AIRoleRecord struct {
 	// CustomFields are owner-defined extra role attributes (title + why +
 	// optional context). Maps to ai_roles.custom_fields jsonb (migration 102).
 	CustomFields []contracts.AIRoleCustomField
+	// Nil delivery toggles inherit owner-level defaults; non-nil values override them.
+	RichFormattingEnabled *bool
+	StreamingEnabled      *bool
 }
 
 // Repository stores state — in memory when no DB is configured, in Postgres otherwise.
@@ -2235,8 +2238,11 @@ func (r *Repository) UpsertSemanticFact(fact SemanticFactRecord, embedding []flo
 func (r *Repository) SaveAIRole(role AIRoleRecord) AIRoleRecord {
 	if r.db != nil {
 		err := r.db.QueryRow(
-			`INSERT INTO ai_roles (tenant_id, name, description, speaking_style, goals, constraints_text, context_notes, custom_fields)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			`INSERT INTO ai_roles (
+			   tenant_id, name, description, speaking_style, goals, constraints_text,
+			   context_notes, custom_fields, rich_formatting_enabled, streaming_enabled
+			 )
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 			 ON CONFLICT (tenant_id, name) DO UPDATE SET
 			   description      = EXCLUDED.description,
 			   speaking_style   = EXCLUDED.speaking_style,
@@ -2244,10 +2250,12 @@ func (r *Repository) SaveAIRole(role AIRoleRecord) AIRoleRecord {
 			   constraints_text = EXCLUDED.constraints_text,
 			   context_notes    = EXCLUDED.context_notes,
 			   custom_fields    = EXCLUDED.custom_fields,
+			   rich_formatting_enabled = COALESCE(EXCLUDED.rich_formatting_enabled, ai_roles.rich_formatting_enabled),
+			   streaming_enabled       = COALESCE(EXCLUDED.streaming_enabled, ai_roles.streaming_enabled),
 			   updated_at       = now()
 			 RETURNING id`,
 			role.TenantID, role.Name, role.Description, role.SpeakingStyle, role.Goals, role.Constraints, role.Context,
-			encodeRoleCustomFields(role.CustomFields),
+			encodeRoleCustomFields(role.CustomFields), nullableBoolArg(role.RichFormattingEnabled), nullableBoolArg(role.StreamingEnabled),
 		).Scan(&role.ID)
 		if err != nil {
 			return AIRoleRecord{}
@@ -2271,7 +2279,7 @@ func (r *Repository) SaveAIRole(role AIRoleRecord) AIRoleRecord {
 
 // aiRoleColumns is the shared SELECT projection for ai_roles, kept in one place
 // so every read returns the same fields (including the migration-102 jsonb).
-const aiRoleColumns = `id, tenant_id, name, description, speaking_style, goals, constraints_text, COALESCE(context_notes,''), COALESCE(custom_fields,'[]'::jsonb)`
+const aiRoleColumns = `id, tenant_id, name, description, speaking_style, goals, constraints_text, COALESCE(context_notes,''), COALESCE(custom_fields,'[]'::jsonb), rich_formatting_enabled, streaming_enabled`
 
 // rowScanner is satisfied by both *sql.Row and *sql.Rows.
 type rowScanner interface{ Scan(dest ...any) error }
@@ -2281,11 +2289,16 @@ type rowScanner interface{ Scan(dest ...any) error }
 func scanAIRole(s rowScanner) (AIRoleRecord, error) {
 	var role AIRoleRecord
 	var customFields []byte
+	var richFormatting sql.NullBool
+	var streaming sql.NullBool
 	if err := s.Scan(&role.ID, &role.TenantID, &role.Name, &role.Description,
-		&role.SpeakingStyle, &role.Goals, &role.Constraints, &role.Context, &customFields); err != nil {
+		&role.SpeakingStyle, &role.Goals, &role.Constraints, &role.Context, &customFields,
+		&richFormatting, &streaming); err != nil {
 		return AIRoleRecord{}, err
 	}
 	role.CustomFields = decodeRoleCustomFields(customFields)
+	role.RichFormattingEnabled = boolPtrFromNull(richFormatting)
+	role.StreamingEnabled = boolPtrFromNull(streaming)
 	return role, nil
 }
 
@@ -2392,7 +2405,9 @@ func (r *Repository) AssignAIRoleToChat(tenantID, chatID string, roleID int64) {
 func (r *Repository) AIRoleForChat(tenantID, chatID string) (AIRoleRecord, bool) {
 	if r.db != nil {
 		role, err := scanAIRole(r.db.QueryRow(
-			`SELECT ar.id, ar.tenant_id, ar.name, ar.description, ar.speaking_style, ar.goals, ar.constraints_text, COALESCE(ar.context_notes,''), COALESCE(ar.custom_fields,'[]'::jsonb)
+			`SELECT ar.id, ar.tenant_id, ar.name, ar.description, ar.speaking_style, ar.goals,
+			        ar.constraints_text, COALESCE(ar.context_notes,''), COALESCE(ar.custom_fields,'[]'::jsonb),
+			        ar.rich_formatting_enabled, ar.streaming_enabled
 			   FROM chat_settings cs
 			   JOIN ai_roles ar ON ar.id = cs.ai_role_id
 			  WHERE cs.tenant_id = $1 AND cs.chat_id = $2`,
@@ -2527,11 +2542,13 @@ func (r *Repository) UpdateAIRole(role AIRoleRecord) bool {
 			`UPDATE ai_roles
 			    SET name = $3, description = $4, speaking_style = $5,
 			        goals = $6, constraints_text = $7, context_notes = $8,
-			        custom_fields = $9, updated_at = now()
+			        custom_fields = $9, rich_formatting_enabled = $10,
+			        streaming_enabled = $11, updated_at = now()
 			  WHERE tenant_id = $1 AND id = $2`,
 			role.TenantID, role.ID, role.Name, role.Description,
 			role.SpeakingStyle, role.Goals, role.Constraints, role.Context,
 			encodeRoleCustomFields(role.CustomFields),
+			nullableBoolArg(role.RichFormattingEnabled), nullableBoolArg(role.StreamingEnabled),
 		)
 		if err != nil {
 			r.logWriteError("update_ai_role", role.TenantID, "", err)
@@ -3820,6 +3837,7 @@ func (r *Repository) UserSettings(tenantID string) (contracts.UserSettings, bool
 			        COALESCE(us.display_name,''), COALESCE(us.bio,''), COALESCE(us.timezone,''),
 			        us.primary_language, us.secondary_languages,
 			        us.default_mode_for_new_chats, us.learning_enabled, us.rich_formatting_enabled,
+			        us.streaming_enabled,
 			        us.language_for_drafts
 			   FROM user_settings us
 			  WHERE us.tenant_id = $1
@@ -3830,6 +3848,7 @@ func (r *Repository) UserSettings(tenantID string) (contracts.UserSettings, bool
 			&s.DisplayName, &s.Bio, &s.Timezone,
 			&s.PrimaryLanguage, &secLangs,
 			&s.DefaultModeForNewChats, &s.LearningEnabled, &s.RichFormattingEnabled,
+			&s.StreamingEnabled,
 			&s.LanguageForDrafts,
 		)
 		if err == nil {
@@ -3856,8 +3875,9 @@ func (r *Repository) SaveUserSettings(settings contracts.UserSettings) {
 		   user_id, tenant_id, display_name, bio, timezone,
 		   primary_language, secondary_languages,
 		   default_mode_for_new_chats, learning_enabled, rich_formatting_enabled,
+		   streaming_enabled,
 		   language_for_drafts
-		 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+		 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
 		 ON CONFLICT (user_id) DO UPDATE SET
 		   display_name            = EXCLUDED.display_name,
 		   bio                     = EXCLUDED.bio,
@@ -3867,12 +3887,14 @@ func (r *Repository) SaveUserSettings(settings contracts.UserSettings) {
 		   default_mode_for_new_chats = EXCLUDED.default_mode_for_new_chats,
 		   learning_enabled        = EXCLUDED.learning_enabled,
 		   rich_formatting_enabled = EXCLUDED.rich_formatting_enabled,
+		   streaming_enabled       = EXCLUDED.streaming_enabled,
 		   language_for_drafts     = EXCLUDED.language_for_drafts,
 		   updated_at              = now()`,
 		settings.UserID, settings.TenantID,
 		settings.DisplayName, settings.Bio, settings.Timezone,
 		settings.PrimaryLanguage, pq.Array(nilToEmpty(settings.SecondaryLanguages)),
 		settings.DefaultModeForNewChats, settings.LearningEnabled, settings.RichFormattingEnabled,
+		settings.StreamingEnabled,
 		settings.LanguageForDrafts,
 	)
 }
@@ -3880,6 +3902,29 @@ func (r *Repository) SaveUserSettings(settings contracts.UserSettings) {
 // ============================================================
 // Helpers
 // ============================================================
+
+func boolPtrFromNull(value sql.NullBool) *bool {
+	if !value.Valid {
+		return nil
+	}
+	v := value.Bool
+	return &v
+}
+
+func cloneBoolPtr(value *bool) *bool {
+	if value == nil {
+		return nil
+	}
+	v := *value
+	return &v
+}
+
+func nullableBoolArg(value *bool) any {
+	if value == nil {
+		return nil
+	}
+	return *value
+}
 
 func stringsFromPrivacyFlags(flags contracts.PrivacyFlags) []string {
 	values := make([]string, 0, len(flags))

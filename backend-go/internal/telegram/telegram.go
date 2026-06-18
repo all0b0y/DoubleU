@@ -302,6 +302,25 @@ func (s *BotSender) DeleteMessage(ctx context.Context, chatID, messageID string)
 	})
 }
 
+// SendRichMessageDraft streams an ephemeral rich-message preview in a private bot chat.
+func (s *BotSender) SendRichMessageDraft(ctx context.Context, chatID string, draftID int64, markdown string) error {
+	if s.token == "" {
+		return fmt.Errorf("telegram bot token is empty")
+	}
+	if draftID == 0 {
+		return fmt.Errorf("draft_id must be non-zero")
+	}
+	parsedChatID, err := strconv.ParseInt(chatID, 10, 64)
+	if err != nil {
+		return fmt.Errorf("chat_id must be an integer for sendRichMessageDraft: %w", err)
+	}
+	return s.post(ctx, "sendRichMessageDraft", map[string]any{
+		"chat_id":      parsedChatID,
+		"draft_id":     draftID,
+		"rich_message": InputRichMessage{Markdown: markdown},
+	})
+}
+
 // SendMessageGetID sends a message and returns the Telegram message_id of the sent message.
 func (s *BotSender) SendMessageGetID(ctx context.Context, message OutboundMessage) (string, error) {
 	if s.token == "" {

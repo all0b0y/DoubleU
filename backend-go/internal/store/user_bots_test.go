@@ -49,16 +49,27 @@ func TestSetUserBotRole(t *testing.T) {
 	if bot, _ := repo.UserBotByID("tenant:user:77", 555); bot.AIRoleID != 9 {
 		t.Fatalf("bot role = %d, want 9", bot.AIRoleID)
 	}
+	repo.SetUserBotDeliverySettings("tenant:user:77", 555, testBoolPtr(false), testBoolPtr(true))
+	if bot, _ := repo.UserBotByID("tenant:user:77", 555); bot.RichFormattingEnabled == nil || *bot.RichFormattingEnabled || bot.StreamingEnabled == nil || !*bot.StreamingEnabled {
+		t.Fatalf("bot delivery settings = %+v", bot)
+	}
 
-	// Re-registering the same bot (new offset) must preserve the chosen role.
+	// Re-registering the same bot (new offset) must preserve the chosen role and scoped delivery settings.
 	repo.SaveUserBot(UserBotRecord{TenantID: "tenant:user:77", BotID: 555, BotUsername: "helper_bot", Token: "secret2", LastUpdateOffset: 5})
 	if bot, _ := repo.UserBotByID("tenant:user:77", 555); bot.AIRoleID != 9 {
 		t.Fatalf("bot role after re-register = %d, want 9", bot.AIRoleID)
+	}
+	if bot, _ := repo.UserBotByID("tenant:user:77", 555); bot.RichFormattingEnabled == nil || *bot.RichFormattingEnabled || bot.StreamingEnabled == nil || !*bot.StreamingEnabled {
+		t.Fatalf("bot delivery settings after re-register = %+v", bot)
 	}
 
 	repo.SetUserBotRole("tenant:user:77", 555, 0)
 	if bot, _ := repo.UserBotByID("tenant:user:77", 555); bot.AIRoleID != 0 {
 		t.Fatalf("bot role after clear = %d, want 0", bot.AIRoleID)
+	}
+	repo.SetUserBotDeliverySettings("tenant:user:77", 555, nil, nil)
+	if bot, _ := repo.UserBotByID("tenant:user:77", 555); bot.RichFormattingEnabled != nil || bot.StreamingEnabled != nil {
+		t.Fatalf("bot delivery settings after clear = %+v", bot)
 	}
 }
 

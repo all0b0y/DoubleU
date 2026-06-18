@@ -453,6 +453,7 @@ type UserSettings struct {
 	DefaultModeForNewChats string `json:"default_mode_for_new_chats"`
 	LearningEnabled        bool   `json:"learning_enabled"`
 	RichFormattingEnabled  bool   `json:"rich_formatting_enabled"`
+	StreamingEnabled       bool   `json:"streaming_enabled"`
 	// LanguageForDrafts: auto (detect from contact) or primary (always use PrimaryLanguage).
 	LanguageForDrafts string `json:"language_for_drafts"`
 }
