@@ -79,9 +79,9 @@ func TestRepositoryMessagesAuditsAndDrafts(t *testing.T) {
 		t.Fatalf("audits = %+v", audits)
 	}
 
-	draft := DraftRecord{DraftID: "d1", TenantID: "t", ChatID: "c", SourceMessageID: "m", Status: DraftPending, CreatedAt: time.Now()}
+	draft := DraftRecord{DraftID: "d1", TenantID: "t", ChatID: "c", SourceMessageID: "m", TextFormat: contracts.TextFormatRich, Status: DraftPending, CreatedAt: time.Now()}
 	repository.SaveDraft(draft)
-	if got, ok := repository.Draft("d1"); !ok || got.Status != DraftPending {
+	if got, ok := repository.Draft("d1"); !ok || got.Status != DraftPending || got.TextFormat != contracts.TextFormatRich {
 		t.Fatalf("draft = %+v ok=%v", got, ok)
 	}
 	if got, ok := repository.DraftByMessage("t", "c", "m"); !ok || got.DraftID != "d1" {
@@ -116,6 +116,14 @@ func TestRepositoryBusinessConnectionAndTenantSettings(t *testing.T) {
 	repository.SaveChatSettings(contracts.ChatSettings{TenantID: "other", ChatID: "chat-c", Mode: contracts.ChatModeAuto})
 	if got := repository.ChatSettingsForTenant("tenant:user:77"); len(got) != 2 {
 		t.Fatalf("settings count = %d", len(got))
+	}
+
+	repository.SaveUserSettings(contracts.UserSettings{
+		TenantID:              "tenant:user:77",
+		RichFormattingEnabled: false,
+	})
+	if got, ok := repository.UserSettings("tenant:user:77"); !ok || got.RichFormattingEnabled {
+		t.Fatalf("user settings rich toggle = %+v ok=%v", got, ok)
 	}
 }
 

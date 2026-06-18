@@ -4,6 +4,24 @@
 
 ## Bug Backlog
 
+- **(rich formatting fallback, 2026-06-18)** The rich→HTML fallback in
+  `sendRecipient` (`backend-go/internal/core/service.go`) sends
+  `html.EscapeString(text)` with `ParseMode:"HTML"`. It does NOT convert the
+  GFM markdown to HTML, so on the fallback path the contact sees raw markdown
+  syntax (`**`, `#`, `| |`). Also `html.EscapeString` escapes `'`/`"` to
+  `&#39;`/`&#34;`, which is unnecessary for Telegram HTML and can trigger a
+  parse error (self-healed to plain by `sendWithParseModeFallback`). Message is
+  never lost, path is rare. Fix: on fallback send plain text (drop `parse_mode`
+  and escaping) OR add a proper GFM→Telegram-HTML converter. Update
+  `TestHandleTelegramWebhookRichSendFallsBackToHTML` accordingly.
+
+- **(rich formatting slice 2, 2026-06-18)** `service.go` writes
+  `DraftType="warning"` for owner-only critical-risk cards, but the current
+  `drafts.draft_type` SQL CHECK in `infra/migrations/100_clean_schema_v2.sql`
+  and legacy schema only allows `reply/question`. DB-backed warning-card saves
+  can fail while in-memory tests pass. Fix with a dedicated migration that
+  extends the CHECK to include `warning`, then add a DB-backed regression test.
+
 - **Stale contract seed against consolidated schema** — `infra/seed/001_contract_scenarios.sql`
   still `INSERT`s into tables that the consolidated schema
   (`infra/migrations/100_clean_schema_v2.sql`) dropped/renamed:
@@ -41,6 +59,7 @@
 - ~~`ContextScore` recomputes on every mode selection check~~ → ✅ TTL-кэш + инвалидация на write (ARCH-8).
 - ~~`RecentMessages` in-memory O(n)~~ → ✅ per-chat индекс (ARCH-13).
 - ~~`Repository.UpsertSemanticFact` unbounded in-memory slice growth~~ → ✅ аппенд на DB-пути убран (ARCH-13).
+- **(rich formatting, 2026-06-18)** `richFormattingEnabled` runs a separate `UserSettings` lookup per rich reply in `sendRecipient`. Fold the toggle read into the settings already loaded on the hot path to avoid the extra query.
 
 ---
 

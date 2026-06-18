@@ -132,6 +132,10 @@ components:
         intent:
           type: string
           enum: [question, scheduling, commercial, acknowledgement, request, choice_question, general_message]
+        text_format:
+          type: string
+          enum: [plain, rich]
+          default: plain
         model_used: { type: string }
         usage:
           type: object

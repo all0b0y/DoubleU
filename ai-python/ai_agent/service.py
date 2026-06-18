@@ -210,6 +210,7 @@ class AIService:
             intent=intent,
             model_used=outcome.model_used,
             usage=outcome.usage,
+            text_format=outcome.text_format,
             memory_used=memory_used,
             flagged=flagged,
             owner_note=outcome.owner_note,

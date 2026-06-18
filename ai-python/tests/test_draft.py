@@ -211,6 +211,24 @@ class AIRolePromptTests(unittest.TestCase):
         prompt = self._compose(self.ROLE)
         self.assertIn("только из этого чата", prompt)
 
+    def test_prompt_frames_markup_as_readability_tool(self) -> None:
+        """The system prompt permits markup only when it improves structured answers."""
+        prompt = self._compose(self.ROLE)
+
+        self.assertIn("Разметка — инструмент читаемости", prompt)
+        self.assertIn("не используй разметку", prompt)
+
+    def test_decide_text_format_uses_rich_for_role_structured_intents(self) -> None:
+        """Assigned roles may return Rich Markdown for structured answer intents."""
+        for intent in ("question", "scheduling", "commercial", "request"):
+            self.assertEqual(draft_pipeline.decide_text_format(self.ROLE, intent), "rich")
+
+    def test_decide_text_format_keeps_copy_and_short_replies_plain(self) -> None:
+        """Legacy owner-copy replies and short choice/greeting-style intents stay plain."""
+        self.assertEqual(draft_pipeline.decide_text_format(None, "question"), "plain")
+        for intent in ("choice_question", "acknowledgement", "general_message"):
+            self.assertEqual(draft_pipeline.decide_text_format(self.ROLE, intent), "plain")
+
     def test_parse_ai_role_requires_name(self) -> None:
         """A role payload without a name is treated as no role at all."""
         self.assertIsNone(_parse_ai_role({"description": "x"}))

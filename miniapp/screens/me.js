@@ -168,6 +168,17 @@ export function renderMe(navigate) {
                 <div class="toggle-knob"></div>
               </label>
             </div>
+            <div class="st-row" style="padding:0;cursor:default;">
+              <div class="st-row-body">
+                <p class="st-row-title">rich-форматирование ответов</p>
+                <p class="st-row-desc">таблицы, списки и код для ролей</p>
+              </div>
+              <label class="toggle">
+                <input type="checkbox" id="f-rich-formatting" ${settings.rich_formatting_enabled !== false ? 'checked' : ''}>
+                <div class="toggle-track"></div>
+                <div class="toggle-knob"></div>
+              </label>
+            </div>
           </div>
           <div style="padding:10px 0 0;">
             <button class="btn btn-secondary" id="btn-save-me">Сохранить</button>
@@ -257,6 +268,7 @@ export function renderMe(navigate) {
           default_mode_for_new_chats: el.querySelector('#f-default-mode').value,
           language_for_drafts:        el.querySelector('#f-draft-lang').value,
           learning_enabled:           el.querySelector('#f-learning').checked,
+          rich_formatting_enabled:    el.querySelector('#f-rich-formatting').checked,
         });
         twa?.HapticFeedback?.notificationOccurred('success');
         btn.textContent = '✓ Сохранено';

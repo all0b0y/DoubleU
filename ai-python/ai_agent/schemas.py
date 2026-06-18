@@ -217,6 +217,7 @@ class AIProcessMessageResponse(JsonDataclass):
     intent: str
     model_used: str
     usage: Usage
+    text_format: str = "plain"
     memory_used: tuple[str, ...] = field(default_factory=tuple)
     # Set by the Phase 3 OutputSafetyScanner when toxicity/sensitive is found
     # in the draft but repair could not salvage it.  Bot UI annotates with ⚠.

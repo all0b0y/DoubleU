@@ -486,6 +486,7 @@ func (s *Server) apiGetUserSettings(w http.ResponseWriter, r *http.Request) {
 			PrimaryLanguage:        "ru",
 			DefaultModeForNewChats: "manual",
 			LearningEnabled:        true,
+			RichFormattingEnabled:  true,
 			LanguageForDrafts:      "auto",
 		}
 	}
@@ -502,6 +503,7 @@ func (s *Server) apiSaveUserSettings(w http.ResponseWriter, r *http.Request) {
 		PrimaryLanguage        string `json:"primary_language"`
 		DefaultModeForNewChats string `json:"default_mode_for_new_chats"`
 		LearningEnabled        *bool  `json:"learning_enabled"`
+		RichFormattingEnabled  *bool  `json:"rich_formatting_enabled"`
 		LanguageForDrafts      string `json:"language_for_drafts"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -515,6 +517,7 @@ func (s *Server) apiSaveUserSettings(w http.ResponseWriter, r *http.Request) {
 			PrimaryLanguage:        "ru",
 			DefaultModeForNewChats: "manual",
 			LearningEnabled:        true,
+			RichFormattingEnabled:  true,
 			LanguageForDrafts:      "auto",
 		}
 	}
@@ -536,6 +539,9 @@ func (s *Server) apiSaveUserSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.LearningEnabled != nil {
 		settings.LearningEnabled = *req.LearningEnabled
+	}
+	if req.RichFormattingEnabled != nil {
+		settings.RichFormattingEnabled = *req.RichFormattingEnabled
 	}
 	if req.LanguageForDrafts != "" {
 		if req.LanguageForDrafts != "auto" && req.LanguageForDrafts != "primary" {

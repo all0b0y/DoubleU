@@ -20,6 +20,7 @@ func TestHTTPClientProcessMessageAndReviseDraft(t *testing.T) {
 			_ = json.NewEncoder(&body).Encode(contracts.AIProcessMessageResponse{
 				Decision:     contracts.DecisionDraft,
 				ResponseText: "draft",
+				TextFormat:   contracts.TextFormatRich,
 				Confidence:   0.8,
 				RiskLevel:    contracts.RiskLow,
 				Usage:        contracts.TokenUsage{},
@@ -39,6 +40,9 @@ func TestHTTPClientProcessMessageAndReviseDraft(t *testing.T) {
 	}
 	if response.ResponseText != "draft" {
 		t.Fatalf("response = %+v", response)
+	}
+	if response.TextFormat != contracts.TextFormatRich {
+		t.Fatalf("text_format = %q", response.TextFormat)
 	}
 	revised, err := client.ReviseDraft(context.Background(), DraftRevisionRequest{Text: "draft"})
 	if err != nil {

@@ -2,6 +2,7 @@ package telegram
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"strings"
@@ -132,6 +133,57 @@ func TestBotSenderConfiguresWebhookCommandsAndMessages(t *testing.T) {
 	}
 }
 
+func TestBotSenderSendRichMessageBuildsBody(t *testing.T) {
+	var requestPath string
+	var body map[string]any
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		data, _ := io.ReadAll(request.Body)
+		requestPath = request.URL.Path
+		if err := json.Unmarshal(data, &body); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"ok":true,"result":{"message_id":99}}`)),
+		}, nil
+	})}
+	sender := NewBotSender("token", client)
+
+	msgID, err := sender.SendRichMessage(context.Background(), OutboundMessage{
+		ChatID:               "42",
+		BusinessConnectionID: "bc-1",
+		ReplyToMessageID:     "7",
+		Text:                 "# Heading\n\n| A | B |\n|---|---|\n| 1 | 2 |",
+		ReplyMarkup: InlineKeyboardMarkup{InlineKeyboard: [][]InlineKeyboardButton{
+			{{Text: "Open", CallbackData: "open"}},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("send rich: %v", err)
+	}
+	if msgID != "99" {
+		t.Fatalf("message id = %q", msgID)
+	}
+	if !strings.Contains(requestPath, "/sendRichMessage") {
+		t.Fatalf("request path = %s", requestPath)
+	}
+	if body["chat_id"] != "42" || body["business_connection_id"] != "bc-1" {
+		t.Fatalf("body = %#v", body)
+	}
+	rich, ok := body["rich_message"].(map[string]any)
+	if !ok || rich["markdown"] != "# Heading\n\n| A | B |\n|---|---|\n| 1 | 2 |" {
+		t.Fatalf("rich_message = %#v", body["rich_message"])
+	}
+	reply, ok := body["reply_parameters"].(map[string]any)
+	if !ok || reply["message_id"] != float64(7) {
+		t.Fatalf("reply_parameters = %#v", body["reply_parameters"])
+	}
+	if _, ok := body["reply_markup"].(map[string]any); !ok {
+		t.Fatalf("reply_markup missing: %#v", body)
+	}
+}
+
 func TestBotSenderReportsTelegramStatusError(t *testing.T) {
 	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		return &http.Response{
@@ -142,6 +194,21 @@ func TestBotSenderReportsTelegramStatusError(t *testing.T) {
 	})}
 	sender := NewBotSender("token", client)
 	if err := sender.SendMessage(context.Background(), OutboundMessage{ChatID: "42", Text: "hello"}); err == nil {
+		t.Fatalf("expected status error")
+	}
+}
+
+func TestBotSenderSendRichMessageReportsTelegramStatusError(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusBadRequest,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"ok":false}`)),
+		}, nil
+	})}
+	sender := NewBotSender("token", client)
+
+	if _, err := sender.SendRichMessage(context.Background(), OutboundMessage{ChatID: "42", Text: "hello"}); err == nil {
 		t.Fatalf("expected status error")
 	}
 }

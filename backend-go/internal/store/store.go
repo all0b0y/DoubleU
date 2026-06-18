@@ -48,6 +48,7 @@ type DraftRecord struct {
 	SourceMessageID      string
 	SourceMessageText    string // original contact message text; stored so regen works even with no_memory
 	ResponseText         string
+	TextFormat           contracts.TextFormat
 	// DraftType distinguishes regular reply drafts ("reply") from interactive question
 	// cards ("question") where the owner picks one of several AI-suggested options.
 	DraftType        string
@@ -663,14 +664,14 @@ func (r *Repository) SaveDraft(draft DraftRecord) {
 			`INSERT INTO drafts (
 			   draft_id, decision_id, tenant_id, chat_id, business_connection_id,
 			   source_message_id, source_message_text, response_text,
-			   draft_type, suggested_options, status,
+			   text_format, draft_type, suggested_options, status,
 			   owner_chat_id, owner_message_id, sent_message_id, action_history,
 			   trace_id, created_at, updated_at
-			 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$17)
+			 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$18)
 			 ON CONFLICT (draft_id) DO NOTHING`,
 			draft.DraftID, draft.DecisionID, draft.TenantID, draft.ChatID,
 			draft.BusinessConnectionID, draft.SourceMessageID, draft.SourceMessageText,
-			draft.ResponseText, valueOrDefault(draft.DraftType, "reply"),
+			draft.ResponseText, string(draft.TextFormat.Normalize()), valueOrDefault(draft.DraftType, "reply"),
 			pq.Array(nilToEmpty(draft.SuggestedOptions)), string(valueOrDefault(string(draft.Status), "pending")),
 			draft.OwnerChatID, draft.OwnerMessageID, draft.SentMessageID,
 			pq.Array(nilToEmpty(draft.ActionHistory)), traceArg, draft.CreatedAt,
@@ -688,16 +689,17 @@ func (r *Repository) UpdateDraft(draft DraftRecord) {
 		_, _ = r.db.Exec(
 			`UPDATE drafts SET
 			   response_text    = $2,
-			   draft_type       = $3,
-			   suggested_options= $4,
-			   status           = $5,
-			   owner_chat_id    = $6,
-			   owner_message_id = $7,
-			   sent_message_id  = $8,
-			   action_history   = $9,
+			   text_format      = $3,
+			   draft_type       = $4,
+			   suggested_options= $5,
+			   status           = $6,
+			   owner_chat_id    = $7,
+			   owner_message_id = $8,
+			   sent_message_id  = $9,
+			   action_history   = $10,
 			   updated_at       = now()
 			 WHERE draft_id = $1`,
-			draft.DraftID, draft.ResponseText,
+			draft.DraftID, draft.ResponseText, string(draft.TextFormat.Normalize()),
 			valueOrDefault(draft.DraftType, "reply"),
 			pq.Array(nilToEmpty(draft.SuggestedOptions)), string(valueOrDefault(string(draft.Status), "pending")),
 			draft.OwnerChatID, draft.OwnerMessageID, draft.SentMessageID,
@@ -731,13 +733,14 @@ func (r *Repository) dbDraft(draftID string) (DraftRecord, bool) {
 	var d DraftRecord
 	var status string
 	var draftType string
+	var textFormat string
 	var opts pq.StringArray
 	var history pq.StringArray
 	err := r.db.QueryRow(
 		`SELECT draft_id, COALESCE(decision_id,''), tenant_id, chat_id,
 		        COALESCE(business_connection_id,''), COALESCE(source_message_id,''),
 		        COALESCE(source_message_text,''), COALESCE(response_text,''),
-		        draft_type, suggested_options, status,
+		        COALESCE(text_format,'plain'), draft_type, suggested_options, status,
 		        COALESCE(owner_chat_id,''), COALESCE(owner_message_id,''),
 		        COALESCE(sent_message_id,''), action_history,
 		        COALESCE(trace_id,''), created_at, updated_at
@@ -747,13 +750,14 @@ func (r *Repository) dbDraft(draftID string) (DraftRecord, bool) {
 		&d.DraftID, &d.DecisionID, &d.TenantID, &d.ChatID,
 		&d.BusinessConnectionID, &d.SourceMessageID,
 		&d.SourceMessageText, &d.ResponseText,
-		&draftType, &opts, &status,
+		&textFormat, &draftType, &opts, &status,
 		&d.OwnerChatID, &d.OwnerMessageID,
 		&d.SentMessageID, &history, &d.TraceID, &d.CreatedAt, &d.UpdatedAt,
 	)
 	if err != nil {
 		return DraftRecord{}, false
 	}
+	d.TextFormat = contracts.TextFormat(textFormat).Normalize()
 	d.DraftType = draftType
 	d.Status = DraftStatus(status)
 	d.SuggestedOptions = []string(opts)
@@ -3815,7 +3819,8 @@ func (r *Repository) UserSettings(tenantID string) (contracts.UserSettings, bool
 			`SELECT us.user_id, us.tenant_id,
 			        COALESCE(us.display_name,''), COALESCE(us.bio,''), COALESCE(us.timezone,''),
 			        us.primary_language, us.secondary_languages,
-			        us.default_mode_for_new_chats, us.learning_enabled, us.language_for_drafts
+			        us.default_mode_for_new_chats, us.learning_enabled, us.rich_formatting_enabled,
+			        us.language_for_drafts
 			   FROM user_settings us
 			  WHERE us.tenant_id = $1
 			  LIMIT 1`,
@@ -3824,7 +3829,8 @@ func (r *Repository) UserSettings(tenantID string) (contracts.UserSettings, bool
 			&s.UserID, &s.TenantID,
 			&s.DisplayName, &s.Bio, &s.Timezone,
 			&s.PrimaryLanguage, &secLangs,
-			&s.DefaultModeForNewChats, &s.LearningEnabled, &s.LanguageForDrafts,
+			&s.DefaultModeForNewChats, &s.LearningEnabled, &s.RichFormattingEnabled,
+			&s.LanguageForDrafts,
 		)
 		if err == nil {
 			s.SecondaryLanguages = []string(secLangs)
@@ -3849,8 +3855,9 @@ func (r *Repository) SaveUserSettings(settings contracts.UserSettings) {
 		`INSERT INTO user_settings (
 		   user_id, tenant_id, display_name, bio, timezone,
 		   primary_language, secondary_languages,
-		   default_mode_for_new_chats, learning_enabled, language_for_drafts
-		 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+		   default_mode_for_new_chats, learning_enabled, rich_formatting_enabled,
+		   language_for_drafts
+		 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
 		 ON CONFLICT (user_id) DO UPDATE SET
 		   display_name            = EXCLUDED.display_name,
 		   bio                     = EXCLUDED.bio,
@@ -3859,12 +3866,14 @@ func (r *Repository) SaveUserSettings(settings contracts.UserSettings) {
 		   secondary_languages     = EXCLUDED.secondary_languages,
 		   default_mode_for_new_chats = EXCLUDED.default_mode_for_new_chats,
 		   learning_enabled        = EXCLUDED.learning_enabled,
+		   rich_formatting_enabled = EXCLUDED.rich_formatting_enabled,
 		   language_for_drafts     = EXCLUDED.language_for_drafts,
 		   updated_at              = now()`,
 		settings.UserID, settings.TenantID,
 		settings.DisplayName, settings.Bio, settings.Timezone,
 		settings.PrimaryLanguage, pq.Array(nilToEmpty(settings.SecondaryLanguages)),
-		settings.DefaultModeForNewChats, settings.LearningEnabled, settings.LanguageForDrafts,
+		settings.DefaultModeForNewChats, settings.LearningEnabled, settings.RichFormattingEnabled,
+		settings.LanguageForDrafts,
 	)
 }
 

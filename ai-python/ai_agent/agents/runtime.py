@@ -541,6 +541,7 @@ class AgentRuntime:
             model_used=model_used,
             usage=total,
             intent=drafted.intent,
+            text_format=draft_pipeline.decide_text_format(request.ai_role, drafted.intent),
             options=drafted.options if drafted.intent == "choice_question" else (),
             confidence=confidence,
             topic=drafted.topic,

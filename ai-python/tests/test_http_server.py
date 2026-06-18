@@ -64,11 +64,12 @@ class HTTPServerTests(unittest.TestCase):
             set(response),
             {
                 "decision", "response_text", "confidence", "risk_level", "intent",
-                "model_used", "usage", "memory_used", "flagged",
+                "text_format", "model_used", "usage", "memory_used", "flagged",
                 "owner_note", "options", "topic",
             },
         )
         self.assertEqual(response["decision"], "auto_reply")
+        self.assertEqual(response["text_format"], "plain")
         self.assertFalse(response["flagged"])
         self.assertEqual(response["owner_note"], "")
 

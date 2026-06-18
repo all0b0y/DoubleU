@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"html"
 	"log/slog"
 	"sort"
 	"strconv"
@@ -775,7 +776,7 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 	}
 
 	if replyBlockNote != "" {
-		draft := s.createDraft(event, event.EventID, replyBlockNote)
+		draft := s.createDraft(event, event.EventID, replyBlockNote, contracts.TextFormatPlain)
 		s.repository.SaveDraft(draft)
 		s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateDraftSentToOwner)
 		s.repository.AppendAudit(s.auditEvent(event, contracts.DecisionAskOwner, "business_connection_cannot_reply"))
@@ -909,7 +910,7 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 	result := InboundResult{Event: event, Decision: decision, Reason: reason}
 	switch decision {
 	case contracts.DecisionAutoReply:
-		sentMsgID, err := s.sendRecipient(ctx, event, event.EventID, proposal.ResponseText)
+		sentMsgID, err := s.sendRecipient(ctx, event, event.EventID, proposal.ResponseText, proposal.TextFormat)
 		if err != nil {
 			s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateFailed)
 			s.repository.AppendAudit(s.auditEvent(event, contracts.DecisionErrorFallback, "send_error:"+err.Error()))
@@ -918,7 +919,7 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 		}
 		s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateSentToRecipient)
 		s.logger.Info("telegram auto reply sent", "tenant_id", event.TenantID, "chat_id", event.ChatID, "source_message_id", event.SourceMessageID)
-		s.saveOutgoingMessage(event, ownerID, sentMsgID, proposal.ResponseText, event.EventID)
+		s.saveOutgoingMessage(event, ownerID, sentMsgID, proposal.ResponseText, event.EventID, proposal.TextFormat)
 		// A reply went out on the owner's behalf: nothing is awaited from the owner.
 		s.repository.ClearEpisodeRuntimeState(event.TenantID, event.ChatID)
 		if s.notify != nil {
@@ -929,7 +930,7 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 		// row carries an empty ResponseText and DraftType="warning" so no approval
 		// path can ever deliver the service text to the contact.
 		if ownerNote := s.ownerNoteFor(proposal); decision == contracts.DecisionAskOwner && ownerNote != "" {
-			draft := s.createDraft(event, event.EventID, "")
+			draft := s.createDraft(event, event.EventID, "", contracts.TextFormatPlain)
 			draft.DraftType = "warning"
 			s.repository.SaveDraft(draft)
 			s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateDraftSentToOwner)
@@ -959,7 +960,7 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 				options = parseOptions(proposal.ResponseText)
 			}
 			if len(options) > 0 {
-				draft := s.createDraft(event, event.EventID, "")
+				draft := s.createDraft(event, event.EventID, "", contracts.TextFormatPlain)
 				draft.DraftType = "question"
 				draft.SuggestedOptions = options
 				s.repository.SaveDraft(draft)
@@ -981,7 +982,7 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 				break
 			}
 		}
-		draft := s.createDraft(event, event.EventID, proposal.ResponseText)
+		draft := s.createDraft(event, event.EventID, proposal.ResponseText, proposal.TextFormat)
 		if proposal.Flagged {
 			draft.ActionHistory = append(draft.ActionHistory, "flagged")
 		}
@@ -2156,7 +2157,7 @@ func (s *Service) HandleApprovalCallback(ctx context.Context, payload contracts.
 			ChatID:               draft.ChatID,
 			BusinessConnectionID: draft.BusinessConnectionID,
 			SourceMessageID:      draft.SourceMessageID,
-		}, draft.DecisionID, draft.ResponseText)
+		}, draft.DecisionID, draft.ResponseText, draft.TextFormat)
 		if err != nil {
 			s.repository.AppendState(draft.TenantID, draft.ChatID, draft.SourceMessageID, contracts.StateFailed)
 			return ApprovalResult{}, err
@@ -2353,6 +2354,7 @@ func (s *Service) regenerateDraft(ctx context.Context, draft store.DraftRecord) 
 	}
 	s.repository.AppendState(draft.TenantID, draft.ChatID, draft.SourceMessageID, contracts.StateAIGenerated)
 	draft.ResponseText = proposal.ResponseText
+	draft.TextFormat = proposal.TextFormat.Normalize()
 	draft.UpdatedAt = s.now()
 	s.repository.UpdateDraft(draft)
 	s.repository.AppendState(draft.TenantID, draft.ChatID, draft.SourceMessageID, contracts.StateDraftSentToOwner)
@@ -2395,6 +2397,7 @@ func (s *Service) regenerateDraftWithHint(ctx context.Context, draft store.Draft
 	s.repository.AppendState(draft.TenantID, draft.ChatID, draft.SourceMessageID, contracts.StateAIGenerated)
 	draft.ActionHistory = append(draft.ActionHistory, "ai_refine")
 	draft.ResponseText = proposal.ResponseText
+	draft.TextFormat = proposal.TextFormat.Normalize()
 	draft.UpdatedAt = s.now()
 	s.repository.UpdateDraft(draft)
 	s.repository.AppendState(draft.TenantID, draft.ChatID, draft.SourceMessageID, contracts.StateDraftSentToOwner)
@@ -2435,7 +2438,7 @@ func (s *Service) resolveSourceEvent(draft store.DraftRecord) contracts.Normaliz
 	}
 }
 
-func (s *Service) createDraft(event contracts.NormalizedTelegramEvent, decisionID, text string) store.DraftRecord {
+func (s *Service) createDraft(event contracts.NormalizedTelegramEvent, decisionID, text string, textFormat contracts.TextFormat) store.DraftRecord {
 	now := s.now()
 	return store.DraftRecord{
 		DraftID:              "draft:" + decisionID,
@@ -2446,6 +2449,7 @@ func (s *Service) createDraft(event contracts.NormalizedTelegramEvent, decisionI
 		SourceMessageID:      event.SourceMessageID,
 		SourceMessageText:    event.MessageText,
 		ResponseText:         text,
+		TextFormat:           textFormat.Normalize(),
 		Status:               store.DraftPending,
 		// Persisting trace_id lets owner feedback (approve / thumb) attach a
 		// Langfuse score back to the Phase 4 generation span.
@@ -2467,7 +2471,7 @@ func (s *Service) notifyDraftStatus(draft store.DraftRecord) {
 }
 
 // sendRecipient sends a reply to the contact and returns the Telegram message_id of the sent message.
-func (s *Service) sendRecipient(ctx context.Context, event contracts.NormalizedTelegramEvent, decisionID, text string) (string, error) {
+func (s *Service) sendRecipient(ctx context.Context, event contracts.NormalizedTelegramEvent, decisionID, text string, textFormat contracts.TextFormat) (string, error) {
 	key := contracts.SendIdempotencyKey(event.TenantID, event.ChatID, event.SourceMessageID, decisionID)
 	duplicate := s.repository.MarkSend(store.SendRecord{
 		Key:             key,
@@ -2492,15 +2496,51 @@ func (s *Service) sendRecipient(ctx context.Context, event contracts.NormalizedT
 		ReplyToMessageID:     event.SourceMessageID,
 		DecisionID:           decisionID,
 		Text:                 text,
-		// Contact-facing replies carry LLM text that may use Markdown (lists,
-		// bold, code). The sender falls back to plain text if Telegram rejects
-		// the markup, so formatting is best-effort and never loses a reply.
-		ParseMode: "Markdown",
 	}
 	sender, err := s.recipientSender(event)
 	if err != nil {
 		return "", err
 	}
+	if textFormat.Normalize() == contracts.TextFormatRich {
+		if !s.richFormattingEnabled(event.TenantID) {
+			return sendMessage(ctx, sender, msg)
+		}
+		if richSender, ok := sender.(interface {
+			SendRichMessage(context.Context, telegram.OutboundMessage) (string, error)
+		}); ok {
+			msgID, err := richSender.SendRichMessage(ctx, msg)
+			if err == nil {
+				return msgID, nil
+			}
+			s.logger.Warn("telegram rich send failed; falling back to HTML",
+				"tenant_id", event.TenantID,
+				"chat_id", event.ChatID,
+				"decision_id", decisionID,
+				"error", err,
+			)
+		} else {
+			s.logger.Warn("telegram rich sender unavailable; falling back to HTML",
+				"tenant_id", event.TenantID,
+				"chat_id", event.ChatID,
+				"decision_id", decisionID,
+			)
+		}
+		msg.Text = html.EscapeString(text)
+		msg.ParseMode = "HTML"
+		return sendMessage(ctx, sender, msg)
+	}
+	return sendMessage(ctx, sender, msg)
+}
+
+func (s *Service) richFormattingEnabled(tenantID string) bool {
+	settings, ok := s.repository.UserSettings(tenantID)
+	if !ok {
+		return true
+	}
+	return settings.RichFormattingEnabled
+}
+
+func sendMessage(ctx context.Context, sender telegram.Sender, msg telegram.OutboundMessage) (string, error) {
 	if idSender, ok := sender.(interface {
 		SendMessageGetID(context.Context, telegram.OutboundMessage) (string, error)
 	}); ok {
@@ -3070,7 +3110,7 @@ func outgoingUpdateID(decisionID string) int64 {
 
 // saveOutgoingMessage persists a synthetic outgoing message and a virtual sent draft so the
 // Mini App can display the AI auto-reply in chat history and label it as "DoubleU".
-func (s *Service) saveOutgoingMessage(event contracts.NormalizedTelegramEvent, ownerID, sentMsgID, text, decisionID string) {
+func (s *Service) saveOutgoingMessage(event contracts.NormalizedTelegramEvent, ownerID, sentMsgID, text, decisionID string, textFormat contracts.TextFormat) {
 	if ownerID == "" || sentMsgID == "" {
 		return
 	}
@@ -3095,6 +3135,7 @@ func (s *Service) saveOutgoingMessage(event contracts.NormalizedTelegramEvent, o
 		BusinessConnectionID: event.BusinessConnectionID,
 		SourceMessageID:      event.SourceMessageID,
 		ResponseText:         text,
+		TextFormat:           textFormat.Normalize(),
 		Status:               store.DraftSent,
 		SentMessageID:        sentMsgID,
 		CreatedAt:            s.now(),
@@ -3151,7 +3192,7 @@ func (s *Service) ManualSend(ctx context.Context, tenantID, chatID, text string)
 	sentMsgID, err := s.sendRecipient(ctx, contracts.NormalizedTelegramEvent{
 		TenantID: tenantID,
 		ChatID:   chatID,
-	}, decisionID, text)
+	}, decisionID, text, contracts.TextFormatPlain)
 	if err != nil {
 		return err
 	}
@@ -3761,7 +3802,7 @@ func (s *Service) handleChoiceOption(ctx context.Context, event contracts.Normal
 	if err != nil {
 		s.logger.Error("choice option: ai hint failed, sending option text directly", "error", err, "draft_id", draftID)
 		srcEvent := s.resolveSourceEvent(draft)
-		_, _ = s.sendRecipient(ctx, srcEvent, draft.DecisionID+":choice_fallback", optionText)
+		_, _ = s.sendRecipient(ctx, srcEvent, draft.DecisionID+":choice_fallback", optionText, contracts.TextFormatPlain)
 		return InboundResult{Event: event, Decision: contracts.DecisionAutoReply, Reason: "choice_fallback_sent", DraftID: draftID}
 	}
 
@@ -3772,8 +3813,8 @@ func (s *Service) handleChoiceOption(ctx context.Context, event contracts.Normal
 	}
 	srcEvent := s.resolveSourceEvent(newDraft)
 	if settings.Mode == contracts.ChatModeAuto {
-		_, _ = s.sendRecipient(ctx, srcEvent, newDraft.DecisionID, newDraft.ResponseText)
-		s.saveOutgoingMessage(srcEvent, ownerID, "", newDraft.ResponseText, newDraft.DecisionID)
+		_, _ = s.sendRecipient(ctx, srcEvent, newDraft.DecisionID, newDraft.ResponseText, newDraft.TextFormat)
+		s.saveOutgoingMessage(srcEvent, ownerID, "", newDraft.ResponseText, newDraft.DecisionID, newDraft.TextFormat)
 		if s.notify != nil {
 			s.notify(newDraft.TenantID, "new_message", map[string]any{"chat_id": newDraft.ChatID})
 		}

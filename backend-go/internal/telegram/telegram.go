@@ -31,6 +31,11 @@ type OutboundMessage struct {
 	ReplyMarkup ReplyMarkup
 }
 
+// InputRichMessage carries Rich Markdown for Telegram Bot API sendRichMessage.
+type InputRichMessage struct {
+	Markdown string `json:"markdown,omitempty"`
+}
+
 // Sender sends recipient-facing messages and answers inline button callbacks.
 type Sender interface {
 	SendMessage(ctx context.Context, message OutboundMessage) error
@@ -144,6 +149,30 @@ func (s *BotSender) sendMessageBody(message OutboundMessage) map[string]any {
 	return body
 }
 
+// richMessageBody builds the sendRichMessage JSON body using vendored Bot API
+// fields for phase 1: chat_id, rich_message.markdown, business_connection_id,
+// reply_parameters and inline reply_markup.
+func (s *BotSender) richMessageBody(message OutboundMessage) (map[string]any, error) {
+	body := map[string]any{
+		"chat_id":      message.ChatID,
+		"rich_message": InputRichMessage{Markdown: message.Text},
+	}
+	if message.BusinessConnectionID != "" {
+		body["business_connection_id"] = message.BusinessConnectionID
+	}
+	if replyID, ok := parseMessageID(message.ReplyToMessageID); ok {
+		body["reply_parameters"] = map[string]any{"message_id": replyID}
+	}
+	if message.ReplyMarkup != nil {
+		inline, ok := message.ReplyMarkup.(InlineKeyboardMarkup)
+		if !ok {
+			return nil, fmt.Errorf("sendRichMessage supports only inline reply markup")
+		}
+		body["reply_markup"] = inline
+	}
+	return body, nil
+}
+
 // sendWithParseModeFallback posts sendMessage and, when Telegram rejects the
 // request for a message that asked for formatting (typically "can't parse
 // entities" — LLM output is not guaranteed valid markup), retries once as
@@ -183,6 +212,30 @@ func (s *BotSender) sendMessageRaw(ctx context.Context, body map[string]any) ([]
 	return raw, nil
 }
 
+// sendRichMessageRaw posts a sendRichMessage request and returns the raw response body.
+func (s *BotSender) sendRichMessageRaw(ctx context.Context, body map[string]any) ([]byte, error) {
+	data, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	url := "https://api.telegram.org/bot" + s.token + "/sendRichMessage"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	res, err := s.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(res.Body, 8192))
+	if res.StatusCode < 200 || res.StatusCode > 299 {
+		return nil, fmt.Errorf("telegram sendRichMessage status %d: %s", res.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	return raw, nil
+}
+
 // SendMessage sends a message to Telegram.
 func (s *BotSender) SendMessage(ctx context.Context, message OutboundMessage) error {
 	if s.token == "" {
@@ -190,6 +243,31 @@ func (s *BotSender) SendMessage(ctx context.Context, message OutboundMessage) er
 	}
 	_, err := s.sendWithParseModeFallback(ctx, message)
 	return err
+}
+
+// SendRichMessage sends Telegram Rich Markdown via sendRichMessage and returns the message_id when available.
+func (s *BotSender) SendRichMessage(ctx context.Context, message OutboundMessage) (string, error) {
+	if s.token == "" {
+		return "", fmt.Errorf("telegram bot token is empty")
+	}
+	body, err := s.richMessageBody(message)
+	if err != nil {
+		return "", err
+	}
+	raw, err := s.sendRichMessageRaw(ctx, body)
+	if err != nil {
+		return "", err
+	}
+	var result struct {
+		OK     bool `json:"ok"`
+		Result struct {
+			MessageID int64 `json:"message_id"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(raw, &result); err != nil || !result.OK {
+		return "", nil // sent OK but couldn't parse ID — not critical
+	}
+	return strconv.FormatInt(result.Result.MessageID, 10), nil
 }
 
 // AnswerCallbackQuery dismisses the loading spinner on an inline button click.
@@ -551,7 +629,7 @@ func NormalizeBotUpdate(payload []byte, botID int64, tenantID string, now time.T
 	return contracts.NormalizedTelegramEvent{
 		// update_id sequences are per-bot, so both the event id and the receive
 		// idempotency key derived from it must be scoped by bot id.
-		EventID: fmt.Sprintf("%d:bot:%s:%s", *update.UpdateID, bot, sourceMessageID),
+		EventID:  fmt.Sprintf("%d:bot:%s:%s", *update.UpdateID, bot, sourceMessageID),
 		TenantID: tenantID,
 		// Bot-transport chat identity is namespaced by bot id so a tenant's two
 		// bots talking to the SAME Telegram user resolve to two distinct chats.
@@ -572,18 +650,18 @@ func NormalizeBotUpdate(payload []byte, botID int64, tenantID string, now time.T
 }
 
 type telegramUpdate struct {
-	UpdateID           *int64               `json:"update_id"`
-	BusinessConnection telegramBusinessConn `json:"business_connection"`
-	BusinessMessage    *telegramMessage     `json:"business_message"`
-	Message            *telegramMessage     `json:"message"`
+	UpdateID           *int64                 `json:"update_id"`
+	BusinessConnection telegramBusinessConn   `json:"business_connection"`
+	BusinessMessage    *telegramMessage       `json:"business_message"`
+	Message            *telegramMessage       `json:"message"`
 	CallbackQuery      *telegramCallbackQuery `json:"callback_query"`
 }
 
 type telegramCallbackQuery struct {
-	ID      string          `json:"id"`
-	From    telegramUser    `json:"from"`
+	ID      string           `json:"id"`
+	From    telegramUser     `json:"from"`
 	Message *telegramMessage `json:"message"`
-	Data    string          `json:"data"`
+	Data    string           `json:"data"`
 }
 
 type telegramBusinessConn struct {

@@ -124,6 +124,12 @@ func TestHandleTelegramWebhookAutoReplyAndDuplicateAudit(t *testing.T) {
 	if sender.calls != 1 {
 		t.Fatalf("sender calls = %d", sender.calls)
 	}
+	if sender.richCalls != 0 {
+		t.Fatalf("rich sender calls = %d, want 0", sender.richCalls)
+	}
+	if len(sender.sent) != 1 || sender.sent[0].ParseMode != "" {
+		t.Fatalf("plain auto reply must not set parse_mode, sent = %+v", sender.sent)
+	}
 	audits := repository.Audits()
 	if len(audits) != 2 {
 		t.Fatalf("audit count = %d", len(audits))
@@ -170,6 +176,103 @@ func TestHandleTelegramWebhookSendsAssignedAIRole(t *testing.T) {
 	}
 	if ai.lastRequest.AIRole != nil {
 		t.Fatalf("expected no ai_role after clear, got %+v", ai.lastRequest.AIRole)
+	}
+}
+
+func TestHandleTelegramWebhookRichAutoReplyUsesRichSend(t *testing.T) {
+	repository := store.NewRepository()
+	repository.SaveChatSettings(contracts.ChatSettings{TenantID: "tenant-1", ChatID: "42", Mode: contracts.ChatModeAuto})
+	repository.SaveChat(store.ChatRecord{TenantID: "tenant-1", ChatID: "42"})
+	ai := &fakeAI{response: contracts.AIProcessMessageResponse{
+		Decision:     contracts.DecisionAutoReply,
+		ResponseText: "# План\n\n- A\n- B",
+		TextFormat:   contracts.TextFormatRich,
+		Confidence:   0.99,
+		RiskLevel:    contracts.RiskLow,
+	}}
+	sender := &fakeSender{}
+	service := newTestService(repository, ai, sender)
+
+	result, err := service.HandleTelegramWebhook(context.Background(), telegramPayload(1006, "bc-1", 42, 7, "hi"), "tenant-1")
+	if err != nil {
+		t.Fatalf("webhook: %v", err)
+	}
+	if result.Decision != contracts.DecisionAutoReply {
+		t.Fatalf("decision = %s", result.Decision)
+	}
+	if sender.richCalls != 1 || sender.calls != 0 {
+		t.Fatalf("rich calls=%d plain calls=%d", sender.richCalls, sender.calls)
+	}
+	if got := sender.richSent[0].Text; got != "# План\n\n- A\n- B" {
+		t.Fatalf("rich text = %q", got)
+	}
+}
+
+func TestHandleTelegramWebhookRichSendFallsBackToHTML(t *testing.T) {
+	repository := store.NewRepository()
+	repository.SaveChatSettings(contracts.ChatSettings{TenantID: "tenant-1", ChatID: "42", Mode: contracts.ChatModeAuto})
+	repository.SaveChat(store.ChatRecord{TenantID: "tenant-1", ChatID: "42"})
+	ai := &fakeAI{response: contracts.AIProcessMessageResponse{
+		Decision:     contracts.DecisionAutoReply,
+		ResponseText: "Use <tag> & table",
+		TextFormat:   contracts.TextFormatRich,
+		Confidence:   0.99,
+		RiskLevel:    contracts.RiskLow,
+	}}
+	sender := &fakeSender{richErr: errors.New("rich unavailable")}
+	service := newTestService(repository, ai, sender)
+
+	result, err := service.HandleTelegramWebhook(context.Background(), telegramPayload(1007, "bc-1", 42, 7, "hi"), "tenant-1")
+	if err != nil {
+		t.Fatalf("webhook: %v", err)
+	}
+	if result.Decision != contracts.DecisionAutoReply {
+		t.Fatalf("decision = %s", result.Decision)
+	}
+	if sender.richCalls != 1 || sender.calls != 1 {
+		t.Fatalf("rich calls=%d fallback calls=%d", sender.richCalls, sender.calls)
+	}
+	if sender.sent[0].ParseMode != "HTML" {
+		t.Fatalf("fallback parse_mode = %q", sender.sent[0].ParseMode)
+	}
+	if sender.sent[0].Text != "Use &lt;tag&gt; &amp; table" {
+		t.Fatalf("fallback text = %q", sender.sent[0].Text)
+	}
+}
+
+func TestHandleTelegramWebhookRichFormattingToggleOffForcesPlainSend(t *testing.T) {
+	repository := store.NewRepository()
+	repository.SaveChatSettings(contracts.ChatSettings{TenantID: "tenant-1", ChatID: "42", Mode: contracts.ChatModeAuto})
+	repository.SaveChat(store.ChatRecord{TenantID: "tenant-1", ChatID: "42"})
+	repository.SaveUserSettings(contracts.UserSettings{
+		TenantID:               "tenant-1",
+		RichFormattingEnabled:  false,
+		DefaultModeForNewChats: "manual",
+		LearningEnabled:        true,
+		LanguageForDrafts:      "auto",
+	})
+	ai := &fakeAI{response: contracts.AIProcessMessageResponse{
+		Decision:     contracts.DecisionAutoReply,
+		ResponseText: "# План\n\n- A\n- B",
+		TextFormat:   contracts.TextFormatRich,
+		Confidence:   0.99,
+		RiskLevel:    contracts.RiskLow,
+	}}
+	sender := &fakeSender{}
+	service := newTestService(repository, ai, sender)
+
+	result, err := service.HandleTelegramWebhook(context.Background(), telegramPayload(1009, "bc-1", 42, 7, "hi"), "tenant-1")
+	if err != nil {
+		t.Fatalf("webhook: %v", err)
+	}
+	if result.Decision != contracts.DecisionAutoReply {
+		t.Fatalf("decision = %s", result.Decision)
+	}
+	if sender.richCalls != 0 || sender.calls != 1 {
+		t.Fatalf("rich calls=%d plain calls=%d", sender.richCalls, sender.calls)
+	}
+	if sender.sent[0].ParseMode != "" || sender.sent[0].Text != "# План\n\n- A\n- B" {
+		t.Fatalf("plain fallback send = %+v", sender.sent[0])
 	}
 }
 
@@ -286,6 +389,51 @@ func TestApprovalApproveIsIdempotent(t *testing.T) {
 	}
 	if sender.calls != 1 || repository.SendCount() != 1 {
 		t.Fatalf("sender calls=%d send count=%d", sender.calls, repository.SendCount())
+	}
+}
+
+func TestApprovalApproveUsesSavedRichTextFormat(t *testing.T) {
+	repository := store.NewRepository()
+	repository.SaveChatSettings(contracts.ChatSettings{TenantID: "tenant-1", ChatID: "42", Mode: contracts.ChatModeManual})
+	repository.SaveChat(store.ChatRecord{TenantID: "tenant-1", ChatID: "42"})
+	ai := &fakeAI{response: contracts.AIProcessMessageResponse{
+		Decision:     contracts.DecisionDraft,
+		ResponseText: "## Ответ\n\n| A | B |\n|---|---|",
+		TextFormat:   contracts.TextFormatRich,
+		Confidence:   0.9,
+		RiskLevel:    contracts.RiskLow,
+	}}
+	sender := &fakeSender{}
+	service := newTestService(repository, ai, sender)
+
+	inbound, err := service.HandleTelegramWebhook(context.Background(), telegramPayload(1008, "bc-1", 42, 7, "hi"), "tenant-1")
+	if err != nil {
+		t.Fatalf("webhook: %v", err)
+	}
+	draft, ok := repository.Draft(inbound.DraftID)
+	if !ok {
+		t.Fatalf("draft not found")
+	}
+	if draft.TextFormat != contracts.TextFormatRich {
+		t.Fatalf("draft text format = %q", draft.TextFormat)
+	}
+	_, err = service.HandleApprovalCallback(context.Background(), contracts.ApprovalCallbackPayload{
+		Action:          contracts.ApprovalApprove,
+		TenantID:        "tenant-1",
+		ChatID:          "42",
+		SourceMessageID: "7",
+		DraftID:         inbound.DraftID,
+		DecisionID:      inbound.Event.EventID,
+		IdempotencyKey:  "callback-rich-approve",
+	})
+	if err != nil {
+		t.Fatalf("approval: %v", err)
+	}
+	if sender.richCalls != 1 || sender.calls != 0 {
+		t.Fatalf("rich calls=%d plain calls=%d", sender.richCalls, sender.calls)
+	}
+	if sender.richSent[0].Text != draft.ResponseText {
+		t.Fatalf("sent rich text = %q want %q", sender.richSent[0].Text, draft.ResponseText)
 	}
 }
 
@@ -1485,14 +1633,26 @@ func (f *fakeAI) ProcessMessage(ctx context.Context, request contracts.AIProcess
 }
 
 type fakeSender struct {
-	calls int
-	sent  []telegram.OutboundMessage
+	calls     int
+	richCalls int
+	sent      []telegram.OutboundMessage
+	richSent  []telegram.OutboundMessage
+	richErr   error
 }
 
 func (f *fakeSender) SendMessage(ctx context.Context, message telegram.OutboundMessage) error {
 	f.calls++
 	f.sent = append(f.sent, message)
 	return nil
+}
+
+func (f *fakeSender) SendRichMessage(ctx context.Context, message telegram.OutboundMessage) (string, error) {
+	f.richCalls++
+	f.richSent = append(f.richSent, message)
+	if f.richErr != nil {
+		return "", f.richErr
+	}
+	return "rich:" + strconv.Itoa(f.richCalls), nil
 }
 
 func (f *fakeSender) AnswerCallbackQuery(ctx context.Context, queryID string) error {

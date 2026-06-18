@@ -27,6 +27,7 @@ from ai_agent.pipelines import (
 )
 from ai_agent.schemas import (
     AIProcessMessageRequest,
+    AIRoleData,
     ChatMode,
     ChatSettings,
     ChatSummaryRequest,
@@ -175,6 +176,44 @@ class ServicePolicyTests(unittest.TestCase):
 
         self.assertEqual(response.intent, "choice_question")
         self.assertGreaterEqual(len(response.options), 2)
+
+    def test_role_structured_answer_sets_rich_text_format(self) -> None:
+        """Assigned role answers carry text_format=rich for structured answer intents."""
+        response = self.service.process_message(
+            _process_request(
+                mode=ChatMode.MANUAL,
+                text="Can you explain the pricing?",
+                ai_role=AIRoleData(
+                    name="Support",
+                    description="Answers product FAQ and pricing questions.",
+                ),
+            )
+        )
+
+        self.assertEqual(response.intent, "question")
+        self.assertEqual(response.text_format, "rich")
+
+    def test_legacy_owner_copy_defaults_to_plain_text_format(self) -> None:
+        """Without ai_role the service keeps the legacy digital-copy path plain."""
+        response = self.service.process_message(
+            _process_request(mode=ChatMode.MANUAL, text="Can you explain the pricing?")
+        )
+
+        self.assertEqual(response.text_format, "plain")
+
+    def test_response_text_format_default_is_plain_for_old_construction(self) -> None:
+        """Back-compat: callers that omit text_format get the contract default."""
+        response = schemas.AIProcessMessageResponse(
+            decision=Decision.DRAFT,
+            response_text="ok",
+            confidence=0.9,
+            risk_level=RiskLevel.LOW,
+            intent="question",
+            model_used="test",
+            usage=schemas.Usage(),
+        )
+
+        self.assertEqual(response.text_format, "plain")
 
     def test_agent_failure_yields_error_fallback(self) -> None:
         """A draft the agent cannot produce surfaces as the error_fallback decision."""
@@ -374,6 +413,7 @@ def _process_request(
     text: str,
     privacy_flags: tuple[PrivacyFlag, ...] = (),
     memory_context: tuple[str, ...] = ("Customer prefers short replies.",),
+    ai_role: AIRoleData | None = None,
 ) -> AIProcessMessageRequest:
     return AIProcessMessageRequest(
         request_id="req-1",
@@ -396,6 +436,7 @@ def _process_request(
             privacy_flags=privacy_flags,
         ),
         memory_context=memory_context,
+        ai_role=ai_role,
     )
 
 

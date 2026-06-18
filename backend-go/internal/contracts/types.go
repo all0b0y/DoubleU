@@ -107,6 +107,24 @@ func (r RiskLevel) IsValid() bool {
 	}
 }
 
+// TextFormat declares the delivery formatting requested by the AI service.
+type TextFormat string
+
+const (
+	// TextFormatPlain sends the response as plain text with no parse_mode.
+	TextFormatPlain TextFormat = "plain"
+	// TextFormatRich sends the response through Telegram Rich Messages.
+	TextFormatRich TextFormat = "rich"
+)
+
+// Normalize returns a supported text format, defaulting old/unknown values to plain.
+func (f TextFormat) Normalize() TextFormat {
+	if f == TextFormatRich {
+		return TextFormatRich
+	}
+	return TextFormatPlain
+}
+
 // MessageState is an auditable lifecycle state for an inbound message.
 // Allowed values are generated from contracts/contracts.json — see contract_enums.gen.go.
 type MessageState string
@@ -434,6 +452,7 @@ type UserSettings struct {
 	// DefaultModeForNewChats: off, observe, manual, semi_auto, auto.
 	DefaultModeForNewChats string `json:"default_mode_for_new_chats"`
 	LearningEnabled        bool   `json:"learning_enabled"`
+	RichFormattingEnabled  bool   `json:"rich_formatting_enabled"`
 	// LanguageForDrafts: auto (detect from contact) or primary (always use PrimaryLanguage).
 	LanguageForDrafts string `json:"language_for_drafts"`
 }
@@ -659,6 +678,7 @@ type AIProcessMessageResponse struct {
 	Intent       string     `json:"intent"`
 	ModelUsed    string     `json:"model_used"`
 	Usage        TokenUsage `json:"usage"`
+	TextFormat   TextFormat `json:"text_format,omitempty"`
 	MemoryUsed   []string   `json:"memory_used"`
 	// Flagged is set by the Phase 3 output-safety layer when a draft contains
 	// toxicity, sensitive content, or schema-invalid output the repair attempt

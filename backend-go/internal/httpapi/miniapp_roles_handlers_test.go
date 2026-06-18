@@ -283,12 +283,12 @@ func TestUserSettingsRoundTrip(t *testing.T) {
 	res := miniappRequest(t, server, http.MethodGet, "/api/v1/settings/user", "")
 	var got contracts.UserSettings
 	decodeBody(t, res, &got)
-	if got.DefaultModeForNewChats != "manual" || !got.LearningEnabled {
+	if got.DefaultModeForNewChats != "manual" || !got.LearningEnabled || !got.RichFormattingEnabled {
 		t.Fatalf("defaults = %+v", got)
 	}
 
 	res = miniappRequest(t, server, http.MethodPut, "/api/v1/settings/user",
-		`{"display_name":"Алексей","bio":"продакт","default_mode_for_new_chats":"semi_auto","learning_enabled":false,"language_for_drafts":"primary"}`)
+		`{"display_name":"Алексей","bio":"продакт","default_mode_for_new_chats":"semi_auto","learning_enabled":false,"rich_formatting_enabled":false,"language_for_drafts":"primary"}`)
 	if res.Code != http.StatusOK {
 		t.Fatalf("save status = %d body=%s", res.Code, res.Body.String())
 	}
@@ -296,7 +296,7 @@ func TestUserSettingsRoundTrip(t *testing.T) {
 	res = miniappRequest(t, server, http.MethodGet, "/api/v1/settings/user", "")
 	decodeBody(t, res, &got)
 	if got.DisplayName != "Алексей" || got.DefaultModeForNewChats != "semi_auto" ||
-		got.LearningEnabled || got.LanguageForDrafts != "primary" {
+		got.LearningEnabled || got.RichFormattingEnabled || got.LanguageForDrafts != "primary" {
 		t.Fatalf("round-trip settings = %+v", got)
 	}
 
