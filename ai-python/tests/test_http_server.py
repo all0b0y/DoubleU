@@ -74,6 +74,21 @@ class HTTPServerTests(unittest.TestCase):
         self.assertEqual(response["owner_note"], "")
 
 
+    def test_extract_media_endpoint_matches_shape(self) -> None:
+        """The extract-media route parses the request and returns the frozen shape."""
+        import base64
+
+        response = self.handler._extract_media(
+            {
+                "kind": "voice",
+                "data_base64": base64.b64encode(b"oggbytes").decode("ascii"),
+                "mime_type": "audio/ogg",
+            }
+        )
+        self.assertEqual(set(response), {"text", "provenance", "model_used"})
+        self.assertEqual(response["provenance"], "voice_transcript")
+        self.assertTrue(response["text"])
+
     def test_synthesize_pattern_endpoint_matches_contract_shape(self) -> None:
         """The synthesize-pattern route parses the request and returns the frozen shape."""
         response = self.handler._synthesize_pattern(

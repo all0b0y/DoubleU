@@ -486,6 +486,44 @@ class SynthesizePatternResponse(JsonDataclass):
     blocked_by_privacy: bool = False
 
 
+# Media kinds the extract-media endpoint understands. Mirrors the Go
+# MediaDescriptor.Kind values; anything else routes to "unsupported".
+MEDIA_KINDS = ("voice", "audio", "photo", "document")
+
+
+@dataclass(frozen=True)
+class ExtractMediaRequest(JsonDataclass):
+    """Request body for `/ai/extract-media`.
+
+    The Go transport layer downloads a Telegram attachment (it owns the bot
+    token) and posts the raw bytes here as base64. The AI service — which already
+    holds the provider credentials — turns the media into plain text BEFORE the
+    frozen `/ai/process-message` call, keeping the agent text-only. ``kind`` is
+    one of :data:`MEDIA_KINDS`; ``duration`` is voice/audio seconds (0 otherwise).
+    """
+
+    kind: str
+    data_base64: str
+    mime_type: str = ""
+    duration: int = 0
+    trace_id: str = ""
+
+
+@dataclass(frozen=True)
+class ExtractMediaResponse(JsonDataclass):
+    """Response body for `/ai/extract-media`.
+
+    ``text`` is the extracted plain text (voice transcript / image OCR+caption /
+    document text), empty when nothing could be extracted. ``provenance`` labels
+    how it was produced so the caller wraps it with the right untrusted-input
+    marker and the model never mistakes transcribed user content for instructions.
+    """
+
+    text: str
+    provenance: str  # voice_transcript|image_caption|document_text|unsupported|error
+    model_used: str
+
+
 def parse_process_message_request(payload: dict[str, Any]) -> AIProcessMessageRequest:
     """Parse a process-message JSON object into a typed request."""
     event = payload.get("event") or {}
@@ -616,6 +654,28 @@ def parse_synthesize_pattern_request(payload: dict[str, Any]) -> SynthesizePatte
         tenant_id=str(payload.get("tenant_id", "")),
         chat_id=str(payload.get("chat_id", "")),
         privacy_flags=_parse_privacy_flags(payload.get("privacy_flags", [])),
+        trace_id=str(payload.get("trace_id", "")),
+    )
+
+
+def parse_extract_media_request(payload: dict[str, Any]) -> ExtractMediaRequest:
+    """Parse an extract-media JSON object into a typed request.
+
+    Validates the boundary: ``kind`` and ``data_base64`` are required (untrusted
+    input from the transport layer). An unknown ``kind`` is allowed through so a
+    new Telegram media type degrades to "unsupported" rather than a 400.
+    """
+    kind = str(payload.get("kind", "")).strip()
+    data_base64 = str(payload.get("data_base64", ""))
+    if not kind:
+        raise ValueError("kind is required")
+    if not data_base64:
+        raise ValueError("data_base64 is required")
+    return ExtractMediaRequest(
+        kind=kind,
+        data_base64=data_base64,
+        mime_type=str(payload.get("mime_type", "")),
+        duration=int(payload.get("duration", 0) or 0),
         trace_id=str(payload.get("trace_id", "")),
     )
 

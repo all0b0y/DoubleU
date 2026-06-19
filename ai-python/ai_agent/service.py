@@ -30,6 +30,7 @@ from .pipelines import (
     draft,
     embedding,
     intent,
+    media,
     memory,
     risk,
 )
@@ -42,6 +43,8 @@ from .schemas import (
     Decision,
     EmbedTextsRequest,
     EmbedTextsResponse,
+    ExtractMediaRequest,
+    ExtractMediaResponse,
     IntentRequest,
     IntentResponse,
     MemoryExtractionRequest,
@@ -138,6 +141,14 @@ class AIService:
     def embed_texts(self, request: EmbedTextsRequest) -> EmbedTextsResponse:
         """Generate embeddings for a batch of texts via the embedding pipeline."""
         return embedding.embed_texts(request)
+
+    def extract_media(self, request: ExtractMediaRequest) -> ExtractMediaResponse:
+        """Turn a media attachment (voice/audio/photo/document) into plain text.
+
+        A direct provider call (like embedding), not an agent task: keeps the
+        agent text-only so the frozen process-message contract is untouched.
+        """
+        return media.extract_media(request)
 
     def tag_topic(self, request: TopicTaggingRequest) -> TopicTaggingResponse:
         """Return a short topic label for the active conversation episode."""

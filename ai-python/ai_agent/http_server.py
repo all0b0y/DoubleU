@@ -19,6 +19,7 @@ from .safety.input import InputSafetyScanner
 from .safety.output import OutputSafetyScanner
 from .schemas import (
     parse_embed_texts_request,
+    parse_extract_media_request,
     parse_intent_request,
     parse_memory_request,
     parse_process_message_request,
@@ -58,6 +59,7 @@ class AIHTTPHandler(BaseHTTPRequestHandler):
             "/ai/extract-memory": self._extract_memory,
             "/ai/extract-facts-typed": self._extract_facts_typed,
             "/ai/embed-texts": self._embed_texts,
+            "/ai/extract-media": self._extract_media,
             "/ai/summarize-chat": self._summarize_chat,
             "/ai/tag-topic": self._tag_topic,
             "/ai/rerank-facts": self._rerank_facts,
@@ -114,6 +116,9 @@ class AIHTTPHandler(BaseHTTPRequestHandler):
     def _embed_texts(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self.service.embed_texts(parse_embed_texts_request(payload)).to_dict()
 
+    def _extract_media(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self.service.extract_media(parse_extract_media_request(payload)).to_dict()
+
     def _summarize_chat(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self.service.summarize_chat(parse_summary_request(payload)).to_dict()
 
@@ -135,6 +140,7 @@ class AIHTTPHandler(BaseHTTPRequestHandler):
         "/ai/extract-memory": LLMPurpose.EXTRACT,
         "/ai/extract-facts-typed": LLMPurpose.EXTRACT,
         "/ai/embed-texts": LLMPurpose.EMBED,
+        "/ai/extract-media": LLMPurpose.EXTRACT,
         "/ai/summarize-chat": LLMPurpose.SUMMARIZE,
         "/ai/tag-topic": LLMPurpose.EXTRACT,
         "/ai/rerank-facts": LLMPurpose.EXTRACT,
@@ -280,11 +286,16 @@ def _extract_context(path: str, payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _request_summary(path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    # Elide raw media bytes from the request preview: base64 blobs are large and
+    # are private user content, not useful in logs.
+    preview = payload
+    if "data_base64" in payload:
+        preview = {**payload, "data_base64": f"<{len(str(payload.get('data_base64', '')))} b64 chars>"}
     return {
         "path": path,
         "request_id": payload.get("request_id", ""),
         **_extract_context(path, payload),
-        "request_body_preview": _truncate(json.dumps(payload, ensure_ascii=False), 2000),
+        "request_body_preview": _truncate(json.dumps(preview, ensure_ascii=False), 2000),
     }
 
 

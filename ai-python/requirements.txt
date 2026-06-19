@@ -21,3 +21,10 @@ pgvector==0.*
 # Offline draft-quality evals (evals/eval_drafts.py) and the owner-feedback
 # regression loop (evals/export_feedback.py).
 pydantic-evals==1.*
+
+# Media extract pipeline (/ai/extract-media) document parsers. Optional: the
+# pipeline imports them lazily and degrades to "unsupported" when absent, so
+# voice/photo/text extraction still works without them. Voice (STT) and photo
+# (vision) are plain HTTP calls and need no extra package.
+pdfminer.six==2024.*
+python-docx==1.*
