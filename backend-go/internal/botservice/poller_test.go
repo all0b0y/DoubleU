@@ -12,6 +12,7 @@ import (
 
 	"doubleu/backend-go/internal/contracts"
 	"doubleu/backend-go/internal/store"
+	"doubleu/backend-go/internal/telegram"
 )
 
 // fakeTelegram is a scripted Bot API: each getUpdates call pops the next
@@ -91,7 +92,7 @@ type collectingHandler struct {
 	want   int
 }
 
-func (c *collectingHandler) HandleBotMessage(_ context.Context, event contracts.NormalizedTelegramEvent) error {
+func (c *collectingHandler) HandleBotMessage(_ context.Context, event contracts.NormalizedTelegramEvent, _ *telegram.MediaDescriptor) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.events = append(c.events, event)

@@ -154,6 +154,26 @@ func (c *HTTPClient) RerankFacts(ctx context.Context, request RerankFactsRequest
 	return response, nil
 }
 
+// extractMediaTimeout is the per-call deadline for /ai/extract-media. Speech-to-
+// text and vision through a remote provider routinely exceed the default 10s
+// client timeout, so the call gets the same headroom as embedding.
+const extractMediaTimeout = 60 * time.Second
+
+// ExtractMedia calls the Python AI /ai/extract-media endpoint to turn a media
+// attachment (voice/audio/photo/document) into plain text.
+func (c *HTTPClient) ExtractMedia(ctx context.Context, request ExtractMediaRequest) (ExtractMediaResponse, error) {
+	var response ExtractMediaResponse
+	if c.baseURL == "" {
+		return response, fmt.Errorf("ai base url is empty")
+	}
+	mediaCtx, cancel := context.WithTimeout(ctx, extractMediaTimeout)
+	defer cancel()
+	if err := c.postJSON(mediaCtx, "/ai/extract-media", request, &response); err != nil {
+		return response, err
+	}
+	return response, nil
+}
+
 func (c *HTTPClient) postJSON(ctx context.Context, path string, input any, output any) error {
 	body, err := json.Marshal(input)
 	if err != nil {

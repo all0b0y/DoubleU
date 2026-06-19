@@ -98,7 +98,15 @@ func (p *poller) run(ctx context.Context) {
 			if !isMessage {
 				continue
 			}
-			if err := p.handler.HandleBotMessage(ctx, event); err != nil {
+			// Parse any downloadable attachment so the handler can turn it into
+			// text. A parse failure is non-fatal: the message is still processed
+			// (as text/placeholder), never dropped.
+			media, mediaErr := telegram.MediaFromBotUpdate(raw)
+			if mediaErr != nil {
+				p.logger.Warn("bot media descriptor parse failed",
+					"bot_id", p.bot.BotID, "update_id", updateID, "error", mediaErr)
+			}
+			if err := p.handler.HandleBotMessage(ctx, event, media); err != nil {
 				// The receive idempotency key makes redelivery safe, but we do not
 				// retry here: the next message will surface persistent failures.
 				p.logger.Error("bot message processing failed",

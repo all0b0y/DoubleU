@@ -98,7 +98,11 @@ func main() {
 	// handler closes over the service variable assigned right below.
 	var service *core.Service
 	botManager := botservice.NewManager(repository,
-		botservice.HandlerFunc(func(ctx context.Context, event contracts.NormalizedTelegramEvent) error {
+		botservice.HandlerFunc(func(ctx context.Context, event contracts.NormalizedTelegramEvent, media *telegram.MediaDescriptor) error {
+			// Turn any voice/photo/document into text before AI processing so the
+			// agent stays text-only (media -> text). Best-effort: never blocks the
+			// message on extraction failure.
+			event = service.EnrichBotMedia(ctx, event, media)
 			_, err := service.HandleBotMessage(ctx, event)
 			return err
 		}),
@@ -106,6 +110,8 @@ func main() {
 		botservice.WithLogger(logger),
 		botservice.WithDefaultIngestionMode(ingestionDefault),
 	)
+	mediaCfg := core.DefaultMediaConfig()
+	mediaCfg.Enabled = cfg.MediaExtractionEnabled
 	service = core.NewService(repository, ai, sender,
 		core.WithLogger(logger),
 		core.WithReplyDelay(cfg.ReplyDelay),
@@ -114,6 +120,7 @@ func main() {
 		core.WithDefaultIngestionMode(ingestionDefault),
 		core.WithAIMemorySource(string(flags.AIMemorySource)),
 		core.WithReflectionMode(string(flags.ReflectionMode)),
+		core.WithMediaConfig(mediaCfg),
 	)
 	server := httpapi.NewServer(service,
 		httpapi.WithHub(hub),

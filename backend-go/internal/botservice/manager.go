@@ -33,17 +33,19 @@ import (
 const defaultAPIBaseURL = "https://api.telegram.org"
 
 // Handler consumes normalized bot-transport events (implemented by
-// core.Service through an adapter in cmd/backend).
+// core.Service through an adapter in cmd/backend). media is the message's
+// downloadable attachment (nil for plain text); the transport parses it here so
+// the core service can turn media into text before AI processing.
 type Handler interface {
-	HandleBotMessage(ctx context.Context, event contracts.NormalizedTelegramEvent) error
+	HandleBotMessage(ctx context.Context, event contracts.NormalizedTelegramEvent, media *telegram.MediaDescriptor) error
 }
 
 // HandlerFunc adapts a plain function to Handler.
-type HandlerFunc func(ctx context.Context, event contracts.NormalizedTelegramEvent) error
+type HandlerFunc func(ctx context.Context, event contracts.NormalizedTelegramEvent, media *telegram.MediaDescriptor) error
 
 // HandleBotMessage calls f.
-func (f HandlerFunc) HandleBotMessage(ctx context.Context, event contracts.NormalizedTelegramEvent) error {
-	return f(ctx, event)
+func (f HandlerFunc) HandleBotMessage(ctx context.Context, event contracts.NormalizedTelegramEvent, media *telegram.MediaDescriptor) error {
+	return f(ctx, event, media)
 }
 
 // Store is the persistence surface the manager needs; *store.Repository implements it.

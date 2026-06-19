@@ -39,6 +39,34 @@ type PatternSynthesizer interface {
 	SynthesizePattern(ctx context.Context, request contracts.SynthesizePatternRequest) (contracts.SynthesizePatternResponse, error)
 }
 
+// ExtractMediaRequest asks the Python AI service to turn a downloaded Telegram
+// attachment into plain text (the "media -> text" preprocessing step). DataBase64
+// is the raw file bytes the Go transport downloaded; the agent itself stays
+// text-only and never sees the media.
+type ExtractMediaRequest struct {
+	Kind       string `json:"kind"`
+	DataBase64 string `json:"data_base64"`
+	MimeType   string `json:"mime_type,omitempty"`
+	Duration   int64  `json:"duration,omitempty"`
+	TraceID    string `json:"trace_id,omitempty"`
+}
+
+// ExtractMediaResponse carries the extracted text and how it was produced
+// (voice_transcript|image_caption|document_text|unsupported|error).
+type ExtractMediaResponse struct {
+	Text       string `json:"text"`
+	Provenance string `json:"provenance"`
+	ModelUsed  string `json:"model_used"`
+}
+
+// MediaExtractor is optionally implemented by AI clients that can convert media
+// (voice/audio/photo/document) into text via /ai/extract-media. Called in the
+// inbound path before ProcessMessage so the enriched text flows through drafting,
+// memory and embeddings unchanged.
+type MediaExtractor interface {
+	ExtractMedia(ctx context.Context, request ExtractMediaRequest) (ExtractMediaResponse, error)
+}
+
 // MemoryExtractionRequest is sent to the Python AI service for async fact extraction.
 type MemoryExtractionRequest struct {
 	MessageText  string   `json:"message_text"`
