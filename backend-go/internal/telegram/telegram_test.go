@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -294,6 +295,146 @@ func TestBotSenderMarkdownFallback(t *testing.T) {
 	if strings.Contains(bodies[1], "parse_mode") {
 		t.Fatalf("fallback attempt must drop parse_mode, body = %s", bodies[1])
 	}
+}
+
+// TestExtractMedia verifies that the downloadable attachment and its file_id are
+// recovered from each supported message kind, and that photos resolve to the
+// largest (last) size for best extraction quality.
+func TestExtractMedia(t *testing.T) {
+	cases := []struct {
+		name     string
+		message  string
+		wantKind string
+		wantID   string
+	}{
+		{"photo picks largest size", `{"photo":[{"file_id":"small","file_size":100},{"file_id":"large","file_size":900}]}`, "photo", "large"},
+		{"voice", `{"voice":{"file_id":"v1","mime_type":"audio/ogg","duration":7}}`, "voice", "v1"},
+		{"audio", `{"audio":{"file_id":"a1","mime_type":"audio/mpeg"}}`, "audio", "a1"},
+		{"document", `{"document":{"file_id":"d1","mime_type":"application/pdf","file_size":2048}}`, "document", "d1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var m telegramMessage
+			if err := json.Unmarshal([]byte(tc.message), &m); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			got := extractMedia(&m)
+			if got == nil {
+				t.Fatalf("extractMedia = nil, want kind %s", tc.wantKind)
+			}
+			if got.Kind != tc.wantKind || got.FileID != tc.wantID {
+				t.Fatalf("extractMedia = %+v, want kind %s id %s", got, tc.wantKind, tc.wantID)
+			}
+		})
+	}
+}
+
+// TestExtractMediaVoiceMetadata verifies that mime type and duration (needed for
+// downstream routing and Slice 3 limits) survive the parse.
+func TestExtractMediaVoiceMetadata(t *testing.T) {
+	var m telegramMessage
+	if err := json.Unmarshal([]byte(`{"voice":{"file_id":"v1","mime_type":"audio/ogg","duration":42}}`), &m); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	got := extractMedia(&m)
+	if got == nil || got.Duration != 42 || got.MimeType != "audio/ogg" {
+		t.Fatalf("voice descriptor = %+v", got)
+	}
+}
+
+// TestExtractMediaNonMedia confirms that messages with no extractable media —
+// plain text, out-of-scope kinds (video), and decorative kinds (sticker) — yield
+// no descriptor, so the enrichment stage skips them.
+func TestExtractMediaNonMedia(t *testing.T) {
+	for _, payload := range []string{
+		`{"text":"hello"}`,
+		`{"sticker":{"file_id":"s1"}}`,
+		`{"video":{"file_id":"vid1"}}`,
+		`{}`,
+	} {
+		var m telegramMessage
+		if err := json.Unmarshal([]byte(payload), &m); err != nil {
+			t.Fatalf("unmarshal %s: %v", payload, err)
+		}
+		if got := extractMedia(&m); got != nil {
+			t.Fatalf("extractMedia(%s) = %+v, want nil", payload, got)
+		}
+	}
+}
+
+// TestBotSenderGetFilePath verifies getFile resolves a file_id to its file_path.
+func TestBotSenderGetFilePath(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/botTOKEN/getFile" {
+			t.Errorf("path = %s", r.URL.Path)
+		}
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body["file_id"] != "FID" {
+			t.Errorf("file_id = %v", body["file_id"])
+		}
+		_, _ = io.WriteString(w, `{"ok":true,"result":{"file_path":"voice/file_1.oga"}}`)
+	}))
+	defer srv.Close()
+
+	s := NewBotSender("TOKEN", srv.Client())
+	s.apiBase = srv.URL
+	path, err := s.GetFilePath(context.Background(), "FID")
+	if err != nil {
+		t.Fatalf("GetFilePath: %v", err)
+	}
+	if path != "voice/file_1.oga" {
+		t.Fatalf("path = %s", path)
+	}
+}
+
+// TestBotSenderDownloadFile verifies the file bytes and content type are returned
+// from the file-download endpoint.
+func TestBotSenderDownloadFile(t *testing.T) {
+	want := []byte("ogg-opus-bytes")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/file/botTOKEN/voice/file_1.oga" {
+			t.Errorf("path = %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "audio/ogg")
+		_, _ = w.Write(want)
+	}))
+	defer srv.Close()
+
+	s := NewBotSender("TOKEN", srv.Client())
+	s.apiBase = srv.URL
+	data, ctype, err := s.DownloadFile(context.Background(), "voice/file_1.oga")
+	if err != nil {
+		t.Fatalf("DownloadFile: %v", err)
+	}
+	if string(data) != string(want) || ctype != "audio/ogg" {
+		t.Fatalf("data=%q ctype=%q", data, ctype)
+	}
+}
+
+// TestBotSenderDownloadFileCapEnforced verifies an oversized body is rejected
+// rather than buffered, so the caller can degrade gracefully.
+func TestBotSenderDownloadFileCapEnforced(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.CopyN(w, devZero{}, maxDownloadBytes+1)
+	}))
+	defer srv.Close()
+
+	s := NewBotSender("TOKEN", srv.Client())
+	s.apiBase = srv.URL
+	if _, _, err := s.DownloadFile(context.Background(), "big/file.bin"); err == nil {
+		t.Fatalf("expected download cap error")
+	}
+}
+
+// devZero is an infinite source of zero bytes for the download-cap test.
+type devZero struct{}
+
+func (devZero) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 0
+	}
+	return len(p), nil
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)

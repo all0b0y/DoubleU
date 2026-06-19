@@ -111,7 +111,20 @@ func (NoopSender) DeleteMessage(ctx context.Context, chatID, messageID string) e
 type BotSender struct {
 	token  string
 	client *http.Client
+	// apiBase is the Telegram API host. Real senders use the public host; tests
+	// point it at an httptest server. Both the bot-method endpoints
+	// (apiBase/bot<token>/<method>) and the file-download endpoint
+	// (apiBase/file/bot<token>/<path>) derive from it.
+	apiBase string
 }
+
+// telegramAPIHost is the public Telegram API host used by production senders.
+const telegramAPIHost = "https://api.telegram.org"
+
+// maxDownloadBytes is the Telegram Bot API getFile download cap. Files above it
+// cannot be fetched through a bot token, so DownloadFile rejects them instead of
+// buffering unbounded data, letting callers degrade gracefully.
+const maxDownloadBytes = 20 * 1024 * 1024
 
 // BotCommand describes one Telegram command menu item.
 type BotCommand struct {
@@ -124,7 +137,12 @@ func NewBotSender(token string, client *http.Client) *BotSender {
 	if client == nil {
 		client = &http.Client{Timeout: 10 * time.Second}
 	}
-	return &BotSender{token: token, client: client}
+	return &BotSender{token: token, client: client, apiBase: telegramAPIHost}
+}
+
+// methodURL builds the URL for a Telegram bot API method.
+func (s *BotSender) methodURL(method string) string {
+	return s.apiBase + "/bot" + s.token + "/" + method
 }
 
 // sendMessageBody builds the sendMessage JSON body from an OutboundMessage.
@@ -194,7 +212,7 @@ func (s *BotSender) sendMessageRaw(ctx context.Context, body map[string]any) ([]
 	if err != nil {
 		return nil, err
 	}
-	url := "https://api.telegram.org/bot" + s.token + "/sendMessage"
+	url := s.methodURL("sendMessage")
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(data))
 	if err != nil {
 		return nil, err
@@ -218,7 +236,7 @@ func (s *BotSender) sendRichMessageRaw(ctx context.Context, body map[string]any)
 	if err != nil {
 		return nil, err
 	}
-	url := "https://api.telegram.org/bot" + s.token + "/sendRichMessage"
+	url := s.methodURL("sendRichMessage")
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(data))
 	if err != nil {
 		return nil, err
@@ -374,7 +392,7 @@ func (s *BotSender) post(ctx context.Context, method string, body map[string]any
 	if err != nil {
 		return err
 	}
-	url := "https://api.telegram.org/bot" + s.token + "/" + method
+	url := s.methodURL(method)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(data))
 	if err != nil {
 		return err
@@ -390,6 +408,89 @@ func (s *BotSender) post(ctx context.Context, method string, body map[string]any
 		return fmt.Errorf("telegram %s status %d: %s", method, res.StatusCode, strings.TrimSpace(string(data)))
 	}
 	return nil
+}
+
+// FileDownloader is the subset of sender behaviour needed to fetch a media
+// attachment's bytes. *BotSender implements it; NoopSender does not, so callers
+// type-assert and skip media extraction when the active sender cannot download.
+type FileDownloader interface {
+	GetFilePath(ctx context.Context, fileID string) (string, error)
+	DownloadFile(ctx context.Context, filePath string) ([]byte, string, error)
+}
+
+// GetFilePath resolves a Telegram file_id to its relative file_path via getFile.
+// The path feeds DownloadFile. The getFile result is short-lived (Telegram may
+// expire it), so callers should download promptly. Returns an error for an empty
+// token, transport failure, non-2xx status, or a response without a file_path.
+func (s *BotSender) GetFilePath(ctx context.Context, fileID string) (string, error) {
+	if s.token == "" {
+		return "", fmt.Errorf("telegram bot token is empty")
+	}
+	data, err := json.Marshal(map[string]any{"file_id": fileID})
+	if err != nil {
+		return "", err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.methodURL("getFile"), bytes.NewReader(data))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	res, err := s.client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer res.Body.Close()
+	if res.StatusCode < 200 || res.StatusCode > 299 {
+		raw, _ := io.ReadAll(io.LimitReader(res.Body, 4096))
+		return "", fmt.Errorf("telegram getFile status %d: %s", res.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	var parsed struct {
+		OK     bool `json:"ok"`
+		Result struct {
+			FilePath string `json:"file_path"`
+		} `json:"result"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&parsed); err != nil {
+		return "", err
+	}
+	if !parsed.OK || parsed.Result.FilePath == "" {
+		return "", fmt.Errorf("telegram getFile: missing file_path")
+	}
+	return parsed.Result.FilePath, nil
+}
+
+// DownloadFile fetches the bytes of a resolved Telegram file_path. It enforces
+// the Bot API download cap (maxDownloadBytes), erroring instead of buffering an
+// oversized body so callers degrade gracefully. The returned string is the
+// response Content-Type (best-effort; Telegram does not always set a precise one).
+func (s *BotSender) DownloadFile(ctx context.Context, filePath string) ([]byte, string, error) {
+	if s.token == "" {
+		return nil, "", fmt.Errorf("telegram bot token is empty")
+	}
+	url := s.apiBase + "/file/bot" + s.token + "/" + filePath
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, "", err
+	}
+	res, err := s.client.Do(req)
+	if err != nil {
+		return nil, "", err
+	}
+	defer res.Body.Close()
+	if res.StatusCode < 200 || res.StatusCode > 299 {
+		raw, _ := io.ReadAll(io.LimitReader(res.Body, 4096))
+		return nil, "", fmt.Errorf("telegram download status %d: %s", res.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	// Read one byte past the cap so a file exactly at the limit still succeeds
+	// while anything larger is detected and rejected.
+	raw, err := io.ReadAll(io.LimitReader(res.Body, maxDownloadBytes+1))
+	if err != nil {
+		return nil, "", err
+	}
+	if len(raw) > maxDownloadBytes {
+		return nil, "", fmt.Errorf("telegram file exceeds %d byte download cap", maxDownloadBytes)
+	}
+	return raw, res.Header.Get("Content-Type"), nil
 }
 
 // CallbackQueryUpdate describes an owner inline-button callback.
@@ -753,6 +854,78 @@ func detectMessageType(m *telegramMessage) string {
 	default:
 		return "unknown"
 	}
+}
+
+// MediaDescriptor identifies a downloadable Telegram attachment plus the minimum
+// metadata needed to fetch and route it for text extraction. Kind is one of
+// "voice", "audio", "photo", "document" — the kinds the extract-media path
+// understands. Video, stickers and animations are deliberately excluded.
+type MediaDescriptor struct {
+	Kind     string
+	FileID   string
+	MimeType string
+	FileSize int64
+	Duration int64 // seconds; voice/audio only, 0 otherwise
+}
+
+// telegramFile holds the Telegram file fields shared by voice, audio, document
+// and photo-size objects — only the subset needed for download and routing.
+type telegramFile struct {
+	FileID   string `json:"file_id"`
+	FileSize int64  `json:"file_size"`
+	MimeType string `json:"mime_type"`
+	Duration int64  `json:"duration"`
+}
+
+// extractMedia returns the downloadable attachment of a message, or nil when it
+// carries no extractable media (plain text, sticker, video, animation, …).
+// Photos arrive as an ascending-size array, so the largest (last) size is chosen
+// for best extraction quality. Caption text is handled separately by the caller.
+func extractMedia(m *telegramMessage) *MediaDescriptor {
+	switch {
+	case len(m.Photo) > 0:
+		return fileDescriptor("photo", &m.Photo[len(m.Photo)-1])
+	case m.Voice != nil:
+		return fileDescriptor("voice", m.Voice)
+	case m.Audio != nil:
+		return fileDescriptor("audio", m.Audio)
+	case m.Document != nil:
+		return fileDescriptor("document", m.Document)
+	default:
+		return nil
+	}
+}
+
+// fileDescriptor decodes a Telegram file sub-object into a MediaDescriptor,
+// returning nil when the payload is malformed or carries no file_id (nothing to
+// download).
+func fileDescriptor(kind string, raw *json.RawMessage) *MediaDescriptor {
+	var f telegramFile
+	if err := json.Unmarshal(*raw, &f); err != nil || f.FileID == "" {
+		return nil
+	}
+	return &MediaDescriptor{
+		Kind:     kind,
+		FileID:   f.FileID,
+		MimeType: f.MimeType,
+		FileSize: f.FileSize,
+		Duration: f.Duration,
+	}
+}
+
+// MediaFromBotUpdate parses a getUpdates payload and returns its downloadable
+// media attachment, if any. Returns (nil, nil) when the update has no message or
+// no extractable media. The bot poller calls this so the core service can turn
+// media into text before AI processing without re-threading the raw payload.
+func MediaFromBotUpdate(payload []byte) (*MediaDescriptor, error) {
+	var update telegramUpdate
+	if err := json.Unmarshal(payload, &update); err != nil {
+		return nil, err
+	}
+	if update.Message == nil {
+		return nil, nil
+	}
+	return extractMedia(update.Message), nil
 }
 
 // parseMessageID converts a stringified Telegram message_id to int64.
