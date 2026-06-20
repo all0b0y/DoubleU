@@ -66,12 +66,37 @@ BEGIN
 
   IF EXISTS (
     SELECT 1
-    FROM memory_facts
+    FROM semantic_facts
     WHERE tenant_id = 'tenant_a'
+      AND scope_kind = 'chat'
       AND chat_id = 'no_memory_chat'
   ) THEN
     RAISE EXCEPTION 'no_memory_chat must not have persisted memory facts';
   END IF;
+
+  INSERT INTO drafts (
+    draft_id,
+    tenant_id,
+    chat_id,
+    source_message_id,
+    source_message_text,
+    response_text,
+    draft_type
+  ) VALUES (
+    'smoke_warning_draft',
+    'tenant_a',
+    'semi_auto_chat',
+    'high_risk_message',
+    'Smoke warning draft',
+    '',
+    'warning'
+  )
+  ON CONFLICT (draft_id) DO UPDATE SET
+    draft_type = EXCLUDED.draft_type,
+    updated_at = now();
+
+  DELETE FROM drafts
+  WHERE draft_id = 'smoke_warning_draft';
 
   IF NOT EXISTS (
     SELECT 1
