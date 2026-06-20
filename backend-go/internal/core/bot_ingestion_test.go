@@ -118,6 +118,55 @@ func TestHandleBotMessageAutoReplyUsesBotSender(t *testing.T) {
 	}
 }
 
+// A role configured to speak as an open bot must answer a low-risk DM even
+// when the new bot-scoped chat still has the conservative manual default.
+func TestBotPersonaManualDefaultAutoRepliesLowRisk(t *testing.T) {
+	repository := store.NewRepository()
+	role := repository.SaveAIRole(store.AIRoleRecord{
+		TenantID:     "tenant:user:77",
+		Name:         "Tutor",
+		SpeakAsOwner: false,
+	})
+	repository.SaveUserBot(store.UserBotRecord{
+		TenantID: "tenant:user:77",
+		BotID:    555,
+		Status:   "active",
+		AIRoleID: role.ID,
+	})
+	ai := &fakeAI{response: contracts.AIProcessMessageResponse{
+		Decision:     contracts.DecisionDraft,
+		ResponseText: "Прямой ответ бота",
+		Confidence:   0.9,
+		RiskLevel:    contracts.RiskLow,
+	}}
+	controlSender := &fakeSender{}
+	botSender := &fakeSender{}
+	service := NewService(repository, ai, controlSender,
+		WithClock(func() time.Time { return time.Unix(1700000000, 0).UTC() }),
+		WithDefaultIngestionMode(contracts.IngestionModeFull),
+		WithBotSenderProvider(&fakeBotSenders{sender: botSender}),
+	)
+
+	result, err := service.HandleBotMessage(
+		context.Background(), botEvent(t, 9003, 42, 9, "объясни тему"),
+	)
+	if err != nil {
+		t.Fatalf("bot message: %v", err)
+	}
+	if result.Decision != contracts.DecisionAutoReply || result.Reason != "bot_persona_low_risk_send" {
+		t.Fatalf("result = %+v, want bot persona auto reply", result)
+	}
+	if ai.lastRequest.ChatSettings.Mode != contracts.ChatModeAuto {
+		t.Fatalf("AI effective mode = %q, want auto", ai.lastRequest.ChatSettings.Mode)
+	}
+	if len(botSender.sent) != 1 || botSender.sent[0].ChatID != "42" {
+		t.Fatalf("bot replies = %+v, want one reply to chat 42", botSender.sent)
+	}
+	if len(controlSender.sent) != 0 {
+		t.Fatalf("control bot must not receive a draft card: %+v", controlSender.sent)
+	}
+}
+
 // TestTwoBotsSameUserAreIsolated is the multi-bot isolation contract: when a
 // tenant's two bots both talk to the SAME Telegram user, the bot-namespaced
 // chat ids keep their messages and drafts completely separate — no bleed.

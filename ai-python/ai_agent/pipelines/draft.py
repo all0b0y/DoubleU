@@ -55,7 +55,7 @@ _DATE_PATTERN = re.compile(r"\[(\d{4}-\d{2}-\d{2})")
 
 TextFormat = Literal["plain", "rich"]
 
-_PLAIN_FORMAT_INTENTS = frozenset({"choice_question", "acknowledgement", "general_message"})
+_PLAIN_FORMAT_INTENTS = frozenset({"choice_question", "acknowledgement"})
 
 @dataclass(frozen=True)
 class DraftOutcome:

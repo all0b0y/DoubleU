@@ -418,6 +418,11 @@ type AIRole struct {
 	// MCPServers are the external MCP toolsets this role may call (#7). Resolved
 	// from role_mcp_access + mcp_servers; empty means the role has no tools.
 	MCPServers []MCPServerSpec `json:"mcp_servers,omitempty"`
+	// SpeakAsOwner controls the AI persona frame. true (default) = impersonate
+	// the owner — the contact perceives the reply as written by a human.
+	// false = the AI responds as the role itself (assistant / companion
+	// scenarios); the reply is clearly from the bot persona, not the owner.
+	SpeakAsOwner bool `json:"speak_as_owner"`
 }
 
 // MCPServerSpec is one MCP server a role may call, with its per-role tool
@@ -461,7 +466,7 @@ type UserSettings struct {
 // SemanticFact is a typed, atomic piece of knowledge about the conversation
 // or the owner, stored in the Semantic Layer (semantic_facts table).
 type SemanticFact struct {
-	ID   int64  `json:"id"`
+	ID int64 `json:"id"`
 	// ScopeKind is always "chat": memory is strictly per-chat (migration 011
 	// retired the owner_global scope).
 	ScopeKind string `json:"scope_kind"`
@@ -471,8 +476,8 @@ type SemanticFact struct {
 	// FactType: preference, biographical, commitment, event, relationship, health, taboo.
 	FactType string `json:"fact_type"`
 	// Subject: contact, owner, relationship, third_party.
-	Subject         string   `json:"subject"`
-	Confidence      float64  `json:"confidence"`
+	Subject    string  `json:"subject"`
+	Confidence float64 `json:"confidence"`
 	// Source: llm_extracted, owner_confirmed, owner_authored.
 	Source          string     `json:"source"`
 	SourceMessageID string     `json:"source_message_id,omitempty"`
@@ -637,31 +642,31 @@ func (s ChatSettings) WithDefaults() ChatSettings {
 
 // FeedbackItem carries one owner rating on a past draft for inclusion in the AI context.
 type FeedbackItem struct {
-	Rating       string `json:"rating"`        // "up" or "down"
+	Rating       string `json:"rating"` // "up" or "down"
 	ResponseText string `json:"response_text"`
 	FeedbackText string `json:"feedback_text,omitempty"`
 }
 
 // AIProcessMessageRequest is sent to the Python AI service.
 type AIProcessMessageRequest struct {
-	RequestID       string                  `json:"request_id"`
+	RequestID string `json:"request_id"`
 	// TraceID is the deterministic W3C trace-id derived from Event.EventID.
 	// Propagated to Python via the traceparent header and persisted on every
 	// state/audit row produced for this webhook so all spans correlate.
-	TraceID         string                  `json:"trace_id,omitempty"`
-	Event           NormalizedTelegramEvent `json:"event"`
-	ChatSettings    ChatSettings            `json:"chat_settings"`
+	TraceID      string                  `json:"trace_id,omitempty"`
+	Event        NormalizedTelegramEvent `json:"event"`
+	ChatSettings ChatSettings            `json:"chat_settings"`
 	// MemoryContext is the assembled prompt context (Working + Episodic + Semantic layers).
-	MemoryContext   []string                `json:"memory_context"`
-	FeedbackContext []FeedbackItem          `json:"feedback_context,omitempty"`
-	ContactProfile  *ContactProfile         `json:"contact_profile,omitempty"`
+	MemoryContext   []string        `json:"memory_context"`
+	FeedbackContext []FeedbackItem  `json:"feedback_context,omitempty"`
+	ContactProfile  *ContactProfile `json:"contact_profile,omitempty"`
 	// UserSettings provides the owner's identity and preferences to the AI.
-	UserSettings    *UserSettings           `json:"user_settings,omitempty"`
+	UserSettings *UserSettings `json:"user_settings,omitempty"`
 	// ActiveEpisode gives the AI awareness of the current open conversation episode.
-	ActiveEpisode   *ActiveEpisode          `json:"active_episode,omitempty"`
+	ActiveEpisode *ActiveEpisode `json:"active_episode,omitempty"`
 	// AIRole is the persona assigned to this chat; nil means the default
 	// assistant persona (reply in the owner's observed style).
-	AIRole          *AIRole                 `json:"ai_role,omitempty"`
+	AIRole *AIRole `json:"ai_role,omitempty"`
 }
 
 // TokenUsage contains model input and output token counts.
@@ -684,30 +689,30 @@ type AIProcessMessageResponse struct {
 	// Flagged is set by the Phase 3 output-safety layer when a draft contains
 	// toxicity, sensitive content, or schema-invalid output the repair attempt
 	// could not salvage.  Drafts are still returned; the bot UI annotates them.
-	Flagged      bool       `json:"flagged,omitempty"`
+	Flagged bool `json:"flagged,omitempty"`
 	// OwnerNote is an owner-facing service note (e.g. the critical-risk warning).
 	// It is rendered on the owner's card only and must NEVER be sent to the
 	// contact; ResponseText stays empty when this is set (ARCH-1).
-	OwnerNote    string     `json:"owner_note,omitempty"`
+	OwnerNote string `json:"owner_note,omitempty"`
 	// Options are AI-suggested short replies for Intent == "choice_question".
-	Options      []string   `json:"options,omitempty"`
+	Options []string `json:"options,omitempty"`
 	// Topic is a 3-7 word label of the current conversation produced by the
 	// same draft call (replaces the per-message /ai/tag-topic call — ARCH-4).
-	Topic        string     `json:"topic,omitempty"`
+	Topic string `json:"topic,omitempty"`
 }
 
 // AuditEvent records the policy outcome for an inbound message.
 type AuditEvent struct {
-	AuditID         string    `json:"audit_id"`
-	TenantID        string    `json:"tenant_id"`
-	ChatID          string    `json:"chat_id"`
-	SourceMessageID string    `json:"source_message_id"`
-	Decision        Decision  `json:"decision"`
-	Reason          string    `json:"reason"`
+	AuditID         string   `json:"audit_id"`
+	TenantID        string   `json:"tenant_id"`
+	ChatID          string   `json:"chat_id"`
+	SourceMessageID string   `json:"source_message_id"`
+	Decision        Decision `json:"decision"`
+	Reason          string   `json:"reason"`
 	// TraceID is the W3C trace-id this audit row belongs to.  Joins audit
 	// rows back to Langfuse spans and message_states for the same event.
-	TraceID         string    `json:"trace_id,omitempty"`
-	CreatedAt       time.Time `json:"created_at"`
+	TraceID   string    `json:"trace_id,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // ApprovalCallbackPayload is the callback payload sent by owner approval controls.
@@ -731,8 +736,8 @@ type ChatSummaryRequest struct {
 
 // ChatSummaryResponse is returned by the Python AI service.
 type ChatSummaryResponse struct {
-	Summary          string     `json:"summary"`
-	ActionItems      []string   `json:"action_items"`
+	Summary     string   `json:"summary"`
+	ActionItems []string `json:"action_items"`
 	// Recommendations are proactive suggestions for the owner based on the contact's interests
 	// and conversation history. Populated by the Python AI service when relevant.
 	Recommendations  []string   `json:"recommendations,omitempty"`

@@ -256,13 +256,13 @@ class AIRolePromptTests(unittest.TestCase):
 
     def test_decide_text_format_uses_rich_for_role_structured_intents(self) -> None:
         """Assigned roles may return Rich Markdown for structured answer intents."""
-        for intent in ("question", "scheduling", "commercial", "request"):
+        for intent in ("question", "scheduling", "commercial", "request", "general_message"):
             self.assertEqual(draft_pipeline.decide_text_format(self.ROLE, intent), "rich")
 
     def test_decide_text_format_keeps_copy_and_short_replies_plain(self) -> None:
         """Legacy owner-copy replies and short choice/greeting-style intents stay plain."""
         self.assertEqual(draft_pipeline.decide_text_format(None, "question"), "plain")
-        for intent in ("choice_question", "acknowledgement", "general_message"):
+        for intent in ("choice_question", "acknowledgement"):
             self.assertEqual(draft_pipeline.decide_text_format(self.ROLE, intent), "plain")
 
     def test_parse_ai_role_requires_name(self) -> None:

@@ -27,6 +27,7 @@ export function renderRoleEdit(navigate, roleId) {
   let role = {
     name: '', description: '', speaking_style: '', goals: '', constraints: '',
     context: '', custom_fields: [], rich_formatting_enabled: null, streaming_enabled: null,
+    speak_as_owner: true,
   };
   // Owner-defined extra fields (title + why + optional context), edited live.
   let customFields = [];
@@ -93,6 +94,31 @@ export function renderRoleEdit(navigate, roleId) {
           <option value="off" ${mode === 'off' ? 'selected' : ''}>выключено</option>
         </select>
         <div style="font-size:11px;color:var(--muted);line-height:1.4;margin-top:6px;">${hint}</div>
+      </div>`;
+  }
+
+  // speak_as_owner toggle: ON = "личный чат" (AI replies as the owner, an
+  // invisible human stand-in); OFF = "как бот" (AI replies openly as the role
+  // persona). Mirrors AIRole.speak_as_owner on the backend.
+  function speakAsSection() {
+    const asOwner = role.speak_as_owner !== false; // default ON
+    return `
+      <div class="st-section">
+        <p class="st-section-label">от чьего лица отвечать</p>
+        <div class="st-card">
+          <div class="st-row" style="cursor:default;">
+            <span class="st-row-icon">🎭</span>
+            <div class="st-row-body">
+              <p class="st-row-title">Личный чат — от вашего лица</p>
+              <p class="st-row-desc">Вкл: ИИ пишет как вы, собеседник думает, что общается с вами. Выкл: ИИ отвечает открыто как бот-ассистент в этой роли.</p>
+            </div>
+            <label class="toggle">
+              <input type="checkbox" id="f-speak-as-owner" ${asOwner ? 'checked' : ''}>
+              <div class="toggle-track"></div>
+              <div class="toggle-knob"></div>
+            </label>
+          </div>
+        </div>
       </div>`;
   }
 
@@ -202,6 +228,7 @@ export function renderRoleEdit(navigate, roleId) {
             { textarea: true, placeholder: 'Не обещать скидки, не обсуждать конкурентов…' })}
         </div>
 
+        ${speakAsSection()}
         ${deliverySettingsHTML()}
 
         <div class="st-section">
@@ -318,6 +345,7 @@ export function renderRoleEdit(navigate, roleId) {
       custom_fields:  cleaned,
       rich_formatting_enabled: modeToNullableBool(el.querySelector('#f-rich-formatting')?.value),
       streaming_enabled:       modeToNullableBool(el.querySelector('#f-streaming')?.value),
+      speak_as_owner:  el.querySelector('#f-speak-as-owner')?.checked ?? true,
     };
     if (!data.name) {
       twa?.HapticFeedback?.notificationOccurred('error');

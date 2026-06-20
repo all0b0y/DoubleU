@@ -83,6 +83,13 @@ components:
         speaking_style: { type: string }
         goals: { type: string }
         constraints: { type: string }
+        speak_as_owner:
+          type: boolean
+          default: true
+          description: >
+            true (default): the AI impersonates the owner — the contact perceives
+            the reply as written by a human. false: the AI replies openly as the
+            role persona (assistant/companion), without owner impersonation.
         context:
           type: string
           description: >

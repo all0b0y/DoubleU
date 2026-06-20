@@ -268,9 +268,11 @@ func (l *Layer) handleProfileSetCommand(command telegram.BotCommandUpdate, tenan
 }
 
 // roleCreateUsage is shown whenever /role_create arguments cannot be parsed.
-const roleCreateUsage = "Формат: /role_create Имя | Описание | стиль речи | цели | ограничения\n" +
+const roleCreateUsage = "Формат: /role_create Имя | Описание | стиль речи | цели | ограничения | режим\n" +
 	"Обязательны имя и описание, остальное — по желанию.\n" +
-	"Пример: /role_create Менеджер | Личный менеджер Алексея, отвечает клиентам от его имени | вежливо, кратко, на «вы» | договориться о встрече | не обещать скидки"
+	"Режим: own — отвечать от лица владельца (по умолчанию), bot — отвечать от лица роли/ассистента.\n" +
+	"Пример: /role_create Менеджер | Личный менеджер Алексея, отвечает клиентам от его имени | вежливо, кратко, на «вы» | договориться о встрече | не обещать скидки | own\n" +
+	"Пример: /role_create Компаньон | Личный ИИ-ассистент, помогает планировать дела | дружелюбно, кратко | напоминать о задачах | | bot"
 
 func (l *Layer) handleRolesCommand(tenantID string) CommandResponse {
 	roles := l.repository.AIRoles(tenantID)
@@ -310,12 +312,17 @@ func (l *Layer) handleRoleCommand(command telegram.BotCommandUpdate, tenantID st
 			ReplyMarkup: mainMenuKeyboard(),
 		}
 	}
+	speakAsLabel := "от лица владельца (own)"
+	if !role.SpeakAsOwner {
+		speakAsLabel = "от лица роли/ассистента (bot)"
+	}
 	lines := []string{
 		fmt.Sprintf("🎭 Роль в чате «%s»: %s", chatName(chat), role.Name),
 		fmt.Sprintf("• Описание: %s", valueOrDash(role.Description)),
 		fmt.Sprintf("• Стиль речи: %s", valueOrDash(role.SpeakingStyle)),
 		fmt.Sprintf("• Цели: %s", valueOrDash(role.Goals)),
 		fmt.Sprintf("• Ограничения: %s", valueOrDash(role.Constraints)),
+		fmt.Sprintf("• Режим ответа: %s", speakAsLabel),
 		"",
 		fmt.Sprintf("Снять роль: /role_clear %s", selector),
 	}
@@ -334,6 +341,9 @@ func (l *Layer) handleRoleCreateCommand(command telegram.BotCommandUpdate, tenan
 	if name == "" || description == "" || len(name) > 64 {
 		return CommandResponse{Text: roleCreateUsage, Reason: "role_create_bad_args", ReplyMarkup: mainMenuKeyboard()}
 	}
+	// 6th field: "bot" means speak_as_owner=false (assistant mode); anything
+	// else (including empty) defaults to true (owner-impersonation, legacy).
+	speakAsOwner := strings.ToLower(strings.TrimSpace(part(5))) != "bot"
 	role := l.repository.SaveAIRole(store.AIRoleRecord{
 		TenantID:      tenantID,
 		Name:          name,
@@ -341,6 +351,7 @@ func (l *Layer) handleRoleCreateCommand(command telegram.BotCommandUpdate, tenan
 		SpeakingStyle: part(2),
 		Goals:         part(3),
 		Constraints:   part(4),
+		SpeakAsOwner:  speakAsOwner,
 	})
 	if role.ID == 0 && role.Name == "" {
 		return CommandResponse{Text: "Не удалось сохранить роль, попробуй ещё раз.", Reason: "role_create_failed", ReplyMarkup: mainMenuKeyboard()}

@@ -48,3 +48,13 @@ func cloneBoolPtr(value *bool) *bool {
 	v := *value
 	return &v
 }
+
+// boolOrDefault resolves an optional JSON bool to a concrete value: the pointer
+// when present, else fallback. Used for non-nullable bool columns where an
+// omitted field must keep a default rather than collapse to false.
+func boolOrDefault(value *bool, fallback bool) bool {
+	if value == nil {
+		return fallback
+	}
+	return *value
+}

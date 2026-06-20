@@ -410,7 +410,7 @@ func TestHandleTelegramWebhookRichStreamingNeverRunsForDigitalCopy(t *testing.T)
 	}
 }
 
-func TestHandleTelegramWebhookRichSendFallsBackToHTML(t *testing.T) {
+func TestHandleTelegramWebhookRichSendFallsBackToPlain(t *testing.T) {
 	repository := store.NewRepository()
 	repository.SaveChatSettings(contracts.ChatSettings{TenantID: "tenant-1", ChatID: "42", Mode: contracts.ChatModeAuto})
 	repository.SaveChat(store.ChatRecord{TenantID: "tenant-1", ChatID: "42"})
@@ -434,10 +434,10 @@ func TestHandleTelegramWebhookRichSendFallsBackToHTML(t *testing.T) {
 	if sender.richCalls != 1 || sender.calls != 1 {
 		t.Fatalf("rich calls=%d fallback calls=%d", sender.richCalls, sender.calls)
 	}
-	if sender.sent[0].ParseMode != "HTML" {
+	if sender.sent[0].ParseMode != "" {
 		t.Fatalf("fallback parse_mode = %q", sender.sent[0].ParseMode)
 	}
-	if sender.sent[0].Text != "Use &lt;tag&gt; &amp; table" {
+	if sender.sent[0].Text != "Use <tag> & table" {
 		t.Fatalf("fallback text = %q", sender.sent[0].Text)
 	}
 }

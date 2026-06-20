@@ -33,6 +33,9 @@ type roleJSON struct {
 	CustomFields          []contracts.AIRoleCustomField `json:"custom_fields"`
 	RichFormattingEnabled *bool                         `json:"rich_formatting_enabled"`
 	StreamingEnabled      *bool                         `json:"streaming_enabled"`
+	// SpeakAsOwner: true = reply as the owner (personal-chat impersonation);
+	// false = reply as the bot/role persona.
+	SpeakAsOwner bool `json:"speak_as_owner"`
 }
 
 func roleToJSON(role store.AIRoleRecord) roleJSON {
@@ -52,6 +55,7 @@ func roleToJSON(role store.AIRoleRecord) roleJSON {
 		CustomFields:          fields,
 		RichFormattingEnabled: cloneBoolPtr(role.RichFormattingEnabled),
 		StreamingEnabled:      cloneBoolPtr(role.StreamingEnabled),
+		SpeakAsOwner:          role.SpeakAsOwner,
 	}
 }
 
@@ -67,6 +71,9 @@ type roleRequest struct {
 	CustomFields          []contracts.AIRoleCustomField `json:"custom_fields"`
 	RichFormattingEnabled optionalBoolPatch             `json:"rich_formatting_enabled"`
 	StreamingEnabled      optionalBoolPatch             `json:"streaming_enabled"`
+	// SpeakAsOwner is a pointer so an omitted field keeps the create-time
+	// default (true) / the existing value on update, rather than forcing false.
+	SpeakAsOwner *bool `json:"speak_as_owner"`
 }
 
 func (req *roleRequest) normalize() {
@@ -157,6 +164,7 @@ func (s *Server) apiCreateRole(w http.ResponseWriter, r *http.Request) {
 		CustomFields:          req.CustomFields,
 		RichFormattingEnabled: req.RichFormattingEnabled.Apply(nil),
 		StreamingEnabled:      req.StreamingEnabled.Apply(nil),
+		SpeakAsOwner:          boolOrDefault(req.SpeakAsOwner, true),
 	})
 	if role.ID == 0 {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to save role"})
@@ -205,6 +213,7 @@ func (s *Server) apiUpdateRole(w http.ResponseWriter, r *http.Request) {
 		CustomFields:          req.CustomFields,
 		RichFormattingEnabled: req.RichFormattingEnabled.Apply(existing.RichFormattingEnabled),
 		StreamingEnabled:      req.StreamingEnabled.Apply(existing.StreamingEnabled),
+		SpeakAsOwner:          boolOrDefault(req.SpeakAsOwner, existing.SpeakAsOwner),
 	}
 	if !s.service.Repository().UpdateAIRole(role) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to update role"})

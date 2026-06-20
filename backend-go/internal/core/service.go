@@ -1053,8 +1053,15 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 		}
 	}
 
+	aiRole := s.aiRoleFor(event.TenantID, event.ChatID)
+	effectiveSettings, botPersonaAuto := botPersonaEffectiveSettings(event, settings, aiRole)
 	s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateAIRequested)
-	s.logger.Info("ai analysis started", "tenant_id", event.TenantID, "chat_id", event.ChatID, "mode", settings.Mode)
+	s.logger.Info("ai analysis started",
+		"tenant_id", event.TenantID,
+		"chat_id", event.ChatID,
+		"mode", settings.Mode,
+		"effective_mode", effectiveSettings.Mode,
+	)
 	if s.notify != nil {
 		s.notify(event.TenantID, "ai_thinking", map[string]any{"chat_id": event.ChatID})
 	}
@@ -1063,7 +1070,7 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 		RequestID:       event.EventID,
 		TraceID:         tracepkg.DeriveTraceID(event.EventID),
 		Event:           event,
-		ChatSettings:    settings,
+		ChatSettings:    effectiveSettings,
 		MemoryContext:   memoryContext,
 		FeedbackContext: s.feedbackContext(event.TenantID, event.ChatID, 5),
 	}
@@ -1071,7 +1078,7 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 		request.ContactProfile = &profile
 	}
 	// AI role: the persona assigned to this chat (nil → default assistant persona).
-	request.AIRole = s.aiRoleFor(event.TenantID, event.ChatID)
+	request.AIRole = aiRole
 	// User Layer: owner identity and preferences (§3).
 	if us, ok := s.repository.UserSettings(event.TenantID); ok {
 		request.UserSettings = &us
@@ -1098,6 +1105,7 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 		"message_type", event.MessageType,
 		"message_text", truncateForLog(event.MessageText, 1000),
 		"mode", settings.Mode,
+		"effective_mode", effectiveSettings.Mode,
 		"privacy_flags", settings.PrivacyFlags,
 		"memory_context_count", len(request.MemoryContext),
 	)
@@ -1133,7 +1141,10 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 		"memory_used_count", len(proposal.MemoryUsed),
 	)
 
-	decision, reason := s.engine.Decide(settings, proposal)
+	decision, reason := s.engine.Decide(effectiveSettings, proposal)
+	if botPersonaAuto && decision == contracts.DecisionAutoReply {
+		reason = "bot_persona_low_risk_send"
+	}
 	s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateDecisionMade)
 	s.logger.Info("backend final decision made", "tenant_id", event.TenantID, "chat_id", event.ChatID, "decision", decision, "reason", reason)
 	if !settings.PrivacyFlags.Contains(contracts.PrivacyNoMemory) {
@@ -1724,7 +1735,26 @@ func (s *Service) aiRoleFor(tenantID, chatID string) *contracts.AIRole {
 		Context:       role.Context,
 		CustomFields:  role.CustomFields,
 		MCPServers:    s.repository.RoleMCPServers(role.ID),
+		SpeakAsOwner:  role.SpeakAsOwner,
 	}
+}
+
+// botPersonaEffectiveSettings makes an open bot persona conversational by
+// default. Bot chats are otherwise born in conservative manual mode, which
+// would save every generated answer as an owner draft and leave the Telegram
+// user without a reply. Explicit disabled/silent/semi-auto/auto settings,
+// owner-speaking roles, business chats and all risk/privacy gates are preserved.
+func botPersonaEffectiveSettings(
+	event contracts.NormalizedTelegramEvent,
+	settings contracts.ChatSettings,
+	role *contracts.AIRole,
+) (contracts.ChatSettings, bool) {
+	if event.Transport != contracts.TransportBot || role == nil || role.SpeakAsOwner ||
+		settings.Mode != contracts.ChatModeManual {
+		return settings, false
+	}
+	settings.Mode = contracts.ChatModeAuto
+	return settings, true
 }
 
 // resolveRole picks the persona for a chat. Bot-transport chats answer in the
@@ -2879,22 +2909,22 @@ func (s *Service) sendRichRecipient(ctx context.Context, sender telegram.Sender,
 		if err == nil {
 			return msgID, nil
 		}
-		s.logger.Warn("telegram rich send failed; falling back to HTML",
+		s.logger.Warn("telegram rich send failed; falling back to plain text",
 			"tenant_id", msg.TenantID,
 			"chat_id", msg.ChatID,
 			"decision_id", msg.DecisionID,
 			"error", err,
 		)
 	} else {
-		s.logger.Warn("telegram rich sender unavailable; falling back to HTML",
+		s.logger.Warn("telegram rich sender unavailable; falling back to plain text",
 			"tenant_id", msg.TenantID,
 			"chat_id", msg.ChatID,
 			"decision_id", msg.DecisionID,
 		)
 	}
 	fallback := msg
-	fallback.Text = html.EscapeString(msg.Text)
-	fallback.ParseMode = "HTML"
+	fallback.Text = msg.Text
+	fallback.ParseMode = ""
 	return sendMessage(ctx, sender, fallback)
 }
 
