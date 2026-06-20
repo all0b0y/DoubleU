@@ -35,7 +35,7 @@ class DraftResult(BaseModel):
 
     reply: str = Field(
         min_length=1,
-        description="Текст ответа собеседнику от лица владельца — только текст сообщения, без пояснений.",
+        description="Текст ответа собеседнику от лица назначенной персоны — без пояснений.",
     )
     intent: Intent = Field(
         default="general_message",
@@ -48,7 +48,7 @@ class DraftResult(BaseModel):
         default=(),
         max_length=4,
         description=(
-            "Для intent=choice_question — 2-4 коротких готовых ответа от лица владельца."
+            "Для intent=choice_question — 2-4 коротких готовых ответа от лица назначенной персоны."
             " Для остальных интентов — пустой список."
         ),
     )

@@ -167,7 +167,7 @@ class AIRolePromptTests(unittest.TestCase):
             contact_profile=kwargs.pop("contact_profile", None),
             current_draft=None,
             owner_instruction=None,
-            feedback_hint="",
+            feedback_hint=kwargs.pop("feedback_hint", ""),
             ai_role=ai_role,
             **kwargs,
         )
@@ -199,6 +199,37 @@ class AIRolePromptTests(unittest.TestCase):
         persona_block, _ = _split_sections(self._compose(role, contact_profile=profile))
         self.assertIn(OWNER_STYLE, persona_block)
 
+    def test_bot_role_uses_owner_bio_as_context_not_personality(self) -> None:
+        """Bot mode may reason from owner facts without inheriting the owner's voice."""
+        from ai_agent.schemas import UserSettingsData
+
+        role = AIRoleData(
+            name="bot-role-sentinel",
+            description="bot-description-sentinel",
+            speak_as_owner=False,
+        )
+        prompt = self._compose(
+            role,
+            owner_style_facts=[OWNER_STYLE],
+            contact_profile=ContactProfileData(owner_style=OWNER_STYLE),
+            user_settings=UserSettingsData(
+                display_name="owner-name-sentinel",
+                bio="owner-bio-sentinel",
+            ),
+            feedback_hint="owner-feedback-sentinel",
+        )
+
+        self.assertIn("Твоя единственная персона", prompt)
+        self.assertIn("bot-role-sentinel", prompt)
+        self.assertIn("не копируй личность", prompt.lower())
+        self.assertIn("выше остальных инструкций", prompt)
+        self.assertIn("СПРАВОЧНЫЙ КОНТЕКСТ, НЕ ПЕРСОНА БОТА", prompt)
+        self.assertIn("owner-name-sentinel", prompt)
+        self.assertIn("owner-bio-sentinel", prompt)
+        self.assertIn("точный совет, объяснение или вывод", prompt)
+        self.assertNotIn(OWNER_STYLE, prompt)
+        self.assertNotIn("owner-feedback-sentinel", prompt)
+
     def test_no_role_falls_back_to_owner_assistant_persona(self) -> None:
         """Without a role the prompt keeps the legacy copy-the-owner behaviour."""
         profile = ContactProfileData(owner_style=OWNER_STYLE)
@@ -212,11 +243,16 @@ class AIRolePromptTests(unittest.TestCase):
         self.assertIn("только из этого чата", prompt)
 
     def test_prompt_frames_markup_as_readability_tool(self) -> None:
-        """The system prompt permits markup only when it improves structured answers."""
+        """The compact prompt names the Rich Markdown dialect and useful GFM blocks."""
         prompt = self._compose(self.ROLE)
 
-        self.assertIn("Разметка — инструмент читаемости", prompt)
-        self.assertIn("не используй разметку", prompt)
+        self.assertIn("Telegram Rich Markdown (GFM)", prompt)
+        self.assertIn("GFM-таблицы", prompt)
+        self.assertIn("Короткий ответ пиши обычным текстом", prompt)
+
+    def test_no_role_prompt_forbids_markup(self) -> None:
+        """The legacy owner-copy path remains plain to match its delivery contract."""
+        self.assertIn("Пиши обычным текстом без разметки", self._compose(None))
 
     def test_decide_text_format_uses_rich_for_role_structured_intents(self) -> None:
         """Assigned roles may return Rich Markdown for structured answer intents."""
@@ -237,6 +273,11 @@ class AIRolePromptTests(unittest.TestCase):
         assert parsed is not None
         self.assertEqual(parsed.name, "n")
         self.assertEqual(parsed.constraints, "c")
+        self.assertTrue(parsed.speak_as_owner)
+
+        bot_role = _parse_ai_role({"name": "bot", "speak_as_owner": False})
+        assert bot_role is not None
+        self.assertFalse(bot_role.speak_as_owner)
 
     def test_custom_fields_render_in_persona_block(self) -> None:
         """Owner-defined custom fields reach the persona block, not the contact block."""

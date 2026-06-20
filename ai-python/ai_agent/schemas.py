@@ -170,6 +170,10 @@ class AIRoleData(JsonDataclass):
     custom_fields: tuple[AIRoleCustomFieldData, ...] = field(default_factory=tuple)
     # MCP servers this role may call (#7); empty means no external tools.
     mcp_servers: tuple[MCPServerSpecData, ...] = field(default_factory=tuple)
+    # speak_as_owner=True (default): AI impersonates the owner — contact thinks
+    # they are talking to a human.  False: AI responds as the role persona
+    # itself (assistant / companion); no owner impersonation.
+    speak_as_owner: bool = True
 
 
 @dataclass(frozen=True)
@@ -720,6 +724,11 @@ def _parse_ai_role(raw: Any) -> AIRoleData | None:
     name = str(raw.get("name", "")).strip()
     if not name:
         return None
+    # speak_as_owner defaults to True when absent (backward compat with existing
+    # roles that predate migration 111).
+    speak_as_owner = raw.get("speak_as_owner")
+    if not isinstance(speak_as_owner, bool):
+        speak_as_owner = True
     return AIRoleData(
         name=name,
         description=str(raw.get("description", "")).strip(),
@@ -729,6 +738,7 @@ def _parse_ai_role(raw: Any) -> AIRoleData | None:
         context=str(raw.get("context", "")).strip(),
         custom_fields=_parse_role_custom_fields(raw.get("custom_fields")),
         mcp_servers=_parse_mcp_servers(raw.get("mcp_servers")),
+        speak_as_owner=speak_as_owner,
     )
 
 
