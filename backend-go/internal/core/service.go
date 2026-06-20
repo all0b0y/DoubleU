@@ -1090,8 +1090,14 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 	// AI role: the persona assigned to this chat (nil → default assistant persona).
 	request.AIRole = aiRole
 	// User Layer: owner identity and preferences (§3).
+	// Also pre-compute delivery settings from the same read so sendRecipient below
+	// does not need a second UserSettings lookup on this hot path.
+	var hotDelivery deliverySettings
 	if us, ok := s.repository.UserSettings(event.TenantID); ok {
 		request.UserSettings = &us
+		hotDelivery = s.deliverySettingsFromUser(event, &us)
+	} else {
+		hotDelivery = s.deliverySettingsFromUser(event, nil)
 	}
 	// Runtime State Layer: current open episode data for AI awareness (§6.2).
 	if ep, ok := s.repository.ActiveEpisodeByChat(event.TenantID, event.ChatID); ok {
@@ -1163,7 +1169,7 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 	result := InboundResult{Event: event, Decision: decision, Reason: reason}
 	switch decision {
 	case contracts.DecisionAutoReply:
-		sentMsgID, err := s.sendRecipient(ctx, event, event.EventID, proposal.ResponseText, proposal.TextFormat, true)
+		sentMsgID, err := s.sendRecipient(ctx, event, event.EventID, proposal.ResponseText, proposal.TextFormat, true, hotDelivery)
 		if err != nil {
 			s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateFailed)
 			s.repository.AppendAudit(s.auditEvent(event, contracts.DecisionErrorFallback, "send_error:"+err.Error()))
@@ -2425,12 +2431,13 @@ func (s *Service) HandleApprovalCallback(ctx context.Context, payload contracts.
 			return ApprovalResult{}, fmt.Errorf("draft has no sendable text")
 		}
 		s.repository.AppendState(draft.TenantID, draft.ChatID, draft.SourceMessageID, contracts.StateApprovedByOwner)
-		sentMsgID, err := s.sendRecipient(ctx, contracts.NormalizedTelegramEvent{
+		approvalEvent := contracts.NormalizedTelegramEvent{
 			TenantID:             draft.TenantID,
 			ChatID:               draft.ChatID,
 			BusinessConnectionID: draft.BusinessConnectionID,
 			SourceMessageID:      draft.SourceMessageID,
-		}, draft.DecisionID, draft.ResponseText, draft.TextFormat, false)
+		}
+		sentMsgID, err := s.sendRecipient(ctx, approvalEvent, draft.DecisionID, draft.ResponseText, draft.TextFormat, false, s.deliverySettingsFor(approvalEvent))
 		if err != nil {
 			s.repository.AppendState(draft.TenantID, draft.ChatID, draft.SourceMessageID, contracts.StateFailed)
 			return ApprovalResult{}, err
@@ -2744,7 +2751,9 @@ func (s *Service) notifyDraftStatus(draft store.DraftRecord) {
 }
 
 // sendRecipient sends a reply to the contact and returns the Telegram message_id of the sent message.
-func (s *Service) sendRecipient(ctx context.Context, event contracts.NormalizedTelegramEvent, decisionID, text string, textFormat contracts.TextFormat, allowStreaming bool) (string, error) {
+// delivery holds the pre-computed rich-formatting and streaming toggles; callers on the hot path
+// supply deliverySettingsFromUser (no extra repository read) while others use deliverySettingsFor.
+func (s *Service) sendRecipient(ctx context.Context, event contracts.NormalizedTelegramEvent, decisionID, text string, textFormat contracts.TextFormat, allowStreaming bool, delivery deliverySettings) (string, error) {
 	key := contracts.SendIdempotencyKey(event.TenantID, event.ChatID, event.SourceMessageID, decisionID)
 	duplicate := s.repository.MarkSend(store.SendRecord{
 		Key:             key,
@@ -2775,8 +2784,7 @@ func (s *Service) sendRecipient(ctx context.Context, event contracts.NormalizedT
 		return "", err
 	}
 	if textFormat.Normalize() == contracts.TextFormatRich {
-		deliverySettings := s.deliverySettingsFor(event)
-		if !deliverySettings.RichFormattingEnabled {
+		if !delivery.RichFormattingEnabled {
 			// Rich formatting is disabled; degrade to HTML so the LLM-produced
 			// markdown never appears raw (### ** ~~) in the chat.
 			htmlMsg := msg
@@ -2784,7 +2792,7 @@ func (s *Service) sendRecipient(ctx context.Context, event contracts.NormalizedT
 			htmlMsg.ParseMode = "HTML"
 			return sendMessage(ctx, sender, htmlMsg)
 		}
-		if allowStreaming && deliverySettings.StreamingEnabled && s.richDraftStreamingAllowedFor(event) {
+		if allowStreaming && delivery.StreamingEnabled && s.richDraftStreamingAllowedFor(event) {
 			return s.sendStreamingRichRecipient(ctx, sender, msg)
 		}
 		return s.sendRichRecipient(ctx, sender, msg)
@@ -2797,11 +2805,24 @@ type deliverySettings struct {
 	StreamingEnabled      bool
 }
 
+// deliverySettingsFor resolves rich-formatting and streaming toggles from all config layers.
+// Callers on the hot path that have already fetched UserSettings should call
+// deliverySettingsFromUser instead to avoid a redundant repository read.
 func (s *Service) deliverySettingsFor(event contracts.NormalizedTelegramEvent) deliverySettings {
+	if us, ok := s.repository.UserSettings(event.TenantID); ok {
+		return s.deliverySettingsFromUser(event, &us)
+	}
+	return s.deliverySettingsFromUser(event, nil)
+}
+
+// deliverySettingsFromUser is the core toggle resolver: accepts a pre-loaded user settings
+// value so the hot path (processContactMessage) does not re-read the repository.
+// Pass nil when UserSettings was not found — rich formatting then defaults to enabled.
+func (s *Service) deliverySettingsFromUser(event contracts.NormalizedTelegramEvent, us *contracts.UserSettings) deliverySettings {
 	settings := deliverySettings{RichFormattingEnabled: true}
-	if userSettings, ok := s.repository.UserSettings(event.TenantID); ok {
-		settings.RichFormattingEnabled = userSettings.RichFormattingEnabled
-		settings.StreamingEnabled = userSettings.StreamingEnabled
+	if us != nil {
+		settings.RichFormattingEnabled = us.RichFormattingEnabled
+		settings.StreamingEnabled = us.StreamingEnabled
 	}
 	if role, ok := s.resolveRole(event.TenantID, event.ChatID); ok {
 		settings.RichFormattingEnabled = applyScopedBool(settings.RichFormattingEnabled, role.RichFormattingEnabled)
@@ -3664,10 +3685,8 @@ func (s *Service) ManualSend(ctx context.Context, tenantID, chatID, text string)
 	}
 	ownerID := strings.TrimPrefix(tenantID, "tenant:user:")
 	decisionID := fmt.Sprintf("manual:%s:%d", chatID, s.now().UnixNano())
-	sentMsgID, err := s.sendRecipient(ctx, contracts.NormalizedTelegramEvent{
-		TenantID: tenantID,
-		ChatID:   chatID,
-	}, decisionID, text, contracts.TextFormatPlain, false)
+	manualEvent := contracts.NormalizedTelegramEvent{TenantID: tenantID, ChatID: chatID}
+	sentMsgID, err := s.sendRecipient(ctx, manualEvent, decisionID, text, contracts.TextFormatPlain, false, s.deliverySettingsFor(manualEvent))
 	if err != nil {
 		return err
 	}
@@ -4275,7 +4294,7 @@ func (s *Service) handleChoiceOption(ctx context.Context, event contracts.Normal
 	if err != nil {
 		s.logger.Error("choice option: ai hint failed, sending option text directly", "error", err, "draft_id", draftID)
 		srcEvent := s.resolveSourceEvent(draft)
-		_, _ = s.sendRecipient(ctx, srcEvent, draft.DecisionID+":choice_fallback", optionText, contracts.TextFormatPlain, false)
+		_, _ = s.sendRecipient(ctx, srcEvent, draft.DecisionID+":choice_fallback", optionText, contracts.TextFormatPlain, false, s.deliverySettingsFor(srcEvent))
 		return InboundResult{Event: event, Decision: contracts.DecisionAutoReply, Reason: "choice_fallback_sent", DraftID: draftID}
 	}
 
@@ -4286,7 +4305,7 @@ func (s *Service) handleChoiceOption(ctx context.Context, event contracts.Normal
 	}
 	srcEvent := s.resolveSourceEvent(newDraft)
 	if settings.Mode == contracts.ChatModeAuto {
-		_, _ = s.sendRecipient(ctx, srcEvent, newDraft.DecisionID, newDraft.ResponseText, newDraft.TextFormat, true)
+		_, _ = s.sendRecipient(ctx, srcEvent, newDraft.DecisionID, newDraft.ResponseText, newDraft.TextFormat, true, s.deliverySettingsFor(srcEvent))
 		s.saveOutgoingMessage(srcEvent, ownerID, "", newDraft.ResponseText, newDraft.DecisionID, newDraft.TextFormat)
 		if s.notify != nil {
 			s.notify(newDraft.TenantID, "new_message", map[string]any{"chat_id": newDraft.ChatID})
