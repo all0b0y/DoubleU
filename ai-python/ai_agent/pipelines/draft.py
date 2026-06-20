@@ -221,9 +221,14 @@ def _compose_base_instruction(
         )
     if ai_role is not None:
         formatting_line = (
-            "ФОРМАТ: Для структурного ответа используй Telegram Rich Markdown (GFM):"
-            " **жирный**, # заголовки, -/1. списки, > цитаты, GFM-таблицы, `код` и"
-            " [ссылки](URL). Короткий ответ пиши обычным текстом; не украшай разметкой."
+            "ФОРМАТ: Применяй Telegram Rich Markdown (GFM) только для реально"
+            " структурного ответа (инструкция, сравнение, план, код)."
+            " Доступные элементы: **жирный**, # заголовки, -/1. списки,"
+            " > цитаты, GFM-таблицы, `код`, [ссылки](URL)."
+            " Правила: пустая строка до и после каждого заголовка и списка;"
+            " «# Заголовок» ставь только с новой строки, никогда в одной строке"
+            " с текстом или эмодзи."
+            " Короткий ответ пиши обычным текстом без разметки."
         )
     else:
         formatting_line = "ФОРМАТ: Пиши обычным текстом без разметки."
@@ -287,6 +292,43 @@ def decide_text_format(ai_role: AIRoleData | None, intent: str | None) -> TextFo
     if ai_role is None:
         return "plain"
     return "rich"
+
+
+# _HEADING_INLINE_RE matches a heading marker (# through ######) that is
+# preceded by at least one non-newline character (possibly with whitespace
+# between).  Telegram's Rich parser — like standard GFM — requires an
+# empty line before a heading; the pattern captures the last non-newline
+# character before the heading so the replacement can insert \n\n.
+_HEADING_INLINE_RE = re.compile(r"([^\n])\s*(#{1,6} )")
+
+
+def normalize_rich_markdown(text: str) -> str:
+    """Normalize LLM-produced Rich Markdown before delivery.
+
+    Fixes two common model output patterns that break Telegram's rich parser
+    or produce visual artefacts:
+
+    1. Heading markers appearing inline or after a single newline:
+       ``"😊 ### Заголовок"`` → ``"😊\\n\\n### Заголовок"``.
+       GFM requires a blank line before a heading; without it Telegram
+       renders the ``###`` as literal text.
+
+    2. Three or more consecutive newlines collapsed to two (Telegram
+       ignores extra blank lines, so they waste characters and make the
+       rich parse less predictable).
+
+    Only applied when ``decide_text_format`` resolves to ``"rich"`` — plain
+    responses are never touched.
+
+    This function is idempotent: a second pass produces identical output.
+    """
+    # Separate any heading that trails non-newline text (incl. same-line emoji)
+    # onto its own paragraph.  The replacement preserves the preceding character
+    # and inserts exactly one blank line.
+    text = _HEADING_INLINE_RE.sub(r"\1\n\n\2", text)
+    # Collapse three or more newlines to exactly two.
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text
 
 
 def _greeting_rule(memory_context: tuple[str, ...]) -> str:

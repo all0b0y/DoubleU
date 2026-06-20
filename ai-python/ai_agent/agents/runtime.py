@@ -540,12 +540,16 @@ class AgentRuntime:
         self._record_run(
             ctx, AgentTask.DRAFT, system_prompt, user_payload, drafted.reply, total, privacy_flags
         )
+        text_format = draft_pipeline.decide_text_format(request.ai_role, drafted.intent)
+        if text_format == "rich":
+            # Normalize only the final safe text — never raw LLM chunks.
+            text = draft_pipeline.normalize_rich_markdown(text)
         return draft_pipeline.DraftOutcome(
             text=text,
             model_used=model_used,
             usage=total,
             intent=drafted.intent,
-            text_format=draft_pipeline.decide_text_format(request.ai_role, drafted.intent),
+            text_format=text_format,
             options=drafted.options if drafted.intent == "choice_question" else (),
             confidence=confidence,
             topic=drafted.topic,

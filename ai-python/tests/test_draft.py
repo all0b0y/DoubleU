@@ -361,6 +361,69 @@ class PromptBuilderTests(unittest.TestCase):
         self.assertIn("<untrusted_user_message>", payload)
 
 
+class NormalizeRichMarkdownTests(unittest.TestCase):
+    """``normalize_rich_markdown`` fixes common model-output heading artefacts."""
+
+    def _norm(self, text: str) -> str:
+        return draft_pipeline.normalize_rich_markdown(text)
+
+    def test_inline_heading_after_emoji_gets_paragraph_break(self) -> None:
+        """Emoji followed by a heading on the same line must be split."""
+        result = self._norm("Hello 😊 ### Заголовок")
+        self.assertIn("\n\n### Заголовок", result)
+        # The emoji must stay on its own line, not disappear.
+        self.assertIn("😊", result)
+
+    def test_heading_after_single_newline_gets_blank_line(self) -> None:
+        """A heading immediately after text (single \\n) must get a blank line."""
+        result = self._norm("Paragraph.\n## Section")
+        self.assertIn("\n\n## Section", result)
+
+    def test_heading_already_separated_is_unchanged(self) -> None:
+        """A heading already on its own paragraph must not gain extra newlines."""
+        text = "Paragraph.\n\n## Section\n\nContent."
+        result = self._norm(text)
+        self.assertEqual(result, text)
+
+    def test_plain_response_is_not_modified(self) -> None:
+        """Text with no heading markers must be returned as-is."""
+        text = "Just a short reply with no markdown."
+        self.assertEqual(self._norm(text), text)
+
+    def test_triple_newlines_collapsed(self) -> None:
+        """Three or more consecutive newlines are collapsed to exactly two."""
+        result = self._norm("A\n\n\n\nB")
+        self.assertNotIn("\n\n\n", result)
+        self.assertIn("A\n\nB", result)
+
+    def test_idempotent_on_already_normalized_text(self) -> None:
+        """A second pass must produce the same output as the first."""
+        text = "😊 ### Title\n\nBody text."
+        first = self._norm(text)
+        second = self._norm(first)
+        self.assertEqual(first, second)
+
+    def test_heading_at_start_of_text_unchanged(self) -> None:
+        """A heading at the very start of the text needs no preceding blank line."""
+        text = "# Title\n\nContent."
+        self.assertEqual(self._norm(text), text)
+
+    def test_formatting_line_enforces_heading_rules(self) -> None:
+        """The formatting prompt forbids # on the same line as text or emoji."""
+        role = AIRoleData(name="r", description="d")
+        prompt = draft_pipeline._compose_base_instruction(
+            clean_memory=[],
+            owner_style_facts=[],
+            contact_profile=None,
+            current_draft=None,
+            owner_instruction=None,
+            feedback_hint="",
+            ai_role=role,
+        )
+        self.assertIn("никогда в одной строке", prompt)
+        self.assertIn("пустая строка до и после", prompt)
+
+
 def _split_sections(prompt: str) -> tuple[str, str]:
     """Return (persona_block, contact_block) substrings of the system prompt."""
     role_start = prompt.index("КТО ТЫ В ЭТОМ ЧАТЕ:")
