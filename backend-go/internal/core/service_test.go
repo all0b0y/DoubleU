@@ -434,10 +434,12 @@ func TestHandleTelegramWebhookRichSendFallsBackToPlain(t *testing.T) {
 	if sender.richCalls != 1 || sender.calls != 1 {
 		t.Fatalf("rich calls=%d fallback calls=%d", sender.richCalls, sender.calls)
 	}
-	if sender.sent[0].ParseMode != "" {
-		t.Fatalf("fallback parse_mode = %q", sender.sent[0].ParseMode)
+	// Rich failed → must degrade to HTML, never dump raw markdown.
+	if sender.sent[0].ParseMode != "HTML" {
+		t.Fatalf("fallback parse_mode = %q, want HTML", sender.sent[0].ParseMode)
 	}
-	if sender.sent[0].Text != "Use <tag> & table" {
+	// HTML special chars in the original text must be escaped.
+	if sender.sent[0].Text != "Use &lt;tag&gt; &amp; table" {
 		t.Fatalf("fallback text = %q", sender.sent[0].Text)
 	}
 }
@@ -473,8 +475,13 @@ func TestHandleTelegramWebhookRichFormattingToggleOffForcesPlainSend(t *testing.
 	if sender.richCalls != 0 || sender.calls != 1 {
 		t.Fatalf("rich calls=%d plain calls=%d", sender.richCalls, sender.calls)
 	}
-	if sender.sent[0].ParseMode != "" || sender.sent[0].Text != "# План\n\n- A\n- B" {
-		t.Fatalf("plain fallback send = %+v", sender.sent[0])
+	// Toggled-off rich must degrade to HTML, never dump raw markdown (### • …).
+	if sender.sent[0].ParseMode != "HTML" {
+		t.Fatalf("parse_mode = %q, want HTML", sender.sent[0].ParseMode)
+	}
+	want := "<b>План</b>\n\n• A\n• B"
+	if sender.sent[0].Text != want {
+		t.Fatalf("text = %q, want %q", sender.sent[0].Text, want)
 	}
 }
 

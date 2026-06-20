@@ -2766,7 +2766,12 @@ func (s *Service) sendRecipient(ctx context.Context, event contracts.NormalizedT
 	if textFormat.Normalize() == contracts.TextFormatRich {
 		deliverySettings := s.deliverySettingsFor(event)
 		if !deliverySettings.RichFormattingEnabled {
-			return sendMessage(ctx, sender, msg)
+			// Rich formatting is disabled; degrade to HTML so the LLM-produced
+			// markdown never appears raw (### ** ~~) in the chat.
+			htmlMsg := msg
+			htmlMsg.Text = telegram.MarkdownToHTML(msg.Text)
+			htmlMsg.ParseMode = "HTML"
+			return sendMessage(ctx, sender, htmlMsg)
 		}
 		if allowStreaming && deliverySettings.StreamingEnabled && s.richDraftStreamingAllowedFor(event) {
 			return s.sendStreamingRichRecipient(ctx, sender, msg)
@@ -2916,16 +2921,28 @@ func (s *Service) sendRichRecipient(ctx context.Context, sender telegram.Sender,
 			"error", err,
 		)
 	} else {
-		s.logger.Warn("telegram rich sender unavailable; falling back to plain text",
+		s.logger.Warn("telegram rich sender unavailable; falling back to HTML",
 			"tenant_id", msg.TenantID,
 			"chat_id", msg.ChatID,
 			"decision_id", msg.DecisionID,
 		)
 	}
-	fallback := msg
-	fallback.Text = msg.Text
-	fallback.ParseMode = ""
-	return sendMessage(ctx, sender, fallback)
+	// Degrade through HTML → stripped plain so raw markdown never leaks.
+	htmlMsg := msg
+	htmlMsg.Text = telegram.MarkdownToHTML(msg.Text)
+	htmlMsg.ParseMode = "HTML"
+	if msgID, err := sendMessage(ctx, sender, htmlMsg); err == nil {
+		return msgID, nil
+	}
+	s.logger.Warn("telegram HTML fallback failed; stripping markdown to plain",
+		"tenant_id", msg.TenantID,
+		"chat_id", msg.ChatID,
+		"decision_id", msg.DecisionID,
+	)
+	stripped := msg
+	stripped.Text = telegram.StripMarkdown(msg.Text)
+	stripped.ParseMode = ""
+	return sendMessage(ctx, sender, stripped)
 }
 
 func (s *Service) botForDeliverySettings(event contracts.NormalizedTelegramEvent) (store.UserBotRecord, bool) {
