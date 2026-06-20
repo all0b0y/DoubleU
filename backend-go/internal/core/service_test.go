@@ -319,6 +319,10 @@ func TestHandleBotMessageRichStreamingSendsDraftsThenFinal(t *testing.T) {
 	if botSender.richSent[0].Text != "## Финал\n\n- безопасный текст" {
 		t.Fatalf("final rich text = %q", botSender.richSent[0].Text)
 	}
+	// Phase D: typing indicator must fire exactly once, before draft frames.
+	if len(botSender.chatActions) != 1 || botSender.chatActions[0] != "typing" {
+		t.Fatalf("chat actions = %v, want [typing]", botSender.chatActions)
+	}
 
 	_, err = service.HandleBotMessage(context.Background(), botEvent(t, 1012, 42, 7, "hi"))
 	if err != nil {
@@ -326,6 +330,9 @@ func TestHandleBotMessageRichStreamingSendsDraftsThenFinal(t *testing.T) {
 	}
 	if botSender.richCalls != 1 || len(botSender.richDrafts) != 2 {
 		t.Fatalf("duplicate must not send again: rich calls=%d drafts=%d", botSender.richCalls, len(botSender.richDrafts))
+	}
+	if len(botSender.chatActions) != 1 {
+		t.Fatalf("duplicate must not send chat action again: chat actions = %v", botSender.chatActions)
 	}
 }
 
@@ -482,6 +489,95 @@ func TestHandleTelegramWebhookRichFormattingToggleOffForcesPlainSend(t *testing.
 	want := "<b>План</b>\n\n• A\n• B"
 	if sender.sent[0].Text != want {
 		t.Fatalf("text = %q, want %q", sender.sent[0].Text, want)
+	}
+}
+
+// TestHandleBotMessageStreamingTypingActionNotSentWhenOff verifies that sendChatAction
+// is never called when streaming is disabled — the Phase A plain rich path must stay clean.
+func TestHandleBotMessageStreamingTypingActionNotSentWhenOff(t *testing.T) {
+	repository := store.NewRepository()
+	repository.SaveChatSettings(contracts.ChatSettings{TenantID: "tenant:user:77", ChatID: contracts.BotChatID("555", "42"), Mode: contracts.ChatModeAuto})
+	repository.SaveUserSettings(contracts.UserSettings{
+		TenantID:              "tenant:user:77",
+		RichFormattingEnabled: true,
+		StreamingEnabled:      false, // OFF
+		LearningEnabled:       true,
+		LanguageForDrafts:     "auto",
+	})
+	ai := &fakeAI{response: contracts.AIProcessMessageResponse{
+		Decision:     contracts.DecisionAutoReply,
+		ResponseText: "## Ответ",
+		TextFormat:   contracts.TextFormatRich,
+		Confidence:   0.99,
+		RiskLevel:    contracts.RiskLow,
+	}}
+	controlSender := &fakeSender{}
+	botSender := &fakeSender{}
+	service := NewService(repository, ai, controlSender,
+		WithClock(func() time.Time { return time.Unix(1700000000, 0).UTC() }),
+		WithDefaultIngestionMode(contracts.IngestionModeFull),
+		WithBotSenderProvider(&fakeBotSenders{sender: botSender}),
+	)
+
+	if _, err := service.HandleBotMessage(context.Background(), botEvent(t, 1100, 42, 7, "hi")); err != nil {
+		t.Fatalf("bot message: %v", err)
+	}
+	if len(botSender.chatActions) != 0 {
+		t.Fatalf("streaming off: expected no chat action, got %v", botSender.chatActions)
+	}
+	if len(botSender.richDrafts) != 0 {
+		t.Fatalf("streaming off: expected no rich drafts, got %d", len(botSender.richDrafts))
+	}
+	if botSender.richCalls != 1 {
+		t.Fatalf("streaming off: expected 1 rich send (phase A path), got %d", botSender.richCalls)
+	}
+}
+
+// TestRichDraftFramesNeverContainsHalfAnswer verifies that richDraftFrames no longer
+// emits the old "first half of text" frame — only the thinking indicator and full-text
+// paragraph chunks are allowed.
+func TestRichDraftFramesNeverContainsHalfAnswer(t *testing.T) {
+	// Use a deliberately short first paragraph so it clearly cannot match the rune-midpoint.
+	long := "Intro.\n\n" +
+		"Этот абзац значительно длиннее первого и содержит достаточно текста чтобы весь ответ " +
+		"превысил порог в сто двадцать рун для активации механизма разбивки по абзацам."
+	if len([]rune(long)) < 120 {
+		t.Skip("test text is too short — adjust it")
+	}
+	frames := richDraftFrames(long)
+	if len(frames) < 3 {
+		t.Fatalf("expected ≥ 3 frames (thinking + chunks), got %d: %v", len(frames), frames)
+	}
+	if frames[0] != richStreamingThinkingMarkdown {
+		t.Fatalf("frame[0] must be thinking indicator, got %q", frames[0])
+	}
+	// Old half-answer was text[:len/2] — the new frames must never equal that exact truncation.
+	runes := []rune(long)
+	oldHalf := string(runes[:len(runes)/2])
+	for i, f := range frames[1:] {
+		if f == oldHalf {
+			t.Fatalf("frame[%d] is the old rune-midpoint half-answer %q; that pattern must be gone", i+1, f)
+		}
+	}
+	// Last frame must be the full text.
+	if last := frames[len(frames)-1]; last != long {
+		t.Fatalf("last frame must equal full text; got %q", last)
+	}
+}
+
+// TestRichDraftFramesShortTextTwoFrames verifies short texts still produce exactly two frames:
+// the thinking indicator and the full text (no unnecessary chunking).
+func TestRichDraftFramesShortTextTwoFrames(t *testing.T) {
+	short := "Привет!"
+	frames := richDraftFrames(short)
+	if len(frames) != 2 {
+		t.Fatalf("short text: expected 2 frames, got %d: %v", len(frames), frames)
+	}
+	if frames[0] != richStreamingThinkingMarkdown {
+		t.Fatalf("frame[0] must be thinking indicator, got %q", frames[0])
+	}
+	if frames[1] != short {
+		t.Fatalf("frame[1] must equal input text, got %q", frames[1])
 	}
 }
 
@@ -1944,6 +2040,7 @@ type fakeSender struct {
 	richErr      error
 	richDrafts   []richDraftCall
 	richDraftErr error
+	chatActions  []string // action values passed to SendChatAction, in order
 }
 
 type richDraftCall struct {
@@ -1970,6 +2067,11 @@ func (f *fakeSender) SendRichMessage(ctx context.Context, message telegram.Outbo
 func (f *fakeSender) SendRichMessageDraft(ctx context.Context, chatID string, draftID int64, markdown string) error {
 	f.richDrafts = append(f.richDrafts, richDraftCall{chatID: chatID, draftID: draftID, markdown: markdown})
 	return f.richDraftErr
+}
+
+func (f *fakeSender) SendChatAction(_ context.Context, _ string, action string) error {
+	f.chatActions = append(f.chatActions, action)
+	return nil
 }
 
 func (f *fakeSender) AnswerCallbackQuery(ctx context.Context, queryID string) error {

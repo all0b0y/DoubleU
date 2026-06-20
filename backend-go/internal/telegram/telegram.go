@@ -339,6 +339,25 @@ func (s *BotSender) SendRichMessageDraft(ctx context.Context, chatID string, dra
 	})
 }
 
+// SendChatAction broadcasts a transient typing indicator to the given private chat.
+// Telegram shows the indicator for up to 5 seconds; call before starting a long operation
+// so the user sees "bot is typing…" instead of silence. Returns immediately.
+// action is typically "typing"; other values ("upload_document" etc.) are accepted but
+// this codebase only uses "typing".
+func (s *BotSender) SendChatAction(ctx context.Context, chatID string, action string) error {
+	if s.token == "" {
+		return fmt.Errorf("telegram bot token is empty")
+	}
+	parsedChatID, err := strconv.ParseInt(chatID, 10, 64)
+	if err != nil {
+		return fmt.Errorf("chat_id must be an integer for sendChatAction: %w", err)
+	}
+	return s.post(ctx, "sendChatAction", map[string]any{
+		"chat_id": parsedChatID,
+		"action":  action,
+	})
+}
+
 // SendMessageGetID sends a message and returns the Telegram message_id of the sent message.
 func (s *BotSender) SendMessageGetID(ctx context.Context, message OutboundMessage) (string, error) {
 	if s.token == "" {

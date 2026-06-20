@@ -114,7 +114,8 @@ type Service struct {
 	logger     *slog.Logger
 	now        func() time.Time
 	debounce   sync.Map      // map[chatKey]string — latest event_id per chat for typing-delay debounce
-	replyDelay time.Duration // wait before calling AI (lets users finish sending multi-message bursts)
+	replyDelay       time.Duration // wait before calling AI (lets users finish sending multi-message bursts)
+	streamFramePause time.Duration // pause between rich draft preview frames; 0 = no pause (tests)
 	// notify pushes real-time events to connected Mini App clients.
 	// When set, bot draft cards are suppressed — the Mini App is the primary UI.
 	notify func(tenantID, eventType string, payload any)
@@ -238,6 +239,15 @@ type Option func(*Service)
 func WithReplyDelay(d time.Duration) Option {
 	return func(service *Service) {
 		service.replyDelay = d
+	}
+}
+
+// WithStreamFramePause sets the pause inserted between consecutive rich draft preview frames.
+// Defaults to zero (no pause) so tests run instantly; production callers should set ~300 ms
+// so the thinking indicator "breathes" visibly before the text appears.
+func WithStreamFramePause(d time.Duration) Option {
+	return func(service *Service) {
+		service.streamFramePause = d
 	}
 }
 
@@ -2852,6 +2862,19 @@ func (s *Service) richDraftStreamingAllowedFor(event contracts.NormalizedTelegra
 }
 
 func (s *Service) sendStreamingRichRecipient(ctx context.Context, sender telegram.Sender, msg telegram.OutboundMessage) (string, error) {
+	// Broadcast a native "bot is typing…" indicator immediately — visible on all
+	// Telegram clients while the rich preview frames stream in.
+	if chatActionSender, ok := sender.(interface {
+		SendChatAction(context.Context, string, string) error
+	}); ok {
+		if err := chatActionSender.SendChatAction(ctx, msg.ChatID, "typing"); err != nil {
+			s.logger.Warn("telegram sendChatAction failed; continuing",
+				"tenant_id", msg.TenantID,
+				"chat_id", msg.ChatID,
+				"error", err,
+			)
+		}
+	}
 	draftSender, ok := sender.(interface {
 		SendRichMessageDraft(context.Context, string, int64, string) error
 	})
@@ -2871,7 +2894,10 @@ func (s *Service) sendRichDraftPreview(ctx context.Context, sender interface {
 	SendRichMessageDraft(context.Context, string, int64, string) error
 }, msg telegram.OutboundMessage) {
 	draftID := richDraftID(msg)
-	for _, markdown := range richDraftFrames(msg.Text) {
+	for i, markdown := range richDraftFrames(msg.Text) {
+		if i > 0 && s.streamFramePause > 0 {
+			time.Sleep(s.streamFramePause)
+		}
 		if err := sender.SendRichMessageDraft(ctx, msg.ChatID, draftID, markdown); err != nil {
 			s.logger.Warn("telegram rich draft send failed; continuing with final send",
 				"tenant_id", msg.TenantID,
@@ -2885,16 +2911,47 @@ func (s *Service) sendRichDraftPreview(ctx context.Context, sender interface {
 	}
 }
 
+// richDraftFrames returns the ordered sequence of markdown strings to stream as
+// ephemeral draft previews before the final sendRichMessage.
+//
+// Frame 0 is always the thinking indicator (<tg-thinking>). Subsequent frames are
+// cumulative paragraph chunks of finalMarkdown so the user sees the reply build up
+// progressively. The last frame equals finalMarkdown so the draft matches the final
+// message and the animated transition is seamless.
 func richDraftFrames(finalMarkdown string) []string {
 	frames := []string{richStreamingThinkingMarkdown}
-	runes := []rune(finalMarkdown)
-	if len(runes) > 120 {
-		frames = append(frames, string(runes[:len(runes)/2]))
+	if finalMarkdown == "" {
+		return frames
 	}
-	if finalMarkdown != "" {
-		frames = append(frames, finalMarkdown)
+	for _, chunk := range splitIntoChunks(finalMarkdown) {
+		frames = append(frames, chunk)
 	}
 	return frames
+}
+
+// splitIntoChunks splits markdown into progressive prefix chunks for draft streaming.
+// Short texts (under 120 runes) are returned as a single chunk. Longer texts are split
+// at paragraph breaks (\n\n); each chunk is the accumulated text up to that boundary, so
+// the last chunk always equals the full text.
+func splitIntoChunks(text string) []string {
+	const minTotalRunes = 120
+	if len([]rune(text)) < minTotalRunes {
+		return []string{text}
+	}
+	paragraphs := strings.Split(text, "\n\n")
+	if len(paragraphs) <= 1 {
+		return []string{text}
+	}
+	chunks := make([]string, 0, len(paragraphs))
+	var acc string
+	for i, para := range paragraphs {
+		if i > 0 {
+			acc += "\n\n"
+		}
+		acc += para
+		chunks = append(chunks, acc)
+	}
+	return chunks
 }
 
 func richDraftID(msg telegram.OutboundMessage) int64 {
