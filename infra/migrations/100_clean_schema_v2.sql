@@ -360,7 +360,7 @@ BEGIN
   IF p_embedding IS NOT NULL THEN
     INSERT INTO fact_embeddings (fact_id, tenant_id, scope_kind, chat_id, embedding_model, embedding)
     VALUES (v_new_id, p_tenant_id, p_scope_kind, p_chat_id, p_embedding_model, p_embedding)
-    ON CONFLICT (fact_id) DO UPDATE SET
+    ON CONFLICT ON CONSTRAINT fact_embeddings_pkey DO UPDATE SET
       embedding = EXCLUDED.embedding,
       embedding_model = EXCLUDED.embedding_model;
   END IF;
