@@ -12,9 +12,12 @@ pipeline module.
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 from uuid import NAMESPACE_URL, uuid5
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:  # pydantic-ai is imported lazily by the HTTP factory
     from .agents.runtime import AgentRuntime
@@ -203,7 +206,8 @@ class AIService:
                 risk_response.risk_level,
                 confidence,
             )
-        except RuntimeError:
+        except RuntimeError as exc:
+            logger.exception("draft agent failed — falling back to error_fallback: %s", exc)
             outcome = draft.DraftOutcome(text="", model_used="none", usage=Usage())
             intent = intent_response.intent
             decision = Decision.ERROR_FALLBACK

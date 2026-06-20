@@ -26,5 +26,5 @@ pydantic-evals==1.*
 # pipeline imports them lazily and degrades to "unsupported" when absent, so
 # voice/photo/text extraction still works without them. Voice (STT) and photo
 # (vision) are plain HTTP calls and need no extra package.
-pdfminer.six==2024.*
+pdfminer.six>=20240706
 python-docx==1.*
