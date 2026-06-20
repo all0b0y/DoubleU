@@ -4,36 +4,12 @@
 
 ## Bug Backlog
 
-- **(rich formatting fallback, 2026-06-18)** The rich→HTML fallback in
-  `sendRecipient` (`backend-go/internal/core/service.go`) sends
-  `html.EscapeString(text)` with `ParseMode:"HTML"`. It does NOT convert the
-  GFM markdown to HTML, so on the fallback path the contact sees raw markdown
-  syntax (`**`, `#`, `| |`). Also `html.EscapeString` escapes `'`/`"` to
-  `&#39;`/`&#34;`, which is unnecessary for Telegram HTML and can trigger a
-  parse error (self-healed to plain by `sendWithParseModeFallback`). Message is
-  never lost, path is rare. Fix: on fallback send plain text (drop `parse_mode`
-  and escaping) OR add a proper GFM→Telegram-HTML converter. Update
-  `TestHandleTelegramWebhookRichSendFallsBackToHTML` accordingly.
+- **(rich formatting fallback, ПЕРЕОТКРЫТО 2026-06-20)** Раз-«фикс» от 2026-06-18 неверный: fallback в `sendRichRecipient`/`sendRecipient` (`backend-go/internal/core/service.go`) шлёт **сырой markdown как plain** (`parse_mode=""`), из-за чего собеседник видит `###`, `**`, `1.`. Нужна деградация markdown→Telegram HTML, а при отказе HTML — вычистка в plain; сырой markdown не слать никогда. План: `docs/rich_models_streaming_plan_2026-06-20.md` (Фаза A). Старый юнит-тест, ассертящий пустой `parse_mode`, переписать.
+- **(rich formatting, 2026-06-20)** Модель ставит `#`/`###` в одну строку с текстом/эмодзи (`😊 ### …`) — markdown требует пустую строку перед заголовком, rich парсится криво. Промпт всегда требует форматирование при роли, но доставка решает про rich отдельно (рассинхрон). План: Фаза B (ужесточить промпт + `normalize_rich_markdown`).
 
-- **(rich formatting slice 2, 2026-06-18)** `service.go` writes
-  `DraftType="warning"` for owner-only critical-risk cards, but the current
-  `drafts.draft_type` SQL CHECK in `infra/migrations/100_clean_schema_v2.sql`
-  and legacy schema only allows `reply/question`. DB-backed warning-card saves
-  can fail while in-memory tests pass. Fix with a dedicated migration that
-  extends the CHECK to include `warning`, then add a DB-backed regression test.
+- ~~**(rich formatting slice 2, 2026-06-18)** `DraftType="warning"` violated the `drafts.draft_type` CHECK.~~ → ✅ закрыто (2026-06-18): migration 109 extends the CHECK to include `warning`, with a rollback and smoke insert check.
 
-- **Stale contract seed against consolidated schema** — `infra/seed/001_contract_scenarios.sql`
-  still `INSERT`s into tables that the consolidated schema
-  (`infra/migrations/100_clean_schema_v2.sql`) dropped/renamed:
-  `assistant_profiles` (now `ai_roles`), `memory_facts` (now `semantic_facts`),
-  `memory_embeddings` (now `fact_embeddings`), and `summaries` (now
-  `episode_summaries`). The static no-docker checks in
-  `scripts/migration-seed-smoke.sh` and `scripts/contract-security-tests.sh`
-  only grep for string presence, so they pass — but the **docker path** of the
-  smoke test actually loads the seed and will fail with `ON_ERROR_STOP=1`.
-  Fix: rewrite the seed to match the new table/column shapes and re-verify with
-  docker (`scripts/migration-seed-smoke.sh`). Larger than the script-path fix
-  and not verifiable without docker, hence backlogged.
+- ~~**Stale contract seed against consolidated schema** — `infra/seed/001_contract_scenarios.sql` inserted into dropped/renamed memory and role tables.~~ → ✅ закрыто (2026-06-18): seed now uses `ai_roles`, `semantic_facts`, and `episode_summaries`; the smoke verifier checks `semantic_facts`.
 
 ---
 
