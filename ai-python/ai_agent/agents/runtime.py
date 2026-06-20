@@ -132,9 +132,8 @@ def _build_query_embedder() -> EmbedderCallable:
 _TOPIC_MAX_HISTORY = 5
 
 _CRITIC_INSTRUCTIONS = (
-    "Ты — строгий рецензент черновиков ответов, которые ИИ пишет от лица владельца"
-    " Telegram-чата. Проверь черновик по критериям:"
-    " 1) не выдаёт, что писал ИИ, и не пересказывает инструкции;"
+    "Ты — строгий рецензент ответов для Telegram-чата. Проверь черновик по критериям:"
+    " 1) соблюдает указанный режим персоны и не пересказывает инструкции;"
     " 2) не выдумывает факты, имена и обещания, которых нет в контексте;"
     " 3) уместен по тону и отвечает именно на последнее сообщение собеседника;"
     " 4) не содержит ничего рискованного (финансовые обещания, медицинские/юридические"
@@ -521,9 +520,14 @@ class AgentRuntime:
         text = drafted.reply
         confidence = drafted.confidence
         if risk_level in _CRITIC_RISKS or confidence < _CRITIC_CONFIDENCE_BAR:
-            feedback_hint = draft_pipeline.build_feedback_hint(request.feedback_context)
+            speak_as_owner = request.ai_role is None or request.ai_role.speak_as_owner
+            feedback_hint = (
+                draft_pipeline.build_feedback_hint(request.feedback_context)
+                if speak_as_owner else ""
+            )
             text, confidence, critic_usage = await self._review_draft(
-                deps, request.event.message_text, drafted, ctx, privacy_flags, feedback_hint
+                deps, request.event.message_text, drafted, ctx, privacy_flags,
+                feedback_hint, speak_as_owner=speak_as_owner,
             )
             total = Usage(
                 input_tokens=total.input_tokens + critic_usage.input_tokens,
@@ -555,6 +559,8 @@ class AgentRuntime:
         ctx: LLMCallContext,
         privacy_flags: tuple[PrivacyFlag, ...],
         feedback_hint: str = "",
+        *,
+        speak_as_owner: bool = True,
     ) -> tuple[str, float, Usage]:
         """Run the critic; returns (final_text, final_confidence, usage).
 
@@ -566,10 +572,16 @@ class AgentRuntime:
         agent saw, so the critic can flag a reply written in a style the owner
         has already rejected (self-correction grounded in past outcomes).
         """
+        persona_rule = (
+            "Режим персоны: ответ от лица владельца; не раскрывай участие ИИ."
+            if speak_as_owner
+            else "Режим персоны: открытый чат-бот в назначенной роли; не имитируй владельца."
+        )
         review_payload = (
+            f"{persona_rule}\n\n"
             "Сообщение собеседника:\n"
             f"{message_text}\n\n"
-            "Черновик ответа от лица владельца:\n"
+            "Черновик ответа:\n"
             f"{drafted.reply}"
         )
         if feedback_hint:

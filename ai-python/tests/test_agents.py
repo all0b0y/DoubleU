@@ -484,3 +484,35 @@ def test_critic_receives_owner_feedback_hint() -> None:
     )
     runtime.draft_outcome(request, RiskLevel.MEDIUM)  # MEDIUM risk forces the critic
     assert "скидку 50%" in captured.get("payload", ""), "owner feedback must reach the critic"
+
+
+def test_critic_preserves_bot_identity_boundary() -> None:
+    """Bot-mode review must not reintroduce owner imitation or owner-style feedback."""
+    captured: dict[str, str] = {}
+
+    def critic_capture(messages, info: AgentInfo) -> ModelResponse:
+        captured["payload"] = "".join(
+            part.content
+            for message in messages
+            for part in getattr(message, "parts", [])
+            if isinstance(getattr(part, "content", None), str)
+        )
+        return ModelResponse(
+            parts=[ToolCallPart(tool_name="final_result",
+                                args={"verdict": "approve", "issues": [], "revised_reply": ""})]
+        )
+
+    runtime = make_runtime(critic_model=FunctionModel(critic_capture))
+    base = process_request("про оплату")
+    request = AIProcessMessageRequest(
+        request_id=base.request_id,
+        event=base.event,
+        chat_settings=base.chat_settings,
+        feedback_context=(FeedbackItem(rating="down", response_text="owner-style-sentinel"),),
+        ai_role=AIRoleData(name="Support", speak_as_owner=False),
+    )
+
+    runtime.draft_outcome(request, RiskLevel.MEDIUM)
+    payload = captured.get("payload", "")
+    assert "открытый чат-бот" in payload
+    assert "owner-style-sentinel" not in payload
