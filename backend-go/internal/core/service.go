@@ -1736,6 +1736,7 @@ func (s *Service) aiRoleFor(tenantID, chatID string) *contracts.AIRole {
 		CustomFields:  role.CustomFields,
 		MCPServers:    s.repository.RoleMCPServers(role.ID),
 		SpeakAsOwner:  role.SpeakAsOwner,
+		ModelTier:     role.ModelTier,
 	}
 }
 

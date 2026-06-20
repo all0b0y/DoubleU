@@ -58,3 +58,13 @@ func boolOrDefault(value *bool, fallback bool) bool {
 	}
 	return *value
 }
+
+// stringOrDefault resolves an optional JSON string to a concrete value: the
+// dereferenced pointer when non-nil and non-empty, else fallback. Used for
+// non-nullable string columns (e.g. model_tier) with a known default.
+func stringOrDefault(value *string, fallback string) string {
+	if value == nil || *value == "" {
+		return fallback
+	}
+	return *value
+}

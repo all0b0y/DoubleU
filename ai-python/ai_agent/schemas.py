@@ -174,6 +174,10 @@ class AIRoleData(JsonDataclass):
     # they are talking to a human.  False: AI responds as the role persona
     # itself (assistant / companion); no owner impersonation.
     speak_as_owner: bool = True
+    # model_tier selects the LLM quality tier for draft generation:
+    # "fast", "balanced" (default), or "smart".  Empty / unrecognised value
+    # degrades to the DRAFT task model (MODEL_DRAFT / OPENROUTER_MODEL).
+    model_tier: str = "balanced"
 
 
 @dataclass(frozen=True)
@@ -729,6 +733,10 @@ def _parse_ai_role(raw: Any) -> AIRoleData | None:
     speak_as_owner = raw.get("speak_as_owner")
     if not isinstance(speak_as_owner, bool):
         speak_as_owner = True
+    # model_tier: accept only the three known values; anything else degrades to
+    # "balanced" so existing roles without the field keep working.
+    raw_tier = str(raw.get("model_tier", "")).strip().lower()
+    model_tier = raw_tier if raw_tier in {"fast", "balanced", "smart"} else "balanced"
     return AIRoleData(
         name=name,
         description=str(raw.get("description", "")).strip(),
@@ -739,6 +747,7 @@ def _parse_ai_role(raw: Any) -> AIRoleData | None:
         custom_fields=_parse_role_custom_fields(raw.get("custom_fields")),
         mcp_servers=_parse_mcp_servers(raw.get("mcp_servers")),
         speak_as_owner=speak_as_owner,
+        model_tier=model_tier,
     )
 
 

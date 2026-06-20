@@ -423,6 +423,11 @@ type AIRole struct {
 	// false = the AI responds as the role itself (assistant / companion
 	// scenarios); the reply is clearly from the bot persona, not the owner.
 	SpeakAsOwner bool `json:"speak_as_owner"`
+	// ModelTier selects the LLM quality tier for this role's draft generation:
+	// "fast" (low-latency), "balanced" (default), or "smart" (highest capability).
+	// Empty string means fall back to the DRAFT task model (MODEL_DRAFT /
+	// OPENROUTER_MODEL), preserving backward compatibility with existing roles.
+	ModelTier string `json:"model_tier,omitempty"`
 }
 
 // MCPServerSpec is one MCP server a role may call, with its per-role tool

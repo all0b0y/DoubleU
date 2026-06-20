@@ -36,6 +36,8 @@ type roleJSON struct {
 	// SpeakAsOwner: true = reply as the owner (personal-chat impersonation);
 	// false = reply as the bot/role persona.
 	SpeakAsOwner bool `json:"speak_as_owner"`
+	// ModelTier selects the LLM quality tier: "fast", "balanced" (default), or "smart".
+	ModelTier string `json:"model_tier,omitempty"`
 }
 
 func roleToJSON(role store.AIRoleRecord) roleJSON {
@@ -56,6 +58,7 @@ func roleToJSON(role store.AIRoleRecord) roleJSON {
 		RichFormattingEnabled: cloneBoolPtr(role.RichFormattingEnabled),
 		StreamingEnabled:      cloneBoolPtr(role.StreamingEnabled),
 		SpeakAsOwner:          role.SpeakAsOwner,
+		ModelTier:             role.ModelTier,
 	}
 }
 
@@ -74,6 +77,9 @@ type roleRequest struct {
 	// SpeakAsOwner is a pointer so an omitted field keeps the create-time
 	// default (true) / the existing value on update, rather than forcing false.
 	SpeakAsOwner *bool `json:"speak_as_owner"`
+	// ModelTier selects the LLM quality tier: "fast", "balanced", or "smart".
+	// Absent means keep the existing value (update) or "balanced" (create).
+	ModelTier *string `json:"model_tier"`
 }
 
 func (req *roleRequest) normalize() {
@@ -165,6 +171,7 @@ func (s *Server) apiCreateRole(w http.ResponseWriter, r *http.Request) {
 		RichFormattingEnabled: req.RichFormattingEnabled.Apply(nil),
 		StreamingEnabled:      req.StreamingEnabled.Apply(nil),
 		SpeakAsOwner:          boolOrDefault(req.SpeakAsOwner, true),
+		ModelTier:             stringOrDefault(req.ModelTier, "balanced"),
 	})
 	if role.ID == 0 {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to save role"})
@@ -214,6 +221,7 @@ func (s *Server) apiUpdateRole(w http.ResponseWriter, r *http.Request) {
 		RichFormattingEnabled: req.RichFormattingEnabled.Apply(existing.RichFormattingEnabled),
 		StreamingEnabled:      req.StreamingEnabled.Apply(existing.StreamingEnabled),
 		SpeakAsOwner:          boolOrDefault(req.SpeakAsOwner, existing.SpeakAsOwner),
+		ModelTier:             stringOrDefault(req.ModelTier, existing.ModelTier),
 	}
 	if !s.service.Repository().UpdateAIRole(role) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to update role"})

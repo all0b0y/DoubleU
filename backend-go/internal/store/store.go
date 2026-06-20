@@ -243,6 +243,9 @@ type AIRoleRecord struct {
 	// SpeakAsOwner mirrors contracts.AIRole.SpeakAsOwner. true (default) = the
 	// AI impersonates the owner; false = the AI responds as the role persona.
 	SpeakAsOwner bool
+	// ModelTier is the LLM quality tier for draft generation: "fast",
+	// "balanced" (default), or "smart". Empty = use the DRAFT task model.
+	ModelTier string
 }
 
 // Repository stores state — in memory when no DB is configured, in Postgres otherwise.
@@ -2244,9 +2247,9 @@ func (r *Repository) SaveAIRole(role AIRoleRecord) AIRoleRecord {
 			`INSERT INTO ai_roles (
 			   tenant_id, name, description, speaking_style, goals, constraints_text,
 			   context_notes, custom_fields, rich_formatting_enabled, streaming_enabled,
-			   speak_as_owner
+			   speak_as_owner, model_tier
 			 )
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 			 ON CONFLICT (tenant_id, name) DO UPDATE SET
 			   description      = EXCLUDED.description,
 			   speaking_style   = EXCLUDED.speaking_style,
@@ -2257,11 +2260,12 @@ func (r *Repository) SaveAIRole(role AIRoleRecord) AIRoleRecord {
 			   rich_formatting_enabled = COALESCE(EXCLUDED.rich_formatting_enabled, ai_roles.rich_formatting_enabled),
 			   streaming_enabled       = COALESCE(EXCLUDED.streaming_enabled, ai_roles.streaming_enabled),
 			   speak_as_owner   = EXCLUDED.speak_as_owner,
+			   model_tier       = EXCLUDED.model_tier,
 			   updated_at       = now()
 			 RETURNING id`,
 			role.TenantID, role.Name, role.Description, role.SpeakingStyle, role.Goals, role.Constraints, role.Context,
 			encodeRoleCustomFields(role.CustomFields), nullableBoolArg(role.RichFormattingEnabled), nullableBoolArg(role.StreamingEnabled),
-			role.SpeakAsOwner,
+			role.SpeakAsOwner, role.ModelTier,
 		).Scan(&role.ID)
 		if err != nil {
 			return AIRoleRecord{}
@@ -2285,7 +2289,7 @@ func (r *Repository) SaveAIRole(role AIRoleRecord) AIRoleRecord {
 
 // aiRoleColumns is the shared SELECT projection for ai_roles, kept in one place
 // so every read returns the same fields (including the migration-102 jsonb).
-const aiRoleColumns = `id, tenant_id, name, description, speaking_style, goals, constraints_text, COALESCE(context_notes,''), COALESCE(custom_fields,'[]'::jsonb), rich_formatting_enabled, streaming_enabled, speak_as_owner`
+const aiRoleColumns = `id, tenant_id, name, description, speaking_style, goals, constraints_text, COALESCE(context_notes,''), COALESCE(custom_fields,'[]'::jsonb), rich_formatting_enabled, streaming_enabled, speak_as_owner, COALESCE(model_tier,'balanced')`
 
 // rowScanner is satisfied by both *sql.Row and *sql.Rows.
 type rowScanner interface{ Scan(dest ...any) error }
@@ -2299,7 +2303,7 @@ func scanAIRole(s rowScanner) (AIRoleRecord, error) {
 	var streaming sql.NullBool
 	if err := s.Scan(&role.ID, &role.TenantID, &role.Name, &role.Description,
 		&role.SpeakingStyle, &role.Goals, &role.Constraints, &role.Context, &customFields,
-		&richFormatting, &streaming, &role.SpeakAsOwner); err != nil {
+		&richFormatting, &streaming, &role.SpeakAsOwner, &role.ModelTier); err != nil {
 		return AIRoleRecord{}, err
 	}
 	role.CustomFields = decodeRoleCustomFields(customFields)
@@ -2549,13 +2553,14 @@ func (r *Repository) UpdateAIRole(role AIRoleRecord) bool {
 			    SET name = $3, description = $4, speaking_style = $5,
 			        goals = $6, constraints_text = $7, context_notes = $8,
 			        custom_fields = $9, rich_formatting_enabled = $10,
-			        streaming_enabled = $11, speak_as_owner = $12, updated_at = now()
+			        streaming_enabled = $11, speak_as_owner = $12,
+			        model_tier = $13, updated_at = now()
 			  WHERE tenant_id = $1 AND id = $2`,
 			role.TenantID, role.ID, role.Name, role.Description,
 			role.SpeakingStyle, role.Goals, role.Constraints, role.Context,
 			encodeRoleCustomFields(role.CustomFields),
 			nullableBoolArg(role.RichFormattingEnabled), nullableBoolArg(role.StreamingEnabled),
-			role.SpeakAsOwner,
+			role.SpeakAsOwner, role.ModelTier,
 		)
 		if err != nil {
 			r.logWriteError("update_ai_role", role.TenantID, "", err)

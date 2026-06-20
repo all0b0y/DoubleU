@@ -67,7 +67,7 @@ from ..schemas import (
 from ..security import PromptBuilder
 from .deps import AgentDeps
 from .memory_tools import memory_toolset
-from .models import AgentTask, build_model, model_name_for
+from .models import AgentTask, ModelTier, build_model, build_tier_model, model_name_for
 from .results import (
     CriticVerdict,
     DraftResult,
@@ -507,15 +507,30 @@ class AgentRuntime:
             pool=await self._get_pool(),
         )
         mcp_toolsets = self._resolve_mcp_toolsets(request.ai_role, privacy_flags)
-        result = await self._draft_agent.run(
-            user_payload,
+        # Per-role tier override: build a tier-specific model when the role
+        # declares one and the env list is configured; otherwise fall back to
+        # the DRAFT task model.  The agent is not recreated — only the
+        # per-request model is passed in.
+        tier_model = (
+            build_tier_model(request.ai_role.model_tier)
+            if request.ai_role is not None
+            else None
+        )
+        run_kwargs: dict = dict(
             deps=deps,
             usage_limits=UsageLimits(tool_calls_limit=_DRAFT_TOOL_CALLS_LIMIT),
             toolsets=mcp_toolsets,
         )
+        if tier_model is not None:
+            run_kwargs["model"] = tier_model
+        result = await self._draft_agent.run(user_payload, **run_kwargs)
         drafted: DraftResult = result.output
         total = self._usage_of(result)
-        model_used = model_name_for(AgentTask.DRAFT) or "test-model"
+        model_used = (
+            request.ai_role.model_tier
+            if (tier_model is not None and request.ai_role is not None)
+            else (model_name_for(AgentTask.DRAFT) or "test-model")
+        )
 
         text = drafted.reply
         confidence = drafted.confidence
