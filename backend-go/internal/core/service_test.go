@@ -2506,3 +2506,130 @@ func TestChatRateLimit(t *testing.T) {
 		}
 	})
 }
+
+// TestPersonaSplit verifies that bot-persona roles (SpeakAsOwner=false) strip
+// owner identity from the AI request while keeping operational defaults intact.
+// Owner-voice roles and the nil-role default must pass identity through unchanged.
+func TestPersonaSplit(t *testing.T) {
+	const tenantID = "tenant-split"
+	const chatID = "99"
+
+	setupRepo := func() *store.Repository {
+		repo := store.NewRepository()
+		repo.SaveChatSettings(contracts.ChatSettings{TenantID: tenantID, ChatID: chatID, Mode: contracts.ChatModeAuto})
+		repo.SaveChat(store.ChatRecord{TenantID: tenantID, ChatID: chatID})
+		repo.SaveBusinessConnection(store.BusinessConnectionRecord{
+			ConnectionID: "bc-split", TenantID: tenantID, UserID: "77",
+			CanReply: true, IsEnabled: true,
+		})
+		repo.SaveUserSettings(contracts.UserSettings{
+			TenantID:           tenantID,
+			DisplayName:        "Alice",
+			Bio:                "founder",
+			Timezone:           "Europe/Kiev",
+			PrimaryLanguage:    "uk",
+			SecondaryLanguages: []string{"en"},
+		})
+		repo.SaveDraftFeedback(contracts.DraftFeedback{
+			DraftID:      "d1",
+			TenantID:     tenantID,
+			ChatID:       chatID,
+			Rating:       "up",
+			ResponseText: "great",
+		})
+		return repo
+	}
+
+	t.Run("bot_persona_strips_identity_and_feedback", func(t *testing.T) {
+		repo := setupRepo()
+		role := repo.SaveAIRole(store.AIRoleRecord{
+			TenantID: tenantID, Name: "BotPersona", SpeakAsOwner: false,
+		})
+		repo.AssignAIRoleToChat(tenantID, chatID, role.ID)
+
+		ai := &fakeAI{response: contracts.AIProcessMessageResponse{
+			Decision: contracts.DecisionAutoReply, ResponseText: "hi", RiskLevel: contracts.RiskLow,
+		}}
+		svc := newTestService(repo, ai, &fakeSender{})
+		if _, err := svc.HandleTelegramWebhook(context.Background(), telegramPayload(5001, "bc-split", 99, 1, "hello"), tenantID); err != nil {
+			t.Fatalf("webhook: %v", err)
+		}
+
+		req := ai.lastRequest
+		if req.UserSettings == nil {
+			t.Fatal("UserSettings must not be nil even for bot-persona")
+		}
+		if req.UserSettings.DisplayName != "" {
+			t.Errorf("DisplayName must be stripped for bot-persona: got %q", req.UserSettings.DisplayName)
+		}
+		if req.UserSettings.Bio != "" {
+			t.Errorf("Bio must be stripped for bot-persona: got %q", req.UserSettings.Bio)
+		}
+		// Operational defaults must survive the strip.
+		if req.UserSettings.Timezone != "Europe/Kiev" {
+			t.Errorf("Timezone stripped unexpectedly: got %q", req.UserSettings.Timezone)
+		}
+		if req.UserSettings.PrimaryLanguage != "uk" {
+			t.Errorf("PrimaryLanguage stripped unexpectedly: got %q", req.UserSettings.PrimaryLanguage)
+		}
+		if len(req.FeedbackContext) != 0 {
+			t.Errorf("FeedbackContext must be nil for bot-persona: got %+v", req.FeedbackContext)
+		}
+	})
+
+	t.Run("speak_as_owner_preserves_identity_and_feedback", func(t *testing.T) {
+		repo := setupRepo()
+		role := repo.SaveAIRole(store.AIRoleRecord{
+			TenantID: tenantID, Name: "OwnerVoice", SpeakAsOwner: true,
+		})
+		repo.AssignAIRoleToChat(tenantID, chatID, role.ID)
+
+		ai := &fakeAI{response: contracts.AIProcessMessageResponse{
+			Decision: contracts.DecisionAutoReply, ResponseText: "hi", RiskLevel: contracts.RiskLow,
+		}}
+		svc := newTestService(repo, ai, &fakeSender{})
+		if _, err := svc.HandleTelegramWebhook(context.Background(), telegramPayload(5002, "bc-split", 99, 2, "hello"), tenantID); err != nil {
+			t.Fatalf("webhook: %v", err)
+		}
+
+		req := ai.lastRequest
+		if req.UserSettings == nil {
+			t.Fatal("UserSettings must not be nil")
+		}
+		if req.UserSettings.DisplayName != "Alice" {
+			t.Errorf("DisplayName unexpectedly stripped for SpeakAsOwner=true: got %q", req.UserSettings.DisplayName)
+		}
+		if req.UserSettings.Bio != "founder" {
+			t.Errorf("Bio unexpectedly stripped for SpeakAsOwner=true: got %q", req.UserSettings.Bio)
+		}
+		if len(req.FeedbackContext) == 0 {
+			t.Error("FeedbackContext must be non-empty for SpeakAsOwner=true")
+		}
+	})
+
+	t.Run("no_role_preserves_identity_and_feedback", func(t *testing.T) {
+		repo := setupRepo()
+		// No role assigned → aiRole=nil → personaSpeaksAsOwner returns true.
+		ai := &fakeAI{response: contracts.AIProcessMessageResponse{
+			Decision: contracts.DecisionAutoReply, ResponseText: "hi", RiskLevel: contracts.RiskLow,
+		}}
+		svc := newTestService(repo, ai, &fakeSender{})
+		if _, err := svc.HandleTelegramWebhook(context.Background(), telegramPayload(5003, "bc-split", 99, 3, "hello"), tenantID); err != nil {
+			t.Fatalf("webhook: %v", err)
+		}
+
+		req := ai.lastRequest
+		if req.UserSettings == nil {
+			t.Fatal("UserSettings must not be nil when no role is set")
+		}
+		if req.UserSettings.DisplayName != "Alice" {
+			t.Errorf("DisplayName unexpectedly stripped for nil role: got %q", req.UserSettings.DisplayName)
+		}
+		if req.UserSettings.Bio != "founder" {
+			t.Errorf("Bio unexpectedly stripped for nil role: got %q", req.UserSettings.Bio)
+		}
+		if len(req.FeedbackContext) == 0 {
+			t.Error("FeedbackContext must be non-empty when no role is set")
+		}
+	})
+}

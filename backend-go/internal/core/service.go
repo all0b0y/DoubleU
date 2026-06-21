@@ -1161,12 +1161,14 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 	}
 	memoryContext, recentRecords := s.conversationContextAndMessages(ctx, event, ownerID, 20)
 	request := contracts.AIProcessMessageRequest{
-		RequestID:       event.EventID,
-		TraceID:         tracepkg.DeriveTraceID(event.EventID),
-		Event:           event,
-		ChatSettings:    effectiveSettings,
-		MemoryContext:   memoryContext,
-		FeedbackContext: s.feedbackContext(event.TenantID, event.ChatID, 5),
+		RequestID:    event.EventID,
+		TraceID:      tracepkg.DeriveTraceID(event.EventID),
+		Event:        event,
+		ChatSettings: effectiveSettings,
+		MemoryContext: memoryContext,
+	}
+	if personaSpeaksAsOwner(aiRole) {
+		request.FeedbackContext = s.feedbackContext(event.TenantID, event.ChatID, 5)
 	}
 	if profile, ok := s.repository.ContactProfile(event.TenantID, event.ChatID); ok {
 		request.ContactProfile = &profile
@@ -1178,8 +1180,16 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 	// does not need a second UserSettings lookup on this hot path.
 	var hotDelivery deliverySettings
 	if us, ok := s.repository.UserSettings(event.TenantID); ok {
-		request.UserSettings = &us
 		hotDelivery = s.deliverySettingsFromUser(event, &us)
+		if personaSpeaksAsOwner(aiRole) {
+			request.UserSettings = &us
+		} else {
+			// Strip owner identity for bot-persona chats; keep operational defaults.
+			stripped := us
+			stripped.DisplayName = ""
+			stripped.Bio = ""
+			request.UserSettings = &stripped
+		}
 	} else {
 		hotDelivery = s.deliverySettingsFromUser(event, nil)
 	}
@@ -1838,6 +1848,13 @@ func (s *Service) aiRoleFor(tenantID, chatID string) *contracts.AIRole {
 		SpeakAsOwner:  role.SpeakAsOwner,
 		ModelTier:     role.ModelTier,
 	}
+}
+
+// personaSpeaksAsOwner reports whether the AI should present owner identity.
+// True for the default assistant (nil role) and any role with SpeakAsOwner set.
+// False for bot-persona roles — those get a stripped UserSettings and no FeedbackContext.
+func personaSpeaksAsOwner(role *contracts.AIRole) bool {
+	return role == nil || role.SpeakAsOwner
 }
 
 // botPersonaEffectiveSettings makes an open bot persona conversational by
@@ -2757,17 +2774,19 @@ func (s *Service) regenerateDraftWithHint(ctx context.Context, draft store.Draft
 		"[OWNER INSTRUCTION] "+hint,
 	)
 	hintRequest := contracts.AIProcessMessageRequest{
-		RequestID:       draft.DecisionID + ":hint",
-		TraceID:         tracepkg.DeriveTraceID(event.EventID),
-		Event:           event,
-		ChatSettings:    settings,
-		MemoryContext:   hintContext,
-		FeedbackContext: s.feedbackContext(draft.TenantID, draft.ChatID, 5),
+		RequestID:    draft.DecisionID + ":hint",
+		TraceID:      tracepkg.DeriveTraceID(event.EventID),
+		Event:        event,
+		ChatSettings: settings,
+		MemoryContext: hintContext,
 	}
 	if profile, ok := s.repository.ContactProfile(draft.TenantID, draft.ChatID); ok {
 		hintRequest.ContactProfile = &profile
 	}
 	hintRequest.AIRole = s.aiRoleFor(draft.TenantID, draft.ChatID)
+	if personaSpeaksAsOwner(hintRequest.AIRole) {
+		hintRequest.FeedbackContext = s.feedbackContext(draft.TenantID, draft.ChatID, 5)
+	}
 	s.repository.AppendState(draft.TenantID, draft.ChatID, draft.SourceMessageID, contracts.StateAIRequested)
 	proposal, err := s.ai.ProcessMessage(ctx, hintRequest)
 	if err != nil {
