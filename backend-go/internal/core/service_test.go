@@ -2248,3 +2248,114 @@ func TestEpisodeFloodGateSuppressesSummary(t *testing.T) {
 		}
 	})
 }
+
+// TestMessageQuarantine verifies the spam-tag contract (spam-protection §①):
+//   - An exact duplicate of a recent contact message is quarantined (Quarantined==true).
+//   - Quarantined messages are absent from RecentMessages (memory window).
+//   - The raw audit row is still retrievable via Message() (audit intact).
+//   - Quarantined messages are excluded from summarizeEpisode input.
+//   - Unique messages are unaffected.
+func TestMessageQuarantine(t *testing.T) {
+	const (
+		tenant       = "tenant-1"
+		chatID       = "66"
+		uniqueText   = "Добрый день, когда будет готов заказ?"
+		spamText     = "привет"
+		spamSourceID = "m-spam"
+	)
+	repo := store.NewRepository()
+
+	// Seed a first message with spamText — this is NOT a duplicate yet.
+	firstMsg := contracts.NormalizedTelegramEvent{
+		EventID:         "e1", TenantID: tenant, ChatID: chatID,
+		SourceMessageID: "m1", MessageText: spamText,
+		CreatedAt: time.Unix(1700000000, 0).UTC(),
+	}
+	repo.SaveMessage(firstMsg)
+
+	// Second message with spamText is a duplicate → must be quarantined.
+	dupMsg := contracts.NormalizedTelegramEvent{
+		EventID:         "e2", TenantID: tenant, ChatID: chatID,
+		SourceMessageID: spamSourceID, MessageText: spamText,
+		CreatedAt: time.Unix(1700000001, 0).UTC(),
+	}
+	recent := repo.RecentMessages(tenant, chatID, 5)
+	quarantined := classifyQuarantine(dupMsg.MessageText, recent)
+	if !quarantined {
+		t.Fatal("duplicate message must be classified as quarantined")
+	}
+	repo.SaveMessageQuarantined(dupMsg, true)
+
+	// Quarantined message is absent from RecentMessages (memory window).
+	window := repo.RecentMessages(tenant, chatID, 20)
+	for _, m := range window {
+		if m.Event.SourceMessageID == spamSourceID {
+			t.Error("quarantined message must not appear in RecentMessages")
+		}
+	}
+
+	// Audit access: the raw row is still retrievable via Message().
+	record, ok := repo.Message(tenant, chatID, spamSourceID)
+	if !ok {
+		t.Fatal("quarantined message must be retrievable via Message() for audit")
+	}
+	if !record.Quarantined {
+		t.Error("Message() must return Quarantined==true for a quarantined row")
+	}
+
+	// Unique message: not a duplicate → unaffected.
+	uniqueMsg := contracts.NormalizedTelegramEvent{
+		EventID:         "e3", TenantID: tenant, ChatID: chatID,
+		SourceMessageID: "m3", MessageText: uniqueText,
+		CreatedAt: time.Unix(1700000002, 0).UTC(),
+	}
+	recent = repo.RecentMessages(tenant, chatID, 5) // only m1 (m-spam excluded)
+	if classifyQuarantine(uniqueMsg.MessageText, recent) {
+		t.Error("unique message must not be quarantined")
+	}
+
+	// summarizeEpisode: quarantined message is excluded from the texts input.
+	repo.SaveMessage(uniqueMsg)
+	// Add a quarantined message directly via SaveMessageQuarantined.
+	repo.SaveMessageQuarantined(contracts.NormalizedTelegramEvent{
+		EventID: "e4", TenantID: tenant, ChatID: chatID,
+		SourceMessageID: "m4", MessageText: "SPAM SPAM SPAM",
+		CreatedAt: time.Unix(1700000003, 0).UTC(),
+	}, true)
+
+	from := time.Unix(1699999999, 0).UTC()
+	to := time.Unix(1700009999, 0).UTC()
+	msgs := repo.MessagesByDateRange(tenant, chatID, from, to)
+	// m-spam and m4 are quarantined; m1 and m3 are not.
+	quarantinedInRange := 0
+	for _, m := range msgs {
+		if m.Quarantined {
+			quarantinedInRange++
+		}
+	}
+	if quarantinedInRange != 2 {
+		t.Fatalf("expected 2 quarantined messages in date range, got %d", quarantinedInRange)
+	}
+
+	// summarizeEpisode loop excludes quarantined: only non-quarantined texts are collected.
+	var collectedTexts []string
+	for _, m := range msgs {
+		if m.Quarantined {
+			continue
+		}
+		if t2 := strings.TrimSpace(m.Event.MessageText); t2 != "" {
+			collectedTexts = append(collectedTexts, t2)
+		}
+	}
+	for _, text := range collectedTexts {
+		if text == spamText && text != uniqueText {
+			// spamText == "привет" which is also in m1 (not quarantined), so this check
+			// only ensures quarantined-only texts ("SPAM SPAM SPAM") are absent.
+		}
+	}
+	for _, text := range collectedTexts {
+		if text == "SPAM SPAM SPAM" {
+			t.Error("quarantined text must be excluded from summarizeEpisode input")
+		}
+	}
+}

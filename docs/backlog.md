@@ -41,6 +41,8 @@
 
 ## Tech Debt
 
+- **(migrations, 2026-06-21)** Two `111_*.sql` files collide (`111_ai_role_speak_as_owner`, `111_role_model_tier`). Migration 112 was used for the quarantine column to avoid the collision. The 111 pair should be consolidated into a single file to restore a linear sequence before the next DB bootstrapping run.
+
 - ~~**(v5 roles)** `upsert_semantic_fact` stored proc dead `RAISE EXCEPTION` branch~~ → ✅ закрыто миграцией 013 (v3 процедуры без global-веток, MEM-1).
 - ~~**(v5 roles)** `/ai/generate-draft` (`DraftRequest`) does not carry `ai_role`~~ → ✅ эндпоинт помечен deprecated в openapi (ARCH-14): regenerate идёт через process-message, Go-клиент standalone-вызов не делает.
 - ~~**(v5 roles)** Role editing UX is `|`-delimited one-liner (`/role_create`); a guided multi-step dialog (pending-input flow like draft edit) would be friendlier for long descriptions.~~ → ✅ закрыто Mini App (2026-06-12): экран `/roles` + форма с 5 полями (`miniapp/screens/role-edit.js`), REST CRUD `/api/v1/roles`; бот-команда осталась как fallback.

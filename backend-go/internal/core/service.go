@@ -931,8 +931,20 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 	// keys from message_states and audit_events back to messages always resolve.
 	// no_memory chats skip persistence — for those, AppendState / AppendAudit
 	// silently fall back to in-memory tracking inside the repository.
+	// quarantined: exact duplicate of a recent contact message → stored for audit
+	// but excluded from every memory surface (window-20, episode summaries, extraction).
+	quarantined := false
 	if !settings.PrivacyFlags.Contains(contracts.PrivacyNoMemory) {
-		s.repository.SaveMessage(event)
+		recent := s.repository.RecentMessages(event.TenantID, event.ChatID, 5)
+		quarantined = classifyQuarantine(event.MessageText, recent)
+		s.repository.SaveMessageQuarantined(event, quarantined)
+		if quarantined {
+			s.logger.Info("message quarantined as duplicate",
+				"tenant_id", event.TenantID,
+				"chat_id", event.ChatID,
+				"source_message_id", event.SourceMessageID,
+			)
+		}
 	}
 	s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateReceived)
 	s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateNormalized)
@@ -1287,9 +1299,9 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 	// Async LLM fact extraction: fires after the draft is dispatched so it never blocks
 	// the reply path.  Prefers TypedMemoryExtractor (/ai/extract-facts-typed) for proper
 	// scope routing; falls back to MemoryExtractor (/ai/extract-memory) if unavailable.
-	// Only runs when the AI client supports extraction, memory is not disabled, and the
-	// message passes the cheap fact-bearing pre-filter (MEM-13).
-	if !settings.PrivacyFlags.Contains(contracts.PrivacyNoMemory) && shouldExtractFacts(event.MessageText) {
+	// Only runs when the AI client supports extraction, memory is not disabled, the message
+	// is not quarantined (spam duplicate), and it passes the cheap fact-bearing pre-filter (MEM-13).
+	if !settings.PrivacyFlags.Contains(contracts.PrivacyNoMemory) && !quarantined && shouldExtractFacts(event.MessageText) {
 		privacyStrings := make([]string, len(settings.PrivacyFlags))
 		for i, f := range settings.PrivacyFlags {
 			privacyStrings[i] = string(f)
@@ -2068,6 +2080,22 @@ func (s *Service) saveProfileSuggestions(ctx context.Context, event contracts.No
 			ReplyMarkup: bot.SuggestionKeyboard(id),
 		})
 	}
+}
+
+// classifyQuarantine reports whether text is an exact duplicate of one of the
+// last ~5 contact messages in the chat. Normalisation: lower, collapse whitespace.
+// Cheap and local — no model call. Task ③ adds the rate-limit layer on top.
+func classifyQuarantine(text string, recent []store.MessageRecord) bool {
+	norm := strings.Join(strings.Fields(strings.ToLower(text)), " ")
+	if norm == "" {
+		return false
+	}
+	for _, m := range recent {
+		if strings.Join(strings.Fields(strings.ToLower(m.Event.MessageText)), " ") == norm {
+			return true
+		}
+	}
+	return false
 }
 
 // shouldExtractFacts is the cheap pre-filter before the extraction LLM call
@@ -3796,6 +3824,9 @@ func (s *Service) summarizeEpisode(ctx context.Context, tenantID, chatID string,
 	texts := make([]string, 0, len(messages))
 	sourceIDs := make([]string, 0, len(messages))
 	for _, m := range messages {
+		if m.Quarantined {
+			continue
+		}
 		if t := strings.TrimSpace(m.Event.MessageText); t != "" {
 			texts = append(texts, t)
 			sourceIDs = append(sourceIDs, m.Event.SourceMessageID)

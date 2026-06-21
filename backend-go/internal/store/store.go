@@ -20,8 +20,9 @@ import (
 
 // MessageRecord stores operational state for a normalized message.
 type MessageRecord struct {
-	Event  contracts.NormalizedTelegramEvent
-	States []contracts.MessageState
+	Event       contracts.NormalizedTelegramEvent
+	States      []contracts.MessageState
+	Quarantined bool // persist for audit; excluded from every memory surface when true
 }
 
 // DraftStatus is the owner approval lifecycle status for a draft.
@@ -506,13 +507,22 @@ func (r *Repository) MarkSend(record SendRecord) bool {
 	return false
 }
 
-// SaveMessage stores a normalized message record.
+// SaveMessage stores a normalized message record as non-quarantined.
+// Call sites that classify quarantine should use SaveMessageQuarantined directly.
 func (r *Repository) SaveMessage(event contracts.NormalizedTelegramEvent) {
+	r.SaveMessageQuarantined(event, false)
+}
+
+// SaveMessageQuarantined stores a normalized message record with an explicit
+// quarantine flag. Quarantined messages persist for audit but are excluded from
+// every memory surface (RecentMessages, summarizeEpisode, extraction).
+func (r *Repository) SaveMessageQuarantined(event contracts.NormalizedTelegramEvent, quarantined bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	key := messageKey(event.TenantID, event.ChatID, event.SourceMessageID)
 	record, existed := r.messages[key]
 	record.Event = event
+	record.Quarantined = quarantined
 	r.messages[key] = record
 	if !existed {
 		// Per-chat insertion-order index so in-memory RecentMessages reads a
@@ -524,15 +534,17 @@ func (r *Repository) SaveMessage(event contracts.NormalizedTelegramEvent) {
 		_, _ = r.db.Exec(
 			`INSERT INTO messages (
 			   tenant_id, chat_id, source_message_id, event_id, telegram_update_id,
-			   business_connection_id, sender_id, message_text, message_type, received_at
-			 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+			   business_connection_id, sender_id, message_text, message_type, received_at,
+			   quarantined
+			 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 			 ON CONFLICT (tenant_id, chat_id, source_message_id) DO UPDATE SET
 			   event_id = EXCLUDED.event_id,
 			   telegram_update_id = EXCLUDED.telegram_update_id,
 			   business_connection_id = EXCLUDED.business_connection_id,
 			   sender_id = EXCLUDED.sender_id,
 			   message_text = EXCLUDED.message_text,
-			   message_type = EXCLUDED.message_type`,
+			   message_type = EXCLUDED.message_type,
+			   quarantined = EXCLUDED.quarantined`,
 			event.TenantID,
 			event.ChatID,
 			event.SourceMessageID,
@@ -543,6 +555,7 @@ func (r *Repository) SaveMessage(event contracts.NormalizedTelegramEvent) {
 			event.MessageText,
 			event.MessageType,
 			event.CreatedAt,
+			quarantined,
 		)
 		traceID := tracepkg.DeriveTraceID(event.EventID)
 		for _, state := range record.States {
@@ -556,9 +569,11 @@ func (r *Repository) SaveMessage(event contracts.NormalizedTelegramEvent) {
 func (r *Repository) Message(tenantID, chatID, sourceMessageID string) (MessageRecord, bool) {
 	if r.db != nil {
 		var event contracts.NormalizedTelegramEvent
+		var quarantined bool
 		err := r.db.QueryRow(
 			`SELECT event_id, tenant_id, chat_id, telegram_update_id, business_connection_id,
-			        source_message_id, sender_id, message_text, message_type, received_at
+			        source_message_id, sender_id, message_text, message_type, received_at,
+			        quarantined
 			   FROM messages
 			  WHERE tenant_id = $1 AND chat_id = $2 AND source_message_id = $3`,
 			tenantID,
@@ -575,9 +590,10 @@ func (r *Repository) Message(tenantID, chatID, sourceMessageID string) (MessageR
 			&event.MessageText,
 			&event.MessageType,
 			&event.CreatedAt,
+			&quarantined,
 		)
 		if err == nil {
-			return MessageRecord{Event: event}, true
+			return MessageRecord{Event: event, Quarantined: quarantined}, true
 		}
 	}
 	r.mu.Lock()
@@ -1355,7 +1371,7 @@ func (r *Repository) RecentMessages(tenantID, chatID string, limit int) []Messag
 			     SELECT event_id, tenant_id, chat_id, telegram_update_id, business_connection_id,
 			            source_message_id, sender_id, message_text, message_type, received_at
 			       FROM messages
-			      WHERE tenant_id = $1 AND chat_id = $2
+			      WHERE tenant_id = $1 AND chat_id = $2 AND quarantined = false
 			      ORDER BY received_at DESC
 			      LIMIT $3
 			   ) recent
@@ -1394,7 +1410,7 @@ func (r *Repository) RecentMessages(tenantID, chatID string, limit int) []Messag
 	keys := r.chatMessageKeys[chatKey(tenantID, chatID)]
 	messages := make([]MessageRecord, 0, len(keys))
 	for _, key := range keys {
-		if record, ok := r.messages[key]; ok && record.Event.EventID != "" {
+		if record, ok := r.messages[key]; ok && record.Event.EventID != "" && !record.Quarantined {
 			messages = append(messages, record)
 		}
 	}
@@ -1973,7 +1989,8 @@ func (r *Repository) MessagesByDateRange(tenantID, chatID string, from, to time.
 	if r.db != nil {
 		rows, err := r.db.Query(
 			`SELECT event_id, tenant_id, chat_id, telegram_update_id, business_connection_id,
-			        source_message_id, sender_id, message_text, message_type, received_at
+			        source_message_id, sender_id, message_text, message_type, received_at,
+			        quarantined
 			   FROM messages
 			  WHERE tenant_id = $1 AND chat_id = $2
 			    AND received_at >= $3 AND received_at < $4
@@ -1985,13 +2002,15 @@ func (r *Repository) MessagesByDateRange(tenantID, chatID string, from, to time.
 			messages := make([]MessageRecord, 0)
 			for rows.Next() {
 				var event contracts.NormalizedTelegramEvent
+				var quarantined bool
 				if rows.Scan(
 					&event.EventID, &event.TenantID, &event.ChatID,
 					&event.TelegramUpdateID, &event.BusinessConnectionID,
 					&event.SourceMessageID, &event.SenderID,
 					&event.MessageText, &event.MessageType, &event.CreatedAt,
+					&quarantined,
 				) == nil {
-					messages = append(messages, MessageRecord{Event: event})
+					messages = append(messages, MessageRecord{Event: event, Quarantined: quarantined})
 				}
 			}
 			return messages
