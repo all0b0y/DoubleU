@@ -2145,3 +2145,106 @@ func TestSaveTypedFactsOutcomeSkipCounting(t *testing.T) {
 		t.Errorf("expected 1 persisted fact, got %d", got)
 	}
 }
+
+// TestEpisodeFloodGateSuppressesSummary verifies the episode-write gate (spam-protection §②):
+// a 40-message burst within minEpisodeSpan closes the episode but produces no summary,
+// while a normal conversation spanning ≥ minEpisodeSpan still produces exactly one summary.
+// Uses the injectable clock to control span deterministically.
+func TestEpisodeFloodGateSuppressesSummary(t *testing.T) {
+	const (
+		tenant = "tenant-1"
+		chatID = "55"
+	)
+
+	setupRepo := func() *store.Repository {
+		r := store.NewRepository()
+		// ChatModeDisabled: episode tracking runs but no AI call is made, keeping
+		// the test fast and independent of AI behaviour.
+		r.SaveChatSettings(contracts.ChatSettings{TenantID: tenant, ChatID: chatID, Mode: contracts.ChatModeDisabled})
+		r.SaveChat(store.ChatRecord{TenantID: tenant, ChatID: chatID})
+		return r
+	}
+
+	// flood40 sends exactly episodeMessageLimit messages from the same clock time.
+	flood40 := func(t *testing.T, svc *Service) {
+		t.Helper()
+		for i := 0; i < episodeMessageLimit; i++ {
+			if _, err := svc.HandleTelegramWebhook(
+				context.Background(),
+				telegramPayload(int64(i+1), "bc-flood", 55, int64(i+1), "spam"),
+				tenant,
+			); err != nil {
+				t.Fatalf("webhook %d: %v", i+1, err)
+			}
+		}
+	}
+
+	t.Run("short span suppresses summary", func(t *testing.T) {
+		repo := setupRepo()
+		ai := &summarizingAI{}
+		clock := time.Unix(1700000000, 0).UTC() // fixed: all 40 messages land at T0
+		svc := NewService(repo, ai, &fakeSender{},
+			WithClock(func() time.Time { return clock }),
+			WithDefaultIngestionMode(contracts.IngestionModeFull),
+		)
+
+		flood40(t, svc)
+
+		if _, ok := repo.ActiveEpisodeByChat(tenant, chatID); ok {
+			t.Error("episode must be closed after 40 messages")
+		}
+		// No goroutine is spawned in the flood path — check is immediate.
+		if s := repo.EpisodeSummaries(tenant, chatID, 10); len(s) != 0 {
+			t.Fatalf("flood: got %d episode summaries, want 0", len(s))
+		}
+	})
+
+	t.Run("long span produces one summary", func(t *testing.T) {
+		repo := setupRepo()
+		ai := &summarizingAI{}
+		base := time.Unix(1700000000, 0).UTC()
+		clock := base
+		svc := NewService(repo, ai, &fakeSender{},
+			WithClock(func() time.Time { return clock }),
+			WithDefaultIngestionMode(contracts.IngestionModeFull),
+		)
+
+		// Send 39 messages at base time (episode.StartedAt = base).
+		for i := 0; i < episodeMessageLimit-1; i++ {
+			if _, err := svc.HandleTelegramWebhook(
+				context.Background(),
+				telegramPayload(int64(i+1), "bc-flood", 55, int64(i+1), "spam"),
+				tenant,
+			); err != nil {
+				t.Fatalf("webhook %d: %v", i+1, err)
+			}
+		}
+		// Advance clock past minEpisodeSpan (3 min > 2 min).
+		clock = base.Add(3 * time.Minute)
+		// Message 40: LastMessageAt = base+3min, span = 3min ≥ 2min → summarize.
+		if _, err := svc.HandleTelegramWebhook(
+			context.Background(),
+			telegramPayload(int64(episodeMessageLimit), "bc-flood", 55, int64(episodeMessageLimit), "spam"),
+			tenant,
+		); err != nil {
+			t.Fatalf("webhook 40: %v", err)
+		}
+
+		if _, ok := repo.ActiveEpisodeByChat(tenant, chatID); ok {
+			t.Error("episode must be closed after 40 messages")
+		}
+		// Poll for the async summary (spawned in a goroutine).
+		deadline := time.Now().Add(2 * time.Second)
+		var summaries []store.EpisodeSummaryRecord
+		for time.Now().Before(deadline) {
+			summaries = repo.EpisodeSummaries(tenant, chatID, 10)
+			if len(summaries) > 0 {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if len(summaries) != 1 {
+			t.Fatalf("normal: got %d episode summaries, want 1", len(summaries))
+		}
+	})
+}

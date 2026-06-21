@@ -984,16 +984,29 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 		// concurrent handler cannot create a duplicate; summarisation runs in a goroutine.
 		if ep.MessageCount >= episodeMessageLimit {
 			s.repository.CloseActiveEpisode(event.TenantID, event.ChatID)
-			s.logger.Info("episode closed by message limit",
-				"tenant_id", event.TenantID,
-				"chat_id", event.ChatID,
-				"message_count", ep.MessageCount,
-			)
 			startedAt, closedAt := ep.StartedAt, ep.LastMessageAt
-			tenantID, chatID := event.TenantID, event.ChatID
-			s.runAsyncLLMTask(event.TenantID, func() {
-				s.summarizeEpisode(context.Background(), tenantID, chatID, startedAt, closedAt, "message_count")
-			})
+			span := closedAt.Sub(startedAt)
+			if span < minEpisodeSpan {
+				// A sub-minEpisodeSpan burst of 40 is a flood, not a conversation.
+				// Closing the episode resets the runtime counter; real content (if any)
+				// is captured later by the time-based daily fallback (summarizeChatDay).
+				s.logger.Info("episode closed by flood, summary skipped",
+					"tenant_id", event.TenantID,
+					"chat_id", event.ChatID,
+					"message_count", ep.MessageCount,
+					"span_seconds", span.Seconds(),
+				)
+			} else {
+				s.logger.Info("episode closed by message limit",
+					"tenant_id", event.TenantID,
+					"chat_id", event.ChatID,
+					"message_count", ep.MessageCount,
+				)
+				tenantID, chatID := event.TenantID, event.ChatID
+				s.runAsyncLLMTask(event.TenantID, func() {
+					s.summarizeEpisode(context.Background(), tenantID, chatID, startedAt, closedAt, "message_count")
+				})
+			}
 		}
 	}
 	s.repository.IncrementChatMessageCount(event.TenantID, event.ChatID)
@@ -3750,6 +3763,12 @@ func truncateForLog(value string, limit int) string {
 // When a chat accumulates this many messages the episode is closed immediately
 // (design §6.2 — episode lifecycle trigger: message_limit).
 const episodeMessageLimit = 40
+
+// minEpisodeSpan is the minimum wall-clock duration between ep.StartedAt and
+// ep.LastMessageAt required to trigger a summary on message-limit close. A
+// 40-message burst arriving within this window is a flood, not a conversation;
+// real content (if any) is captured later by the time-based daily fallback.
+const minEpisodeSpan = 2 * time.Minute
 
 // summarizeEpisode compresses the messages of one closed episode — real
 // episode bounds, not calendar days (MEM-6) — into an episode summary with
