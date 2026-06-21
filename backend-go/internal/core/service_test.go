@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/time/rate"
+
 	"doubleu/backend-go/internal/aiclient"
 	"doubleu/backend-go/internal/contracts"
 	"doubleu/backend-go/internal/store"
@@ -2358,4 +2360,149 @@ func TestMessageQuarantine(t *testing.T) {
 			t.Error("quarantined text must be excluded from summarizeEpisode input")
 		}
 	}
+}
+
+// telegramPayloadWithSender is like telegramPayload but lets the caller set the
+// Telegram sender (from) id, enabling owner-vs-contact distinctions in tests.
+func telegramPayloadWithSender(updateID int64, bc string, chatID, msgID, senderID int64, text string) []byte {
+	return []byte(`{
+		"update_id": ` + intString(updateID) + `,
+		"business_message": {
+			"message_id": ` + intString(msgID) + `,
+			"business_connection_id": "` + bc + `",
+			"chat": {"id": ` + intString(chatID) + `},
+			"from": {"id": ` + intString(senderID) + `},
+			"text": "` + text + `",
+			"date": 1700000000
+		}
+	}`)
+}
+
+// TestChatRateLimit verifies the per-chat+sender inbound rate limit (spam-protection §③):
+// excess messages are quarantined and return DecisionObserve/"rate_limited";
+// owner messages bypass the limiter; distinct bot-chat senders have independent buckets.
+func TestChatRateLimit(t *testing.T) {
+	t.Run("business: burst exceeded is rate_limited and quarantined", func(t *testing.T) {
+		tenant, chatID := "tenant-1", "42"
+		repo := store.NewRepository()
+		repo.SaveChatSettings(contracts.ChatSettings{TenantID: tenant, ChatID: chatID, Mode: contracts.ChatModeAuto})
+		repo.SaveChat(store.ChatRecord{TenantID: tenant, ChatID: chatID})
+		ai := &fakeAI{response: contracts.AIProcessMessageResponse{
+			Decision: contracts.DecisionObserve, Confidence: 0.5, RiskLevel: contracts.RiskLow,
+		}}
+		// burst=2; rate so slow it never meaningfully refills during the test
+		svc := NewService(repo, ai, &fakeSender{},
+			WithChatRateLimit(rate.Every(time.Hour), 2),
+			WithDefaultIngestionMode(contracts.IngestionModeFull),
+			WithClock(func() time.Time { return time.Unix(1700000000, 0).UTC() }),
+		)
+
+		send := func(n int) InboundResult {
+			res, err := svc.HandleTelegramWebhook(context.Background(),
+				telegramPayload(int64(n), "bc-1", 42, int64(n), "hello"), tenant)
+			if err != nil {
+				t.Fatalf("webhook %d: %v", n, err)
+			}
+			return res
+		}
+
+		r1, r2 := send(1), send(2)
+		if r1.Reason == "rate_limited" {
+			t.Fatalf("message 1 (within burst) must not be rate_limited")
+		}
+		if r2.Reason == "rate_limited" {
+			t.Fatalf("message 2 (within burst) must not be rate_limited")
+		}
+
+		r3 := send(3)
+		if r3.Reason != "rate_limited" {
+			t.Fatalf("message 3 (over burst) must be rate_limited; got reason=%s decision=%s", r3.Reason, r3.Decision)
+		}
+		if r3.Decision != contracts.DecisionObserve {
+			t.Fatalf("rate_limited result must carry DecisionObserve, got %s", r3.Decision)
+		}
+
+		// Message 3 must be stored for audit but absent from the memory window.
+		if rec, ok := repo.Message(tenant, chatID, "3"); !ok || !rec.Quarantined {
+			t.Fatal("rate_limited message must be quarantined and retrievable via Message()")
+		}
+		for _, m := range repo.RecentMessages(tenant, chatID, 20) {
+			if m.Event.SourceMessageID == "3" {
+				t.Error("quarantined (rate_limited) message must be absent from RecentMessages")
+			}
+		}
+	})
+
+	t.Run("business: owner messages bypass limiter", func(t *testing.T) {
+		// tenant:user:77 → ownerID="77"; sender 99 is non-owner; sender 77 is owner.
+		tenant, chatID := "tenant:user:77", "42"
+		repo := store.NewRepository()
+		repo.SaveChatSettings(contracts.ChatSettings{TenantID: tenant, ChatID: chatID, Mode: contracts.ChatModeAuto})
+		repo.SaveChat(store.ChatRecord{TenantID: tenant, ChatID: chatID})
+		ai := &fakeAI{response: contracts.AIProcessMessageResponse{
+			Decision: contracts.DecisionObserve, Confidence: 0.5, RiskLevel: contracts.RiskLow,
+		}}
+		// burst=1: one non-owner message exhausts the shared tenant|chat bucket.
+		svc := NewService(repo, ai, &fakeSender{},
+			WithChatRateLimit(rate.Every(time.Hour), 1),
+			WithDefaultIngestionMode(contracts.IngestionModeFull),
+			WithClock(func() time.Time { return time.Unix(1700000000, 0).UTC() }),
+		)
+
+		// Non-owner message (sender=99) exhausts the burst.
+		nonOwner, err := svc.HandleTelegramWebhook(context.Background(),
+			telegramPayloadWithSender(1, "bc-1", 42, 1, 99, "hi"), tenant)
+		if err != nil {
+			t.Fatalf("non-owner webhook: %v", err)
+		}
+		if nonOwner.Reason == "rate_limited" {
+			t.Fatal("first message (within burst) must not be rate_limited")
+		}
+
+		// Owner message (sender=77) must bypass the exhausted limiter.
+		owner, err := svc.HandleTelegramWebhook(context.Background(),
+			telegramPayloadWithSender(2, "bc-1", 42, 2, 77, "owner reply"), tenant)
+		if err != nil {
+			t.Fatalf("owner webhook: %v", err)
+		}
+		if owner.Reason == "rate_limited" {
+			t.Fatalf("owner message must NOT be rate_limited; got reason=%s", owner.Reason)
+		}
+		// Owner messages return "owner_message_observed" (isOwnerSideMessage returns early).
+		if owner.Reason != "owner_message_observed" {
+			t.Fatalf("owner message must return owner_message_observed; got reason=%s", owner.Reason)
+		}
+	})
+
+	t.Run("bot: distinct senders get independent buckets", func(t *testing.T) {
+		repo := store.NewRepository()
+		ai := &fakeAI{response: contracts.AIProcessMessageResponse{
+			Decision: contracts.DecisionObserve, Confidence: 0.5, RiskLevel: contracts.RiskLow,
+		}}
+		// burst=1: one message per sender before rate-limiting.
+		svc := NewService(repo, ai, &fakeSender{},
+			WithChatRateLimit(rate.Every(time.Hour), 1),
+			WithDefaultIngestionMode(contracts.IngestionModeBot),
+			WithClock(func() time.Time { return time.Unix(1700000000, 0).UTC() }),
+		)
+
+		// Sender A (chatID=42): first message passes, second is rate-limited.
+		evA1 := botEvent(t, 1, 42, 1, "hi")
+		evA2 := botEvent(t, 2, 42, 2, "hi")
+		r1, _ := svc.HandleBotMessage(context.Background(), evA1)
+		if r1.Reason == "rate_limited" {
+			t.Fatal("sender A first message must not be rate_limited")
+		}
+		r2, _ := svc.HandleBotMessage(context.Background(), evA2)
+		if r2.Reason != "rate_limited" {
+			t.Fatalf("sender A second message must be rate_limited; got %s", r2.Reason)
+		}
+
+		// Sender B (chatID=88): independent bucket — first message still passes.
+		evB1 := botEvent(t, 3, 88, 3, "hi")
+		r3, _ := svc.HandleBotMessage(context.Background(), evB1)
+		if r3.Reason == "rate_limited" {
+			t.Fatalf("sender B first message must not be rate_limited (independent bucket); got %s", r3.Reason)
+		}
+	})
 }

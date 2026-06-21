@@ -136,6 +136,12 @@ type Service struct {
 	tenantLimiters sync.Map
 	tenantRate     rate.Limit // sustained async-LLM tasks/sec per tenant
 	tenantBurst    int        // burst allowance per tenant
+	// chatLimiters bounds inbound message rate per chat+sender to stop a single
+	// user from flooding a bot chat through the full persist→episode→reply path.
+	// Keyed by "tenant|chat" (business) or "tenant|chat|sender" (bot); built lazily.
+	chatLimiters sync.Map
+	chatRate     rate.Limit // sustained messages/sec per chat+sender
+	chatBurst    int        // initial burst allowance
 	// webhookOverflow is a bounded spill queue: updates that cannot enter their
 	// ordered shard land here instead of spawning unbounded goroutines. When it
 	// too is full the enqueue is shed (HTTP 429) and Telegram retries.
@@ -223,6 +229,10 @@ const (
 	// share of the async-LLM pool: 5 tasks/sec sustained, bursts up to 8.
 	defaultTenantAsyncRate  = rate.Limit(5)
 	defaultTenantAsyncBurst = 8
+	// defaultChatRate / defaultChatBurst bound inbound messages per chat+sender:
+	// 0.5 msg/s sustained (one message per 2 seconds) with an initial burst of 8.
+	defaultChatRate  = rate.Limit(0.5)
+	defaultChatBurst = 8
 )
 
 // OwnerFeedbackSender is implemented by observability.ScoreSender; the
@@ -329,6 +339,20 @@ func WithTenantAsyncRate(r rate.Limit, burst int) Option {
 	}
 }
 
+// WithChatRateLimit configures the per-chat+sender inbound message rate limit.
+// Bot chats are keyed per tenant|chat|sender; business chats per tenant|chat.
+// Zero values keep the defaults (0.5 msg/s, burst 8).
+func WithChatRateLimit(r rate.Limit, burst int) Option {
+	return func(service *Service) {
+		if r > 0 {
+			service.chatRate = r
+		}
+		if burst > 0 {
+			service.chatBurst = burst
+		}
+	}
+}
+
 // MediaConfig controls the media -> text extraction step (Slice 3 hardening):
 // a global toggle plus pre-download caps that keep provider cost bounded.
 type MediaConfig struct {
@@ -388,6 +412,8 @@ func NewService(repository *store.Repository, ai aiclient.Client, sender telegra
 		defaultIngestionMode: contracts.IngestionModeBot,
 		tenantRate:           defaultTenantAsyncRate,
 		tenantBurst:          defaultTenantAsyncBurst,
+		chatRate:             defaultChatRate,
+		chatBurst:            defaultChatBurst,
 		media:                DefaultMediaConfig(),
 	}
 	for _, option := range options {
@@ -503,6 +529,23 @@ func (s *Service) tenantLimiter(tenantID string) *rate.Limiter {
 		return v.(*rate.Limiter)
 	}
 	v, _ := s.tenantLimiters.LoadOrStore(tenantID, rate.NewLimiter(s.tenantRate, s.tenantBurst))
+	return v.(*rate.Limiter)
+}
+
+// chatLimiterFor returns the lazily-built token bucket for the chat+sender key.
+// Bot transport scopes by tenant|chat|sender (each person gets their own bucket).
+// Business transport scopes by tenant|chat (the owner's conversation unit).
+func (s *Service) chatLimiterFor(event contracts.NormalizedTelegramEvent) *rate.Limiter {
+	var key string
+	if event.Transport == contracts.TransportBot {
+		key = event.TenantID + "|" + event.ChatID + "|" + event.SenderID
+	} else {
+		key = event.TenantID + "|" + event.ChatID
+	}
+	if v, ok := s.chatLimiters.Load(key); ok {
+		return v.(*rate.Limiter)
+	}
+	v, _ := s.chatLimiters.LoadOrStore(key, rate.NewLimiter(s.chatRate, s.chatBurst))
 	return v.(*rate.Limiter)
 }
 
@@ -1040,6 +1083,22 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 			"sender_id", event.SenderID,
 		)
 		return InboundResult{Event: event, Decision: contracts.DecisionObserve, Reason: "owner_message_observed"}, nil
+	}
+
+	// Per chat+sender rate limit: owner messages are already handled above (returned early).
+	// Bot chats key by tenant|chat|sender (each user gets an independent bucket).
+	// Business chats key by tenant|chat. Excess messages are quarantined and skipped —
+	// backpressure, not a block; the chat remains open for the next in-window message.
+	if !s.chatLimiterFor(event).Allow() {
+		if !settings.PrivacyFlags.Contains(contracts.PrivacyNoMemory) {
+			s.repository.SaveMessageQuarantined(event, true)
+		}
+		s.logger.Info("message rate_limited",
+			"tenant_id", event.TenantID,
+			"chat_id", event.ChatID,
+			"sender_id", event.SenderID,
+		)
+		return InboundResult{Event: event, Decision: contracts.DecisionObserve, Reason: "rate_limited"}, nil
 	}
 
 	if replyBlockNote != "" {
