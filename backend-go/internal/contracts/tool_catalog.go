@@ -19,6 +19,7 @@ func ToolCatalog() []ToolCatalogEntry {
 		{Key: "memory.save_fact", Label: "Сохранение фактов", Description: "Сохраняет устойчивые факты и договорённости в память чата.", Category: ToolCategoryRead, DefaultEnabled: true},
 		{Key: "memory.suggest_profile_update", Label: "Предложения к профилю", Description: "Предлагает владельцу обновить профиль собеседника.", Category: ToolCategoryRead, DefaultEnabled: true},
 		{Key: "interaction.present_buttons", Label: "Кнопки для собеседника", Description: "Задаёт собеседнику вопрос с вариантами ответа или подтверждением.", Category: ToolCategoryInteraction, DefaultEnabled: false},
+		{Key: "scheduler.create_reminder", Label: "Напоминания", Description: "Создаёт видимые владельцу напоминания для него или собеседника.", Category: ToolCategorySchedule, DefaultEnabled: false},
 	}
 }
 

@@ -32,6 +32,10 @@ export const api = {
   messages:     (chatId)        => request('GET',   `/api/v1/chats/${chatId}/messages`),
   sendMessage:  (chatId, text)  => request('POST',  `/api/v1/chats/${chatId}/send`, { text }),
   drafts:       (chatId)        => request('GET',   `/api/v1/chats/${chatId}/drafts`),
+  scheduledJobs: (chatId)       => request('GET',   `/api/v1/chats/${chatId}/scheduled-jobs`),
+  cancelScheduledJob: (chatId, jobId) => request(
+    'DELETE', `/api/v1/chats/${chatId}/scheduled-jobs/${jobId}`,
+  ),
   draftAction:  (chatId, draftId, action, editedText) =>
     request('POST', `/api/v1/chats/${chatId}/drafts/${draftId}/action`,
       { action, ...(editedText ? { edited_text: editedText } : {}) }),

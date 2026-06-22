@@ -21,8 +21,9 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ..schemas import (
     AIProcessMessageRequest,
@@ -120,6 +121,7 @@ def build_draft_prompt(
     request: AIProcessMessageRequest,
     prompt_builder: PromptBuilder,
     orchestrator_bundle: tuple[str, ...] | None = None,
+    current_time: datetime | None = None,
 ) -> tuple[str, str]:
     """Assemble the (system_prompt, user_payload) pair for the draft agent.
 
@@ -144,6 +146,8 @@ def build_draft_prompt(
         ai_role=request.ai_role,
         two_stage=orchestrator_bundle is not None,
     )
+    if _scheduler_available(request):
+        base_instruction += "\n\n" + _current_time_instruction(request, current_time)
     prompt_context = list(clean_memory)
     if orchestrator_bundle is not None:
         bundle = "\n".join(orchestrator_bundle) or "Инструменты не вернули дополнительного контекста."
@@ -158,6 +162,7 @@ def build_draft_prompt(
 def build_orchestrator_prompt(
     request: AIProcessMessageRequest,
     prompt_builder: PromptBuilder,
+    current_time: datetime | None = None,
 ) -> tuple[str, str]:
     """Build a reduced role-aware prompt for tool selection and execution."""
     role = request.ai_role
@@ -175,7 +180,40 @@ def build_orchestrator_prompt(
     role_lines.append(
         "Используй этот контекст только чтобы выбрать нужные инструменты и понять цель ответа."
     )
+    if _scheduler_available(request):
+        role_lines.append(_current_time_instruction(request, current_time))
     return prompt_builder.build("\n".join(role_lines), request.event.message_text)
+
+
+def _scheduler_available(request: AIProcessMessageRequest) -> bool:
+    if request.ai_role is None:
+        return False
+    if PrivacyFlag.NO_MEMORY in request.chat_settings.privacy_flags:
+        return False
+    if PrivacyFlag.PRIVATE in request.chat_settings.privacy_flags:
+        return False
+    return request.ai_role.tool_settings.get("scheduler.create_reminder", False)
+
+
+def _current_time_instruction(
+    request: AIProcessMessageRequest, current_time: datetime | None
+) -> str:
+    now_utc = (current_time or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    timezone_name = (
+        request.user_settings.timezone
+        if request.user_settings is not None and request.user_settings.timezone
+        else "UTC"
+    )
+    try:
+        local_now = now_utc.astimezone(ZoneInfo(timezone_name))
+    except ZoneInfoNotFoundError:
+        timezone_name = "UTC"
+        local_now = now_utc
+    return (
+        "ТЕКУЩЕЕ ВРЕМЯ ВЛАДЕЛЬЦА: "
+        f"{local_now.isoformat()} ({timezone_name}); UTC: {now_utc.isoformat()}. "
+        "Для scheduler.create_reminder вычисляй абсолютный fire_at_iso с часовым поясом."
+    )
 
 
 def _split_memory_context(

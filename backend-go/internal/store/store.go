@@ -66,6 +66,23 @@ type DraftRecord struct {
 	UpdatedAt time.Time
 }
 
+// ScheduledJobRecord is one deferred owner/contact action created by AI or the owner.
+type ScheduledJobRecord struct {
+	ID             int64          `json:"id"`
+	TenantID       string         `json:"tenant_id"`
+	ChatID         string         `json:"chat_id"`
+	BotID          string         `json:"bot_id,omitempty"`
+	Kind           string         `json:"kind"`
+	Target         string         `json:"target"`
+	FireAt         time.Time      `json:"fire_at"`
+	Payload        map[string]any `json:"payload"`
+	Status         string         `json:"status"`
+	CreatedBy      string         `json:"created_by"`
+	IdempotencyKey string         `json:"idempotency_key"`
+	CreatedAt      time.Time      `json:"created_at"`
+	SentAt         *time.Time     `json:"sent_at,omitempty"`
+}
+
 // SemanticFactRecord stores a typed, atomic fact in the Semantic Layer.
 // It maps to the semantic_facts table and replaces the deprecated MemoryFactRecord.
 type SemanticFactRecord struct {
@@ -291,6 +308,9 @@ type Repository struct {
 	aiRoles       map[int64]AIRoleRecord
 	aiRoleSeq     int64
 	chatAIRoleIDs map[string]int64 // chatKey -> ai_roles.id
+	// scheduledJobs is the in-memory fallback for migration 114.
+	scheduledJobs   map[int64]ScheduledJobRecord
+	scheduledJobSeq int64
 	// ctxScoreCache memoises ContextScoreForChat with a short TTL (ARCH-8):
 	// the score gates mode selection and was recomputed (3 queries) per check.
 	// Writes that affect the score delete the entry so reads stay fresh.
@@ -362,6 +382,7 @@ func NewRepository() *Repository {
 		userSettings:        make(map[string]contracts.UserSettings),
 		aiRoles:             make(map[int64]AIRoleRecord),
 		chatAIRoleIDs:       make(map[string]int64),
+		scheduledJobs:       make(map[int64]ScheduledJobRecord),
 	}
 }
 

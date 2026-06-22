@@ -30,6 +30,7 @@ import logging
 import os
 import threading
 import warnings
+from datetime import datetime, timezone
 from typing import Awaitable, Callable, Sequence, TypeVar
 
 import asyncpg
@@ -74,6 +75,7 @@ from .deps import AgentDeps
 from .interaction_tools import interaction_toolset
 from .memory_tools import memory_toolset
 from .models import AgentTask, ModelTier, build_model, build_tier_model, model_name_for
+from .schedule_tools import schedule_toolset
 from .tool_catalog import TOOL_CATALOG, TOOL_NAME_TO_KEY
 from .results import (
     CriticVerdict,
@@ -95,30 +97,45 @@ T = TypeVar("T")
 EmbedderCallable = Callable[[str], Awaitable[Sequence[float] | None]]
 
 
-def resolve_builtin_toolset(ai_role: AIRoleData | None) -> FilteredToolset[AgentDeps]:
+def resolve_builtin_toolset(
+    ai_role: AIRoleData | None,
+    privacy_flags: tuple[PrivacyFlag, ...] = (),
+) -> FilteredToolset[AgentDeps]:
     """Scope native tools to role overrides while preserving catalog defaults."""
     settings = ai_role.tool_settings if ai_role is not None else {}
+    scheduler_blocked = any(
+        flag in (PrivacyFlag.NO_MEMORY, PrivacyFlag.PRIVATE) for flag in privacy_flags
+    )
     enabled_keys = {
         entry.key
         for entry in TOOL_CATALOG
         if settings.get(entry.key, entry.default_enabled)
+        and not (scheduler_blocked and entry.category.value == "schedule")
     }
     enabled_names = frozenset(
         name for name, key in TOOL_NAME_TO_KEY.items() if key in enabled_keys
     )
     return FilteredToolset(
-        CombinedToolset([memory_toolset, interaction_toolset]),
+        CombinedToolset([memory_toolset, interaction_toolset, schedule_toolset]),
         lambda ctx, tool_def, enabled_names=enabled_names: tool_def.name in enabled_names,
     )
 
 
-def role_has_enabled_tools(ai_role: AIRoleData | None) -> bool:
+def role_has_enabled_tools(
+    ai_role: AIRoleData | None,
+    privacy_flags: tuple[PrivacyFlag, ...] = (),
+) -> bool:
     """Return whether a role enables any catalog or MCP tool."""
     if ai_role is None:
         return False
     settings = ai_role.tool_settings
+    scheduler_blocked = any(
+        flag in (PrivacyFlag.NO_MEMORY, PrivacyFlag.PRIVATE) for flag in privacy_flags
+    )
     builtin_enabled = any(
-        settings.get(entry.key, entry.default_enabled) for entry in TOOL_CATALOG
+        settings.get(entry.key, entry.default_enabled)
+        and not (scheduler_blocked and entry.category.value == "schedule")
+        for entry in TOOL_CATALOG
     )
     return builtin_enabled or bool(ai_role.mcp_servers)
 
@@ -396,6 +413,7 @@ class AgentRuntime:
         source_message_id: str = "",
         system_instruction: str = "",
         pool: asyncpg.Pool | None,
+        current_time: datetime | None = None,
     ) -> AgentDeps:
         return AgentDeps(
             tenant_id=tenant_id,
@@ -405,6 +423,7 @@ class AgentRuntime:
             system_instruction=system_instruction,
             pool=pool,
             embedder=self._query_embedder_factory() if self._query_embedder_factory else None,
+            current_time=current_time or datetime.now(timezone.utc),
         )
 
     # ----------------------------------------------------------- safety/sink
@@ -581,8 +600,9 @@ class AgentRuntime:
         pool: asyncpg.Pool | None,
     ) -> tuple[OrchestratorResult, Usage]:
         """Run the tool-owning context stage without producing a contact reply."""
+        current_time = datetime.now(timezone.utc)
         system_prompt, user_payload = draft_pipeline.build_orchestrator_prompt(
-            request, self._prompt_builder
+            request, self._prompt_builder, current_time=current_time
         )
         system_prompt, user_payload = self._scan_input(
             system_prompt, user_payload, ModelTask.DRAFT_REPLY, ctx
@@ -595,9 +615,10 @@ class AgentRuntime:
             source_message_id=request.event.source_message_id,
             system_instruction=system_prompt,
             pool=pool,
+            current_time=current_time,
         )
         toolsets = [
-            resolve_builtin_toolset(request.ai_role),
+            resolve_builtin_toolset(request.ai_role, privacy_flags),
             *self._resolve_mcp_toolsets(request.ai_role, privacy_flags),
         ]
         result = await self._orchestrator_agent.run(
@@ -645,7 +666,9 @@ class AgentRuntime:
     async def _draft_async(
         self, request: AIProcessMessageRequest, risk_level: RiskLevel, ctx: LLMCallContext
     ) -> draft_pipeline.DraftOutcome:
-        two_stage = self._two_stage_draft and role_has_enabled_tools(request.ai_role)
+        two_stage = self._two_stage_draft and role_has_enabled_tools(
+            request.ai_role, request.chat_settings.privacy_flags
+        )
         pool = await self._get_pool()
         orchestrator_usage = Usage()
         orchestrator_bundle: tuple[str, ...] | None = None
@@ -655,10 +678,12 @@ class AgentRuntime:
                 request, ctx, pool
             )
             orchestrator_bundle = self._orchestrator_bundle(orchestrated)
+        current_time = datetime.now(timezone.utc)
         system_prompt, user_payload = draft_pipeline.build_draft_prompt(
             request,
             self._prompt_builder,
             orchestrator_bundle=orchestrator_bundle,
+            current_time=current_time,
         )
         # Phase 1: may rewrite (anonymize) or raise SafetyBlocked → canned reply.
         system_prompt, user_payload = self._scan_input(
@@ -672,11 +697,12 @@ class AgentRuntime:
             source_message_id=request.event.source_message_id,
             system_instruction=system_prompt,
             pool=pool,
+            current_time=current_time,
         )
         writer_toolsets: list = []
         if not two_stage:
             writer_toolsets = [
-                resolve_builtin_toolset(request.ai_role),
+                resolve_builtin_toolset(request.ai_role, privacy_flags),
                 *self._resolve_mcp_toolsets(request.ai_role, privacy_flags),
             ]
         # Per-role tier override: build a tier-specific model when the role

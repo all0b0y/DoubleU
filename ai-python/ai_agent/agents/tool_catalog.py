@@ -70,6 +70,13 @@ TOOL_CATALOG: tuple[ToolCatalogEntry, ...] = (
         category=ToolCategory.INTERACTION,
         default_enabled=False,
     ),
+    ToolCatalogEntry(
+        key="scheduler.create_reminder",
+        label="Напоминания",
+        description="Создаёт видимые владельцу напоминания для него или собеседника.",
+        category=ToolCategory.SCHEDULE,
+        default_enabled=False,
+    ),
 )
 
 
@@ -83,6 +90,7 @@ TOOL_NAME_TO_KEY: Mapping[str, str] = MappingProxyType(
         "suggest_profile_update": "memory.suggest_profile_update",
         "present_buttons": "interaction.present_buttons",
         "request_confirmation": "interaction.present_buttons",
+        "create_reminder": "scheduler.create_reminder",
     }
 )
 

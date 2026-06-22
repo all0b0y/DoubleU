@@ -68,6 +68,7 @@ func NewServer(service *core.Service, opts ...ServerOption) *Server {
 func (s *Server) Start(ctx context.Context) {
 	s.service.StartWebhookWorkers(ctx)
 	go s.service.StartDailySummaryScheduler(ctx)
+	go s.service.StartScheduler(ctx)
 	go s.service.StartEpisodeCloser(ctx)
 }
 
@@ -94,6 +95,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/v1/chats", s.tmaAuth(s.apiAddChats))
 	s.mux.HandleFunc("GET /api/v1/chats/{chat_id}/messages", s.tmaAuth(s.apiMessages))
 	s.mux.HandleFunc("GET /api/v1/chats/{chat_id}/drafts", s.tmaAuth(s.apiDrafts))
+	s.mux.HandleFunc("GET /api/v1/chats/{chat_id}/scheduled-jobs", s.tmaAuth(s.apiScheduledJobs))
+	s.mux.HandleFunc("DELETE /api/v1/chats/{chat_id}/scheduled-jobs/{job_id}", s.tmaAuth(s.apiCancelScheduledJob))
 	s.mux.HandleFunc("POST /api/v1/chats/{chat_id}/drafts/{draft_id}/action", s.tmaAuth(s.apiDraftAction))
 	s.mux.HandleFunc("POST /api/v1/chats/{chat_id}/send", s.tmaAuth(s.apiSendMessage))
 	s.mux.HandleFunc("GET /api/v1/chats/{chat_id}/settings", s.tmaAuth(s.apiGetChatSettings))

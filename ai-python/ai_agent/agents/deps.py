@@ -10,6 +10,7 @@ or writing memory for a ``no_memory`` chat.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Awaitable, Callable, Sequence
 
 import asyncpg
@@ -40,6 +41,8 @@ class AgentDeps:
     # Interaction tools write a deferred contact-facing form here. The tool
     # itself never performs transport IO; core sends it through approval.
     response_plan: ResponsePlan | None = None
+    # One stable clock value shared by the scheduler prompt and tool validation.
+    current_time: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     @property
     def no_memory(self) -> bool:
@@ -50,3 +53,8 @@ class AgentDeps:
     def no_summary(self) -> bool:
         """True when the chat forbids summarization."""
         return "no_summary" in self.privacy_flags
+
+    @property
+    def private(self) -> bool:
+        """True when autonomous scheduled persistence is forbidden."""
+        return "private" in self.privacy_flags

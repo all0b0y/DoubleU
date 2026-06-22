@@ -140,6 +140,7 @@ func main() {
 	go service.StartEmbeddingWorker(serverCtx)
 	go service.StartEpisodeCloser(serverCtx)
 	go service.StartDailySummaryScheduler(serverCtx)
+	go service.StartScheduler(serverCtx)
 	go service.StartConsolidationWorker(serverCtx)
 	logger.Info("backend storage configured", "storage", storage, "database_url_configured", cfg.DatabaseURL != "")
 	logger.Info("backend listening", "addr", cfg.HTTPAddr, "ai_base_url", cfg.AIBaseURL)

@@ -73,6 +73,8 @@ export function renderChat(navigate, chatId) {
 
     <div id="draft-panel"></div>
 
+    <div id="scheduled-jobs"></div>
+
     <div class="chat-composer" id="chat-composer"
          style="display:flex;gap:8px;align-items:flex-end;padding:8px 12px calc(8px + var(--inset-bottom,0px));border-top:1px solid var(--border-color);background:var(--bg);">
       <textarea id="composer-input" rows="1" placeholder="Ответить от имени бота…"
@@ -130,6 +132,40 @@ export function renderChat(navigate, chatId) {
   });
 
   let currentDrafts = [];
+
+  function renderScheduledJobs(jobs) {
+    const host = el.querySelector('#scheduled-jobs');
+    const pending = (jobs || []).filter(job => job.status === 'pending');
+    if (!pending.length) {
+      host.innerHTML = '';
+      return;
+    }
+    host.innerHTML = `
+      <div style="padding:8px 12px;border-top:1px solid var(--border-color);background:var(--bg2)">
+        <div style="font-size:12px;color:var(--hint);margin-bottom:6px">⏰ Запланировано</div>
+        ${pending.map(job => `
+          <div style="display:flex;align-items:center;gap:8px;padding:6px 0">
+            <div style="flex:1;min-width:0">
+              <div style="font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(job.payload?.text || 'Напоминание')}</div>
+              <div style="font-size:11px;color:var(--hint)">${new Date(job.fire_at).toLocaleString('ru')} · ${job.target === 'owner' ? 'вам' : 'собеседнику'}</div>
+            </div>
+            <button class="draft-trash-btn" data-cancel-job="${job.id}" title="Отменить">×</button>
+          </div>`).join('')}
+      </div>`;
+    host.querySelectorAll('[data-cancel-job]').forEach(button => {
+      button.addEventListener('click', async () => {
+        button.disabled = true;
+        try {
+          await api.cancelScheduledJob(chatId, button.dataset.cancelJob);
+          twa?.HapticFeedback?.notificationOccurred('success');
+          await loadChatData();
+        } catch (err) {
+          button.disabled = false;
+          twa?.showAlert(`Ошибка: ${err.message}`);
+        }
+      });
+    });
+  }
 
   const THINKING_PHRASES = [
     '✨ ИИ подбирает слова…',
@@ -481,9 +517,12 @@ export function renderChat(navigate, chatId) {
 
   async function loadChatData() {
     try {
-      const [msgData, draftData] = await Promise.all([api.messages(chatId), api.drafts(chatId)]);
+      const [msgData, draftData, jobsData] = await Promise.all([
+        api.messages(chatId), api.drafts(chatId), api.scheduledJobs(chatId),
+      ]);
       renderMessages(msgData.messages || [], draftData.drafts || []);
       renderDraftPanel(draftData.drafts || []);
+      renderScheduledJobs(jobsData.scheduled_jobs || []);
     } catch (_) {}
   }
 
@@ -518,6 +557,7 @@ export function renderChat(navigate, chatId) {
     new_message:  (d) => { if (d.chat_id === chatId) { el.querySelector('#ai-error-notice')?.remove(); loadChatData(); } },
     ai_thinking:  (d) => { if (d.chat_id === chatId) showThinkingIndicator(); },
     ai_done:      (d) => { if (d.chat_id === chatId) hideThinkingIndicator(); },
+    scheduled_job: (d) => { if (d.chat_id === chatId) loadChatData(); },
     ai_error:     (d) => { if (d.chat_id === chatId) showAIError(d.message); },
     chat_role_changed: (d) => { if (d.chat_id === chatId) loadChatMeta(); },
   });
