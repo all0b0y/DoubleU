@@ -9,6 +9,7 @@ prompt internals.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -16,6 +17,7 @@ from pydantic_ai.messages import ModelResponse, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from ai_agent.agents.deps import AgentDeps
+import ai_agent.agents.runtime as runtime_module
 from ai_agent.agents.memory_tools import (
     _format_fact_chains,
     save_fact,
@@ -23,6 +25,9 @@ from ai_agent.agents.memory_tools import (
     suggest_profile_update,
 )
 from ai_agent.agents.runtime import AgentRuntime
+from ai_agent.agents.models import AgentTask, model_name_for
+from ai_agent.agents.tool_catalog import TOOL_CATALOG
+from ai_agent.config.flags import load_from_env as load_flags_from_env
 from ai_agent.http_server import _request_summary
 from ai_agent.observability.context import LLMCallContext, with_context
 from ai_agent.schemas import (
@@ -110,6 +115,160 @@ def test_draft_outcome_maps_structured_output() -> None:
     assert outcome.topic == "время встречи"
     # Low risk + confident draft: critic must NOT run (no extra LLM latency).
     assert "+critic" not in outcome.model_used
+
+
+@pytest.mark.parametrize(
+    ("two_stage_draft", "tool_settings"),
+    [
+        (False, {"memory.search_facts": True}),
+        (True, {entry.key: False for entry in TOOL_CATALOG}),
+    ],
+    ids=("flag-off", "role-without-enabled-tools"),
+)
+def test_bimodal_gate_keeps_single_stage_path(
+    two_stage_draft: bool,
+    tool_settings: dict[str, bool],
+) -> None:
+    calls = {"orchestrator": 0, "writer": 0}
+
+    def orchestrator_should_not_run(messages, info: AgentInfo) -> ModelResponse:
+        calls["orchestrator"] += 1
+        raise AssertionError("orchestrator must stay gated off")
+
+    def writer(messages, info: AgentInfo) -> ModelResponse:
+        calls["writer"] += 1
+        return ModelResponse(parts=[ToolCallPart(tool_name="final_result", args={
+            "reply": "Одностадийный ответ.",
+            "intent": "general_message",
+            "options": [],
+            "confidence": 0.9,
+            "topic": "проверка gate",
+        })])
+
+    request = replace(
+        process_request(),
+        ai_role=AIRoleData(name="Support", tool_settings=tool_settings),
+    )
+    runtime = make_runtime(
+        two_stage_draft=two_stage_draft,
+        orchestrator_model=FunctionModel(orchestrator_should_not_run),
+        draft_model=FunctionModel(writer),
+    )
+
+    outcome = runtime.draft_outcome(request, RiskLevel.LOW)
+
+    assert outcome.text == "Одностадийный ответ."
+    assert calls == {"orchestrator": 0, "writer": 1}
+    assert "orchestrate(" not in outcome.model_used
+
+
+def test_bimodal_orchestrator_tools_writer_bundle_tier_and_critic(monkeypatch) -> None:
+    captured: dict[str, object] = {"orchestrator_calls": 0}
+
+    def prompt_text(messages, info: AgentInfo) -> str:
+        chunks = [info.instructions or ""]
+        for message in messages:
+            for part in getattr(message, "parts", []):
+                content = getattr(part, "content", None)
+                if isinstance(content, str):
+                    chunks.append(content)
+        return "\n".join(chunks)
+
+    def orchestrator(messages, info: AgentInfo) -> ModelResponse:
+        captured["orchestrator_calls"] = int(captured["orchestrator_calls"]) + 1
+        captured["orchestrator_tools"] = [tool.name for tool in info.function_tools]
+        captured["orchestrator_prompt"] = prompt_text(messages, info)
+        if captured["orchestrator_calls"] == 1:
+            return ModelResponse(
+                parts=[ToolCallPart(tool_name="get_recent_messages", args={"limit": 1})]
+            )
+        return ModelResponse(parts=[ToolCallPart(tool_name="final_result", args={
+            "gathered_context": ["bundle-sentinel: встреча подтверждена на 19:00"],
+            "suggested_intent": "scheduling",
+            "notes": "не обещать другое время",
+        })])
+
+    def writer(messages, info: AgentInfo) -> ModelResponse:
+        captured["writer_tools"] = [tool.name for tool in info.function_tools]
+        captured["writer_prompt"] = prompt_text(messages, info)
+        return ModelResponse(parts=[ToolCallPart(tool_name="final_result", args={
+            "reply": "Да, встречаемся в 19:00.",
+            "intent": "scheduling",
+            "options": [],
+            "confidence": 0.9,
+            "topic": "время встречи",
+        })])
+
+    writer_model = FunctionModel(writer)
+
+    def tier_model(tier: str):
+        captured["tier"] = tier
+        return writer_model
+
+    monkeypatch.setattr(runtime_module, "build_tier_model", tier_model)
+    monkeypatch.setenv("MODEL_ROUTER", "router-constant")
+    sink = _FakeSink()
+    request = replace(
+        process_request("Встреча точно в семь?"),
+        ai_role=AIRoleData(
+            name="Support",
+            description="Помогает клиентам.",
+            goals="Давать точные ответы.",
+            model_tier="smart",
+            tool_settings={"memory.get_recent_messages": True},
+        ),
+    )
+    runtime = make_runtime(
+        two_stage_draft=True,
+        orchestrator_model=FunctionModel(orchestrator),
+        draft_model=structured({
+            "reply": "wrong default writer",
+            "intent": "general_message",
+            "options": [],
+            "confidence": 0.9,
+            "topic": "",
+        }),
+        critic_model=structured({
+            "verdict": "revise",
+            "issues": ["нужно уточнить подтверждение"],
+            "revised_reply": "Да, всё подтверждено: встречаемся в 19:00.",
+        }),
+        sink=sink,
+    )
+
+    with with_context(LLMCallContext(trace_id="trace-bimodal")):
+        outcome = runtime.draft_outcome(request, RiskLevel.MEDIUM)
+
+    assert captured["orchestrator_calls"] == 2
+    assert "get_recent_messages" in captured["orchestrator_tools"]
+    assert "финальный ответ ты НЕ пишешь" in str(captured["orchestrator_prompt"])
+    assert "Support" in str(captured["orchestrator_prompt"])
+    assert "Telegram Rich Markdown" not in str(captured["orchestrator_prompt"])
+    assert captured["writer_tools"] == []
+    assert "bundle-sentinel" in str(captured["writer_prompt"])
+    assert "НЕТ инструментов" in str(captured["writer_prompt"])
+    assert captured["tier"] == "smart"
+    assert outcome.text == "Да, всё подтверждено: встречаемся в 19:00."
+    assert outcome.model_used == "orchestrate(router-constant)+draft(smart)+critic"
+    recorded_models = [generation["model"] for generation in sink.generations]
+    assert "router-constant" in recorded_models
+    assert "smart" in recorded_models
+
+
+def test_orchestrator_model_name_defaults_to_cheap(monkeypatch) -> None:
+    monkeypatch.delenv("MODEL_ROUTER", raising=False)
+    monkeypatch.setenv("MODEL_CHEAP", "cheap-constant")
+    monkeypatch.setenv("OPENROUTER_MODEL", "general-fallback")
+    assert model_name_for(AgentTask.ORCHESTRATE) == "cheap-constant"
+    monkeypatch.setenv("MODEL_ROUTER", "router-constant")
+    assert model_name_for(AgentTask.ORCHESTRATE) == "router-constant"
+
+
+def test_two_stage_feature_flag_defaults_off(monkeypatch) -> None:
+    monkeypatch.delenv("TWO_STAGE_DRAFT", raising=False)
+    assert load_flags_from_env().two_stage_draft is False
+    monkeypatch.setenv("TWO_STAGE_DRAFT", "true")
+    assert load_flags_from_env().two_stage_draft is True
 
 
 def test_role_draft_is_structured_and_wraps_untrusted_description() -> None:

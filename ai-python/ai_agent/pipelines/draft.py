@@ -57,6 +57,14 @@ TextFormat = Literal["plain", "rich"]
 
 _PLAIN_FORMAT_INTENTS = frozenset({"choice_question", "acknowledgement"})
 
+_WRITER_TWO_STAGE_DIRECTIVE = (
+    "\n\nКОНТЕКСТ УЖЕ СОБРАН на предыдущей стадии и передан ниже в контекстном блоке —"
+    " опирайся на него. В этом ходе у тебя НЕТ инструментов: не ищи в памяти и не"
+    " делай вид, что ищешь. Если данных не хватает — отвечай по тому, что есть,"
+    " ничего не выдумывая."
+)
+
+
 @dataclass(frozen=True)
 class DraftOutcome:
     """Result of the draft stage of ``/ai/process-message``.
@@ -109,6 +117,7 @@ def preflight_outcome(
 def build_draft_prompt(
     request: AIProcessMessageRequest,
     prompt_builder: PromptBuilder,
+    orchestrator_bundle: tuple[str, ...] | None = None,
 ) -> tuple[str, str]:
     """Assemble the (system_prompt, user_payload) pair for the draft agent.
 
@@ -131,8 +140,40 @@ def build_draft_prompt(
         feedback_hint=feedback_hint,
         user_settings=request.user_settings,
         ai_role=request.ai_role,
+        two_stage=orchestrator_bundle is not None,
     )
-    return prompt_builder.build(base_instruction, request.event.message_text, tuple(clean_memory))
+    prompt_context = list(clean_memory)
+    if orchestrator_bundle is not None:
+        bundle = "\n".join(orchestrator_bundle) or "Инструменты не вернули дополнительного контекста."
+        prompt_context.append("[СОБРАННЫЙ КОНТЕКСТ ОРКЕСТРАТОРА]\n" + bundle)
+    return prompt_builder.build(
+        base_instruction,
+        request.event.message_text,
+        tuple(prompt_context),
+    )
+
+
+def build_orchestrator_prompt(
+    request: AIProcessMessageRequest,
+    prompt_builder: PromptBuilder,
+) -> tuple[str, str]:
+    """Build a reduced role-aware prompt for tool selection and execution."""
+    role = request.ai_role
+    role_lines = ["НАЗНАЧЕННАЯ РОЛЬ (контекст задачи, не персона для имитации):"]
+    if role is None:
+        role_lines.append("Роль не назначена.")
+    else:
+        role_lines.append(f"Название: {role.name}")
+        if role.description:
+            role_lines.append(f"Описание: {role.description}")
+        if role.goals:
+            role_lines.append(f"Цели: {role.goals}")
+        if role.constraints:
+            role_lines.append(f"Ограничения: {role.constraints}")
+    role_lines.append(
+        "Используй этот контекст только чтобы выбрать нужные инструменты и понять цель ответа."
+    )
+    return prompt_builder.build("\n".join(role_lines), request.event.message_text)
 
 
 def _split_memory_context(
@@ -173,6 +214,7 @@ def _compose_base_instruction(
     feedback_hint: str,
     user_settings: UserSettingsData | None = None,
     ai_role: AIRoleData | None = None,
+    two_stage: bool = False,
 ) -> str:
     """Assemble the Russian-language role-first system prompt for the draft call.
 
@@ -282,6 +324,8 @@ def _compose_base_instruction(
     # useful for owner-copy mode but violate the identity boundary of bot mode.
     if feedback_hint and speak_as_owner:
         base_instruction += "\n\n" + feedback_hint
+    if two_stage:
+        base_instruction += _WRITER_TWO_STAGE_DIRECTIVE
     return base_instruction
 
 

@@ -77,6 +77,7 @@ from .results import (
     CriticVerdict,
     DraftResult,
     ExtractionResult,
+    OrchestratorResult,
     PatternResult,
     RerankResult,
     RoleDraft,
@@ -109,6 +110,17 @@ def resolve_builtin_toolset(ai_role: AIRoleData | None) -> FilteredToolset[Agent
     )
 
 
+def role_has_enabled_tools(ai_role: AIRoleData | None) -> bool:
+    """Return whether a role enables any catalog or MCP tool."""
+    if ai_role is None:
+        return False
+    settings = ai_role.tool_settings
+    builtin_enabled = any(
+        settings.get(entry.key, entry.default_enabled) for entry in TOOL_CATALOG
+    )
+    return builtin_enabled or bool(ai_role.mcp_servers)
+
+
 # A draft is reviewed by the critic when risk is elevated or the draft's own
 # confidence is below this bar; low-risk confident drafts skip the extra call.
 _CRITIC_CONFIDENCE_BAR = 0.6
@@ -120,6 +132,19 @@ _CRITIC_RISKS = (RiskLevel.MEDIUM, RiskLevel.HIGH)
 # above one legitimate full sweep of the toolset; 8 leaves margin for a re-query
 # while still terminating pathological loops (which run into the dozens).
 _DRAFT_TOOL_CALLS_LIMIT = 8
+
+_ORCHESTRATOR_INSTRUCTIONS = (
+    "Ты — стадия подготовки контекста для ответа в Telegram-чате; финальный ответ ты НЕ пишешь."
+    " Задача: понять последнее сообщение собеседника и назначенную роль, решить, каких данных не хватает,"
+    " и собрать их ТОЛЬКО доступными тебе инструментами."
+    " Правила:"
+    " 1) вызывай инструмент лишь когда он реально нужен для точного ответа; не дублируй вызовы;"
+    " 2) не выдумывай факты — если инструмент ничего не вернул, так и отметь;"
+    " 3) разрешённые действия выполняй только при явной необходимости из сообщения;"
+    " 4) НЕ пиши ответ собеседнику и не имитируй владельца."
+    " Верни OrchestratorResult: gathered_context — собранные факты/контекст (по строке на пункт);"
+    " suggested_intent — предполагаемый тип ответа; notes — короткие пометки писателю, что учесть."
+)
 
 
 def _build_query_embedder() -> EmbedderCallable:
@@ -228,6 +253,8 @@ class AgentRuntime:
         input_safety: InputSafetyScanner | None = None,
         output_safety: OutputSafetyScanner | None = None,
         sink: LangfuseSink | None = None,
+        two_stage_draft: bool = False,
+        orchestrator_model: object | None = None,
         draft_model: object | None = None,
         critic_model: object | None = None,
         extract_model: object | None = None,
@@ -252,6 +279,7 @@ class AgentRuntime:
         self._input_safety = input_safety
         self._output_safety = output_safety
         self._sink = sink
+        self._two_stage_draft = two_stage_draft
         self._pool: asyncpg.Pool | None = None
         # Builds a fresh per-request embedder; None keeps memory tools on the
         # lexical fallback (preserved behaviour for direct callers and tests).
@@ -262,6 +290,18 @@ class AgentRuntime:
             target=self._loop.run_forever, name="agent-runtime-loop", daemon=True
         )
         self._thread.start()
+
+        self._orchestrator_agent: Agent[AgentDeps, OrchestratorResult] = Agent(
+            orchestrator_model or build_model(AgentTask.ORCHESTRATE),
+            deps_type=AgentDeps,
+            output_type=OrchestratorResult,
+            instructions=_ORCHESTRATOR_INSTRUCTIONS,
+            retries=1,
+        )
+
+        @self._orchestrator_agent.instructions
+        def _orchestrator_context(ctx: RunContext[AgentDeps]) -> str:
+            return ctx.deps.system_instruction
 
         self._draft_agent: Agent[AgentDeps, DraftResult] = Agent(
             draft_model or build_model(AgentTask.DRAFT),
@@ -393,6 +433,8 @@ class AgentRuntime:
         completion: str,
         usage: Usage,
         privacy_flags: tuple[PrivacyFlag, ...],
+        *,
+        model_name_override: str = "",
     ) -> None:
         """Push one generation (and trace/safety spans) to the Langfuse sink.
 
@@ -414,7 +456,7 @@ class AgentRuntime:
             self._sink.record_span(ctx.trace_id, "output_safety", {"flagged": ctx.output_flagged})
         self._sink.record_generation(
             trace_id=ctx.trace_id,
-            model=model_name_for(task) or "test-model",
+            model=model_name_override or model_name_for(task) or "test-model",
             prompt=f"[system]\n{system_prompt[:400]}\n[user]\n{user_payload[:400]}",
             completion=completion,
             privacy_flags=privacy_flags,
@@ -529,11 +571,83 @@ class AgentRuntime:
             toolsets.append(server)
         return toolsets
 
+    async def _orchestrate_async(
+        self,
+        request: AIProcessMessageRequest,
+        ctx: LLMCallContext,
+        pool: asyncpg.Pool | None,
+    ) -> tuple[OrchestratorResult, Usage]:
+        """Run the tool-owning context stage without producing a contact reply."""
+        system_prompt, user_payload = draft_pipeline.build_orchestrator_prompt(
+            request, self._prompt_builder
+        )
+        system_prompt, user_payload = self._scan_input(
+            system_prompt, user_payload, ModelTask.DRAFT_REPLY, ctx
+        )
+        privacy_flags = request.chat_settings.privacy_flags
+        deps = self._deps_for(
+            request.event.tenant_id,
+            request.event.chat_id,
+            privacy_flags,
+            source_message_id=request.event.source_message_id,
+            system_instruction=system_prompt,
+            pool=pool,
+        )
+        toolsets = [
+            resolve_builtin_toolset(request.ai_role),
+            *self._resolve_mcp_toolsets(request.ai_role, privacy_flags),
+        ]
+        result = await self._orchestrator_agent.run(
+            user_payload,
+            deps=deps,
+            usage_limits=UsageLimits(tool_calls_limit=_DRAFT_TOOL_CALLS_LIMIT),
+            toolsets=toolsets,
+        )
+        orchestrated: OrchestratorResult = result.output
+        usage = self._usage_of(result)
+        completion = "\n".join(
+            [
+                *orchestrated.gathered_context,
+                f"suggested_intent: {orchestrated.suggested_intent}",
+                f"notes: {orchestrated.notes}",
+            ]
+        )
+        self._record_run(
+            ctx,
+            AgentTask.ORCHESTRATE,
+            system_prompt,
+            user_payload,
+            completion,
+            usage,
+            privacy_flags,
+        )
+        return orchestrated, usage
+
+    @staticmethod
+    def _orchestrator_bundle(result: OrchestratorResult) -> tuple[str, ...]:
+        bundle = list(result.gathered_context)
+        if result.suggested_intent:
+            bundle.append("Предполагаемый интент: " + result.suggested_intent)
+        if result.notes:
+            bundle.append("Пометки писателю: " + result.notes)
+        return tuple(bundle)
+
     async def _draft_async(
         self, request: AIProcessMessageRequest, risk_level: RiskLevel, ctx: LLMCallContext
     ) -> draft_pipeline.DraftOutcome:
+        two_stage = self._two_stage_draft and role_has_enabled_tools(request.ai_role)
+        pool = await self._get_pool()
+        orchestrator_usage = Usage()
+        orchestrator_bundle: tuple[str, ...] | None = None
+        if two_stage:
+            orchestrated, orchestrator_usage = await self._orchestrate_async(
+                request, ctx, pool
+            )
+            orchestrator_bundle = self._orchestrator_bundle(orchestrated)
         system_prompt, user_payload = draft_pipeline.build_draft_prompt(
-            request, self._prompt_builder
+            request,
+            self._prompt_builder,
+            orchestrator_bundle=orchestrator_bundle,
         )
         # Phase 1: may rewrite (anonymize) or raise SafetyBlocked → canned reply.
         system_prompt, user_payload = self._scan_input(
@@ -546,10 +660,14 @@ class AgentRuntime:
             privacy_flags,
             source_message_id=request.event.source_message_id,
             system_instruction=system_prompt,
-            pool=await self._get_pool(),
+            pool=pool,
         )
-        mcp_toolsets = self._resolve_mcp_toolsets(request.ai_role, privacy_flags)
-        builtin_toolset = resolve_builtin_toolset(request.ai_role)
+        writer_toolsets: list = []
+        if not two_stage:
+            writer_toolsets = [
+                resolve_builtin_toolset(request.ai_role),
+                *self._resolve_mcp_toolsets(request.ai_role, privacy_flags),
+            ]
         # Per-role tier override: build a tier-specific model when the role
         # declares one and the env list is configured; otherwise fall back to
         # the DRAFT task model.  The agent is not recreated — only the
@@ -562,18 +680,27 @@ class AgentRuntime:
         run_kwargs: dict = dict(
             deps=deps,
             usage_limits=UsageLimits(tool_calls_limit=_DRAFT_TOOL_CALLS_LIMIT),
-            toolsets=[builtin_toolset, *mcp_toolsets],
+            toolsets=writer_toolsets,
         )
         if tier_model is not None:
             run_kwargs["model"] = tier_model
         result = await self._draft_agent.run(user_payload, **run_kwargs)
         drafted: DraftResult = result.output
-        total = self._usage_of(result)
-        model_used = (
-            request.ai_role.model_tier
-            if (tier_model is not None and request.ai_role is not None)
-            else (model_name_for(AgentTask.DRAFT) or "test-model")
-        )
+        draft_usage = self._usage_of(result)
+        if two_stage and request.ai_role is not None:
+            router_name = model_name_for(AgentTask.ORCHESTRATE) or "test-model"
+            writer_name = (
+                request.ai_role.model_tier
+                or model_name_for(AgentTask.DRAFT)
+                or "test-model"
+            )
+            model_used = f"orchestrate({router_name})+draft({writer_name})"
+        else:
+            model_used = (
+                request.ai_role.model_tier
+                if (tier_model is not None and request.ai_role is not None)
+                else (model_name_for(AgentTask.DRAFT) or "test-model")
+            )
 
         text = drafted.reply
         confidence = drafted.confidence
@@ -587,16 +714,27 @@ class AgentRuntime:
                 deps, request.event.message_text, drafted, ctx, privacy_flags,
                 feedback_hint, speak_as_owner=speak_as_owner,
             )
-            total = Usage(
-                input_tokens=total.input_tokens + critic_usage.input_tokens,
-                output_tokens=total.output_tokens + critic_usage.output_tokens,
+            draft_usage = Usage(
+                input_tokens=draft_usage.input_tokens + critic_usage.input_tokens,
+                output_tokens=draft_usage.output_tokens + critic_usage.output_tokens,
             )
             model_used += "+critic"
 
         # Phase 3: deanonymize + non-blocking flags on the final text.
         text, _ = self._scan_output(text, ModelTask.DRAFT_REPLY, ctx)
         self._record_run(
-            ctx, AgentTask.DRAFT, system_prompt, user_payload, drafted.reply, total, privacy_flags
+            ctx,
+            AgentTask.DRAFT,
+            system_prompt,
+            user_payload,
+            drafted.reply,
+            draft_usage,
+            privacy_flags,
+            model_name_override=(request.ai_role.model_tier if two_stage and request.ai_role else ""),
+        )
+        total = Usage(
+            input_tokens=orchestrator_usage.input_tokens + draft_usage.input_tokens,
+            output_tokens=orchestrator_usage.output_tokens + draft_usage.output_tokens,
         )
         text_format = draft_pipeline.decide_text_format(request.ai_role, drafted.intent)
         if text_format == "rich":
@@ -1029,6 +1167,7 @@ def build_runtime(
     input_safety: InputSafetyScanner | None = None,
     output_safety: OutputSafetyScanner | None = None,
     sink: LangfuseSink | None = None,
+    two_stage_draft: bool = False,
 ) -> AgentRuntime:
     """Build the agent runtime — the single LLM execution path for the service.
 
@@ -1059,5 +1198,6 @@ def build_runtime(
         input_safety=input_safety,
         output_safety=output_safety,
         sink=sink,
+        two_stage_draft=two_stage_draft,
         query_embedder_factory=embedder_factory,
     )

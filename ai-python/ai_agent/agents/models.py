@@ -35,6 +35,7 @@ from pydantic_ai.providers.openrouter import OpenRouterProvider
 class AgentTask(str, Enum):
     """Agent task → env-configured model binding."""
 
+    ORCHESTRATE = "orchestrate"
     DRAFT = "draft"
     CRITIC = "critic"
     EXTRACT = "extract"
@@ -70,6 +71,7 @@ _TIER_ENV: dict[ModelTier, str] = {
 # OPENROUTER_MODEL so a single-variable setup keeps working.  Topic tagging and
 # reranking are cheap auxiliary calls, so they share the cheap model tier.
 _TASK_ENV = {
+    AgentTask.ORCHESTRATE: "MODEL_ROUTER",
     AgentTask.DRAFT: "MODEL_DRAFT",
     AgentTask.CRITIC: "MODEL_CRITIC",
     AgentTask.EXTRACT: "MODEL_CHEAP",
@@ -86,6 +88,10 @@ def model_name_for(task: AgentTask) -> str:
     name = os.getenv(_TASK_ENV[task], "").strip()
     if name:
         return name
+    if task == AgentTask.ORCHESTRATE:
+        cheap_name = os.getenv("MODEL_CHEAP", "").strip()
+        if cheap_name:
+            return cheap_name
     return os.getenv("OPENROUTER_MODEL", "").strip()
 
 

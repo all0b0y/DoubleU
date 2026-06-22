@@ -250,6 +250,14 @@ class AIRolePromptTests(unittest.TestCase):
         self.assertIn("GFM-таблицы", prompt)
         self.assertIn("Короткий ответ пиши обычным текстом", prompt)
 
+    def test_two_stage_writer_directive_is_opt_in(self) -> None:
+        """Only the bimodal writer is told that tools are unavailable."""
+        single_stage = self._compose(self.ROLE)
+        two_stage = self._compose(self.ROLE, two_stage=True)
+        self.assertNotIn("КОНТЕКСТ УЖЕ СОБРАН", single_stage)
+        self.assertIn("КОНТЕКСТ УЖЕ СОБРАН", two_stage)
+        self.assertIn("НЕТ инструментов", two_stage)
+
     def test_no_role_prompt_forbids_markup(self) -> None:
         """The legacy owner-copy path remains plain to match its delivery contract."""
         self.assertIn("Пиши обычным текстом без разметки", self._compose(None))

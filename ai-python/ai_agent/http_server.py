@@ -221,7 +221,12 @@ def create_service_from_env() -> tuple[AIService, bool, FeatureFlags]:
     # Imported lazily so importing the HTTP module never hard-requires pydantic-ai.
     from .agents import build_runtime
 
-    agents = build_runtime(input_safety=input_safety, output_safety=output_safety, sink=sink)
+    agents = build_runtime(
+        input_safety=input_safety,
+        output_safety=output_safety,
+        sink=sink,
+        two_stage_draft=flags.two_stage_draft,
+    )
     return build_service(agents), mock_llm, flags
 
 

@@ -28,6 +28,27 @@ Intent = Literal[
 ]
 
 
+class OrchestratorResult(BaseModel):
+    """Tool-stage output consumed by the final writer, never by the contact."""
+
+    model_config = ConfigDict(frozen=True)
+
+    gathered_context: tuple[str, ...] = Field(
+        default=(),
+        description="Собранные инструментами факты и результаты, по одному пункту на строку.",
+    )
+    suggested_intent: str = Field(
+        default="",
+        max_length=100,
+        description="Предполагаемый тип ответа для писателя.",
+    )
+    notes: str = Field(
+        default="",
+        description="Короткие указания писателю о важных ограничениях и пробелах в данных.",
+    )
+    # The interaction-tools commit will add the structured response-form field here.
+
+
 class DraftResult(BaseModel):
     """Structured draft: reply + intent + options + confidence + topic (ARCH-4)."""
 
