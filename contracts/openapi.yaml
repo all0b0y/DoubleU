@@ -229,6 +229,19 @@ components:
           type: array
           items: { type: string }
           description: AI-suggested short replies; non-empty only for intent=choice_question.
+        response_plan:
+          type: object
+          required: [shape, options]
+          description: Deferred contact-facing form produced by an interaction tool.
+          properties:
+            shape:
+              type: string
+              enum: [buttons]
+            options:
+              type: array
+              minItems: 2
+              maxItems: 4
+              items: { type: string }
         topic:
           type: string
           description: 3-7 word conversation topic from the same draft call (replaces per-message /ai/tag-topic).

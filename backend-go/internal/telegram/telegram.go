@@ -512,7 +512,8 @@ func (s *BotSender) DownloadFile(ctx context.Context, filePath string) ([]byte, 
 	return raw, res.Header.Get("Content-Type"), nil
 }
 
-// CallbackQueryUpdate describes an owner inline-button callback.
+// CallbackQueryUpdate describes an inline-button callback from either the
+// control bot (owner) or a tenant bot (contact).
 type CallbackQueryUpdate struct {
 	UpdateID              int64
 	QueryID               string
@@ -521,6 +522,11 @@ type CallbackQueryUpdate struct {
 	ChatID                string
 	OriginalMsgID         string
 	ReceiveIdempotencyKey string
+	// Bot transport metadata is attached by the per-user-bot poller. Empty
+	// values identify owner callbacks received by the control-bot webhook.
+	TenantID  string
+	BotID     string
+	Transport string
 }
 
 // ParseCallbackQueryUpdate returns a callback query update when present.

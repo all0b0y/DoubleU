@@ -53,7 +53,7 @@ type DraftRecord struct {
 	// DraftType distinguishes regular reply drafts ("reply") from interactive question
 	// cards ("question") where the owner picks one of several AI-suggested options.
 	DraftType        string
-	SuggestedOptions []string // non-empty when DraftType == "question"
+	SuggestedOptions []string // owner choices for "question"; contact buttons for interaction "reply"
 	Status           DraftStatus
 	OwnerChatID      string   // owner's bot chat ID (for editing the draft card)
 	OwnerMessageID   string   // Telegram message_id of the draft card in owner's chat

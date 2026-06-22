@@ -145,6 +145,38 @@ func TestHandleTelegramWebhookAutoReplyAndDuplicateAudit(t *testing.T) {
 	}
 }
 
+func TestInteractionButtonsNeverSendOnBusinessTransport(t *testing.T) {
+	repository := store.NewRepository()
+	repository.SaveChatSettings(contracts.ChatSettings{
+		TenantID: "tenant-1", ChatID: "42", Mode: contracts.ChatModeAuto,
+	})
+	repository.SaveChat(store.ChatRecord{
+		TenantID: "tenant-1", ChatID: "42", Transport: contracts.TransportBusiness,
+	})
+	role := repository.SaveAIRole(store.AIRoleRecord{
+		TenantID: "tenant-1", Name: "Interactive",
+		ToolSettings: map[string]bool{"interaction.present_buttons": true},
+	})
+	repository.AssignAIRoleToChat("tenant-1", "42", role.ID)
+	ai := &fakeAI{response: contracts.AIProcessMessageResponse{
+		Decision: contracts.DecisionAutoReply, ResponseText: "Выберите вариант",
+		Confidence: 0.99, RiskLevel: contracts.RiskLow, Intent: "choice_question",
+		ResponsePlan: &contracts.ResponsePlan{Shape: "buttons", Options: []string{"Один", "Два"}},
+	}}
+	sender := &fakeSender{}
+	service := newTestService(repository, ai, sender)
+
+	result, err := service.HandleTelegramWebhook(
+		context.Background(), telegramPayload(1002, "bc-1", 42, 8, "вопрос"), "tenant-1",
+	)
+	if err != nil || result.Decision != contracts.DecisionAutoReply {
+		t.Fatalf("business interaction fallback: %+v err=%v", result, err)
+	}
+	if len(sender.sent) != 1 || sender.sent[0].ReplyMarkup != nil {
+		t.Fatalf("business transport must send plain text without buttons: %+v", sender.sent)
+	}
+}
+
 // TestHandleTelegramWebhookSendsAssignedAIRole verifies the role contract:
 // the persona assigned to the chat reaches the Python AI service on every
 // process-message request, and an unassigned chat sends no role at all.
@@ -2043,6 +2075,14 @@ type fakeSender struct {
 	richDrafts   []richDraftCall
 	richDraftErr error
 	chatActions  []string // action values passed to SendChatAction, in order
+	answered     []string
+	edits        []editedMessage
+}
+
+type editedMessage struct {
+	chatID    string
+	messageID string
+	text      string
 }
 
 type richDraftCall struct {
@@ -2077,6 +2117,7 @@ func (f *fakeSender) SendChatAction(_ context.Context, _ string, action string) 
 }
 
 func (f *fakeSender) AnswerCallbackQuery(ctx context.Context, queryID string) error {
+	f.answered = append(f.answered, queryID)
 	return nil
 }
 
@@ -2085,6 +2126,7 @@ func (f *fakeSender) EditMessageReplyMarkup(ctx context.Context, chatID, message
 }
 
 func (f *fakeSender) EditMessageText(ctx context.Context, chatID, messageID, text string, markup telegram.InlineKeyboardMarkup) error {
+	f.edits = append(f.edits, editedMessage{chatID: chatID, messageID: messageID, text: text})
 	return nil
 }
 
@@ -2269,7 +2311,7 @@ func TestMessageQuarantine(t *testing.T) {
 
 	// Seed a first message with spamText — this is NOT a duplicate yet.
 	firstMsg := contracts.NormalizedTelegramEvent{
-		EventID:         "e1", TenantID: tenant, ChatID: chatID,
+		EventID: "e1", TenantID: tenant, ChatID: chatID,
 		SourceMessageID: "m1", MessageText: spamText,
 		CreatedAt: time.Unix(1700000000, 0).UTC(),
 	}
@@ -2277,7 +2319,7 @@ func TestMessageQuarantine(t *testing.T) {
 
 	// Second message with spamText is a duplicate → must be quarantined.
 	dupMsg := contracts.NormalizedTelegramEvent{
-		EventID:         "e2", TenantID: tenant, ChatID: chatID,
+		EventID: "e2", TenantID: tenant, ChatID: chatID,
 		SourceMessageID: spamSourceID, MessageText: spamText,
 		CreatedAt: time.Unix(1700000001, 0).UTC(),
 	}
@@ -2307,7 +2349,7 @@ func TestMessageQuarantine(t *testing.T) {
 
 	// Unique message: not a duplicate → unaffected.
 	uniqueMsg := contracts.NormalizedTelegramEvent{
-		EventID:         "e3", TenantID: tenant, ChatID: chatID,
+		EventID: "e3", TenantID: tenant, ChatID: chatID,
 		SourceMessageID: "m3", MessageText: uniqueText,
 		CreatedAt: time.Unix(1700000002, 0).UTC(),
 	}

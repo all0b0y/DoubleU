@@ -30,6 +30,7 @@ from ..schemas import (
     ChatMode,
     ContactProfileData,
     PrivacyFlag,
+    ResponsePlanData,
     RiskLevel,
     Usage,
     UserSettingsData,
@@ -82,6 +83,7 @@ class DraftOutcome:
     intent: str | None = None
     text_format: TextFormat = "plain"
     options: tuple[str, ...] = field(default_factory=tuple)
+    response_plan: ResponsePlanData | None = None
     confidence: float | None = None
     topic: str = ""
 

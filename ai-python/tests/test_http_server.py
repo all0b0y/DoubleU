@@ -59,19 +59,20 @@ class HTTPServerTests(unittest.TestCase):
             },
         )
 
-        # Phase 3 added "flagged"; ARCH-1/ARCH-4 added owner_note/options/topic.
+        # Interaction tools add response_plan; it stays null for ordinary replies.
         self.assertEqual(
             set(response),
             {
                 "decision", "response_text", "confidence", "risk_level", "intent",
                 "text_format", "model_used", "usage", "memory_used", "flagged",
-                "owner_note", "options", "topic",
+                "owner_note", "options", "response_plan", "topic",
             },
         )
         self.assertEqual(response["decision"], "auto_reply")
         self.assertEqual(response["text_format"], "plain")
         self.assertFalse(response["flagged"])
         self.assertEqual(response["owner_note"], "")
+        self.assertIsNone(response["response_plan"])
 
 
     def test_extract_media_endpoint_matches_shape(self) -> None:

@@ -385,3 +385,129 @@ func TestApprovalApproveSendsThroughBotTransport(t *testing.T) {
 		t.Fatalf("approved reply must go through the user bot to chat 42, got %+v", botSender.sent)
 	}
 }
+
+func TestInteractionDraftWaitsForApprovalThenSendsButtons(t *testing.T) {
+	repository := store.NewRepository()
+	role := repository.SaveAIRole(store.AIRoleRecord{
+		TenantID:     "tenant:user:77",
+		Name:         "Interactive",
+		SpeakAsOwner: true,
+		ToolSettings: map[string]bool{"interaction.present_buttons": true},
+	})
+	repository.SaveUserBot(store.UserBotRecord{
+		TenantID: "tenant:user:77", BotID: 555, Status: "active", AIRoleID: role.ID,
+	})
+	chatID := contracts.BotChatID("555", "42")
+	repository.SaveChatSettings(contracts.ChatSettings{
+		TenantID: "tenant:user:77", ChatID: chatID, Mode: contracts.ChatModeManual,
+	})
+	ai := &fakeAI{response: contracts.AIProcessMessageResponse{
+		Decision:     contracts.DecisionDraft,
+		ResponseText: "Когда вам удобно?",
+		Confidence:   0.9,
+		RiskLevel:    contracts.RiskLow,
+		Intent:       "choice_question",
+		Options:      []string{"Сегодня", "Завтра"},
+		ResponsePlan: &contracts.ResponsePlan{Shape: "buttons", Options: []string{"Сегодня", "Завтра"}},
+	}}
+	controlSender := &fakeSender{}
+	botSender := &fakeSender{}
+	service := NewService(repository, ai, controlSender,
+		WithClock(func() time.Time { return time.Unix(1700000000, 0).UTC() }),
+		WithDefaultIngestionMode(contracts.IngestionModeFull),
+		WithBotSenderProvider(&fakeBotSenders{sender: botSender}),
+	)
+
+	inbound, err := service.HandleBotMessage(context.Background(), botEvent(t, 9500, 42, 20, "Назначим звонок"))
+	if err != nil || inbound.DraftID == "" {
+		t.Fatalf("interaction draft: %+v err=%v", inbound, err)
+	}
+	if len(botSender.sent) != 0 {
+		t.Fatalf("tool must not send before approval: %+v", botSender.sent)
+	}
+	draft, ok := repository.Draft(inbound.DraftID)
+	if !ok || draft.DraftType != "reply" || len(draft.SuggestedOptions) != 2 {
+		t.Fatalf("deferred interaction draft = %+v ok=%v", draft, ok)
+	}
+
+	_, err = service.HandleApprovalCallback(context.Background(), contracts.ApprovalCallbackPayload{
+		Action: contracts.ApprovalApprove, TenantID: "tenant:user:77", ChatID: chatID,
+		SourceMessageID: "20", DraftID: inbound.DraftID, DecisionID: inbound.Event.EventID,
+		IdempotencyKey: "approve:interaction:9500",
+	})
+	if err != nil {
+		t.Fatalf("approve interaction: %v", err)
+	}
+	if len(botSender.sent) != 1 {
+		t.Fatalf("approved interaction sends once, got %+v", botSender.sent)
+	}
+	markup, ok := botSender.sent[0].ReplyMarkup.(telegram.InlineKeyboardMarkup)
+	if !ok || len(markup.InlineKeyboard) != 2 {
+		t.Fatalf("interaction markup = %#v", botSender.sent[0].ReplyMarkup)
+	}
+	if _, _, _, ok := contracts.CallbackDataDecodeAIButton(markup.InlineKeyboard[0][0].CallbackData); !ok {
+		t.Fatalf("invalid aibtn callback: %q", markup.InlineKeyboard[0][0].CallbackData)
+	}
+}
+
+func TestInteractionButtonStartsNewTurnAndIsIdempotent(t *testing.T) {
+	repository := store.NewRepository()
+	role := repository.SaveAIRole(store.AIRoleRecord{
+		TenantID: "tenant:user:77", Name: "Interactive",
+		ToolSettings: map[string]bool{"interaction.present_buttons": true},
+	})
+	repository.SaveUserBot(store.UserBotRecord{
+		TenantID: "tenant:user:77", BotID: 555, Status: "active", AIRoleID: role.ID,
+	})
+	chatID := contracts.BotChatID("555", "42")
+	repository.SaveChatSettings(contracts.ChatSettings{
+		TenantID: "tenant:user:77", ChatID: chatID, Mode: contracts.ChatModeAuto,
+	})
+	ai := &fakeAI{response: contracts.AIProcessMessageResponse{
+		Decision: contracts.DecisionAutoReply, ResponseText: "Выберите день",
+		Confidence: 0.99, RiskLevel: contracts.RiskLow, Intent: "choice_question",
+		ResponsePlan: &contracts.ResponsePlan{Shape: "buttons", Options: []string{"Сегодня", "Завтра"}},
+	}}
+	botSender := &fakeSender{}
+	service := NewService(repository, ai, &fakeSender{},
+		WithClock(func() time.Time { return time.Unix(1700000000, 0).UTC() }),
+		WithDefaultIngestionMode(contracts.IngestionModeFull),
+		WithBotSenderProvider(&fakeBotSenders{sender: botSender}),
+	)
+
+	inbound, err := service.HandleBotMessage(context.Background(), botEvent(t, 9600, 42, 21, "Когда?"))
+	if err != nil || inbound.DraftID == "" || len(botSender.sent) != 1 {
+		t.Fatalf("auto interaction: %+v sends=%+v err=%v", inbound, botSender.sent, err)
+	}
+	markup := botSender.sent[0].ReplyMarkup.(telegram.InlineKeyboardMarkup)
+	callbackData := markup.InlineKeyboard[1][0].CallbackData
+	ai.response = contracts.AIProcessMessageResponse{
+		Decision: contracts.DecisionAutoReply, ResponseText: "Завтра подходит.",
+		Confidence: 0.99, RiskLevel: contracts.RiskLow, Intent: "acknowledgement",
+	}
+	callback := telegram.CallbackQueryUpdate{
+		UpdateID: 9601, QueryID: "query-1", Data: callbackData, SenderID: "42",
+		ChatID: "42", OriginalMsgID: "100", ReceiveIdempotencyKey: "9601:callback_query:query-1",
+	}
+	result, err := service.HandleBotCallbackQuery(context.Background(), callback, "tenant:user:77", "555")
+	if err != nil || result.Decision != contracts.DecisionAutoReply {
+		t.Fatalf("button result: %+v err=%v", result, err)
+	}
+	if ai.calls != 2 || ai.lastRequest.Event.MessageText != "Завтра" {
+		t.Fatalf("button did not become new AI turn: calls=%d request=%+v", ai.calls, ai.lastRequest.Event)
+	}
+	if len(botSender.answered) != 1 || len(botSender.edits) != 1 {
+		t.Fatalf("callback ack/edit = answered:%+v edits:%+v", botSender.answered, botSender.edits)
+	}
+
+	callback.UpdateID = 9602
+	callback.QueryID = "query-2"
+	callback.ReceiveIdempotencyKey = "9602:callback_query:query-2"
+	duplicate, err := service.HandleBotCallbackQuery(context.Background(), callback, "tenant:user:77", "555")
+	if err != nil || !duplicate.Duplicate || duplicate.Reason != "duplicate_aibtn_callback" {
+		t.Fatalf("double press = %+v err=%v", duplicate, err)
+	}
+	if ai.calls != 2 {
+		t.Fatalf("double press triggered AI again: %d", ai.calls)
+	}
+}

@@ -98,14 +98,17 @@ func main() {
 	// handler closes over the service variable assigned right below.
 	var service *core.Service
 	botManager := botservice.NewManager(repository,
-		botservice.HandlerFunc(func(ctx context.Context, event contracts.NormalizedTelegramEvent, media *telegram.MediaDescriptor) error {
+		botservice.HandlerFuncs{Message: botservice.HandlerFunc(func(ctx context.Context, event contracts.NormalizedTelegramEvent, media *telegram.MediaDescriptor) error {
 			// Turn any voice/photo/document into text before AI processing so the
 			// agent stays text-only (media -> text). Best-effort: never blocks the
 			// message on extraction failure.
 			event = service.EnrichBotMedia(ctx, event, media)
 			_, err := service.HandleBotMessage(ctx, event)
 			return err
-		}),
+		}), Callback: func(ctx context.Context, callback telegram.CallbackQueryUpdate, tenantID, botID string) error {
+			_, err := service.HandleBotCallbackQuery(ctx, callback, tenantID, botID)
+			return err
+		}},
 		telegramHTTPClient,
 		botservice.WithLogger(logger),
 		botservice.WithDefaultIngestionMode(ingestionDefault),

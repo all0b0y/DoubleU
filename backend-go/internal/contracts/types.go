@@ -301,6 +301,51 @@ func CallbackDataDecodeChoice(data string) (optionIdx int, draftID string, idemp
 	return n, draftID, idempotencyKey, true
 }
 
+// CallbackDataEncodeAIButton encodes a contact-facing interaction option.
+// The idempotency suffix is stable for the draft, so concurrent presses on
+// different options still resolve to one logical answer.
+func CallbackDataEncodeAIButton(draftID string, optionIdx int) string {
+	bare := strings.TrimPrefix(draftID, "draft:")
+	return fmt.Sprintf("aibtn:%s:%d:%s", bare, optionIdx, aiButtonIdem(bare))
+}
+
+// CallbackDataDecodeAIButton parses "aibtn:{draftId}:{optionIdx}:{idem}".
+// Draft ids may contain colons, so separators are consumed from the right.
+func CallbackDataDecodeAIButton(data string) (optionIdx int, draftID string, idempotencyKey string, ok bool) {
+	if !strings.HasPrefix(data, "aibtn:") {
+		return 0, "", "", false
+	}
+	rest := strings.TrimPrefix(data, "aibtn:")
+	idemSep := strings.LastIndex(rest, ":")
+	if idemSep <= 0 {
+		return 0, "", "", false
+	}
+	idem := rest[idemSep+1:]
+	rest = rest[:idemSep]
+	indexSep := strings.LastIndex(rest, ":")
+	if indexSep <= 0 {
+		return 0, "", "", false
+	}
+	bare := rest[:indexSep]
+	n, err := strconv.Atoi(rest[indexSep+1:])
+	if err != nil || n < 0 || n > 3 || idem != aiButtonIdem(bare) {
+		return 0, "", "", false
+	}
+	draftID = "draft:" + bare
+	return n, draftID, draftID + ":aibtn:" + idem, true
+}
+
+func aiButtonIdem(value string) string {
+	// Small deterministic FNV-1a suffix: compact enough for Telegram's 64-byte
+	// callback_data cap and sufficient to reject malformed/stale payloads.
+	var hash uint32 = 2166136261
+	for index := 0; index < len(value); index++ {
+		hash ^= uint32(value[index])
+		hash *= 16777619
+	}
+	return strconv.FormatUint(uint64(hash), 36)
+}
+
 // ContactProfile is the owner-supplied description of a contact in a specific chat.
 // It maps to the contact_profiles table and covers three concerns:
 //  1. Собеседник — objective facts about the contact.
@@ -697,6 +742,12 @@ type TokenUsage struct {
 	OutputTokens int `json:"output_tokens"`
 }
 
+// ResponsePlan marks Options as a deferred contact-facing response form.
+type ResponsePlan struct {
+	Shape   string   `json:"shape"`
+	Options []string `json:"options"`
+}
+
 // AIProcessMessageResponse is returned by the Python AI service.
 type AIProcessMessageResponse struct {
 	Decision     Decision   `json:"decision"`
@@ -718,6 +769,9 @@ type AIProcessMessageResponse struct {
 	OwnerNote string `json:"owner_note,omitempty"`
 	// Options are AI-suggested short replies for Intent == "choice_question".
 	Options []string `json:"options,omitempty"`
+	// ResponsePlan is set only for interaction-tool output. Ordinary
+	// choice_question options remain an owner-facing card.
+	ResponsePlan *ResponsePlan `json:"response_plan,omitempty"`
 	// Topic is a 3-7 word label of the current conversation produced by the
 	// same draft call (replaces the per-message /ai/tag-topic call — ARCH-4).
 	Topic string `json:"topic,omitempty"`

@@ -7,7 +7,16 @@ import pathlib
 import unittest
 
 from ai_agent import contract_enums
-from ai_agent.schemas import ChatMode, Decision, LLMPurpose, PrivacyFlag, RiskLevel
+from ai_agent.schemas import (
+    AIProcessMessageResponse,
+    ChatMode,
+    Decision,
+    LLMPurpose,
+    PrivacyFlag,
+    ResponsePlanData,
+    RiskLevel,
+    Usage,
+)
 
 CONTRACTS_JSON = (
     pathlib.Path(__file__).resolve().parent.parent.parent / "contracts" / "contracts.json"
@@ -63,6 +72,21 @@ class ContractEnumTests(unittest.TestCase):
     def test_llm_purpose_draft_str_value(self) -> None:
         """LLMPurpose("draft").value must equal "draft" (header attribute)."""
         self.assertEqual(LLMPurpose("draft").value, "draft")
+
+    def test_response_plan_serializes_with_options(self) -> None:
+        response = AIProcessMessageResponse(
+            decision=Decision.DRAFT,
+            response_text="Выберите время",
+            confidence=0.9,
+            risk_level=RiskLevel.LOW,
+            intent="choice_question",
+            model_used="test",
+            usage=Usage(),
+            response_plan=ResponsePlanData(shape="buttons", options=("Сегодня", "Завтра")),
+        )
+        self.assertEqual(response.to_dict()["response_plan"], {
+            "shape": "buttons", "options": ["Сегодня", "Завтра"]
+        })
 
 
 class GeneratedEnumsMatchContractJSONTests(unittest.TestCase):

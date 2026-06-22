@@ -28,6 +28,20 @@ Intent = Literal[
 ]
 
 
+class ResponsePlan(BaseModel):
+    """A contact-facing response form prepared by an interaction tool."""
+
+    model_config = ConfigDict(frozen=True)
+
+    shape: Literal["buttons"] = "buttons"
+    prompt: str = Field(min_length=1, description="Текст вопроса над inline-кнопками.")
+    options: tuple[str, ...] = Field(
+        min_length=2,
+        max_length=4,
+        description="Короткие варианты ответа собеседника.",
+    )
+
+
 class OrchestratorResult(BaseModel):
     """Tool-stage output consumed by the final writer, never by the contact."""
 
@@ -46,7 +60,10 @@ class OrchestratorResult(BaseModel):
         default="",
         description="Короткие указания писателю о важных ограничениях и пробелах в данных.",
     )
-    # The interaction-tools commit will add the structured response-form field here.
+    response_plan: ResponsePlan | None = Field(
+        default=None,
+        description="Форма ответа, созданная вызванным interaction-инструментом.",
+    )
 
 
 class DraftResult(BaseModel):

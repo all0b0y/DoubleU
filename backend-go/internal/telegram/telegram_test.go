@@ -67,6 +67,29 @@ func TestParseBotCommandUpdate(t *testing.T) {
 	}
 }
 
+func TestParseCallbackQueryUpdate(t *testing.T) {
+	payload := []byte(`{
+		"update_id": 126,
+		"callback_query": {
+			"id": "query-1",
+			"from": {"id": 42},
+			"data": "aibtn:draft:0:idem",
+			"message": {"message_id": 57, "chat": {"id": 42}}
+		}
+	}`)
+
+	callback, ok, err := ParseCallbackQueryUpdate(payload)
+	if err != nil || !ok {
+		t.Fatalf("parse callback: ok=%v err=%v", ok, err)
+	}
+	if callback.QueryID != "query-1" || callback.ChatID != "42" || callback.OriginalMsgID != "57" {
+		t.Fatalf("callback = %+v", callback)
+	}
+	if callback.ReceiveIdempotencyKey != "126:callback_query:query-1" {
+		t.Fatalf("receive key = %q", callback.ReceiveIdempotencyKey)
+	}
+}
+
 func TestParseBusinessConnectionUpdate(t *testing.T) {
 	payload := []byte(`{
 		"update_id": 125,

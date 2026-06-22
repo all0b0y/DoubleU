@@ -49,6 +49,14 @@ class Usage(JsonDataclass):
 
 
 @dataclass(frozen=True)
+class ResponsePlanData(JsonDataclass):
+    """Deferred contact-facing form produced by an interaction tool."""
+
+    shape: str
+    options: tuple[str, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
 class NormalizedTelegramEvent(JsonDataclass):
     """Normalized Telegram message event from the Go backend."""
 
@@ -239,6 +247,9 @@ class AIProcessMessageResponse(JsonDataclass):
     owner_note: str = ""
     # Suggested short replies when intent == "choice_question" (ARCH-4).
     options: tuple[str, ...] = field(default_factory=tuple)
+    # Present only when options are a contact-facing interaction form rather
+    # than the existing owner-facing choice-question card.
+    response_plan: ResponsePlanData | None = None
     # 3-7 word conversation topic produced by the same draft call; replaces the
     # separate /ai/tag-topic call in the hot path (ARCH-4).
     topic: str = ""

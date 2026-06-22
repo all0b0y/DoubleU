@@ -14,6 +14,8 @@ from typing import Awaitable, Callable, Sequence
 
 import asyncpg
 
+from .results import ResponsePlan
+
 
 @dataclass
 class AgentDeps:
@@ -35,6 +37,9 @@ class AgentDeps:
     # Lines the memory tools should treat as already-provided context
     # (prefetched by the Go backend) — used only for diagnostics/logging.
     prefetched_context: tuple[str, ...] = field(default_factory=tuple)
+    # Interaction tools write a deferred contact-facing form here. The tool
+    # itself never performs transport IO; core sends it through approval.
+    response_plan: ResponsePlan | None = None
 
     @property
     def no_memory(self) -> bool:

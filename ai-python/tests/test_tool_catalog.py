@@ -20,7 +20,13 @@ class BuiltinToolEnablementTests(unittest.TestCase):
             toolset = resolve_builtin_toolset(role)
             self.assertIsInstance(toolset, FilteredToolset)
             for tool_name in TOOL_NAME_TO_KEY:
-                self.assertTrue(toolset.filter_func(None, SimpleNamespace(name=tool_name)))
+                key = TOOL_NAME_TO_KEY[tool_name]
+                expected = next(
+                    entry.default_enabled for entry in TOOL_CATALOG if entry.key == key
+                )
+                self.assertEqual(
+                    toolset.filter_func(None, SimpleNamespace(name=tool_name)), expected
+                )
 
     def test_disabled_tool_is_absent_from_filtered_toolset(self) -> None:
         role = AIRoleData(
@@ -30,6 +36,16 @@ class BuiltinToolEnablementTests(unittest.TestCase):
         toolset = resolve_builtin_toolset(role)
         self.assertFalse(toolset.filter_func(None, SimpleNamespace(name="search_facts")))
         self.assertTrue(toolset.filter_func(None, SimpleNamespace(name="get_recent_messages")))
+
+    def test_interaction_tool_requires_explicit_enablement(self) -> None:
+        disabled = resolve_builtin_toolset(AIRoleData(name="legacy"))
+        enabled = resolve_builtin_toolset(AIRoleData(
+            name="interactive",
+            tool_settings={"interaction.present_buttons": True},
+        ))
+        for tool_name in ("present_buttons", "request_confirmation"):
+            self.assertFalse(disabled.filter_func(None, SimpleNamespace(name=tool_name)))
+            self.assertTrue(enabled.filter_func(None, SimpleNamespace(name=tool_name)))
 
     def test_tool_name_mapping_covers_catalog_once(self) -> None:
         self.assertEqual(set(TOOL_NAME_TO_KEY.values()), {entry.key for entry in TOOL_CATALOG})

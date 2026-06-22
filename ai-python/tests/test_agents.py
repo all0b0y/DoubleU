@@ -255,6 +255,56 @@ def test_bimodal_orchestrator_tools_writer_bundle_tier_and_critic(monkeypatch) -
     assert "smart" in recorded_models
 
 
+def test_interaction_tool_forms_choice_question_without_sending() -> None:
+    calls = {"orchestrator": 0}
+
+    def orchestrator(messages, info: AgentInfo) -> ModelResponse:
+        calls["orchestrator"] += 1
+        if calls["orchestrator"] == 1:
+            return ModelResponse(parts=[ToolCallPart(
+                tool_name="present_buttons",
+                args={"prompt": "Какой вариант вам удобнее?", "options": ["Сегодня", "Завтра"]},
+            )])
+        return ModelResponse(parts=[ToolCallPart(tool_name="final_result", args={
+            "gathered_context": [],
+            "suggested_intent": "choice_question",
+            "notes": "",
+            "response_plan": None,
+        })])
+
+    request = replace(
+        process_request("Когда созвонимся?"),
+        ai_role=AIRoleData(
+            name="Support",
+            tool_settings={
+                **{entry.key: False for entry in TOOL_CATALOG},
+                "interaction.present_buttons": True,
+            },
+        ),
+    )
+    runtime = make_runtime(
+        two_stage_draft=True,
+        orchestrator_model=FunctionModel(orchestrator),
+        draft_model=structured({
+            "reply": "writer placeholder",
+            "intent": "general_message",
+            "options": [],
+            "confidence": 0.9,
+            "topic": "выбор времени",
+        }),
+    )
+
+    outcome = runtime.draft_outcome(request, RiskLevel.LOW)
+
+    assert calls["orchestrator"] == 2
+    assert outcome.text == "Какой вариант вам удобнее?"
+    assert outcome.intent == "choice_question"
+    assert outcome.options == ("Сегодня", "Завтра")
+    assert outcome.response_plan is not None
+    assert outcome.response_plan.shape == "buttons"
+    assert outcome.response_plan.options == ("Сегодня", "Завтра")
+
+
 def test_orchestrator_model_name_defaults_to_cheap(monkeypatch) -> None:
     monkeypatch.delenv("MODEL_ROUTER", raising=False)
     monkeypatch.setenv("MODEL_CHEAP", "cheap-constant")

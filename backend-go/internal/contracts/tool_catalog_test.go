@@ -45,3 +45,12 @@ print(json.dumps(entries))`,
 		}
 	}
 }
+
+func TestInteractionToolDefaultsDisabled(t *testing.T) {
+	if ToolEnabled(nil, "interaction.present_buttons") {
+		t.Fatal("interaction tool must require explicit role enablement")
+	}
+	if !ToolEnabled(map[string]bool{"interaction.present_buttons": true}, "interaction.present_buttons") {
+		t.Fatal("explicit interaction enablement ignored")
+	}
+}

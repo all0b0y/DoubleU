@@ -89,6 +89,20 @@ func (p *poller) run(ctx context.Context) {
 			if updateID > maxUpdateID {
 				maxUpdateID = updateID
 			}
+			if callback, isCallback, callbackErr := telegram.ParseCallbackQueryUpdate(raw); callbackErr != nil {
+				p.logger.Warn("bot callback normalization failed",
+					"bot_id", p.bot.BotID, "update_id", updateID, "error", callbackErr)
+				continue
+			} else if isCallback {
+				if handler, ok := p.handler.(CallbackHandler); ok {
+					if err := handler.HandleBotCallbackQuery(ctx, callback, p.bot.TenantID, fmt.Sprint(p.bot.BotID)); err != nil {
+						p.logger.Error("bot callback processing failed",
+							"tenant_id", p.bot.TenantID, "bot_id", p.bot.BotID,
+							"query_id", callback.QueryID, "error", err)
+					}
+				}
+				continue
+			}
 			event, isMessage, err := telegram.NormalizeBotUpdate(raw, p.bot.BotID, p.bot.TenantID, time.Now().UTC())
 			if err != nil {
 				p.logger.Warn("bot update normalization failed",
@@ -171,7 +185,7 @@ func getUpdates(ctx context.Context, client *http.Client, baseURL, token string,
 	body := map[string]any{
 		"offset":          offset,
 		"timeout":         longPollTimeoutSeconds,
-		"allowed_updates": []string{"message"},
+		"allowed_updates": []string{"message", "callback_query"},
 	}
 	var result []json.RawMessage
 	err := callAPI(ctx, client, baseURL, token, "getUpdates", body, &result)

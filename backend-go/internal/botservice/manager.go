@@ -40,12 +40,35 @@ type Handler interface {
 	HandleBotMessage(ctx context.Context, event contracts.NormalizedTelegramEvent, media *telegram.MediaDescriptor) error
 }
 
+// CallbackHandler is an optional extension implemented by handlers that
+// consume contact-facing inline-button callbacks from user-supplied bots.
+type CallbackHandler interface {
+	HandleBotCallbackQuery(ctx context.Context, callback telegram.CallbackQueryUpdate, tenantID, botID string) error
+}
+
 // HandlerFunc adapts a plain function to Handler.
 type HandlerFunc func(ctx context.Context, event contracts.NormalizedTelegramEvent, media *telegram.MediaDescriptor) error
 
 // HandleBotMessage calls f.
 func (f HandlerFunc) HandleBotMessage(ctx context.Context, event contracts.NormalizedTelegramEvent, media *telegram.MediaDescriptor) error {
 	return f(ctx, event, media)
+}
+
+// HandlerFuncs adapts message and callback functions to the polling handler.
+type HandlerFuncs struct {
+	Message  HandlerFunc
+	Callback func(context.Context, telegram.CallbackQueryUpdate, string, string) error
+}
+
+func (h HandlerFuncs) HandleBotMessage(ctx context.Context, event contracts.NormalizedTelegramEvent, media *telegram.MediaDescriptor) error {
+	return h.Message(ctx, event, media)
+}
+
+func (h HandlerFuncs) HandleBotCallbackQuery(ctx context.Context, callback telegram.CallbackQueryUpdate, tenantID, botID string) error {
+	if h.Callback == nil {
+		return nil
+	}
+	return h.Callback(ctx, callback, tenantID, botID)
 }
 
 // Store is the persistence surface the manager needs; *store.Repository implements it.

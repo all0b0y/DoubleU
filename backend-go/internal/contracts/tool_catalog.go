@@ -18,7 +18,21 @@ func ToolCatalog() []ToolCatalogEntry {
 		{Key: "memory.get_contact_profile", Label: "Профиль собеседника", Description: "Читает сохранённые имя, отношения, тон и обращение к собеседнику.", Category: ToolCategoryRead, DefaultEnabled: true},
 		{Key: "memory.save_fact", Label: "Сохранение фактов", Description: "Сохраняет устойчивые факты и договорённости в память чата.", Category: ToolCategoryRead, DefaultEnabled: true},
 		{Key: "memory.suggest_profile_update", Label: "Предложения к профилю", Description: "Предлагает владельцу обновить профиль собеседника.", Category: ToolCategoryRead, DefaultEnabled: true},
+		{Key: "interaction.present_buttons", Label: "Кнопки для собеседника", Description: "Задаёт собеседнику вопрос с вариантами ответа или подтверждением.", Category: ToolCategoryInteraction, DefaultEnabled: false},
 	}
+}
+
+// ToolEnabled resolves a role override while preserving the catalog default.
+func ToolEnabled(settings map[string]bool, key string) bool {
+	if enabled, ok := settings[key]; ok {
+		return enabled
+	}
+	for _, tool := range ToolCatalog() {
+		if tool.Key == key {
+			return tool.DefaultEnabled
+		}
+	}
+	return false
 }
 
 // IsKnownToolKey reports whether key belongs to the native-tool catalog.

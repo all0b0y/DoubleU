@@ -749,6 +749,15 @@ func (s *Service) HandleBotMessage(ctx context.Context, event contracts.Normaliz
 	return s.processContactMessage(ctx, event, ownerID, "")
 }
 
+// HandleBotCallbackQuery processes a callback received by a tenant's own bot.
+// Tenant/bot scope comes from the poller registration, never from callback data.
+func (s *Service) HandleBotCallbackQuery(ctx context.Context, callback telegram.CallbackQueryUpdate, tenantID, botID string) (InboundResult, error) {
+	callback.TenantID = tenantID
+	callback.BotID = botID
+	callback.Transport = contracts.TransportBot
+	return s.handleCallbackQuery(ctx, callback), nil
+}
+
 // mediaExtractTimeout bounds the download + extract step so a slow or oversized
 // attachment never stalls a bot poller's sequential loop indefinitely.
 const mediaExtractTimeout = 60 * time.Second
@@ -1261,9 +1270,23 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 		s.updateEpisodeRuntime(event, proposal, decision)
 	}
 	result := InboundResult{Event: event, Decision: decision, Reason: reason}
+	interactionOptions, contactInteraction := s.contactInteractionOptions(event, proposal)
 	switch decision {
 	case contracts.DecisionAutoReply:
-		sentMsgID, err := s.sendRecipient(ctx, event, event.EventID, proposal.ResponseText, proposal.TextFormat, true, hotDelivery)
+		decisionID := event.EventID
+		var interactionDraft store.DraftRecord
+		if contactInteraction {
+			interactionDraft = s.createDraft(event, decisionID, proposal.ResponseText, proposal.TextFormat)
+			interactionDraft.DraftID = interactionDraftID(decisionID)
+			interactionDraft.SuggestedOptions = interactionOptions
+			s.repository.SaveDraft(interactionDraft)
+			result.DraftID = interactionDraft.DraftID
+		}
+		markup := telegram.ReplyMarkup(nil)
+		if contactInteraction {
+			markup = contactOptionsKeyboard(interactionDraft.DraftID, interactionOptions)
+		}
+		sentMsgID, err := s.sendRecipientWithMarkup(ctx, event, decisionID, proposal.ResponseText, proposal.TextFormat, true, hotDelivery, markup)
 		if err != nil {
 			s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateFailed)
 			s.repository.AppendAudit(s.auditEvent(event, contracts.DecisionErrorFallback, "send_error:"+err.Error()))
@@ -1273,6 +1296,12 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 		s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateSentToRecipient)
 		s.logger.Info("telegram auto reply sent", "tenant_id", event.TenantID, "chat_id", event.ChatID, "source_message_id", event.SourceMessageID)
 		s.saveOutgoingMessage(event, ownerID, sentMsgID, proposal.ResponseText, event.EventID, proposal.TextFormat)
+		if contactInteraction {
+			interactionDraft.Status = store.DraftSent
+			interactionDraft.SentMessageID = sentMsgID
+			interactionDraft.UpdatedAt = s.now()
+			s.repository.UpdateDraft(interactionDraft)
+		}
 		// A reply went out on the owner's behalf: nothing is awaited from the owner.
 		s.repository.ClearEpisodeRuntimeState(event.TenantID, event.ChatID)
 		if s.notify != nil {
@@ -1305,7 +1334,7 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 		}
 		// When the AI flags the incoming message as a choice question, replace the normal
 		// draft flow with an interactive question card that lets the owner pick an option.
-		if proposal.Intent == "choice_question" {
+		if proposal.Intent == "choice_question" && proposal.ResponsePlan == nil {
 			// Structured output carries options directly (ARCH-4); the line-split
 			// of ResponseText remains as a legacy fallback.
 			options := proposal.Options
@@ -1336,6 +1365,10 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 			}
 		}
 		draft := s.createDraft(event, event.EventID, proposal.ResponseText, proposal.TextFormat)
+		if contactInteraction {
+			draft.DraftID = interactionDraftID(event.EventID)
+			draft.SuggestedOptions = interactionOptions
+		}
 		if proposal.Flagged {
 			draft.ActionHistory = append(draft.ActionHistory, "flagged")
 		}
@@ -2549,13 +2582,12 @@ func (s *Service) HandleApprovalCallback(ctx context.Context, payload contracts.
 			return ApprovalResult{}, fmt.Errorf("draft has no sendable text")
 		}
 		s.repository.AppendState(draft.TenantID, draft.ChatID, draft.SourceMessageID, contracts.StateApprovedByOwner)
-		approvalEvent := contracts.NormalizedTelegramEvent{
-			TenantID:             draft.TenantID,
-			ChatID:               draft.ChatID,
-			BusinessConnectionID: draft.BusinessConnectionID,
-			SourceMessageID:      draft.SourceMessageID,
+		approvalEvent := s.resolveSourceEvent(draft)
+		markup := telegram.ReplyMarkup(nil)
+		if s.contactInteractionEnabled(approvalEvent) && len(draft.SuggestedOptions) >= 2 {
+			markup = contactOptionsKeyboard(draft.DraftID, draft.SuggestedOptions)
 		}
-		sentMsgID, err := s.sendRecipient(ctx, approvalEvent, draft.DecisionID, draft.ResponseText, draft.TextFormat, false, s.deliverySettingsFor(approvalEvent))
+		sentMsgID, err := s.sendRecipientWithMarkup(ctx, approvalEvent, draft.DecisionID, draft.ResponseText, draft.TextFormat, false, s.deliverySettingsFor(approvalEvent), markup)
 		if err != nil {
 			s.repository.AppendState(draft.TenantID, draft.ChatID, draft.SourceMessageID, contracts.StateFailed)
 			return ApprovalResult{}, err
@@ -2850,6 +2882,7 @@ func (s *Service) createDraft(event contracts.NormalizedTelegramEvent, decisionI
 		SourceMessageText:    event.MessageText,
 		ResponseText:         text,
 		TextFormat:           textFormat.Normalize(),
+		DraftType:            "reply",
 		Status:               store.DraftPending,
 		// Persisting trace_id lets owner feedback (approve / thumb) attach a
 		// Langfuse score back to the Phase 4 generation span.
@@ -2870,10 +2903,73 @@ func (s *Service) notifyDraftStatus(draft store.DraftRecord) {
 	})
 }
 
+func (s *Service) contactInteractionOptions(event contracts.NormalizedTelegramEvent, proposal contracts.AIProcessMessageResponse) ([]string, bool) {
+	if proposal.ResponsePlan == nil || proposal.ResponsePlan.Shape != "buttons" || !s.contactInteractionEnabled(event) {
+		return nil, false
+	}
+	if len(proposal.ResponsePlan.Options) < 2 || len(proposal.ResponsePlan.Options) > 4 {
+		return nil, false
+	}
+	options := make([]string, 0, len(proposal.ResponsePlan.Options))
+	seen := make(map[string]struct{}, len(proposal.ResponsePlan.Options))
+	for _, option := range proposal.ResponsePlan.Options {
+		option = strings.TrimSpace(option)
+		if option == "" {
+			return nil, false
+		}
+		if _, duplicate := seen[option]; duplicate {
+			return nil, false
+		}
+		seen[option] = struct{}{}
+		options = append(options, option)
+	}
+	return options, true
+}
+
+func (s *Service) contactInteractionEnabled(event contracts.NormalizedTelegramEvent) bool {
+	transport := event.Transport
+	if transport == "" {
+		transport = s.repository.ChatTransport(event.TenantID, event.ChatID)
+	}
+	if transport != contracts.TransportBot {
+		return false
+	}
+	role, ok := s.resolveRole(event.TenantID, event.ChatID)
+	return ok && contracts.ToolEnabled(role.ToolSettings, "interaction.present_buttons")
+}
+
+func contactOptionsKeyboard(draftID string, options []string) telegram.InlineKeyboardMarkup {
+	rows := make([][]telegram.InlineKeyboardButton, 0, len(options))
+	for index, option := range options {
+		if index > 3 {
+			break
+		}
+		label := []rune(option)
+		if len(label) > 40 {
+			label = append(label[:37], '.', '.', '.')
+		}
+		rows = append(rows, []telegram.InlineKeyboardButton{{
+			Text:         string(label),
+			CallbackData: contracts.CallbackDataEncodeAIButton(draftID, index),
+		}})
+	}
+	return telegram.InlineKeyboardMarkup{InlineKeyboard: rows}
+}
+
+func interactionDraftID(decisionID string) string {
+	hash := fnv.New64a()
+	_, _ = hash.Write([]byte(decisionID)) // hash.Hash never returns an error.
+	return fmt.Sprintf("draft:aibtn-%x", hash.Sum64())
+}
+
 // sendRecipient sends a reply to the contact and returns the Telegram message_id of the sent message.
 // delivery holds the pre-computed rich-formatting and streaming toggles; callers on the hot path
 // supply deliverySettingsFromUser (no extra repository read) while others use deliverySettingsFor.
 func (s *Service) sendRecipient(ctx context.Context, event contracts.NormalizedTelegramEvent, decisionID, text string, textFormat contracts.TextFormat, allowStreaming bool, delivery deliverySettings) (string, error) {
+	return s.sendRecipientWithMarkup(ctx, event, decisionID, text, textFormat, allowStreaming, delivery, nil)
+}
+
+func (s *Service) sendRecipientWithMarkup(ctx context.Context, event contracts.NormalizedTelegramEvent, decisionID, text string, textFormat contracts.TextFormat, allowStreaming bool, delivery deliverySettings, replyMarkup telegram.ReplyMarkup) (string, error) {
 	key := contracts.SendIdempotencyKey(event.TenantID, event.ChatID, event.SourceMessageID, decisionID)
 	duplicate := s.repository.MarkSend(store.SendRecord{
 		Key:             key,
@@ -2898,6 +2994,10 @@ func (s *Service) sendRecipient(ctx context.Context, event contracts.NormalizedT
 		ReplyToMessageID:     event.SourceMessageID,
 		DecisionID:           decisionID,
 		Text:                 text,
+		ReplyMarkup:          replyMarkup,
+	}
+	if event.MessageType == "callback_query" {
+		msg.ReplyToMessageID = ""
 	}
 	sender, err := s.recipientSender(event)
 	if err != nil {
@@ -3417,10 +3517,21 @@ func (s *Service) inferOwnerChatID(businessConnectionID string) string {
 func (s *Service) handleCallbackQuery(ctx context.Context, cbq telegram.CallbackQueryUpdate) InboundResult {
 	tenantID := tenantForUser(cbq.SenderID)
 	event := onboardingEvent(tenantID, cbq.ChatID, cbq.OriginalMsgID, cbq.UpdateID)
+	callbackSender := s.sender
+	if cbq.Transport == contracts.TransportBot && s.botSenders != nil {
+		if sender, ok := s.botSenders.SenderFor(cbq.TenantID, cbq.BotID); ok {
+			callbackSender = sender
+		}
+	}
 
 	if duplicate := s.repository.MarkReceive(cbq.ReceiveIdempotencyKey); duplicate {
-		_ = s.sender.AnswerCallbackQuery(ctx, cbq.QueryID)
+		_ = callbackSender.AnswerCallbackQuery(ctx, cbq.QueryID)
 		return InboundResult{Event: event, Decision: contracts.DecisionIgnore, Reason: "duplicate_callback_query", Duplicate: true}
+	}
+
+	if optionIdx, draftID, idempotencyKey, buttonOK := contracts.CallbackDataDecodeAIButton(cbq.Data); buttonOK {
+		_ = callbackSender.AnswerCallbackQuery(ctx, cbq.QueryID)
+		return s.handleAIButton(ctx, cbq, callbackSender, optionIdx, draftID, idempotencyKey)
 	}
 
 	// Handle question-card option selection (format "co:N:bareID") before the regular decode.
@@ -3569,6 +3680,64 @@ func (s *Service) handleCallbackQuery(ctx context.Context, cbq telegram.Callback
 
 	s.logger.Info("callback query handled", "action", result.Action, "draft_id", result.DraftID, "status", result.Status)
 	return InboundResult{Event: event, Decision: contracts.DecisionObserve, Reason: "callback_" + string(result.Action), DraftID: result.DraftID}
+}
+
+func (s *Service) handleAIButton(ctx context.Context, cbq telegram.CallbackQueryUpdate, callbackSender telegram.Sender, optionIdx int, draftID, idempotencyKey string) InboundResult {
+	event := contracts.NormalizedTelegramEvent{
+		EventID:          fmt.Sprintf("%d:callback_query:%s", cbq.UpdateID, cbq.QueryID),
+		TenantID:         cbq.TenantID,
+		ChatID:           contracts.BotChatID(cbq.BotID, cbq.ChatID),
+		TelegramUpdateID: cbq.UpdateID,
+		SourceMessageID:  cbq.QueryID,
+		SenderID:         cbq.SenderID,
+		MessageType:      "callback_query",
+		CreatedAt:        s.now(),
+		Transport:        contracts.TransportBot,
+		BotID:            cbq.BotID,
+	}
+	if cbq.Transport != contracts.TransportBot || cbq.TenantID == "" || cbq.BotID == "" {
+		return InboundResult{Event: event, Decision: contracts.DecisionIgnore, Reason: "aibtn_not_bot_transport"}
+	}
+	if s.repository.MarkCallback(idempotencyKey) {
+		return InboundResult{Event: event, Decision: contracts.DecisionIgnore, Reason: "duplicate_aibtn_callback", Duplicate: true}
+	}
+	draft, ok := s.repository.Draft(draftID)
+	if !ok || draft.DraftType == "question" || draft.TenantID != cbq.TenantID {
+		return InboundResult{Event: event, Decision: contracts.DecisionIgnore, Reason: "aibtn_draft_not_found"}
+	}
+	if draft.ChatID != event.ChatID || contracts.RawChatID(draft.ChatID) != cbq.ChatID {
+		return InboundResult{Event: event, Decision: contracts.DecisionIgnore, Reason: "aibtn_chat_mismatch"}
+	}
+	sourceEvent := s.resolveSourceEvent(draft)
+	if !s.contactInteractionEnabled(sourceEvent) {
+		return InboundResult{Event: event, Decision: contracts.DecisionIgnore, Reason: "aibtn_tool_disabled"}
+	}
+	if optionIdx < 0 || optionIdx >= len(draft.SuggestedOptions) {
+		return InboundResult{Event: event, Decision: contracts.DecisionIgnore, Reason: "aibtn_option_out_of_range"}
+	}
+	option := draft.SuggestedOptions[optionIdx]
+	event.MessageText = option
+	if cbq.OriginalMsgID != "" {
+		selectedText := draft.ResponseText + "\n\n✓ Выбрано: " + option
+		if err := callbackSender.EditMessageText(ctx, cbq.ChatID, cbq.OriginalMsgID, selectedText, telegram.InlineKeyboardMarkup{}); err != nil {
+			s.logger.Warn("contact interaction message edit failed",
+				"tenant_id", cbq.TenantID, "draft_id", draftID, "error", err)
+		}
+	}
+	s.logger.Info("contact interaction option selected",
+		"tenant_id", cbq.TenantID, "chat_id", event.ChatID,
+		"draft_id", draftID, "option_idx", optionIdx)
+	ownerID := strings.TrimPrefix(cbq.TenantID, "tenant:user:")
+	if ownerID == cbq.TenantID {
+		ownerID = ""
+	}
+	result, err := s.processContactMessage(ctx, event, ownerID, "")
+	if err != nil {
+		s.logger.Error("contact interaction follow-up failed",
+			"tenant_id", cbq.TenantID, "draft_id", draftID, "error", err)
+		return InboundResult{Event: event, Decision: contracts.DecisionErrorFallback, Reason: "aibtn_process_error"}
+	}
+	return result
 }
 
 // handleOwnerMessage handles plain (non-command) text from the owner in the bot chat.

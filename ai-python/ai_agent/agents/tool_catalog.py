@@ -63,6 +63,13 @@ TOOL_CATALOG: tuple[ToolCatalogEntry, ...] = (
         category=ToolCategory.READ,
         default_enabled=True,
     ),
+    ToolCatalogEntry(
+        key="interaction.present_buttons",
+        label="Кнопки для собеседника",
+        description="Задаёт собеседнику вопрос с вариантами ответа или подтверждением.",
+        category=ToolCategory.INTERACTION,
+        default_enabled=False,
+    ),
 )
 
 
@@ -74,6 +81,8 @@ TOOL_NAME_TO_KEY: Mapping[str, str] = MappingProxyType(
         "get_contact_profile": "memory.get_contact_profile",
         "save_fact": "memory.save_fact",
         "suggest_profile_update": "memory.suggest_profile_update",
+        "present_buttons": "interaction.present_buttons",
+        "request_confirmation": "interaction.present_buttons",
     }
 )
 

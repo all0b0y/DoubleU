@@ -34,7 +34,7 @@ from typing import Awaitable, Callable, Sequence, TypeVar
 
 import asyncpg
 from pydantic_ai import Agent, RunContext, UsageLimits
-from pydantic_ai.toolsets import FilteredToolset
+from pydantic_ai.toolsets import CombinedToolset, FilteredToolset
 
 from ..classifiers import TypedMemoryExtractor
 from ..observability.context import LLMCallContext, current_context
@@ -59,6 +59,7 @@ from ..schemas import (
     RerankFactsRequest,
     RerankFactsResponse,
     RiskLevel,
+    ResponsePlanData,
     SynthesizePatternRequest,
     SynthesizePatternResponse,
     TopicTaggingRequest,
@@ -70,6 +71,7 @@ from ..schemas import (
 )
 from ..security import PromptBuilder
 from .deps import AgentDeps
+from .interaction_tools import interaction_toolset
 from .memory_tools import memory_toolset
 from .models import AgentTask, ModelTier, build_model, build_tier_model, model_name_for
 from .tool_catalog import TOOL_CATALOG, TOOL_NAME_TO_KEY
@@ -105,7 +107,7 @@ def resolve_builtin_toolset(ai_role: AIRoleData | None) -> FilteredToolset[Agent
         name for name, key in TOOL_NAME_TO_KEY.items() if key in enabled_keys
     )
     return FilteredToolset(
-        memory_toolset,
+        CombinedToolset([memory_toolset, interaction_toolset]),
         lambda ctx, tool_def, enabled_names=enabled_names: tool_def.name in enabled_names,
     )
 
@@ -143,7 +145,8 @@ _ORCHESTRATOR_INSTRUCTIONS = (
     " 3) разрешённые действия выполняй только при явной необходимости из сообщения;"
     " 4) НЕ пиши ответ собеседнику и не имитируй владельца."
     " Верни OrchestratorResult: gathered_context — собранные факты/контекст (по строке на пункт);"
-    " suggested_intent — предполагаемый тип ответа; notes — короткие пометки писателю, что учесть."
+    " suggested_intent — предполагаемый тип ответа; notes — короткие пометки писателю, что учесть;"
+    " response_plan заполняется только interaction-инструментом, если нужна форма с кнопками."
 )
 
 
@@ -603,13 +606,18 @@ class AgentRuntime:
             usage_limits=UsageLimits(tool_calls_limit=_DRAFT_TOOL_CALLS_LIMIT),
             toolsets=toolsets,
         )
-        orchestrated: OrchestratorResult = result.output
+        # A response form is authoritative only when a tool actually wrote it
+        # into deps. Structured model output alone cannot fabricate buttons.
+        orchestrated: OrchestratorResult = result.output.model_copy(
+            update={"response_plan": deps.response_plan}
+        )
         usage = self._usage_of(result)
         completion = "\n".join(
             [
                 *orchestrated.gathered_context,
                 f"suggested_intent: {orchestrated.suggested_intent}",
                 f"notes: {orchestrated.notes}",
+                f"response_plan: {orchestrated.response_plan}",
             ]
         )
         self._record_run(
@@ -630,6 +638,8 @@ class AgentRuntime:
             bundle.append("Предполагаемый интент: " + result.suggested_intent)
         if result.notes:
             bundle.append("Пометки писателю: " + result.notes)
+        if result.response_plan is not None:
+            bundle.append("Форма ответа уже задана interaction-инструментом.")
         return tuple(bundle)
 
     async def _draft_async(
@@ -639,6 +649,7 @@ class AgentRuntime:
         pool = await self._get_pool()
         orchestrator_usage = Usage()
         orchestrator_bundle: tuple[str, ...] | None = None
+        orchestrated: OrchestratorResult | None = None
         if two_stage:
             orchestrated, orchestrator_usage = await self._orchestrate_async(
                 request, ctx, pool
@@ -686,6 +697,15 @@ class AgentRuntime:
             run_kwargs["model"] = tier_model
         result = await self._draft_agent.run(user_payload, **run_kwargs)
         drafted: DraftResult = result.output
+        response_plan = orchestrated.response_plan if orchestrated is not None else None
+        if response_plan is not None:
+            drafted = drafted.model_copy(
+                update={
+                    "reply": response_plan.prompt,
+                    "intent": "choice_question",
+                    "options": response_plan.options,
+                }
+            )
         draft_usage = self._usage_of(result)
         if two_stage and request.ai_role is not None:
             router_name = model_name_for(AgentTask.ORCHESTRATE) or "test-model"
@@ -747,6 +767,14 @@ class AgentRuntime:
             intent=drafted.intent,
             text_format=text_format,
             options=drafted.options if drafted.intent == "choice_question" else (),
+            response_plan=(
+                ResponsePlanData(
+                    shape=response_plan.shape,
+                    options=response_plan.options,
+                )
+                if response_plan is not None
+                else None
+            ),
             confidence=confidence,
             topic=drafted.topic,
         )
