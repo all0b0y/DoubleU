@@ -44,6 +44,7 @@ export const api = {
 
   // AI roles (personas)
   roles:          ()              => request('GET',    '/api/v1/roles'),
+  draftRole:      (data)          => request('POST',   '/api/v1/roles/draft', data),
   createRole:     (data)          => request('POST',   '/api/v1/roles', data),
   updateRole:     (roleId, data)  => request('PUT',    `/api/v1/roles/${roleId}`, data),
   deleteRole:     (roleId)        => request('DELETE', `/api/v1/roles/${roleId}`),

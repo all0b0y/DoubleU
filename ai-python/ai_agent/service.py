@@ -44,6 +44,8 @@ from .schemas import (
     ChatSummaryRequest,
     ChatSummaryResponse,
     Decision,
+    DraftRoleRequest,
+    DraftRoleResponse,
     EmbedTextsRequest,
     EmbedTextsResponse,
     ExtractMediaRequest,
@@ -152,6 +154,10 @@ class AIService:
         agent text-only so the frozen process-message contract is untouched.
         """
         return media.extract_media(request)
+
+    def draft_role(self, request: DraftRoleRequest) -> DraftRoleResponse:
+        """Generate an editable AI-role draft from a free-text description."""
+        return self._agents.draft_role(request)
 
     def tag_topic(self, request: TopicTaggingRequest) -> TopicTaggingResponse:
         """Return a short topic label for the active conversation episode."""

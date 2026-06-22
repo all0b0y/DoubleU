@@ -41,6 +41,11 @@
 
 ## Tech Debt
 
+- **Voice role drafting: base64 JSON upload.** Mini App пока буферизует запись `MediaRecorder`
+  целиком в памяти и отправляет base64 в JSON (лимит записи 60 секунд, серверный cap 14 MiB).
+  При росте лимитов заменить на streaming/multipart upload и добавить codec fallback для WebView
+  без `audio/webm`; текущий вариант достаточен для короткого голосового описания роли.
+
 - **(migrations, 2026-06-21)** Two `111_*.sql` files collide (`111_ai_role_speak_as_owner`, `111_role_model_tier`). Migration 112 was used for the quarantine column to avoid the collision. The 111 pair should be consolidated into a single file to restore a linear sequence before the next DB bootstrapping run.
 
 - ~~**(v5 roles)** `upsert_semantic_fact` stored proc dead `RAISE EXCEPTION` branch~~ → ✅ закрыто миграцией 013 (v3 процедуры без global-веток, MEM-1).

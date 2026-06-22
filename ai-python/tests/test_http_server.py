@@ -89,6 +89,27 @@ class HTTPServerTests(unittest.TestCase):
         self.assertEqual(response["provenance"], "voice_transcript")
         self.assertTrue(response["text"])
 
+    def test_draft_role_endpoint_returns_structured_mock_draft(self) -> None:
+        """The draft-role route returns the complete frozen wire shape in mock mode."""
+        response = self.handler._draft_role(
+            {"text": "Нужен менеджер поддержки: спокойно отвечает клиентам на русском."}
+        )
+
+        self.assertEqual(
+            set(response),
+            {
+                "name",
+                "description",
+                "speaking_style",
+                "goals",
+                "constraints",
+                "custom_fields",
+            },
+        )
+        self.assertTrue(response["name"])
+        self.assertTrue(response["description"])
+        self.assertIsInstance(response["custom_fields"], list)
+
     def test_synthesize_pattern_endpoint_matches_contract_shape(self) -> None:
         """The synthesize-pattern route parses the request and returns the frozen shape."""
         response = self.handler._synthesize_pattern(

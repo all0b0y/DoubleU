@@ -159,6 +159,10 @@ func (c *HTTPClient) RerankFacts(ctx context.Context, request RerankFactsRequest
 // client timeout, so the call gets the same headroom as embedding.
 const extractMediaTimeout = 60 * time.Second
 
+// draftRoleTimeout allows a cheap structured-output model enough time to
+// produce and validate the complete role shape.
+const draftRoleTimeout = 60 * time.Second
+
 // ExtractMedia calls the Python AI /ai/extract-media endpoint to turn a media
 // attachment (voice/audio/photo/document) into plain text.
 func (c *HTTPClient) ExtractMedia(ctx context.Context, request ExtractMediaRequest) (ExtractMediaResponse, error) {
@@ -169,6 +173,21 @@ func (c *HTTPClient) ExtractMedia(ctx context.Context, request ExtractMediaReque
 	mediaCtx, cancel := context.WithTimeout(ctx, extractMediaTimeout)
 	defer cancel()
 	if err := c.postJSON(mediaCtx, "/ai/extract-media", request, &response); err != nil {
+		return response, err
+	}
+	return response, nil
+}
+
+// DraftRole calls the Python AI /ai/draft-role endpoint to generate editable
+// role fields from a free-text description.
+func (c *HTTPClient) DraftRole(ctx context.Context, request DraftRoleRequest) (DraftRoleResponse, error) {
+	var response DraftRoleResponse
+	if c.baseURL == "" {
+		return response, fmt.Errorf("ai base url is empty")
+	}
+	draftCtx, cancel := context.WithTimeout(ctx, draftRoleTimeout)
+	defer cancel()
+	if err := c.postJSON(draftCtx, "/ai/draft-role", request, &response); err != nil {
 		return response, err
 	}
 	return response, nil

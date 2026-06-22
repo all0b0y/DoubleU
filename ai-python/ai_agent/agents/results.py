@@ -124,6 +124,32 @@ class ExtractionResult(BaseModel):
     profile_suggestions: tuple[ProfileSuggestionResult, ...] = ()
 
 
+class RoleDraftCustomField(BaseModel):
+    """One owner-editable custom field proposed for an AI role."""
+
+    model_config = ConfigDict(frozen=True)
+
+    title: str = Field(min_length=1, max_length=64)
+    description: str = Field(
+        min_length=1,
+        description="Зачем это поле нужно роли и как оно влияет на ответы.",
+    )
+    context: str = Field(default="", max_length=5000)
+
+
+class RoleDraft(BaseModel):
+    """A complete owner-editable AI-role draft generated from free text."""
+
+    model_config = ConfigDict(frozen=True)
+
+    name: str = Field(min_length=1, max_length=64)
+    description: str = Field(min_length=1)
+    speaking_style: str = ""
+    goals: str = ""
+    constraints: str = ""
+    custom_fields: tuple[RoleDraftCustomField, ...] = ()
+
+
 class SummaryResult(BaseModel):
     """Episode/chat summary with actionable follow-ups (ARCH-10)."""
 

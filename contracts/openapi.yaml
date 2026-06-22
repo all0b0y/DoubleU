@@ -3,6 +3,23 @@ info:
   title: DoubleU Technical MVP Contract
   version: 0.1.0
 paths:
+  /ai/draft-role:
+    post:
+      summary: Generate an editable AI-role draft from a free-text description.
+      operationId: draftRole
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DraftRoleRequest"
+      responses:
+        "200":
+          description: Structured role draft.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DraftRoleResponse"
   /ai/process-message:
     post:
       summary: Process a normalized Telegram message and return an AI decision proposal.
@@ -22,6 +39,33 @@ paths:
                 $ref: "#/components/schemas/AIProcessMessageResponse"
 components:
   schemas:
+    DraftRoleRequest:
+      type: object
+      required: [text]
+      properties:
+        text:
+          type: string
+          minLength: 1
+          maxLength: 8000
+        trace_id: { type: string }
+    DraftRoleResponse:
+      type: object
+      required: [name, description, speaking_style, goals, constraints, custom_fields]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 64 }
+        description: { type: string, minLength: 1 }
+        speaking_style: { type: string }
+        goals: { type: string }
+        constraints: { type: string }
+        custom_fields:
+          type: array
+          items:
+            type: object
+            required: [title, description]
+            properties:
+              title: { type: string, minLength: 1, maxLength: 64 }
+              description: { type: string, minLength: 1 }
+              context: { type: string, maxLength: 5000 }
     NormalizedTelegramEvent:
       type: object
       required:

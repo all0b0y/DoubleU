@@ -128,6 +128,7 @@ func main() {
 		httpapi.WithWebhookSecret(cfg.TelegramWebhookSecret),
 		httpapi.WithMiniAppDir(cfg.MiniAppDir),
 		httpapi.WithBotManager(botManager),
+		httpapi.WithAIBaseURL(cfg.AIBaseURL),
 	)
 	serverCtx, serverCancel := context.WithCancel(context.Background())
 	defer serverCancel()

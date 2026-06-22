@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -40,6 +41,116 @@ func decodeBody(t *testing.T, res *httptest.ResponseRecorder, out any) {
 }
 
 const testTenant = "tenant:user:777"
+
+func TestDraftRoleFromTextDoesNotPersist(t *testing.T) {
+	var mu sync.Mutex
+	requestedText := ""
+	aiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/ai/draft-role" {
+			http.NotFound(w, r)
+			return
+		}
+		var request struct {
+			Text string `json:"text"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&request)
+		mu.Lock()
+		requestedText = request.Text
+		mu.Unlock()
+		writeJSON(w, http.StatusOK, map[string]any{
+			"name": "Менеджер", "description": "Помогает клиентам",
+			"speaking_style": "Кратко", "goals": "Решать вопросы",
+			"constraints": "Не выдумывать факты", "custom_fields": []any{},
+		})
+	}))
+	defer aiServer.Close()
+
+	repo := store.NewRepository()
+	server := NewServer(core.NewService(repo, nil, nil), WithAIBaseURL(aiServer.URL))
+	res := miniappRequest(t, server, http.MethodPost, "/api/v1/roles/draft",
+		`{"text":"Нужен менеджер поддержки"}`)
+	if res.Code != http.StatusOK {
+		t.Fatalf("draft text status = %d body=%s", res.Code, res.Body.String())
+	}
+	var draft roleJSON
+	decodeBody(t, res, &draft)
+	if draft.ID != 0 || draft.Name != "Менеджер" || draft.ModelTier != "balanced" {
+		t.Fatalf("draft = %+v", draft)
+	}
+	mu.Lock()
+	gotText := requestedText
+	mu.Unlock()
+	if gotText != "Нужен менеджер поддержки" {
+		t.Fatalf("AI draft text = %q", gotText)
+	}
+	if roles := repo.AIRoles(testTenant); len(roles) != 0 {
+		t.Fatalf("draft endpoint persisted roles: %+v", roles)
+	}
+}
+
+func TestDraftRoleFromAudioTranscribesBeforeDraftAndDoesNotPersist(t *testing.T) {
+	var mu sync.Mutex
+	calls := make([]string, 0, 2)
+	draftedText := ""
+	aiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls = append(calls, r.URL.Path)
+		mu.Unlock()
+		switch r.URL.Path {
+		case "/ai/extract-media":
+			var request struct {
+				Kind       string `json:"kind"`
+				DataBase64 string `json:"data_base64"`
+				MimeType   string `json:"mime_type"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&request)
+			if request.Kind != "voice" || request.DataBase64 != "b2dnYnl0ZXM=" || request.MimeType != "audio/webm" {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unexpected media request"})
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]string{
+				"text": "Голосовое описание роли", "provenance": "voice_transcript", "model_used": "test",
+			})
+		case "/ai/draft-role":
+			var request struct {
+				Text string `json:"text"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&request)
+			mu.Lock()
+			draftedText = request.Text
+			mu.Unlock()
+			writeJSON(w, http.StatusOK, map[string]any{
+				"name": "Консультант", "description": "Консультирует клиентов",
+				"speaking_style": "Спокойно", "goals": "Помочь выбрать",
+				"constraints": "Не давать гарантий", "custom_fields": []any{},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer aiServer.Close()
+
+	repo := store.NewRepository()
+	server := NewServer(core.NewService(repo, nil, nil), WithAIBaseURL(aiServer.URL))
+	res := miniappRequest(t, server, http.MethodPost, "/api/v1/roles/draft",
+		`{"audio_base64":"b2dnYnl0ZXM=","mime_type":"audio/webm"}`)
+	if res.Code != http.StatusOK {
+		t.Fatalf("draft audio status = %d body=%s", res.Code, res.Body.String())
+	}
+	mu.Lock()
+	gotCalls := append([]string(nil), calls...)
+	gotDraftedText := draftedText
+	mu.Unlock()
+	if strings.Join(gotCalls, ",") != "/ai/extract-media,/ai/draft-role" {
+		t.Fatalf("AI call order = %v", gotCalls)
+	}
+	if gotDraftedText != "Голосовое описание роли" {
+		t.Fatalf("drafted transcript = %q", gotDraftedText)
+	}
+	if roles := repo.AIRoles(testTenant); len(roles) != 0 {
+		t.Fatalf("audio draft endpoint persisted roles: %+v", roles)
+	}
+}
 
 func TestRoleLifecycle(t *testing.T) {
 	repo := store.NewRepository()
@@ -387,6 +498,7 @@ func TestMiniAppRoutesRequireAuth(t *testing.T) {
 	for _, route := range []struct{ method, path string }{
 		{http.MethodGet, "/api/v1/roles"},
 		{http.MethodPost, "/api/v1/roles"},
+		{http.MethodPost, "/api/v1/roles/draft"},
 		{http.MethodGet, "/api/v1/suggestions"},
 		{http.MethodPost, "/api/v1/forget-all"},
 		{http.MethodGet, "/api/v1/settings/user"},

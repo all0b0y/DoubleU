@@ -65,6 +65,10 @@ export function renderRoleEdit(navigate, roleId) {
   twa?.BackButton?.onClick(handleBack);
   const obs = new MutationObserver(() => {
     if (!document.body.contains(el)) {
+      screenDisposed = true;
+      if (recordingTimeout) clearTimeout(recordingTimeout);
+      if (mediaRecorder?.state === 'recording') mediaRecorder.stop();
+      audioStream?.getTracks().forEach(track => track.stop());
       twa?.BackButton?.offClick(handleBack);
       obs.disconnect();
     }
@@ -173,6 +177,31 @@ export function renderRoleEdit(navigate, roleId) {
       </div>`;
   }
 
+  function roleDraftToolsHTML() {
+    if (!isNew) return '';
+    return `
+      <div class="st-section">
+        <p class="st-section-label">создать роль с AI</p>
+        <div class="st-card" style="padding:14px;display:flex;flex-direction:column;gap:10px;">
+          <textarea class="field-input field-textarea" id="role-draft-text" style="min-height:96px;"
+            placeholder="Опиши роль свободно: кто она, как говорит, чего должна добиваться и чего делать нельзя."></textarea>
+          <button type="button" class="btn btn-secondary" id="btn-draft-text">
+            ✍️ Сгенерировать из текста
+          </button>
+          <button type="button" class="btn btn-secondary" id="btn-draft-voice">
+            🎙 Описать голосом
+          </button>
+          <div id="role-draft-status" style="min-height:16px;font-size:11px;color:var(--muted);line-height:1.4;"></div>
+        </div>
+      </div>`;
+  }
+
+  let mediaRecorder = null;
+  let audioStream = null;
+  let audioChunks = [];
+  let recordingTimeout = null;
+  let screenDisposed = false;
+
   // Read the live input values back into customFields so add/remove/save never
   // lose what the user has typed.
   function collectCustomFields() {
@@ -215,6 +244,7 @@ export function renderRoleEdit(navigate, roleId) {
 
     el.querySelector('#re-scroll').innerHTML = `
       <div class="st-content">
+        ${roleDraftToolsHTML()}
         <div class="st-section" style="display:flex;flex-direction:column;gap:16px;">
           ${fieldHTML('f-name', 'имя роли', 'Короткое название — как ты будешь её узнавать.', role.name,
             { required: true, placeholder: 'Менеджер, Техподдержка…' })}
@@ -273,6 +303,24 @@ export function renderRoleEdit(navigate, roleId) {
     updateContextCounter();
     el.querySelector('#f-context')?.addEventListener('input', updateContextCounter);
 
+    el.querySelector('#btn-draft-text')?.addEventListener('click', async () => {
+      const text = el.querySelector('#role-draft-text')?.value.trim() || '';
+      if (!text) {
+        twa?.HapticFeedback?.notificationOccurred('error');
+        twa?.showAlert('Сначала опиши роль текстом.');
+        return;
+      }
+      await generateRoleDraft({ text });
+    });
+
+    el.querySelector('#btn-draft-voice')?.addEventListener('click', async () => {
+      if (mediaRecorder?.state === 'recording') {
+        mediaRecorder.stop();
+        return;
+      }
+      await startRoleRecording();
+    });
+
     // File attach: read text files in-browser and append their content to the
     // context. No upload endpoint — the text rides along in the role's context
     // field, persisted in Postgres (ai_roles.context_notes).
@@ -326,6 +374,122 @@ export function renderRoleEdit(navigate, roleId) {
           twa?.showAlert(`Ошибка: ${err.message}`);
         }
       });
+    });
+  }
+
+  function setDraftBusy(busy, status = '') {
+    const textBtn = el.querySelector('#btn-draft-text');
+    const voiceBtn = el.querySelector('#btn-draft-voice');
+    if (textBtn) textBtn.disabled = busy;
+    if (voiceBtn) voiceBtn.disabled = busy;
+    const statusEl = el.querySelector('#role-draft-status');
+    if (statusEl) statusEl.textContent = status;
+  }
+
+  function applyRoleDraft(draft) {
+    role = {
+      ...role,
+      name: draft.name || '',
+      description: draft.description || '',
+      speaking_style: draft.speaking_style || '',
+      goals: draft.goals || '',
+      constraints: draft.constraints || '',
+      custom_fields: draft.custom_fields || [],
+    };
+    const fields = [
+      ['#f-name', role.name],
+      ['#f-desc', role.description],
+      ['#f-style', role.speaking_style],
+      ['#f-goals', role.goals],
+      ['#f-constraints', role.constraints],
+    ];
+    fields.forEach(([selector, value]) => {
+      const input = el.querySelector(selector);
+      if (input) input.value = value;
+    });
+    customFields = role.custom_fields.map(field => ({
+      title: field.title || '',
+      description: field.description || '',
+      context: field.context || '',
+    }));
+    renderCustomFieldRows();
+    el.querySelector('#f-name')?.focus();
+  }
+
+  async function generateRoleDraft(payload) {
+    setDraftBusy(true, 'AI собирает черновик роли…');
+    try {
+      const draft = await api.draftRole(payload);
+      applyRoleDraft(draft);
+      twa?.HapticFeedback?.notificationOccurred('success');
+      setDraftBusy(false, 'Черновик готов — проверь поля и сохрани роль.');
+    } catch (err) {
+      twa?.HapticFeedback?.notificationOccurred('error');
+      setDraftBusy(false, 'Не удалось создать черновик.');
+      twa?.showAlert(`Ошибка: ${err.message}`);
+    }
+  }
+
+  async function startRoleRecording() {
+    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
+      twa?.showAlert('Запись голоса не поддерживается в этом браузере.');
+      return;
+    }
+    try {
+      audioStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const preferred = 'audio/webm;codecs=opus';
+      const options = MediaRecorder.isTypeSupported?.(preferred) ? { mimeType: preferred } : {};
+      mediaRecorder = new MediaRecorder(audioStream, options);
+      audioChunks = [];
+      mediaRecorder.addEventListener('dataavailable', event => {
+        if (event.data.size) audioChunks.push(event.data);
+      });
+      mediaRecorder.addEventListener('stop', async () => {
+        if (recordingTimeout) clearTimeout(recordingTimeout);
+        recordingTimeout = null;
+        audioStream?.getTracks().forEach(track => track.stop());
+        const mimeType = mediaRecorder.mimeType || audioChunks[0]?.type || 'audio/webm';
+        const blob = new Blob(audioChunks, { type: mimeType });
+        mediaRecorder = null;
+        audioStream = null;
+        audioChunks = [];
+        if (screenDisposed || !blob.size) return;
+        const voiceBtn = el.querySelector('#btn-draft-voice');
+        if (voiceBtn) voiceBtn.textContent = '🎙 Описать голосом';
+        setDraftBusy(true, 'Обрабатываю запись…');
+        try {
+          const audioBase64 = await blobToBase64(blob);
+          await generateRoleDraft({ audio_base64: audioBase64, mime_type: mimeType });
+        } catch (err) {
+          setDraftBusy(false, 'Не удалось обработать запись.');
+          twa?.HapticFeedback?.notificationOccurred('error');
+          twa?.showAlert(err.message);
+        }
+      });
+      mediaRecorder.start();
+      const voiceBtn = el.querySelector('#btn-draft-voice');
+      if (voiceBtn) voiceBtn.textContent = '⏹ Завершить запись';
+      const textBtn = el.querySelector('#btn-draft-text');
+      if (textBtn) textBtn.disabled = true;
+      const status = el.querySelector('#role-draft-status');
+      if (status) status.textContent = 'Идёт запись — нажми ещё раз, чтобы завершить.';
+      recordingTimeout = setTimeout(() => {
+        if (mediaRecorder?.state === 'recording') mediaRecorder.stop();
+      }, 60000);
+    } catch (err) {
+      audioStream?.getTracks().forEach(track => track.stop());
+      audioStream = null;
+      twa?.HapticFeedback?.notificationOccurred('error');
+      twa?.showAlert(`Не удалось начать запись: ${err.message}`);
+    }
+  }
+
+  function blobToBase64(blob) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result).split(',', 2)[1] || '');
+      reader.onerror = () => reject(new Error('Не удалось прочитать аудиозапись.'));
+      reader.readAsDataURL(blob);
     });
   }
 

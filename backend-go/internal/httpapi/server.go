@@ -36,6 +36,11 @@ func WithMiniAppDir(dir string) ServerOption {
 	return func(s *Server) { s.miniappDir = dir }
 }
 
+// WithAIBaseURL sets the Python AI service base URL used by Mini App AI calls.
+func WithAIBaseURL(url string) ServerOption {
+	return func(s *Server) { s.aiBaseURL = url }
+}
+
 // Server exposes health, Telegram webhook, approval callback, and Mini App API handlers.
 type Server struct {
 	service       *core.Service
@@ -45,6 +50,7 @@ type Server struct {
 	botToken      string
 	webhookSecret string
 	miniappDir    string
+	aiBaseURL     string
 }
 
 // NewServer creates an HTTP server wrapper.
@@ -99,6 +105,7 @@ func (s *Server) routes() {
 
 	// AI roles (personas) — CRUD plus per-chat assignment.
 	s.mux.HandleFunc("GET /api/v1/roles", s.tmaAuth(s.apiRoles))
+	s.mux.HandleFunc("POST /api/v1/roles/draft", s.tmaAuth(s.apiDraftRole))
 	s.mux.HandleFunc("POST /api/v1/roles", s.tmaAuth(s.apiCreateRole))
 	s.mux.HandleFunc("PUT /api/v1/roles/{role_id}", s.tmaAuth(s.apiUpdateRole))
 	s.mux.HandleFunc("DELETE /api/v1/roles/{role_id}", s.tmaAuth(s.apiDeleteRole))

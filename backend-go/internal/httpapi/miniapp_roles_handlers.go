@@ -1,12 +1,16 @@
 package httpapi
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
+	"doubleu/backend-go/internal/aiclient"
 	"doubleu/backend-go/internal/bot"
 	"doubleu/backend-go/internal/contracts"
 	"doubleu/backend-go/internal/core"
@@ -20,6 +24,12 @@ const roleContextMaxRunes = 20000
 // roleCustomFieldMaxRunes caps a single custom field's context, mirroring the
 // whole-role context cap so the prompt stays within budget.
 const roleCustomFieldMaxRunes = 5000
+
+const (
+	roleDraftTextMaxRunes = 8000
+	roleDraftAudioMaxB64  = 14 * 1024 * 1024
+	roleDraftHTTPTimeout  = 90 * time.Second
+)
 
 // roleJSON is the wire shape of an AI role in the Mini App API.
 type roleJSON struct {
@@ -140,6 +150,120 @@ func (s *Server) apiRoles(w http.ResponseWriter, r *http.Request) {
 		items = append(items, roleToJSON(role))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"roles": items})
+}
+
+type roleDraftRequest struct {
+	Text        string `json:"text"`
+	AudioBase64 string `json:"audio_base64"`
+	MimeType    string `json:"mime_type"`
+}
+
+// apiDraftRole generates an editable role form without writing anything to
+// the repository. Only the existing create endpoint persists the final role.
+func (s *Server) apiDraftRole(w http.ResponseWriter, r *http.Request) {
+	if s.aiBaseURL == "" {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "ai service not configured"})
+		return
+	}
+	defer r.Body.Close()
+	var req roleDraftRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	req.Text = strings.TrimSpace(req.Text)
+	req.AudioBase64 = strings.TrimSpace(req.AudioBase64)
+	req.MimeType = strings.TrimSpace(req.MimeType)
+	if (req.Text == "") == (req.AudioBase64 == "") {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "provide exactly one of text or audio_base64"})
+		return
+	}
+	if len([]rune(req.Text)) > roleDraftTextMaxRunes {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "text is too long (max 8000 characters)"})
+		return
+	}
+	if len(req.AudioBase64) > roleDraftAudioMaxB64 {
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "audio is too large"})
+		return
+	}
+	if req.AudioBase64 != "" {
+		if req.MimeType == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "mime_type is required for audio"})
+			return
+		}
+		if _, err := base64.StdEncoding.DecodeString(req.AudioBase64); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "audio_base64 is invalid"})
+			return
+		}
+	}
+
+	client := aiclient.NewHTTPClient(
+		s.aiBaseURL,
+		&http.Client{Timeout: roleDraftHTTPTimeout},
+	)
+	text := req.Text
+	if req.AudioBase64 != "" {
+		extracted, err := client.ExtractMedia(r.Context(), aiclient.ExtractMediaRequest{
+			Kind:       "voice",
+			DataBase64: req.AudioBase64,
+			MimeType:   req.MimeType,
+		})
+		if err != nil {
+			slog.WarnContext(r.Context(), "role audio transcription failed",
+				"tenant_id", tenantFromContext(r.Context()), "mime_type", req.MimeType, "error", err)
+			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "audio transcription failed"})
+			return
+		}
+		text = strings.TrimSpace(extracted.Text)
+		if text == "" {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "audio contains no recognizable speech"})
+			return
+		}
+	}
+
+	draft, err := client.DraftRole(r.Context(), aiclient.DraftRoleRequest{Text: text})
+	if err != nil {
+		slog.WarnContext(r.Context(), "role drafting failed",
+			"tenant_id", tenantFromContext(r.Context()), "source", roleDraftSource(req), "error", err)
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "role drafting failed"})
+		return
+	}
+	validated := roleRequest{
+		Name:          draft.Name,
+		Description:   draft.Description,
+		SpeakingStyle: draft.SpeakingStyle,
+		Goals:         draft.Goals,
+		Constraints:   draft.Constraints,
+		CustomFields:  draft.CustomFields,
+	}
+	validated.normalize()
+	if msg := validated.validate(); msg != "" {
+		slog.WarnContext(r.Context(), "role drafting returned invalid data",
+			"tenant_id", tenantFromContext(r.Context()), "reason", msg)
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "ai returned an invalid role draft"})
+		return
+	}
+	fields := validated.CustomFields
+	if fields == nil {
+		fields = []contracts.AIRoleCustomField{}
+	}
+	writeJSON(w, http.StatusOK, roleJSON{
+		Name:          validated.Name,
+		Description:   validated.Description,
+		SpeakingStyle: validated.SpeakingStyle,
+		Goals:         validated.Goals,
+		Constraints:   validated.Constraints,
+		CustomFields:  fields,
+		SpeakAsOwner:  true,
+		ModelTier:     "balanced",
+	})
+}
+
+func roleDraftSource(req roleDraftRequest) string {
+	if req.AudioBase64 != "" {
+		return "audio"
+	}
+	return "text"
 }
 
 func (s *Server) apiCreateRole(w http.ResponseWriter, r *http.Request) {

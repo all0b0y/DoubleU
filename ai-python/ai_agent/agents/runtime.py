@@ -45,9 +45,12 @@ from ..safety.input import InputSafetyScanner
 from ..safety.output import OutputSafetyScanner
 from ..schemas import (
     AIProcessMessageRequest,
+    AIRoleCustomFieldData,
     AIRoleData,
     ChatSummaryRequest,
     ChatSummaryResponse,
+    DraftRoleRequest,
+    DraftRoleResponse,
     EmbedTextsRequest,
     ModelTask,
     PrivacyFlag,
@@ -74,6 +77,7 @@ from .results import (
     ExtractionResult,
     PatternResult,
     RerankResult,
+    RoleDraft,
     SummaryResult,
     TopicResult,
 )
@@ -183,6 +187,14 @@ _PATTERN_INSTRUCTIONS = (
     " повторяй один факт как «паттерн»."
 )
 
+_ROLE_DRAFT_INSTRUCTIONS = (
+    "Из свободного описания собери цельную, готовую к использованию AI-роль. "
+    "Заполни короткое имя, полное описание, стиль речи, цели и ограничения. "
+    "Добавляй custom_fields только для важных деталей, которые не помещаются в основные поля; "
+    "у каждого такого поля должны быть title и description. Не выдумывай факты о бизнесе, "
+    "ценах или людях. Пиши весь черновик на языке исходного описания."
+)
+
 
 class AgentRuntime:
     """Owns the agents, the event-loop thread, safety/observability and the pool."""
@@ -203,6 +215,7 @@ class AgentRuntime:
         topic_model: object | None = None,
         rerank_model: object | None = None,
         pattern_model: object | None = None,
+        role_draft_model: object | None = None,
         query_embedder_factory: Callable[[], EmbedderCallable] | None = None,
     ) -> None:
         """Build agents and start the loop thread.
@@ -284,6 +297,16 @@ class AgentRuntime:
             instructions=_PATTERN_INSTRUCTIONS,
             retries=1,
         )
+        self._role_draft_agent: Agent[AgentDeps, RoleDraft] = Agent(
+            role_draft_model or build_model(AgentTask.ROLE_DRAFT),
+            deps_type=AgentDeps,
+            output_type=RoleDraft,
+            retries=1,
+        )
+
+        @self._role_draft_agent.instructions
+        def _role_draft_agent_instructions(ctx: RunContext[AgentDeps]) -> str:
+            return ctx.deps.system_instruction
 
     # ------------------------------------------------------------------ infra
 
@@ -623,6 +646,60 @@ class AgentRuntime:
             )
             return verdict.revised_reply.strip(), min(drafted.confidence, 0.5), critic_usage
         return drafted.reply, drafted.confidence, critic_usage
+
+    # ------------------------------------------------------------- role draft
+
+    def draft_role(self, request: DraftRoleRequest) -> DraftRoleResponse:
+        """Generate a structured, owner-editable role from free text."""
+        ctx = current_context()
+        try:
+            return self._run(self._draft_role_async(request, ctx))
+        except Exception as exc:  # noqa: BLE001 - convert agent failures at the contract boundary
+            raise RuntimeError(f"role draft agent failed: {exc}") from exc
+
+    async def _draft_role_async(
+        self, request: DraftRoleRequest, ctx: LLMCallContext
+    ) -> DraftRoleResponse:
+        system_prompt, user_payload = self._prompt_builder.build(
+            _ROLE_DRAFT_INSTRUCTIONS, request.text
+        )
+        system_prompt, user_payload = self._scan_input(
+            system_prompt, user_payload, ModelTask.DRAFT_REPLY, ctx
+        )
+        deps = self._deps_for(
+            ctx.tenant_id,
+            ctx.chat_id,
+            (),
+            system_instruction=system_prompt,
+            pool=None,
+        )
+        result = await self._role_draft_agent.run(user_payload, deps=deps)
+        drafted: RoleDraft = result.output
+        usage = self._usage_of(result)
+        self._record_run(
+            ctx,
+            AgentTask.ROLE_DRAFT,
+            system_prompt,
+            user_payload,
+            drafted.model_dump_json(),
+            usage,
+            (),
+        )
+        return DraftRoleResponse(
+            name=drafted.name.strip(),
+            description=drafted.description.strip(),
+            speaking_style=drafted.speaking_style.strip(),
+            goals=drafted.goals.strip(),
+            constraints=drafted.constraints.strip(),
+            custom_fields=tuple(
+                AIRoleCustomFieldData(
+                    title=item.title.strip(),
+                    description=item.description.strip(),
+                    context=item.context.strip(),
+                )
+                for item in drafted.custom_fields
+            ),
+        )
 
     # ------------------------------------------------------------- extraction
 

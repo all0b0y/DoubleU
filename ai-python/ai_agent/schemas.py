@@ -532,6 +532,26 @@ class ExtractMediaResponse(JsonDataclass):
     model_used: str
 
 
+@dataclass(frozen=True)
+class DraftRoleRequest(JsonDataclass):
+    """Request body for `/ai/draft-role`."""
+
+    text: str
+    trace_id: str = ""
+
+
+@dataclass(frozen=True)
+class DraftRoleResponse(JsonDataclass):
+    """Generated role fields returned by `/ai/draft-role`."""
+
+    name: str
+    description: str
+    speaking_style: str = ""
+    goals: str = ""
+    constraints: str = ""
+    custom_fields: tuple[AIRoleCustomFieldData, ...] = field(default_factory=tuple)
+
+
 def parse_process_message_request(payload: dict[str, Any]) -> AIProcessMessageRequest:
     """Parse a process-message JSON object into a typed request."""
     event = payload.get("event") or {}
@@ -686,6 +706,16 @@ def parse_extract_media_request(payload: dict[str, Any]) -> ExtractMediaRequest:
         duration=int(payload.get("duration", 0) or 0),
         trace_id=str(payload.get("trace_id", "")),
     )
+
+
+def parse_draft_role_request(payload: dict[str, Any]) -> DraftRoleRequest:
+    """Parse and validate a free-text role description."""
+    text = str(payload.get("text", "")).strip()
+    if not text:
+        raise ValueError("text is required")
+    if len(text) > 8000:
+        raise ValueError("text is too long (max 8000 characters)")
+    return DraftRoleRequest(text=text, trace_id=str(payload.get("trace_id", "")))
 
 
 def _parse_contact_profile(raw: Any) -> ContactProfileData | None:
