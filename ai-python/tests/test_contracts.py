@@ -81,6 +81,12 @@ class GeneratedEnumsMatchContractJSONTests(unittest.TestCase):
     def test_decisions(self) -> None:
         self.assertEqual(_values(contract_enums.Decision), set(self.contract["decisions"]))
 
+    def test_tool_categories(self) -> None:
+        self.assertEqual(
+            _values(contract_enums.ToolCategory),
+            set(self.contract["tool_categories"]),
+        )
+
     def test_chat_modes(self) -> None:
         self.assertEqual(_values(contract_enums.ChatMode), set(self.contract["chat_modes"]))
 

@@ -247,6 +247,9 @@ type AIRoleRecord struct {
 	// ModelTier is the LLM quality tier for draft generation: "fast",
 	// "balanced" (default), or "smart". Empty = use the DRAFT task model.
 	ModelTier string
+	// ToolSettings stores explicit per-role native-tool overrides. Missing keys
+	// inherit defaults from the tool catalog (migration 113).
+	ToolSettings map[string]bool
 }
 
 // Repository stores state — in memory when no DB is configured, in Postgres otherwise.
@@ -2266,9 +2269,9 @@ func (r *Repository) SaveAIRole(role AIRoleRecord) AIRoleRecord {
 			`INSERT INTO ai_roles (
 			   tenant_id, name, description, speaking_style, goals, constraints_text,
 			   context_notes, custom_fields, rich_formatting_enabled, streaming_enabled,
-			   speak_as_owner, model_tier
+			   speak_as_owner, model_tier, tool_settings
 			 )
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 			 ON CONFLICT (tenant_id, name) DO UPDATE SET
 			   description      = EXCLUDED.description,
 			   speaking_style   = EXCLUDED.speaking_style,
@@ -2280,52 +2283,54 @@ func (r *Repository) SaveAIRole(role AIRoleRecord) AIRoleRecord {
 			   streaming_enabled       = COALESCE(EXCLUDED.streaming_enabled, ai_roles.streaming_enabled),
 			   speak_as_owner   = EXCLUDED.speak_as_owner,
 			   model_tier       = EXCLUDED.model_tier,
+			   tool_settings    = EXCLUDED.tool_settings,
 			   updated_at       = now()
 			 RETURNING id`,
 			role.TenantID, role.Name, role.Description, role.SpeakingStyle, role.Goals, role.Constraints, role.Context,
 			encodeRoleCustomFields(role.CustomFields), nullableBoolArg(role.RichFormattingEnabled), nullableBoolArg(role.StreamingEnabled),
-			role.SpeakAsOwner, role.ModelTier,
+			role.SpeakAsOwner, role.ModelTier, encodeRoleToolSettings(role.ToolSettings),
 		).Scan(&role.ID)
 		if err != nil {
 			return AIRoleRecord{}
 		}
-		return role
+		return cloneAIRoleRecord(role)
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for id, existing := range r.aiRoles {
 		if existing.TenantID == role.TenantID && strings.EqualFold(existing.Name, role.Name) {
 			role.ID = id
-			r.aiRoles[id] = role
-			return role
+			r.aiRoles[id] = cloneAIRoleRecord(role)
+			return cloneAIRoleRecord(role)
 		}
 	}
 	r.aiRoleSeq++
 	role.ID = r.aiRoleSeq
-	r.aiRoles[role.ID] = role
-	return role
+	r.aiRoles[role.ID] = cloneAIRoleRecord(role)
+	return cloneAIRoleRecord(role)
 }
 
 // aiRoleColumns is the shared SELECT projection for ai_roles, kept in one place
-// so every read returns the same fields (including the migration-102 jsonb).
-const aiRoleColumns = `id, tenant_id, name, description, speaking_style, goals, constraints_text, COALESCE(context_notes,''), COALESCE(custom_fields,'[]'::jsonb), rich_formatting_enabled, streaming_enabled, speak_as_owner, COALESCE(model_tier,'balanced')`
+// so every read returns the same fields, including both JSONB-backed settings.
+const aiRoleColumns = `id, tenant_id, name, description, speaking_style, goals, constraints_text, COALESCE(context_notes,''), COALESCE(custom_fields,'[]'::jsonb), rich_formatting_enabled, streaming_enabled, speak_as_owner, COALESCE(model_tier,'balanced'), COALESCE(tool_settings,'{}'::jsonb)`
 
 // rowScanner is satisfied by both *sql.Row and *sql.Rows.
 type rowScanner interface{ Scan(dest ...any) error }
 
-// scanAIRole reads one ai_roles row in aiRoleColumns order, decoding the
-// custom_fields jsonb into the typed slice.
+// scanAIRole reads one ai_roles row in aiRoleColumns order and decodes JSONB fields.
 func scanAIRole(s rowScanner) (AIRoleRecord, error) {
 	var role AIRoleRecord
 	var customFields []byte
+	var toolSettings []byte
 	var richFormatting sql.NullBool
 	var streaming sql.NullBool
 	if err := s.Scan(&role.ID, &role.TenantID, &role.Name, &role.Description,
 		&role.SpeakingStyle, &role.Goals, &role.Constraints, &role.Context, &customFields,
-		&richFormatting, &streaming, &role.SpeakAsOwner, &role.ModelTier); err != nil {
+		&richFormatting, &streaming, &role.SpeakAsOwner, &role.ModelTier, &toolSettings); err != nil {
 		return AIRoleRecord{}, err
 	}
 	role.CustomFields = decodeRoleCustomFields(customFields)
+	role.ToolSettings = decodeRoleToolSettings(toolSettings)
 	role.RichFormattingEnabled = boolPtrFromNull(richFormatting)
 	role.StreamingEnabled = boolPtrFromNull(streaming)
 	return role, nil
@@ -2357,6 +2362,44 @@ func encodeRoleCustomFields(fields []contracts.AIRoleCustomField) []byte {
 	return b
 }
 
+// decodeRoleToolSettings unmarshals tool overrides; malformed values degrade
+// to an empty map so every tool falls back to its catalog default.
+func decodeRoleToolSettings(raw []byte) map[string]bool {
+	out := make(map[string]bool)
+	if len(raw) == 0 {
+		return out
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return make(map[string]bool)
+	}
+	return out
+}
+
+// encodeRoleToolSettings stores explicit overrides as a JSON object.
+func encodeRoleToolSettings(settings map[string]bool) []byte {
+	if len(settings) == 0 {
+		return []byte("{}")
+	}
+	b, err := json.Marshal(settings)
+	if err != nil {
+		return []byte("{}")
+	}
+	return b
+}
+
+func cloneRoleToolSettings(settings map[string]bool) map[string]bool {
+	cloned := make(map[string]bool, len(settings))
+	for key, enabled := range settings {
+		cloned[key] = enabled
+	}
+	return cloned
+}
+
+func cloneAIRoleRecord(role AIRoleRecord) AIRoleRecord {
+	role.ToolSettings = cloneRoleToolSettings(role.ToolSettings)
+	return role
+}
+
 // AIRoles returns all roles defined by the tenant, ordered by name.
 func (r *Repository) AIRoles(tenantID string) []AIRoleRecord {
 	if r.db != nil {
@@ -2376,7 +2419,7 @@ func (r *Repository) AIRoles(tenantID string) []AIRoleRecord {
 	result := make([]AIRoleRecord, 0, len(r.aiRoles))
 	for _, role := range r.aiRoles {
 		if role.TenantID == tenantID {
-			result = append(result, role)
+			result = append(result, cloneAIRoleRecord(role))
 		}
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
@@ -2400,7 +2443,7 @@ func (r *Repository) AIRoleByName(tenantID, name string) (AIRoleRecord, bool) {
 	defer r.mu.Unlock()
 	for _, role := range r.aiRoles {
 		if role.TenantID == tenantID && strings.EqualFold(role.Name, name) {
-			return role, true
+			return cloneAIRoleRecord(role), true
 		}
 	}
 	return AIRoleRecord{}, false
@@ -2436,7 +2479,8 @@ func (r *Repository) AIRoleForChat(tenantID, chatID string) (AIRoleRecord, bool)
 		role, err := scanAIRole(r.db.QueryRow(
 			`SELECT ar.id, ar.tenant_id, ar.name, ar.description, ar.speaking_style, ar.goals,
 			        ar.constraints_text, COALESCE(ar.context_notes,''), COALESCE(ar.custom_fields,'[]'::jsonb),
-			        ar.rich_formatting_enabled, ar.streaming_enabled
+			        ar.rich_formatting_enabled, ar.streaming_enabled, ar.speak_as_owner,
+			        COALESCE(ar.model_tier,'balanced'), COALESCE(ar.tool_settings,'{}'::jsonb)
 			   FROM chat_settings cs
 			   JOIN ai_roles ar ON ar.id = cs.ai_role_id
 			  WHERE cs.tenant_id = $1 AND cs.chat_id = $2`,
@@ -2454,7 +2498,7 @@ func (r *Repository) AIRoleForChat(tenantID, chatID string) (AIRoleRecord, bool)
 		return AIRoleRecord{}, false
 	}
 	role, ok := r.aiRoles[roleID]
-	return role, ok
+	return cloneAIRoleRecord(role), ok
 }
 
 func scanAIRoles(rows *sql.Rows) []AIRoleRecord {
@@ -2486,7 +2530,7 @@ func (r *Repository) AIRoleByID(tenantID string, roleID int64) (AIRoleRecord, bo
 	if !ok || role.TenantID != tenantID {
 		return AIRoleRecord{}, false
 	}
-	return role, true
+	return cloneAIRoleRecord(role), true
 }
 
 // RoleMCPServers returns the enabled MCP servers a role may call, with each
@@ -2573,13 +2617,13 @@ func (r *Repository) UpdateAIRole(role AIRoleRecord) bool {
 			        goals = $6, constraints_text = $7, context_notes = $8,
 			        custom_fields = $9, rich_formatting_enabled = $10,
 			        streaming_enabled = $11, speak_as_owner = $12,
-			        model_tier = $13, updated_at = now()
+			        model_tier = $13, tool_settings = $14, updated_at = now()
 			  WHERE tenant_id = $1 AND id = $2`,
 			role.TenantID, role.ID, role.Name, role.Description,
 			role.SpeakingStyle, role.Goals, role.Constraints, role.Context,
 			encodeRoleCustomFields(role.CustomFields),
 			nullableBoolArg(role.RichFormattingEnabled), nullableBoolArg(role.StreamingEnabled),
-			role.SpeakAsOwner, role.ModelTier,
+			role.SpeakAsOwner, role.ModelTier, encodeRoleToolSettings(role.ToolSettings),
 		)
 		if err != nil {
 			r.logWriteError("update_ai_role", role.TenantID, "", err)
@@ -2594,7 +2638,34 @@ func (r *Repository) UpdateAIRole(role AIRoleRecord) bool {
 	if !ok || existing.TenantID != role.TenantID {
 		return false
 	}
-	r.aiRoles[role.ID] = role
+	r.aiRoles[role.ID] = cloneAIRoleRecord(role)
+	return true
+}
+
+// UpdateAIRoleToolSettings replaces only native-tool overrides for one role.
+func (r *Repository) UpdateAIRoleToolSettings(tenantID string, roleID int64, settings map[string]bool) bool {
+	settings = cloneRoleToolSettings(settings)
+	if r.db != nil {
+		res, err := r.db.Exec(
+			`UPDATE ai_roles SET tool_settings = $3, updated_at = now()
+			  WHERE tenant_id = $1 AND id = $2`,
+			tenantID, roleID, encodeRoleToolSettings(settings),
+		)
+		if err != nil {
+			r.logWriteError("update_ai_role_tools", tenantID, "", err)
+			return false
+		}
+		n, _ := res.RowsAffected()
+		return n > 0
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	role, ok := r.aiRoles[roleID]
+	if !ok || role.TenantID != tenantID {
+		return false
+	}
+	role.ToolSettings = settings
+	r.aiRoles[roleID] = role
 	return true
 }
 

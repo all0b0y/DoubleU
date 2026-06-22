@@ -104,10 +104,12 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/v1/chats/{chat_id}/avatar", s.tmaAuth(s.apiGetChatAvatar))
 
 	// AI roles (personas) — CRUD plus per-chat assignment.
+	s.mux.HandleFunc("GET /api/v1/tool-catalog", s.tmaAuth(s.apiToolCatalog))
 	s.mux.HandleFunc("GET /api/v1/roles", s.tmaAuth(s.apiRoles))
 	s.mux.HandleFunc("POST /api/v1/roles/draft", s.tmaAuth(s.apiDraftRole))
 	s.mux.HandleFunc("POST /api/v1/roles", s.tmaAuth(s.apiCreateRole))
 	s.mux.HandleFunc("PUT /api/v1/roles/{role_id}", s.tmaAuth(s.apiUpdateRole))
+	s.mux.HandleFunc("PUT /api/v1/roles/{role_id}/tools", s.tmaAuth(s.apiUpdateRoleTools))
 	s.mux.HandleFunc("DELETE /api/v1/roles/{role_id}", s.tmaAuth(s.apiDeleteRole))
 	s.mux.HandleFunc("PUT /api/v1/chats/{chat_id}/role", s.tmaAuth(s.apiAssignChatRole))
 

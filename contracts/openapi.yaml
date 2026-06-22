@@ -145,6 +145,14 @@ components:
             smart: highest capability, highest cost (MODEL_TIER_SMART).
             Absent or unrecognised value falls back to the task-level
             MODEL_DRAFT / OPENROUTER_MODEL (backward-compatible).
+        tool_settings:
+          type: object
+          additionalProperties:
+            type: boolean
+          default: {}
+          description: >
+            Per-role native-tool overrides keyed by catalog key. Missing keys
+            inherit the tool catalog's default_enabled value.
         context:
           type: string
           description: >

@@ -48,6 +48,9 @@ type roleJSON struct {
 	SpeakAsOwner bool `json:"speak_as_owner"`
 	// ModelTier selects the LLM quality tier: "fast", "balanced" (default), or "smart".
 	ModelTier string `json:"model_tier,omitempty"`
+	// ToolSettings contains explicit per-role overrides; absent keys inherit
+	// defaults from the catalog returned by /api/v1/tool-catalog.
+	ToolSettings map[string]bool `json:"tool_settings"`
 }
 
 func roleToJSON(role store.AIRoleRecord) roleJSON {
@@ -56,6 +59,7 @@ func roleToJSON(role store.AIRoleRecord) roleJSON {
 		// Always emit an array so the Mini App can iterate without a nil guard.
 		fields = []contracts.AIRoleCustomField{}
 	}
+	toolSettings := cloneToolSettings(role.ToolSettings)
 	return roleJSON{
 		ID:                    role.ID,
 		Name:                  role.Name,
@@ -69,6 +73,7 @@ func roleToJSON(role store.AIRoleRecord) roleJSON {
 		StreamingEnabled:      cloneBoolPtr(role.StreamingEnabled),
 		SpeakAsOwner:          role.SpeakAsOwner,
 		ModelTier:             role.ModelTier,
+		ToolSettings:          toolSettings,
 	}
 }
 
@@ -90,6 +95,9 @@ type roleRequest struct {
 	// ModelTier selects the LLM quality tier: "fast", "balanced", or "smart".
 	// Absent means keep the existing value (update) or "balanced" (create).
 	ModelTier *string `json:"model_tier"`
+	// ToolSettings is a pointer so legacy updates that omit it preserve the
+	// role's existing overrides. An explicit empty object resets to defaults.
+	ToolSettings *map[string]bool `json:"tool_settings"`
 }
 
 func (req *roleRequest) normalize() {
@@ -126,6 +134,11 @@ func (req *roleRequest) validate() string {
 	if len([]rune(req.Context)) > roleContextMaxRunes {
 		return "context is too long (max 20000 characters)"
 	}
+	if req.ToolSettings != nil {
+		if msg := validateToolSettings(*req.ToolSettings); msg != "" {
+			return msg
+		}
+	}
 	for _, f := range req.CustomFields {
 		// Each custom field needs a title and a "why it exists" description;
 		// context is optional. Mirrors the Mini App role-edit form rules.
@@ -142,6 +155,30 @@ func (req *roleRequest) validate() string {
 	return ""
 }
 
+func validateToolSettings(settings map[string]bool) string {
+	for key := range settings {
+		if !contracts.IsKnownToolKey(key) {
+			return "unknown tool key: " + key
+		}
+	}
+	return ""
+}
+
+func cloneToolSettings(settings map[string]bool) map[string]bool {
+	cloned := make(map[string]bool, len(settings))
+	for key, enabled := range settings {
+		cloned[key] = enabled
+	}
+	return cloned
+}
+
+func toolSettingsOrDefault(settings *map[string]bool, fallback map[string]bool) map[string]bool {
+	if settings == nil {
+		return cloneToolSettings(fallback)
+	}
+	return cloneToolSettings(*settings)
+}
+
 func (s *Server) apiRoles(w http.ResponseWriter, r *http.Request) {
 	tenantID := tenantFromContext(r.Context())
 	roles := s.service.Repository().AIRoles(tenantID)
@@ -150,6 +187,11 @@ func (s *Server) apiRoles(w http.ResponseWriter, r *http.Request) {
 		items = append(items, roleToJSON(role))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"roles": items})
+}
+
+// apiToolCatalog returns owner-visible metadata for every native AI tool.
+func (s *Server) apiToolCatalog(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"tools": contracts.ToolCatalog()})
 }
 
 type roleDraftRequest struct {
@@ -296,6 +338,7 @@ func (s *Server) apiCreateRole(w http.ResponseWriter, r *http.Request) {
 		StreamingEnabled:      req.StreamingEnabled.Apply(nil),
 		SpeakAsOwner:          boolOrDefault(req.SpeakAsOwner, true),
 		ModelTier:             stringOrDefault(req.ModelTier, "balanced"),
+		ToolSettings:          toolSettingsOrDefault(req.ToolSettings, nil),
 	})
 	if role.ID == 0 {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to save role"})
@@ -346,12 +389,51 @@ func (s *Server) apiUpdateRole(w http.ResponseWriter, r *http.Request) {
 		StreamingEnabled:      req.StreamingEnabled.Apply(existing.StreamingEnabled),
 		SpeakAsOwner:          boolOrDefault(req.SpeakAsOwner, existing.SpeakAsOwner),
 		ModelTier:             stringOrDefault(req.ModelTier, existing.ModelTier),
+		ToolSettings:          toolSettingsOrDefault(req.ToolSettings, existing.ToolSettings),
 	}
 	if !s.service.Repository().UpdateAIRole(role) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to update role"})
 		return
 	}
 	writeJSON(w, http.StatusOK, roleToJSON(role))
+}
+
+type roleToolsRequest struct {
+	ToolSettings *map[string]bool `json:"tool_settings"`
+}
+
+// apiUpdateRoleTools updates only native-tool overrides for an existing role.
+func (s *Server) apiUpdateRoleTools(w http.ResponseWriter, r *http.Request) {
+	tenantID := tenantFromContext(r.Context())
+	roleID, err := strconv.ParseInt(r.PathValue("role_id"), 10, 64)
+	if err != nil || roleID == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid role_id"})
+		return
+	}
+	defer r.Body.Close()
+	var req roleToolsRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	if req.ToolSettings == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "tool_settings is required"})
+		return
+	}
+	if msg := validateToolSettings(*req.ToolSettings); msg != "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": msg})
+		return
+	}
+	if _, ok := s.service.Repository().AIRoleByID(tenantID, roleID); !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "role not found"})
+		return
+	}
+	settings := cloneToolSettings(*req.ToolSettings)
+	if !s.service.Repository().UpdateAIRoleToolSettings(tenantID, roleID, settings) {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to update role tools"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"tool_settings": settings})
 }
 
 func (s *Server) apiDeleteRole(w http.ResponseWriter, r *http.Request) {

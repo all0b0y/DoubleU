@@ -48,6 +48,10 @@ export const api = {
   createRole:     (data)          => request('POST',   '/api/v1/roles', data),
   updateRole:     (roleId, data)  => request('PUT',    `/api/v1/roles/${roleId}`, data),
   deleteRole:     (roleId)        => request('DELETE', `/api/v1/roles/${roleId}`),
+  toolCatalog:    ()              => request('GET',    '/api/v1/tool-catalog'),
+  saveRoleTools:  (roleId, toolSettings) => request(
+    'PUT', `/api/v1/roles/${roleId}/tools`, { tool_settings: toolSettings },
+  ),
   assignRole:     (chatId, roleId) => request('PUT',   `/api/v1/chats/${chatId}/role`, { role_id: roleId }),
 
   // AI profile suggestions

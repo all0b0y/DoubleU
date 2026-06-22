@@ -18,9 +18,10 @@ from ai_agent.contract_enums import (
     LLMPurpose,
     PrivacyFlag,
     RiskLevel,
+    ToolCategory,
 )
 
-__all__ = ["ChatMode", "Decision", "LLMPurpose", "PrivacyFlag", "RiskLevel"]
+__all__ = ["ChatMode", "Decision", "LLMPurpose", "PrivacyFlag", "RiskLevel", "ToolCategory"]
 
 
 class ModelTask(str, Enum):
@@ -178,6 +179,8 @@ class AIRoleData(JsonDataclass):
     # "fast", "balanced" (default), or "smart".  Empty / unrecognised value
     # degrades to the DRAFT task model (MODEL_DRAFT / OPENROUTER_MODEL).
     model_tier: str = "balanced"
+    # Per-role native-tool overrides; absent keys inherit catalog defaults.
+    tool_settings: dict[str, bool] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -767,6 +770,12 @@ def _parse_ai_role(raw: Any) -> AIRoleData | None:
     # "balanced" so existing roles without the field keep working.
     raw_tier = str(raw.get("model_tier", "")).strip().lower()
     model_tier = raw_tier if raw_tier in {"fast", "balanced", "smart"} else "balanced"
+    raw_tool_settings = raw.get("tool_settings")
+    tool_settings = (
+        {str(key): value for key, value in raw_tool_settings.items() if isinstance(value, bool)}
+        if isinstance(raw_tool_settings, dict)
+        else {}
+    )
     return AIRoleData(
         name=name,
         description=str(raw.get("description", "")).strip(),
@@ -778,6 +787,7 @@ def _parse_ai_role(raw: Any) -> AIRoleData | None:
         mcp_servers=_parse_mcp_servers(raw.get("mcp_servers")),
         speak_as_owner=speak_as_owner,
         model_tier=model_tier,
+        tool_settings=tool_settings,
     )
 
 

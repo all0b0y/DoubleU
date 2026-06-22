@@ -55,7 +55,8 @@ export function renderRoleEdit(navigate, roleId) {
     <div class="scroll" id="re-scroll">
       <div class="loading-row"><div class="spinner"></div></div>
     </div>
-    <div style="padding:12px 16px calc(12px + var(--inset-bottom,0px));flex-shrink:0;">
+    <div style="padding:12px 16px calc(12px + var(--inset-bottom,0px));flex-shrink:0;display:flex;gap:8px;">
+      <button id="btn-tools" class="btn btn-secondary">Инструменты</button>
       <button id="btn-save" class="btn btn-primary">${isNew ? 'Создать роль' : 'Сохранить'}</button>
     </div>
   `;
@@ -493,13 +494,13 @@ export function renderRoleEdit(navigate, roleId) {
     });
   }
 
-  el.querySelector('#btn-save').addEventListener('click', async () => {
+  function collectRoleData() {
     collectCustomFields();
     // Keep only fields the user actually filled, and require title + why on each.
     const cleaned = customFields
       .map(f => ({ title: f.title.trim(), description: f.description.trim(), context: f.context.trim() }))
       .filter(f => f.title || f.description || f.context);
-    const data = {
+    return {
       name:           el.querySelector('#f-name')?.value.trim() || '',
       description:    el.querySelector('#f-desc')?.value.trim() || '',
       speaking_style: el.querySelector('#f-style')?.value.trim() || '',
@@ -511,41 +512,71 @@ export function renderRoleEdit(navigate, roleId) {
       streaming_enabled:       modeToNullableBool(el.querySelector('#f-streaming')?.value),
       speak_as_owner:  el.querySelector('#f-speak-as-owner')?.checked ?? true,
     };
+  }
+
+  function validateRoleData(data, openingTools) {
+    const badField = data.custom_fields.find(f => !f.title || !f.description);
+    if (openingTools && (!data.name || !data.description || badField)) {
+      twa?.HapticFeedback?.notificationOccurred('error');
+      twa?.showAlert('сначала заполните имя и описание и сохраните роль');
+      return false;
+    }
     if (!data.name) {
       twa?.HapticFeedback?.notificationOccurred('error');
       twa?.showAlert('Укажи имя роли.');
-      return;
+      return false;
     }
     if (!data.description) {
       twa?.HapticFeedback?.notificationOccurred('error');
       twa?.showAlert('Опиши, кто эта роль — это главный материал для ИИ.');
-      return;
+      return false;
     }
-    const badField = cleaned.find(f => !f.title || !f.description);
     if (badField) {
       twa?.HapticFeedback?.notificationOccurred('error');
       twa?.showAlert('У каждого доп. поля должны быть заголовок и описание (зачем оно).');
-      return;
+      return false;
     }
-    const btn = el.querySelector('#btn-save');
-    btn.textContent = '…'; btn.disabled = true;
+    return true;
+  }
+
+  async function saveRole(openingTools) {
+    const data = collectRoleData();
+    if (!validateRoleData(data, openingTools)) return;
+    const saveBtn = el.querySelector('#btn-save');
+    const toolsBtn = el.querySelector('#btn-tools');
+    const activeBtn = openingTools ? toolsBtn : saveBtn;
+    activeBtn.textContent = '…';
+    saveBtn.disabled = true;
+    toolsBtn.disabled = true;
     try {
+      let saved;
       if (isNew) {
-        await api.createRole(data);
-        twa?.HapticFeedback?.notificationOccurred('success');
-        // Return to the full roles list after creating.
-        navigate('/roles');
+        saved = await api.createRole(data);
       } else {
-        await api.updateRole(roleId, data);
-        twa?.HapticFeedback?.notificationOccurred('success');
-        navigate('/roles');
+        saved = await api.updateRole(roleId, data);
       }
+      twa?.HapticFeedback?.notificationOccurred('success');
+      navigate(openingTools ? `/roles/${saved.id || roleId}/tools` : '/roles');
     } catch (err) {
       twa?.HapticFeedback?.notificationOccurred('error');
       twa?.showAlert(`Ошибка: ${err.message}`);
-      btn.textContent = isNew ? 'Создать роль' : 'Сохранить';
-      btn.disabled = false;
+      saveBtn.textContent = isNew ? 'Создать роль' : 'Сохранить';
+      toolsBtn.textContent = 'Инструменты';
+      saveBtn.disabled = false;
+      toolsBtn.disabled = false;
     }
+  }
+
+  el.querySelector('#btn-save').addEventListener('click', async () => {
+    await saveRole(false);
+  });
+
+  el.querySelector('#btn-tools').addEventListener('click', async () => {
+    if (isNew) {
+      await saveRole(true);
+      return;
+    }
+    navigate(`/roles/${roleId}/tools`);
   });
 
   async function load() {

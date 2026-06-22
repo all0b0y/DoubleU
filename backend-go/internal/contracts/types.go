@@ -22,6 +22,20 @@ func (d Decision) IsValid() bool {
 	}
 }
 
+// ToolCategory groups native tools by their execution and visibility semantics.
+// Allowed values are generated from contracts/contracts.json — see contract_enums.gen.go.
+type ToolCategory string
+
+// IsValid reports whether the category is part of the frozen contract.
+func (c ToolCategory) IsValid() bool {
+	switch c {
+	case ToolCategoryRead, ToolCategorySchedule, ToolCategoryIntegration, ToolCategoryInteraction:
+		return true
+	default:
+		return false
+	}
+}
+
 // ChatMode controls the autonomy level for one tenant/chat pair.
 // Allowed values are generated from contracts/contracts.json — see contract_enums.gen.go.
 type ChatMode string
@@ -428,6 +442,9 @@ type AIRole struct {
 	// Empty string means fall back to the DRAFT task model (MODEL_DRAFT /
 	// OPENROUTER_MODEL), preserving backward compatibility with existing roles.
 	ModelTier string `json:"model_tier,omitempty"`
+	// ToolSettings contains per-role native-tool overrides. Missing keys inherit
+	// the corresponding catalog entry's DefaultEnabled value.
+	ToolSettings map[string]bool `json:"tool_settings,omitempty"`
 }
 
 // MCPServerSpec is one MCP server a role may call, with its per-role tool

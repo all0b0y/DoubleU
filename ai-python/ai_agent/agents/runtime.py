@@ -34,6 +34,7 @@ from typing import Awaitable, Callable, Sequence, TypeVar
 
 import asyncpg
 from pydantic_ai import Agent, RunContext, UsageLimits
+from pydantic_ai.toolsets import FilteredToolset
 
 from ..classifiers import TypedMemoryExtractor
 from ..observability.context import LLMCallContext, current_context
@@ -71,6 +72,7 @@ from ..security import PromptBuilder
 from .deps import AgentDeps
 from .memory_tools import memory_toolset
 from .models import AgentTask, ModelTier, build_model, build_tier_model, model_name_for
+from .tool_catalog import TOOL_CATALOG, TOOL_NAME_TO_KEY
 from .results import (
     CriticVerdict,
     DraftResult,
@@ -88,6 +90,24 @@ T = TypeVar("T")
 
 # Async query-embedding callable shape expected by AgentDeps.embedder.
 EmbedderCallable = Callable[[str], Awaitable[Sequence[float] | None]]
+
+
+def resolve_builtin_toolset(ai_role: AIRoleData | None) -> FilteredToolset[AgentDeps]:
+    """Scope native tools to role overrides while preserving catalog defaults."""
+    settings = ai_role.tool_settings if ai_role is not None else {}
+    enabled_keys = {
+        entry.key
+        for entry in TOOL_CATALOG
+        if settings.get(entry.key, entry.default_enabled)
+    }
+    enabled_names = frozenset(
+        name for name, key in TOOL_NAME_TO_KEY.items() if key in enabled_keys
+    )
+    return FilteredToolset(
+        memory_toolset,
+        lambda ctx, tool_def, enabled_names=enabled_names: tool_def.name in enabled_names,
+    )
+
 
 # A draft is reviewed by the critic when risk is elevated or the draft's own
 # confidence is below this bar; low-risk confident drafts skip the extra call.
@@ -247,7 +267,6 @@ class AgentRuntime:
             draft_model or build_model(AgentTask.DRAFT),
             deps_type=AgentDeps,
             output_type=DraftResult,
-            toolsets=[memory_toolset],
             retries=1,
         )
 
@@ -530,6 +549,7 @@ class AgentRuntime:
             pool=await self._get_pool(),
         )
         mcp_toolsets = self._resolve_mcp_toolsets(request.ai_role, privacy_flags)
+        builtin_toolset = resolve_builtin_toolset(request.ai_role)
         # Per-role tier override: build a tier-specific model when the role
         # declares one and the env list is configured; otherwise fall back to
         # the DRAFT task model.  The agent is not recreated — only the
@@ -542,7 +562,7 @@ class AgentRuntime:
         run_kwargs: dict = dict(
             deps=deps,
             usage_limits=UsageLimits(tool_calls_limit=_DRAFT_TOOL_CALLS_LIMIT),
-            toolsets=mcp_toolsets,
+            toolsets=[builtin_toolset, *mcp_toolsets],
         )
         if tier_model is not None:
             run_kwargs["model"] = tier_model

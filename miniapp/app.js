@@ -7,6 +7,7 @@ import { renderAddChat }   from '/miniapp/screens/add-chat.js';
 import { renderProfile }   from '/miniapp/screens/profile.js';
 import { renderRoles }     from '/miniapp/screens/roles.js';
 import { renderRoleEdit }  from '/miniapp/screens/role-edit.js';
+import { renderRoleTools } from '/miniapp/screens/role-tools.js';
 import { renderMe }        from '/miniapp/screens/me.js';
 import { renderAddBot, renderBotSettings } from '/miniapp/screens/add-bot.js';
 import { brandify }        from '/miniapp/components/glyphs.js';
@@ -76,6 +77,7 @@ const routes = {
   // '/roles/new' must precede '/roles/:id' — the router matches in order.
   '/roles':               () => renderRoles(navigate),
   '/roles/new':           () => renderRoleEdit(navigate, null),
+  '/roles/:id/tools':     (p) => renderRoleTools(navigate, p.id),
   '/roles/:id':           (p) => renderRoleEdit(navigate, p.id),
   '/me':                  () => renderMe(navigate),
 };
