@@ -57,6 +57,18 @@ class ResponsePlanData(JsonDataclass):
 
 
 @dataclass(frozen=True)
+class ScheduledJobData(JsonDataclass):
+    """Deferred scheduler job produced by an AI tool and persisted by Go."""
+
+    kind: str
+    target: str
+    fire_at: str
+    payload: dict[str, Any]
+    idempotency_key: str
+    created_by: str = "ai"
+
+
+@dataclass(frozen=True)
 class NormalizedTelegramEvent(JsonDataclass):
     """Normalized Telegram message event from the Go backend."""
 
@@ -250,6 +262,9 @@ class AIProcessMessageResponse(JsonDataclass):
     # Present only when options are a contact-facing interaction form rather
     # than the existing owner-facing choice-question card.
     response_plan: ResponsePlanData | None = None
+    # Deferred scheduler jobs validated by Python tools; Go persists them
+    # through its repository so Python remains stateless in AI_MEMORY_SOURCE=go.
+    scheduled_jobs: tuple[ScheduledJobData, ...] = field(default_factory=tuple)
     # 3-7 word conversation topic produced by the same draft call; replaces the
     # separate /ai/tag-topic call in the hot path (ARCH-4).
     topic: str = ""

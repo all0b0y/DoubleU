@@ -33,6 +33,7 @@ from ..schemas import (
     PrivacyFlag,
     ResponsePlanData,
     RiskLevel,
+    ScheduledJobData,
     Usage,
     UserSettingsData,
 )
@@ -85,6 +86,7 @@ class DraftOutcome:
     text_format: TextFormat = "plain"
     options: tuple[str, ...] = field(default_factory=tuple)
     response_plan: ResponsePlanData | None = None
+    scheduled_jobs: tuple[ScheduledJobData, ...] = field(default_factory=tuple)
     confidence: float | None = None
     topic: str = ""
 
@@ -148,6 +150,8 @@ def build_draft_prompt(
     )
     if _scheduler_available(request):
         base_instruction += "\n\n" + _current_time_instruction(request, current_time)
+    if orchestrator_bundle is None and _interaction_available(request):
+        base_instruction += "\n\n" + _interaction_instruction()
     prompt_context = list(clean_memory)
     if orchestrator_bundle is not None:
         bundle = "\n".join(orchestrator_bundle) or "Инструменты не вернули дополнительного контекста."
@@ -195,6 +199,20 @@ def _scheduler_available(request: AIProcessMessageRequest) -> bool:
     return request.ai_role.tool_settings.get("scheduler.create_reminder", False)
 
 
+def _interaction_available(request: AIProcessMessageRequest) -> bool:
+    if request.ai_role is None:
+        return False
+    return request.ai_role.tool_settings.get("interaction.present_buttons", False)
+
+
+def _interaction_instruction() -> str:
+    return (
+        "ИНСТРУМЕНТ КНОПОК: у тебя есть инструмент present_buttons(prompt, options[2..4]). "
+        "Вызывай его, когда выбор из вариантов уместнее обычного текста. "
+        "Не описывай кнопки словами — вызывай инструмент."
+    )
+
+
 def _current_time_instruction(
     request: AIProcessMessageRequest, current_time: datetime | None
 ) -> str:
@@ -212,7 +230,13 @@ def _current_time_instruction(
     return (
         "ТЕКУЩЕЕ ВРЕМЯ ВЛАДЕЛЬЦА: "
         f"{local_now.isoformat()} ({timezone_name}); UTC: {now_utc.isoformat()}. "
-        "Для scheduler.create_reminder вычисляй абсолютный fire_at_iso с часовым поясом."
+        "Голое время в сообщении («в 9», «напомни в 18:30», без даты и пояса) — это локальное "
+        "время ВЛАДЕЛЬЦА в указанном поясе; никогда не интерпретируй его как UTC и не как пояс "
+        "собеседника. Если названный момент сегодня по локальному времени владельца уже прошёл, "
+        "переноси напоминание на ближайшее будущее наступление (как правило, на следующий день); "
+        "если перенос неоднозначен, сначала задай уточняющий вопрос вместо вызова инструмента. "
+        "Для scheduler.create_reminder вычисляй fire_at_iso как абсолютную метку времени со "
+        "смещением (offset), а не голое локальное время."
     )
 
 

@@ -11,6 +11,11 @@
 # llm-guard==0.3.*
 # langfuse==2.*
 
+# zoneinfo falls back to this when the OS ships no IANA tz database (true of
+# the python:3.12-alpine runtime image) — required for per-owner timezone math
+# in the scheduler prompt (_current_time_instruction).
+tzdata
+
 pydantic==2.*
 # [mcp] adds the `mcp` package so the draft agent can attach per-role MCP
 # toolsets (HTTP/SSE) at request time (#7); degrades to memory-only when absent.

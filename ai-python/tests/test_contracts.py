@@ -15,6 +15,7 @@ from ai_agent.schemas import (
     PrivacyFlag,
     ResponsePlanData,
     RiskLevel,
+    ScheduledJobData,
     Usage,
 )
 
@@ -87,6 +88,32 @@ class ContractEnumTests(unittest.TestCase):
         self.assertEqual(response.to_dict()["response_plan"], {
             "shape": "buttons", "options": ["Сегодня", "Завтра"]
         })
+
+    def test_scheduled_jobs_serialize_for_go_persistence(self) -> None:
+        response = AIProcessMessageResponse(
+            decision=Decision.DRAFT,
+            response_text="Напоминание поставлено",
+            confidence=0.9,
+            risk_level=RiskLevel.LOW,
+            intent="scheduling",
+            model_used="test",
+            usage=Usage(),
+            scheduled_jobs=(ScheduledJobData(
+                kind="reminder",
+                target="owner",
+                fire_at="2026-06-22T15:00:00+00:00",
+                payload={"text": "Позвонить клиенту"},
+                idempotency_key="scheduler:key",
+            ),),
+        )
+        self.assertEqual(response.to_dict()["scheduled_jobs"], [{
+            "kind": "reminder",
+            "target": "owner",
+            "fire_at": "2026-06-22T15:00:00+00:00",
+            "payload": {"text": "Позвонить клиенту"},
+            "idempotency_key": "scheduler:key",
+            "created_by": "ai",
+        }])
 
 
 class GeneratedEnumsMatchContractJSONTests(unittest.TestCase):

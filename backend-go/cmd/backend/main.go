@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	_ "time/tzdata" // embed the IANA zone database — the alpine runtime image ships none
 
 	"doubleu/backend-go/internal/aiclient"
 	"doubleu/backend-go/internal/botservice"

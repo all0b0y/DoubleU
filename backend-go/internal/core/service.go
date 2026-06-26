@@ -107,14 +107,14 @@ func (DecisionEngine) Decide(settings contracts.ChatSettings, proposal contracts
 
 // Service coordinates Telegram inbound handling, AI calls, audit, and approvals.
 type Service struct {
-	repository *store.Repository
-	ai         aiclient.Client
-	sender     telegram.Sender
-	botLayer   *bot.Layer
-	engine     DecisionEngine
-	logger     *slog.Logger
-	now        func() time.Time
-	debounce   sync.Map      // map[chatKey]string — latest event_id per chat for typing-delay debounce
+	repository       *store.Repository
+	ai               aiclient.Client
+	sender           telegram.Sender
+	botLayer         *bot.Layer
+	engine           DecisionEngine
+	logger           *slog.Logger
+	now              func() time.Time
+	debounce         sync.Map      // map[chatKey]string — latest event_id per chat for typing-delay debounce
 	replyDelay       time.Duration // wait before calling AI (lets users finish sending multi-message bursts)
 	streamFramePause time.Duration // pause between rich draft preview frames; 0 = no pause (tests)
 	// notify pushes real-time events to connected Mini App clients.
@@ -956,6 +956,68 @@ func (s *Service) pythonOwnsMemory() bool {
 	return s.aiMemorySource == "python"
 }
 
+func (s *Service) saveAIScheduledJobs(event contracts.NormalizedTelegramEvent, settings contracts.ChatSettings, jobs []contracts.ScheduledJob) error {
+	if len(jobs) == 0 {
+		return nil
+	}
+	settings = settings.WithDefaults()
+	if settings.PrivacyFlags.Contains(contracts.PrivacyNoMemory) ||
+		settings.PrivacyFlags.Contains(contracts.PrivacyPrivate) {
+		return fmt.Errorf("chat privacy blocks AI-created scheduled job")
+	}
+	now := s.now()
+	for _, job := range jobs {
+		payload := make(map[string]any, len(job.Payload))
+		for key, value := range job.Payload {
+			payload[key] = value
+		}
+		text, ok := payload["text"].(string)
+		if !ok || strings.TrimSpace(text) == "" {
+			return fmt.Errorf("scheduled job payload text is empty")
+		}
+		payload["text"] = strings.TrimSpace(text)
+		createdBy := strings.TrimSpace(job.CreatedBy)
+		if createdBy == "" {
+			createdBy = "ai"
+		}
+		if createdBy != "ai" {
+			return fmt.Errorf("invalid AI scheduled job creator %q", job.CreatedBy)
+		}
+		fireAt := job.FireAt.UTC()
+		if !fireAt.After(now) {
+			return fmt.Errorf("scheduled job fire_at must be in the future")
+		}
+		if fireAt.After(now.Add(365 * 24 * time.Hour)) {
+			return fmt.Errorf("scheduled job fire_at must be no more than 1 year in the future")
+		}
+		botID := event.BotID
+		if botID == "" {
+			if parsed, _, botChat := contracts.ParseBotChatID(event.ChatID); botChat {
+				botID = parsed
+			}
+		}
+		if _, err := s.repository.InsertScheduledJob(store.ScheduledJobRecord{
+			TenantID:       event.TenantID,
+			ChatID:         event.ChatID,
+			BotID:          botID,
+			Kind:           strings.TrimSpace(job.Kind),
+			Target:         strings.TrimSpace(job.Target),
+			FireAt:         fireAt,
+			Payload:        payload,
+			CreatedBy:      createdBy,
+			IdempotencyKey: strings.TrimSpace(job.IdempotencyKey),
+		}); err != nil {
+			return err
+		}
+	}
+	s.logger.Info("scheduled jobs persisted from AI response",
+		"tenant_id", event.TenantID,
+		"chat_id", event.ChatID,
+		"count", len(jobs),
+	)
+	return nil
+}
+
 // ingestionModeFor resolves the tenant's effective ingestion mode
 // (explicit per-tenant selection or the configured default).
 func (s *Service) ingestionModeFor(tenantID string) contracts.IngestionMode {
@@ -1174,10 +1236,10 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 	}
 	memoryContext, recentRecords := s.conversationContextAndMessages(ctx, event, ownerID, 20)
 	request := contracts.AIProcessMessageRequest{
-		RequestID:    event.EventID,
-		TraceID:      tracepkg.DeriveTraceID(event.EventID),
-		Event:        event,
-		ChatSettings: effectiveSettings,
+		RequestID:     event.EventID,
+		TraceID:       tracepkg.DeriveTraceID(event.EventID),
+		Event:         event,
+		ChatSettings:  effectiveSettings,
 		MemoryContext: memoryContext,
 	}
 	if personaSpeaksAsOwner(aiRole) {
@@ -1244,6 +1306,13 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 		return InboundResult{Event: event, Decision: contracts.DecisionErrorFallback, Reason: "ai_process_error"}, nil
 	}
 	s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateAIGenerated)
+	if err := s.saveAIScheduledJobs(event, settings, proposal.ScheduledJobs); err != nil {
+		s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateFailed)
+		s.repository.AppendAudit(s.auditEvent(event, contracts.DecisionErrorFallback, "scheduled_job_persist_error:"+err.Error()))
+		s.logger.Error("scheduled job persistence failed", "tenant_id", event.TenantID, "chat_id", event.ChatID, "error", err)
+		s.notifyAIError(event)
+		return InboundResult{Event: event, Decision: contracts.DecisionErrorFallback, Reason: "scheduled_job_persist_error"}, nil
+	}
 	// Persist fast (regex) facts returned by process-message synchronously.
 	// LLM-based extraction is fired asynchronously below, after the draft is dispatched,
 	// so it never adds latency to the reply path (see backlog §7.1).
@@ -1884,6 +1953,7 @@ func (s *Service) aiRoleFor(tenantID, chatID string) *contracts.AIRole {
 		MCPServers:    s.repository.RoleMCPServers(role.ID),
 		SpeakAsOwner:  role.SpeakAsOwner,
 		ModelTier:     role.ModelTier,
+		ModelName:     role.ModelName,
 		ToolSettings:  role.ToolSettings,
 	}
 }
@@ -2811,10 +2881,10 @@ func (s *Service) regenerateDraftWithHint(ctx context.Context, draft store.Draft
 		"[OWNER INSTRUCTION] "+hint,
 	)
 	hintRequest := contracts.AIProcessMessageRequest{
-		RequestID:    draft.DecisionID + ":hint",
-		TraceID:      tracepkg.DeriveTraceID(event.EventID),
-		Event:        event,
-		ChatSettings: settings,
+		RequestID:     draft.DecisionID + ":hint",
+		TraceID:       tracepkg.DeriveTraceID(event.EventID),
+		Event:         event,
+		ChatSettings:  settings,
 		MemoryContext: hintContext,
 	}
 	if profile, ok := s.repository.ContactProfile(draft.TenantID, draft.ChatID); ok {
@@ -4296,9 +4366,8 @@ func (s *Service) runSchedulerOnce(ctx context.Context) {
 
 func (s *Service) dispatchScheduledJob(ctx context.Context, job store.ScheduledJobRecord) error {
 	settings := s.repository.ChatSettings(job.TenantID, job.ChatID).WithDefaults()
-	if job.CreatedBy == "ai" && (
-		settings.PrivacyFlags.Contains(contracts.PrivacyNoMemory) ||
-			settings.PrivacyFlags.Contains(contracts.PrivacyPrivate)) {
+	if job.CreatedBy == "ai" && (settings.PrivacyFlags.Contains(contracts.PrivacyNoMemory) ||
+		settings.PrivacyFlags.Contains(contracts.PrivacyPrivate)) {
 		return fmt.Errorf("chat privacy blocks AI-created scheduled job")
 	}
 	text, _ := job.Payload["text"].(string)
@@ -4361,6 +4430,10 @@ func (s *Service) scheduledJobEvent(job store.ScheduledJobRecord, text string) (
 			botID = parsed
 		}
 	}
+	transport := chat.Transport
+	if transport == "" && botID != "" {
+		transport = contracts.TransportBot
+	}
 	return contracts.NormalizedTelegramEvent{
 		EventID:              fmt.Sprintf("scheduled-job:%d", job.ID),
 		TenantID:             job.TenantID,
@@ -4374,30 +4447,49 @@ func (s *Service) scheduledJobEvent(job store.ScheduledJobRecord, text string) (
 		MessageText:          text,
 		MessageType:          "scheduled",
 		CreatedAt:            s.now(),
-		Transport:            chat.Transport,
+		Transport:            transport,
 		BotID:                botID,
 	}, nil
 }
 
 func (s *Service) sendScheduledOwnerNotification(ctx context.Context, event contracts.NormalizedTelegramEvent, job store.ScheduledJobRecord, text string) error {
-	ownerChatID := s.ownerChatIDForEvent(event)
-	if ownerChatID == "" {
-		return fmt.Errorf("owner chat not found")
+	sender, chatID, err := s.scheduledOwnerNotificationRoute(event)
+	if err != nil {
+		return err
 	}
 	decisionID := fmt.Sprintf("scheduled-owner:%d", job.ID)
 	if s.repository.MarkSend(store.SendRecord{
-		Key: contracts.SendIdempotencyKey(job.TenantID, job.ChatID, event.SourceMessageID, decisionID),
+		Key:      contracts.SendIdempotencyKey(job.TenantID, job.ChatID, event.SourceMessageID, decisionID),
 		TenantID: job.TenantID, ChatID: job.ChatID, SourceMessageID: event.SourceMessageID,
 		DecisionID: decisionID, Text: text, CreatedAt: s.now(),
 	}) {
 		return nil
 	}
-	_, err := sendMessage(ctx, s.sender, telegram.OutboundMessage{
-		TenantID: job.TenantID, ChatID: ownerChatID,
+	_, err = sendMessage(ctx, sender, telegram.OutboundMessage{
+		TenantID: job.TenantID, ChatID: chatID,
 		SourceMessageID: event.SourceMessageID, DecisionID: decisionID,
 		Text: "⏰ " + text,
 	})
 	return err
+}
+
+func (s *Service) scheduledOwnerNotificationRoute(event contracts.NormalizedTelegramEvent) (telegram.Sender, string, error) {
+	if event.Transport == contracts.TransportBot {
+		sender, err := s.recipientSender(event)
+		if err != nil {
+			return nil, "", err
+		}
+		chatID := contracts.RawChatID(event.ChatID)
+		if strings.TrimSpace(chatID) == "" {
+			return nil, "", fmt.Errorf("scheduled bot chat not found")
+		}
+		return sender, chatID, nil
+	}
+	ownerChatID := s.ownerChatIDForEvent(event)
+	if ownerChatID == "" {
+		return nil, "", fmt.Errorf("owner chat not found")
+	}
+	return s.sender, ownerChatID, nil
 }
 
 func (s *Service) createScheduledDraft(ctx context.Context, event contracts.NormalizedTelegramEvent, job store.ScheduledJobRecord, text string) error {

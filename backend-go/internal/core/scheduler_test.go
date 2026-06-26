@@ -36,6 +36,53 @@ func TestSchedulerWorkerMarksOwnerReminderSentOnce(t *testing.T) {
 	}
 }
 
+func TestSchedulerOwnerReminderInBotChatUsesOriginalBot(t *testing.T) {
+	now := time.Date(2026, 6, 22, 12, 0, 0, 0, time.UTC)
+	repo := store.NewRepository()
+	botChatID := contracts.BotChatID("555", "42")
+	repo.SaveChat(store.ChatRecord{
+		TenantID: "tenant:user:77", ChatID: botChatID, DisplayName: "Контакт",
+		Transport: contracts.TransportBot,
+	})
+	job, err := repo.InsertScheduledJob(store.ScheduledJobRecord{
+		TenantID: "tenant:user:77", ChatID: botChatID, BotID: "555",
+		Kind: "reminder", Target: "owner", FireAt: now.Add(-time.Second),
+		Payload:   map[string]any{"text": "Выпить воду"},
+		CreatedBy: "ai", IdempotencyKey: "scheduler-owner-bot-chat-1",
+	})
+	if err != nil {
+		t.Fatalf("insert job: %v", err)
+	}
+	controlSender := &fakeSender{}
+	botSender := &fakeSender{}
+	ai := &fakeAI{}
+	service := NewService(
+		repo, ai, controlSender,
+		WithClock(func() time.Time { return now }),
+		WithBotSenderProvider(&fakeBotSenders{sender: botSender}),
+	)
+
+	service.runSchedulerOnce(context.Background())
+
+	if ai.calls != 0 {
+		t.Fatalf("owner reminder must use pre-generated payload text, ai calls = %d", ai.calls)
+	}
+	if len(controlSender.sent) != 0 {
+		t.Fatalf("owner reminder leaked to DoubleU control bot: %+v", controlSender.sent)
+	}
+	if len(botSender.sent) != 1 {
+		t.Fatalf("expected one notification through original bot, got %+v", botSender.sent)
+	}
+	sent := botSender.sent[0]
+	if sent.ChatID != "42" || sent.Text != "⏰ Выпить воду" || sent.ReplyToMessageID != "" {
+		t.Fatalf("bot notification = %+v", sent)
+	}
+	jobs := repo.ListJobs("tenant:user:77", botChatID)
+	if len(jobs) != 1 || jobs[0].ID != job.ID || jobs[0].Status != "sent" {
+		t.Fatalf("job after bot notification = %+v", jobs)
+	}
+}
+
 func TestSchedulerContactDeliveryRespectsCurrentChatMode(t *testing.T) {
 	now := time.Date(2026, 6, 22, 12, 0, 0, 0, time.UTC)
 	repo := store.NewRepository()

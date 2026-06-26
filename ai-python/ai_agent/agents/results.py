@@ -11,7 +11,8 @@ types so a hallucinated value can never widen the contract.
 
 from __future__ import annotations
 
-from typing import Literal
+from datetime import datetime
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -40,6 +41,19 @@ class ResponsePlan(BaseModel):
         max_length=4,
         description="Короткие варианты ответа собеседника.",
     )
+
+
+class ScheduledJob(BaseModel):
+    """A deferred scheduler job prepared by a tool for Go-owned persistence."""
+
+    model_config = ConfigDict(frozen=True)
+
+    kind: Literal["reminder"] = "reminder"
+    target: Literal["owner", "contact"]
+    fire_at: datetime
+    payload: dict[str, Any] = Field(default_factory=dict)
+    created_by: Literal["ai"] = "ai"
+    idempotency_key: str = Field(min_length=1)
 
 
 class OrchestratorResult(BaseModel):

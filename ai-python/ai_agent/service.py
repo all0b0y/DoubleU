@@ -237,6 +237,7 @@ class AIService:
             owner_note=outcome.owner_note,
             options=outcome.options,
             response_plan=outcome.response_plan,
+            scheduled_jobs=outcome.scheduled_jobs,
             topic=outcome.topic,
         )
         # Label the Langfuse trace with the actual decision so an auto-sent reply

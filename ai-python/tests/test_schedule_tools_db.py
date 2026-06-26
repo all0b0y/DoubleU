@@ -1,4 +1,4 @@
-"""Real-PostgreSQL integration for scheduler.create_reminder.
+"""Real-PostgreSQL guard for scheduler.create_reminder statelessness.
 
 Run with DATABASE_URL_TEST pointing at a schema with migration 114 applied.
 """
@@ -17,7 +17,7 @@ DATABASE_URL = os.getenv("DATABASE_URL_TEST", "").strip()
 pytestmark = pytest.mark.skipif(not DATABASE_URL, reason="DATABASE_URL_TEST is not set")
 
 
-def test_create_reminder_writes_scheduled_job() -> None:
+def test_create_reminder_does_not_write_scheduled_job_from_python() -> None:
     import asyncpg
 
     from ai_agent.agents.deps import AgentDeps
@@ -30,44 +30,26 @@ def test_create_reminder_writes_scheduled_job() -> None:
     async def scenario() -> None:
         pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=2)
         try:
-            await pool.execute(
-                "INSERT INTO tenants (id, name) VALUES ($1, 'test') ON CONFLICT DO NOTHING",
-                tenant_id,
-            )
-            await pool.execute(
-                """INSERT INTO chats (tenant_id, chat_id, telegram_chat_id, status, transport)
-                   VALUES ($1, $2, $2, 'managed', 'bot') ON CONFLICT DO NOTHING""",
-                tenant_id,
-                chat_id,
-            )
-            ctx = SimpleNamespace(deps=AgentDeps(
+            deps = AgentDeps(
                 tenant_id=tenant_id,
                 chat_id=chat_id,
                 source_message_id="m1",
                 pool=pool,
                 current_time=now,
-            ))
+            )
+            ctx = SimpleNamespace(deps=deps)
             result = await create_reminder(
                 ctx, (now + timedelta(minutes=10)).isoformat(), "Проверить договор", "owner"
             )
-            assert result.startswith("scheduled reminder #")
-            row = await pool.fetchrow(
-                """SELECT tenant_id, chat_id, kind, target, payload->>'text' AS text,
-                          status, created_by
-                     FROM scheduled_jobs
-                    WHERE tenant_id = $1 AND chat_id = $2""",
-                tenant_id,
-                chat_id,
+            assert result.startswith("scheduled reminder for ")
+            assert len(deps.scheduled_jobs) == 1
+            job = deps.scheduled_jobs[0]
+            count = await pool.fetchval(
+                "SELECT count(*) FROM scheduled_jobs WHERE idempotency_key = $1",
+                job.idempotency_key,
             )
-            assert dict(row) == {
-                "tenant_id": tenant_id,
-                "chat_id": chat_id,
-                "kind": "reminder",
-                "target": "owner",
-                "text": "Проверить договор",
-                "status": "pending",
-                "created_by": "ai",
-            }
+            assert count == 0
+            assert job.payload == {"text": "Проверить договор"}
         finally:
             await pool.close()
 

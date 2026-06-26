@@ -15,7 +15,7 @@ from typing import Awaitable, Callable, Sequence
 
 import asyncpg
 
-from .results import ResponsePlan
+from .results import ResponsePlan, ScheduledJob
 
 
 @dataclass
@@ -41,6 +41,9 @@ class AgentDeps:
     # Interaction tools write a deferred contact-facing form here. The tool
     # itself never performs transport IO; core sends it through approval.
     response_plan: ResponsePlan | None = None
+    # Scheduler tools write deferred jobs here. Python does not persist them;
+    # Go owns scheduled_jobs DB IO and consumes this accumulator from the response.
+    scheduled_jobs: list[ScheduledJob] = field(default_factory=list)
     # One stable clock value shared by the scheduler prompt and tool validation.
     current_time: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 

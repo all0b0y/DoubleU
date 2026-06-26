@@ -145,6 +145,47 @@ func TestHandleTelegramWebhookAutoReplyAndDuplicateAudit(t *testing.T) {
 	}
 }
 
+func TestHandleTelegramWebhookPersistsAIScheduledJobsIdempotently(t *testing.T) {
+	repository := store.NewRepository()
+	repository.SaveChatSettings(contracts.ChatSettings{TenantID: "tenant-1", ChatID: "42", Mode: contracts.ChatModeAuto})
+	repository.SaveChat(store.ChatRecord{TenantID: "tenant-1", ChatID: "42"})
+	fireAt := time.Unix(1700000000, 0).UTC().Add(10 * time.Minute)
+	ai := &fakeAI{response: contracts.AIProcessMessageResponse{
+		Decision:     contracts.DecisionAutoReply,
+		ResponseText: "Напоминание поставлено",
+		Confidence:   0.99,
+		RiskLevel:    contracts.RiskLow,
+		ScheduledJobs: []contracts.ScheduledJob{{
+			Kind: "reminder", Target: "owner", FireAt: fireAt,
+			Payload:   map[string]any{"text": " Позвонить клиенту "},
+			CreatedBy: "ai", IdempotencyKey: "scheduler:same-request",
+		}},
+	}}
+	sender := &fakeSender{}
+	service := newTestService(repository, ai, sender)
+
+	first, err := service.HandleTelegramWebhook(context.Background(), telegramPayload(1101, "bc-1", 42, 7, "напомни"), "tenant-1")
+	if err != nil || first.Decision != contracts.DecisionAutoReply {
+		t.Fatalf("first webhook: result=%+v err=%v", first, err)
+	}
+	second, err := service.HandleTelegramWebhook(context.Background(), telegramPayload(1102, "bc-1", 42, 8, "напомни"), "tenant-1")
+	if err != nil || second.Decision != contracts.DecisionAutoReply {
+		t.Fatalf("second webhook: result=%+v err=%v", second, err)
+	}
+
+	jobs := repository.ListJobs("tenant-1", "42")
+	if len(jobs) != 1 {
+		t.Fatalf("scheduled jobs = %+v", jobs)
+	}
+	job := jobs[0]
+	if job.Status != "pending" || job.CreatedBy != "ai" || job.Kind != "reminder" ||
+		job.Target != "owner" || !job.FireAt.Equal(fireAt) ||
+		job.IdempotencyKey != "scheduler:same-request" ||
+		job.Payload["text"] != "Позвонить клиенту" {
+		t.Fatalf("scheduled job = %+v", job)
+	}
+}
+
 func TestInteractionButtonsNeverSendOnBusinessTransport(t *testing.T) {
 	repository := store.NewRepository()
 	repository.SaveChatSettings(contracts.ChatSettings{
@@ -189,6 +230,8 @@ func TestHandleTelegramWebhookSendsAssignedAIRole(t *testing.T) {
 		Name:        "Техподдержка",
 		Description: "Вежливый сотрудник поддержки, отвечает от лица владельца",
 		Constraints: "не обещать возвраты",
+		ModelTier:   "smart",
+		ModelName:   "deepseek/model-b",
 	})
 	repository.AssignAIRoleToChat("tenant-1", "42", role.ID)
 	ai := &fakeAI{response: contracts.AIProcessMessageResponse{
@@ -203,7 +246,8 @@ func TestHandleTelegramWebhookSendsAssignedAIRole(t *testing.T) {
 		t.Fatalf("webhook: %v", err)
 	}
 	got := ai.lastRequest.AIRole
-	if got == nil || got.Name != "Техподдержка" || got.Constraints != "не обещать возвраты" {
+	if got == nil || got.Name != "Техподдержка" || got.Constraints != "не обещать возвраты" ||
+		got.ModelTier != "smart" || got.ModelName != "deepseek/model-b" {
 		t.Fatalf("ai_role in request = %+v", got)
 	}
 

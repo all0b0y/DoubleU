@@ -18,13 +18,13 @@ from ai_agent.schemas import (
 from ai_agent.security import PromptBuilder
 
 
-class _Pool:
+class _RejectingPool:
     def __init__(self) -> None:
         self.calls: list[tuple[str, tuple[object, ...]]] = []
 
     async def fetchrow(self, query: str, *args: object) -> dict[str, int]:
         self.calls.append((query, args))
-        return {"id": 17}
+        raise AssertionError("scheduler tool must not write to Postgres")
 
 
 def _ctx(*, pool=None, flags: tuple[str, ...] = ()) -> SimpleNamespace:
@@ -38,23 +38,31 @@ def _ctx(*, pool=None, flags: tuple[str, ...] = ()) -> SimpleNamespace:
     ))
 
 
-def test_create_reminder_persists_scoped_idempotent_job() -> None:
-    pool = _Pool()
+def test_create_reminder_accumulates_scoped_idempotent_job() -> None:
+    pool = _RejectingPool()
+    ctx = _ctx(pool=pool)
     result = asyncio.run(create_reminder(
-        _ctx(pool=pool), "2026-06-22T18:00:00+03:00", "  Позвонить клиенту  ", "owner"
+        ctx, "2026-06-22T18:00:00+03:00", "  Позвонить клиенту  ", "owner"
+    ))
+    duplicate = asyncio.run(create_reminder(
+        ctx, "2026-06-22T18:00:00+03:00", "Позвонить клиенту", "owner"
     ))
 
-    assert result == "scheduled reminder #17 for 2026-06-22T15:00:00+00:00"
-    assert len(pool.calls) == 1
-    query, args = pool.calls[0]
-    assert "ON CONFLICT (idempotency_key)" in query
-    assert args[0:3] == ("tenant:user:1", "chat-1", "owner")
-    assert "Позвонить клиенту" in str(args[4])
-    assert str(args[5]).startswith("scheduler:")
+    assert result == "scheduled reminder for 2026-06-22T15:00:00+00:00"
+    assert duplicate == result
+    assert pool.calls == []
+    assert len(ctx.deps.scheduled_jobs) == 1
+    job = ctx.deps.scheduled_jobs[0]
+    assert job.kind == "reminder"
+    assert job.target == "owner"
+    assert job.fire_at == datetime(2026, 6, 22, 15, 0, tzinfo=timezone.utc)
+    assert job.payload == {"text": "Позвонить клиенту"}
+    assert job.created_by == "ai"
+    assert job.idempotency_key.startswith("scheduler:")
 
 
 def test_create_reminder_rejects_past_and_more_than_year() -> None:
-    pool = _Pool()
+    pool = _RejectingPool()
     past = asyncio.run(create_reminder(
         _ctx(pool=pool), "2026-06-22T11:59:59Z", "past", "owner"
     ))
@@ -73,13 +81,15 @@ def test_create_reminder_rejects_past_and_more_than_year() -> None:
 def test_create_reminder_respects_privacy_and_storage_gate() -> None:
     for flags in (("no_memory",), ("private",)):
         result = asyncio.run(create_reminder(
-            _ctx(pool=_Pool(), flags=flags), "2026-06-23T12:00:00Z", "blocked", "owner"
+            _ctx(pool=_RejectingPool(), flags=flags), "2026-06-23T12:00:00Z", "blocked", "owner"
         ))
         assert "privacy" in result
-    unavailable = asyncio.run(create_reminder(
-        _ctx(pool=None), "2026-06-23T12:00:00Z", "blocked", "owner"
+    ctx = _ctx(pool=None)
+    available = asyncio.run(create_reminder(
+        ctx, "2026-06-23T12:00:00Z", "allowed without Python storage", "owner"
     ))
-    assert unavailable == "error: scheduler storage is unavailable"
+    assert available == "scheduled reminder for 2026-06-23T12:00:00+00:00"
+    assert len(ctx.deps.scheduled_jobs) == 1
 
 
 def test_orchestrator_prompt_contains_current_owner_time_and_timezone() -> None:

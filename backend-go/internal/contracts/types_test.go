@@ -3,6 +3,7 @@ package contracts
 import (
 	"encoding/json"
 	"testing"
+	"time"
 )
 
 func TestEnumValidationAndHelpers(t *testing.T) {
@@ -45,6 +46,28 @@ func TestContractKeysAndDefaults(t *testing.T) {
 	}
 }
 
+func TestAIRoleModelNameJSONRoundTrip(t *testing.T) {
+	want := AIRole{
+		Name:      "Support",
+		ModelTier: "smart",
+		ModelName: "deepseek/model-b",
+		ToolSettings: map[string]bool{
+			"interaction.present_buttons": true,
+		},
+	}
+	raw, err := json.Marshal(want)
+	if err != nil {
+		t.Fatalf("marshal ai role: %v", err)
+	}
+	var got AIRole
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal ai role: %v", err)
+	}
+	if got.ModelTier != "smart" || got.ModelName != "deepseek/model-b" {
+		t.Fatalf("ai role model round-trip = %+v", got)
+	}
+}
+
 func TestAIButtonCallbackDataRoundTrip(t *testing.T) {
 	draftID := "draft:9002:bot:555:8"
 	data := CallbackDataEncodeAIButton(draftID, 1)
@@ -75,5 +98,34 @@ func TestAIProcessMessageResponsePlanJSONRoundTrip(t *testing.T) {
 	}
 	if got.ResponsePlan == nil || got.ResponsePlan.Shape != "buttons" || len(got.ResponsePlan.Options) != 2 {
 		t.Fatalf("response plan round-trip = %+v", got.ResponsePlan)
+	}
+}
+
+func TestAIProcessMessageScheduledJobsJSONRoundTrip(t *testing.T) {
+	fireAt := time.Date(2026, 6, 22, 15, 0, 0, 0, time.UTC)
+	want := AIProcessMessageResponse{
+		Decision: DecisionDraft, ResponseText: "Напоминание поставлено",
+		ScheduledJobs: []ScheduledJob{{
+			Kind: "reminder", Target: "owner", FireAt: fireAt,
+			Payload:   map[string]any{"text": "Позвонить клиенту"},
+			CreatedBy: "ai", IdempotencyKey: "scheduler:key",
+		}},
+	}
+	raw, err := json.Marshal(want)
+	if err != nil {
+		t.Fatalf("marshal scheduled jobs: %v", err)
+	}
+	var got AIProcessMessageResponse
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal scheduled jobs: %v", err)
+	}
+	if len(got.ScheduledJobs) != 1 {
+		t.Fatalf("scheduled jobs round-trip = %+v", got.ScheduledJobs)
+	}
+	job := got.ScheduledJobs[0]
+	if job.Kind != "reminder" || job.Target != "owner" || !job.FireAt.Equal(fireAt) ||
+		job.Payload["text"] != "Позвонить клиенту" || job.CreatedBy != "ai" ||
+		job.IdempotencyKey != "scheduler:key" {
+		t.Fatalf("scheduled job round-trip = %+v", job)
 	}
 }

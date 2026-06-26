@@ -1,9 +1,8 @@
-"""Deferred scheduler tools backed by PostgreSQL scheduled_jobs."""
+"""Deferred scheduler tools collected for Go-owned scheduled_jobs persistence."""
 
 from __future__ import annotations
 
 import hashlib
-import json
 from datetime import datetime, timedelta, timezone
 from typing import Literal
 
@@ -11,6 +10,7 @@ from pydantic_ai import RunContext
 from pydantic_ai.toolsets import FunctionToolset
 
 from .deps import AgentDeps
+from .results import ScheduledJob
 
 schedule_toolset: FunctionToolset[AgentDeps] = FunctionToolset()
 
@@ -40,14 +40,12 @@ async def create_reminder(
     """Create one future reminder for the owner or current-chat contact.
 
     ``fire_at_iso`` must include a timezone offset. Use the current time and
-    owner timezone from the system instruction. This tool persists the job but
-    never sends the reminder immediately.
+    owner timezone from the system instruction. This tool records the job for
+    the Go backend to persist; it never sends the reminder immediately.
     """
 
     if ctx.deps.no_memory or ctx.deps.private:
         return "error: scheduler is unavailable for this chat privacy mode"
-    if ctx.deps.pool is None:
-        return "error: scheduler storage is unavailable"
     fire_at = _parse_fire_at(fire_at_iso)
     if fire_at is None:
         return "error: fire_at_iso must be an ISO-8601 timestamp with timezone"
@@ -71,21 +69,15 @@ async def create_reminder(
         )
     )
     idempotency_key = "scheduler:" + hashlib.sha256(idem_source.encode()).hexdigest()
-    payload = json.dumps({"text": clean_text}, ensure_ascii=False)
-    row = await ctx.deps.pool.fetchrow(
-        """INSERT INTO scheduled_jobs
-               (tenant_id, chat_id, kind, target, fire_at, payload,
-                status, created_by, idempotency_key)
-           VALUES ($1, $2, 'reminder', $3, $4, $5::jsonb,
-                   'pending', 'ai', $6)
-           ON CONFLICT (idempotency_key) DO UPDATE
-           SET idempotency_key = EXCLUDED.idempotency_key
-           RETURNING id""",
-        ctx.deps.tenant_id,
-        ctx.deps.chat_id,
-        target,
-        fire_at,
-        payload,
-        idempotency_key,
-    )
-    return f"scheduled reminder #{int(row['id'])} for {fire_at.isoformat()}"
+    if not any(job.idempotency_key == idempotency_key for job in ctx.deps.scheduled_jobs):
+        ctx.deps.scheduled_jobs.append(
+            ScheduledJob(
+                kind="reminder",
+                target=target,
+                fire_at=fire_at,
+                payload={"text": clean_text},
+                created_by="ai",
+                idempotency_key=idempotency_key,
+            )
+        )
+    return f"scheduled reminder for {fire_at.isoformat()}"

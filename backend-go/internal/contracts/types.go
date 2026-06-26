@@ -748,6 +748,17 @@ type ResponsePlan struct {
 	Options []string `json:"options"`
 }
 
+// ScheduledJob is a deferred job produced by the Python scheduler tool.
+// Go owns persistence and dispatch through store.ScheduledJobRecord.
+type ScheduledJob struct {
+	Kind           string         `json:"kind"`
+	Target         string         `json:"target"`
+	FireAt         time.Time      `json:"fire_at"`
+	Payload        map[string]any `json:"payload"`
+	CreatedBy      string         `json:"created_by,omitempty"`
+	IdempotencyKey string         `json:"idempotency_key"`
+}
+
 // AIProcessMessageResponse is returned by the Python AI service.
 type AIProcessMessageResponse struct {
 	Decision     Decision   `json:"decision"`
@@ -772,6 +783,9 @@ type AIProcessMessageResponse struct {
 	// ResponsePlan is set only for interaction-tool output. Ordinary
 	// choice_question options remain an owner-facing card.
 	ResponsePlan *ResponsePlan `json:"response_plan,omitempty"`
+	// ScheduledJobs are validated deferred jobs from AI tools. The backend
+	// persists them through the repository so Python remains stateless by default.
+	ScheduledJobs []ScheduledJob `json:"scheduled_jobs,omitempty"`
 	// Topic is a 3-7 word label of the current conversation produced by the
 	// same draft call (replaces the per-message /ai/tag-topic call — ARCH-4).
 	Topic string `json:"topic,omitempty"`
