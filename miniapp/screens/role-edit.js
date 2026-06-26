@@ -45,8 +45,7 @@ export function renderRoleEdit(navigate, roleId) {
 
   async function fetchModelsConfig() {
     try {
-      const resp = await fetch('/api/v1/config/models');
-      if (resp.ok) modelsConfig = await resp.json();
+      modelsConfig = await api.modelConfig();
     } catch (_) { /* keep the saved role model when config is unavailable */ }
   }
 

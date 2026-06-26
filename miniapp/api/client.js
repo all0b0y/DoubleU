@@ -53,6 +53,7 @@ export const api = {
   updateRole:     (roleId, data)  => request('PUT',    `/api/v1/roles/${roleId}`, data),
   deleteRole:     (roleId)        => request('DELETE', `/api/v1/roles/${roleId}`),
   toolCatalog:    ()              => request('GET',    '/api/v1/tool-catalog'),
+  modelConfig:    ()              => request('GET',    '/api/v1/config/models'),
   saveRoleTools:  (roleId, toolSettings) => request(
     'PUT', `/api/v1/roles/${roleId}/tools`, { tool_settings: toolSettings },
   ),
