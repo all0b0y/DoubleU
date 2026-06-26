@@ -61,6 +61,7 @@ from ..schemas import (
     RerankFactsResponse,
     RiskLevel,
     ResponsePlanData,
+    ScheduledJobData,
     SynthesizePatternRequest,
     SynthesizePatternResponse,
     TopicTaggingRequest,
@@ -74,7 +75,15 @@ from ..security import PromptBuilder
 from .deps import AgentDeps
 from .interaction_tools import interaction_toolset
 from .memory_tools import memory_toolset
-from .models import AgentTask, ModelTier, build_model, build_tier_model, model_name_for
+from .models import (
+    AgentTask,
+    ModelTier,
+    build_model,
+    build_named_model,
+    build_tier_model,
+    model_name_for,
+    model_name_for_tier,
+)
 from .schedule_tools import schedule_toolset
 from .tool_catalog import TOOL_CATALOG, TOOL_NAME_TO_KEY
 from .results import (
@@ -85,6 +94,7 @@ from .results import (
     PatternResult,
     RerankResult,
     RoleDraft,
+    ScheduledJob,
     SummaryResult,
     TopicResult,
 )
@@ -138,6 +148,21 @@ def role_has_enabled_tools(
         for entry in TOOL_CATALOG
     )
     return builtin_enabled or bool(ai_role.mcp_servers)
+
+
+def _scheduled_job_data(jobs: list[ScheduledJob]) -> tuple[ScheduledJobData, ...]:
+    """Convert scheduler tool accumulators into the process-message wire shape."""
+    return tuple(
+        ScheduledJobData(
+            kind=job.kind,
+            target=job.target,
+            fire_at=job.fire_at.isoformat(),
+            payload=dict(job.payload),
+            created_by=job.created_by,
+            idempotency_key=job.idempotency_key,
+        )
+        for job in jobs
+    )
 
 
 # A draft is reviewed by the critic when risk is elevated or the draft's own
@@ -598,7 +623,7 @@ class AgentRuntime:
         request: AIProcessMessageRequest,
         ctx: LLMCallContext,
         pool: asyncpg.Pool | None,
-    ) -> tuple[OrchestratorResult, Usage]:
+    ) -> tuple[OrchestratorResult, Usage, tuple[ScheduledJobData, ...]]:
         """Run the tool-owning context stage without producing a contact reply."""
         current_time = datetime.now(timezone.utc)
         system_prompt, user_payload = draft_pipeline.build_orchestrator_prompt(
@@ -632,6 +657,7 @@ class AgentRuntime:
         orchestrated: OrchestratorResult = result.output.model_copy(
             update={"response_plan": deps.response_plan}
         )
+        scheduled_jobs = _scheduled_job_data(deps.scheduled_jobs)
         usage = self._usage_of(result)
         completion = "\n".join(
             [
@@ -639,6 +665,7 @@ class AgentRuntime:
                 f"suggested_intent: {orchestrated.suggested_intent}",
                 f"notes: {orchestrated.notes}",
                 f"response_plan: {orchestrated.response_plan}",
+                f"scheduled_jobs: {len(scheduled_jobs)}",
             ]
         )
         self._record_run(
@@ -650,7 +677,7 @@ class AgentRuntime:
             usage,
             privacy_flags,
         )
-        return orchestrated, usage
+        return orchestrated, usage, scheduled_jobs
 
     @staticmethod
     def _orchestrator_bundle(result: OrchestratorResult) -> tuple[str, ...]:
@@ -673,9 +700,16 @@ class AgentRuntime:
         orchestrator_usage = Usage()
         orchestrator_bundle: tuple[str, ...] | None = None
         orchestrated: OrchestratorResult | None = None
+        orchestrator_scheduled_jobs: tuple[ScheduledJobData, ...] = ()
         if two_stage:
-            orchestrated, orchestrator_usage = await self._orchestrate_async(
-                request, ctx, pool
+            (
+                orchestrated,
+                orchestrator_usage,
+                orchestrator_scheduled_jobs,
+            ) = await self._orchestrate_async(
+                request,
+                ctx,
+                pool,
             )
             orchestrator_bundle = self._orchestrator_bundle(orchestrated)
         current_time = datetime.now(timezone.utc)
@@ -709,11 +743,24 @@ class AgentRuntime:
         # declares one and the env list is configured; otherwise fall back to
         # the DRAFT task model.  The agent is not recreated — only the
         # per-request model is passed in.
-        tier_model = (
-            build_tier_model(request.ai_role.model_tier)
-            if request.ai_role is not None
-            else None
+        role_model_name = (
+            request.ai_role.model_name.strip() if request.ai_role is not None else ""
         )
+        tier_model = None
+        tier_model_label = ""
+        if request.ai_role is not None:
+            if role_model_name:
+                tier_model = build_named_model(
+                    request.ai_role.model_tier,
+                    role_model_name,
+                )
+                if tier_model is not None:
+                    tier_model_label = model_name_for_tier(
+                        request.ai_role.model_tier,
+                        role_model_name,
+                    )
+            else:
+                tier_model = build_tier_model(request.ai_role.model_tier)
         run_kwargs: dict = dict(
             deps=deps,
             usage_limits=UsageLimits(tool_calls_limit=_DRAFT_TOOL_CALLS_LIMIT),
@@ -723,7 +770,13 @@ class AgentRuntime:
             run_kwargs["model"] = tier_model
         result = await self._draft_agent.run(user_payload, **run_kwargs)
         drafted: DraftResult = result.output
-        response_plan = orchestrated.response_plan if orchestrated is not None else None
+        scheduled_jobs = (
+            *orchestrator_scheduled_jobs,
+            *_scheduled_job_data(deps.scheduled_jobs),
+        )
+        response_plan = (
+            orchestrated.response_plan if orchestrated is not None else deps.response_plan
+        )
         if response_plan is not None:
             drafted = drafted.model_copy(
                 update={
@@ -736,14 +789,16 @@ class AgentRuntime:
         if two_stage and request.ai_role is not None:
             router_name = model_name_for(AgentTask.ORCHESTRATE) or "test-model"
             writer_name = (
-                request.ai_role.model_tier
+                tier_model_label
+                or request.ai_role.model_tier
                 or model_name_for(AgentTask.DRAFT)
                 or "test-model"
             )
             model_used = f"orchestrate({router_name})+draft({writer_name})"
         else:
             model_used = (
-                request.ai_role.model_tier
+                tier_model_label
+                or request.ai_role.model_tier
                 if (tier_model is not None and request.ai_role is not None)
                 else (model_name_for(AgentTask.DRAFT) or "test-model")
             )
@@ -776,7 +831,11 @@ class AgentRuntime:
             drafted.reply,
             draft_usage,
             privacy_flags,
-            model_name_override=(request.ai_role.model_tier if two_stage and request.ai_role else ""),
+            model_name_override=(
+                (tier_model_label or request.ai_role.model_tier)
+                if two_stage and request.ai_role
+                else ""
+            ),
         )
         total = Usage(
             input_tokens=orchestrator_usage.input_tokens + draft_usage.input_tokens,
@@ -801,6 +860,7 @@ class AgentRuntime:
                 if response_plan is not None
                 else None
             ),
+            scheduled_jobs=scheduled_jobs,
             confidence=confidence,
             topic=drafted.topic,
         )

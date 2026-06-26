@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import time
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Any
 
@@ -34,6 +35,38 @@ from .schemas import (
 from .service import AIService, build_service
 
 
+@dataclass(frozen=True)
+class ModelConfigResponse:
+    """Wire shape of the GET /ai/model-config response."""
+
+    fast: list[str]
+    balanced: list[str]
+    smart: list[str]
+    default: str
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return the model configuration in its JSON wire shape."""
+        return {
+            "fast": self.fast,
+            "balanced": self.balanced,
+            "smart": self.smart,
+            "default": self.default,
+        }
+
+
+def _build_model_config() -> ModelConfigResponse:
+    """Read MODEL_TIER_* and OPENROUTER_MODEL env vars and build the config response."""
+    def _split(val: str) -> list[str]:
+        return [m.strip() for m in val.split(",") if m.strip()]
+
+    return ModelConfigResponse(
+        fast=_split(os.getenv("MODEL_TIER_FAST", "")),
+        balanced=_split(os.getenv("MODEL_TIER_BALANCED", "")),
+        smart=_split(os.getenv("MODEL_TIER_SMART", "")),
+        default=os.getenv("OPENROUTER_MODEL", ""),
+    )
+
+
 class AIHTTPHandler(BaseHTTPRequestHandler):
     """HTTP handler for health, readiness, and AI JSON endpoints."""
 
@@ -42,12 +75,15 @@ class AIHTTPHandler(BaseHTTPRequestHandler):
     flags: FeatureFlags = FeatureFlags()
 
     def do_GET(self) -> None:
-        """Handle liveness and readiness requests."""
+        """Handle liveness, readiness, and config requests."""
         if self.path == "/health":
             self._write_json(200, self.service.health())
             return
         if self.path == "/ready":
             self._write_json(200, self.service.ready(self.mock_llm))
+            return
+        if self.path == "/ai/model-config":
+            self._write_json(200, _build_model_config().to_dict())
             return
         self._write_json(404, {"error": "not_found"})
 

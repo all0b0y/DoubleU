@@ -90,6 +90,45 @@ func TestAIRoleDeliverySettingsRoundTrip(t *testing.T) {
 	}
 }
 
+func TestAIRoleModelNameRoundTrip(t *testing.T) {
+	repo := NewRepository()
+	saved := repo.SaveAIRole(AIRoleRecord{
+		TenantID:    "t",
+		Name:        "Менеджер",
+		Description: "d",
+		ModelTier:   "smart",
+		ModelName:   "deepseek/model-b",
+	})
+	if saved.ID == 0 {
+		t.Fatal("role not saved")
+	}
+	got, ok := repo.AIRoleByID("t", saved.ID)
+	if !ok || got.ModelTier != "smart" || got.ModelName != "deepseek/model-b" {
+		t.Fatalf("model selection not round-tripped: %+v ok=%v", got, ok)
+	}
+	repo.AssignAIRoleToChat("t", "c", saved.ID)
+	assigned, ok := repo.AIRoleForChat("t", "c")
+	if !ok || assigned.ModelName != "deepseek/model-b" {
+		t.Fatalf("assigned role model name = %+v ok=%v", assigned, ok)
+	}
+	got.ModelName = "deepseek/model-c"
+	if !repo.UpdateAIRole(got) {
+		t.Fatal("update failed")
+	}
+	after, _ := repo.AIRoleByID("t", saved.ID)
+	if after.ModelName != "deepseek/model-c" {
+		t.Fatalf("model name not updated: %+v", after)
+	}
+	after.ModelName = ""
+	if !repo.UpdateAIRole(after) {
+		t.Fatal("clear failed")
+	}
+	cleared, _ := repo.AIRoleByID("t", saved.ID)
+	if cleared.ModelName != "" {
+		t.Fatalf("model name not cleared: %+v", cleared)
+	}
+}
+
 func TestAIRoleToolSettingsRoundTrip(t *testing.T) {
 	repo := NewRepository()
 	saved := repo.SaveAIRole(AIRoleRecord{

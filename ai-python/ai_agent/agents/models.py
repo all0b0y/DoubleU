@@ -110,6 +110,37 @@ def build_model(task: AgentTask) -> Model:
     return _build_openrouter_model(name)
 
 
+def _tier_slugs(tier: str) -> list[str]:
+    try:
+        tier_enum = ModelTier(str(tier).lower().strip())
+    except ValueError:
+        return []
+    raw = os.getenv(_TIER_ENV[tier_enum], "").strip()
+    return [s.strip() for s in raw.split(",") if s.strip()]
+
+
+def _build_model_chain(slugs: list[str]) -> Model | None:
+    if not slugs:
+        return None
+    gateway = os.getenv("LLM_GATEWAY", "none").strip().lower()
+    builder = _build_litellm_model if gateway == "litellm" else _build_openrouter_model
+    models = [builder(slug) for slug in slugs]
+    if len(models) == 1:
+        return models[0]
+    return FallbackModel(*models)
+
+
+def model_name_for_tier(tier: str, model_name: str = "") -> str:
+    """Resolve the concrete model slug a tier selection will use first."""
+    slugs = _tier_slugs(tier)
+    if not slugs:
+        return ""
+    selected = str(model_name or "").strip()
+    if selected and selected in slugs:
+        return selected
+    return slugs[0]
+
+
 def build_tier_model(tier: str) -> Model | None:
     """Build the pydantic-ai model for a named tier (fast/balanced/smart).
 
@@ -127,23 +158,23 @@ def build_tier_model(tier: str) -> Model | None:
     """
     if os.getenv("MOCK_LLM", "true").lower() in ("1", "true", "yes", "on"):
         return None
-    try:
-        tier_enum = ModelTier(tier.lower().strip())
-    except ValueError:
+    return _build_model_chain(_tier_slugs(tier))
+
+
+def build_named_model(tier: str, model_name: str) -> Model | None:
+    """Build a tier model with a saved per-role model promoted to primary.
+
+    When ``model_name`` belongs to the selected tier env list, it becomes the
+    first model in the chain and the rest of the tier remains as fallbacks in
+    original order. Empty or stale names silently degrade to the tier default.
+    """
+    if os.getenv("MOCK_LLM", "true").lower() in ("1", "true", "yes", "on"):
         return None
-    env_var = _TIER_ENV[tier_enum]
-    raw = os.getenv(env_var, "").strip()
-    if not raw:
-        return None
-    slugs = [s.strip() for s in raw.split(",") if s.strip()]
-    if not slugs:
-        return None
-    gateway = os.getenv("LLM_GATEWAY", "none").strip().lower()
-    builder = _build_litellm_model if gateway == "litellm" else _build_openrouter_model
-    models = [builder(slug) for slug in slugs]
-    if len(models) == 1:
-        return models[0]
-    return FallbackModel(*models)
+    slugs = _tier_slugs(tier)
+    selected = str(model_name or "").strip()
+    if selected and selected in slugs:
+        slugs = [selected, *(slug for slug in slugs if slug != selected)]
+    return _build_model_chain(slugs)
 
 
 def _build_litellm_model(name: str) -> Model:

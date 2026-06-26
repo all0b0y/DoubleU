@@ -82,6 +82,11 @@ services:
       OPENROUTER_FALLBACK_MODEL: ${OPENROUTER_FALLBACK_MODEL:-}
       MODEL_ROUTER: ${MODEL_ROUTER:-}
       TWO_STAGE_DRAFT: ${TWO_STAGE_DRAFT:-false}
+      # Per-role draft quality tiers. Comma-separated: primary model first,
+      # then fallbacks. Empty values preserve the legacy OPENROUTER_MODEL path.
+      MODEL_TIER_FAST: ${MODEL_TIER_FAST:-}
+      MODEL_TIER_BALANCED: ${MODEL_TIER_BALANCED:-}
+      MODEL_TIER_SMART: ${MODEL_TIER_SMART:-}
       OPENROUTER_TIMEOUT_SECONDS: ${OPENROUTER_TIMEOUT_SECONDS:-30}
       OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
       OPENROUTER_APP_NAME: ${OPENROUTER_APP_NAME:-DoubleU}
@@ -118,7 +123,13 @@ services:
     # Reuses postgres (schema `litellm`, migration 006) and redis (dedup cache).
     image: ghcr.io/berriai/litellm-database:main-stable
     restart: unless-stopped
-    command: ["--config", "/etc/litellm/config.yaml", "--port", "4000"]
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        /app/.venv/bin/python /opt/doubleu/render_litellm_config.py
+        --base /etc/litellm/config.base.yaml
+        --output /tmp/litellm.config.yaml &&
+        exec /app/.venv/bin/litellm --config /tmp/litellm.config.yaml --port 4000
     environment:
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-sk-doubleu-local-master}
       # Prisma keeps its bookkeeping tables in the dedicated `litellm` schema so
@@ -128,13 +139,22 @@ services:
       # All models use the openrouter/ prefix — DEEPSEEK_API_KEY is intentionally
       # absent so no traffic bypasses OpenRouter.
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-}
+      OPENROUTER_FALLBACK_MODEL: ${OPENROUTER_FALLBACK_MODEL:-}
+      MODEL_DRAFT: ${MODEL_DRAFT:-}
+      MODEL_CRITIC: ${MODEL_CRITIC:-}
+      MODEL_CHEAP: ${MODEL_CHEAP:-}
+      MODEL_TIER_FAST: ${MODEL_TIER_FAST:-}
+      MODEL_TIER_BALANCED: ${MODEL_TIER_BALANCED:-}
+      MODEL_TIER_SMART: ${MODEL_TIER_SMART:-}
       # Langfuse success-callback target (full request/response logging).
       LANGFUSE_HOST: ${LITELLM_LANGFUSE_HOST:-http://langfuse-web:3000}
       LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-pk-lf-doubleu-local}
       LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-sk-lf-doubleu-local}
     volumes:
-      - ./infra/litellm/config.yaml:/etc/litellm/config.yaml:ro
+      - ./infra/litellm/config.yaml:/etc/litellm/config.base.yaml:ro
       - ./infra/litellm/budgets.yaml:/etc/litellm/budgets.yaml:ro
+      - ./scripts/render_litellm_config.py:/opt/doubleu/render_litellm_config.py:ro
     ports:
       - "${LITELLM_PORT:-4000}:4000"
     depends_on:

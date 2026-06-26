@@ -199,6 +199,8 @@ class AIRoleData(JsonDataclass):
     # "fast", "balanced" (default), or "smart".  Empty / unrecognised value
     # degrades to the DRAFT task model (MODEL_DRAFT / OPENROUTER_MODEL).
     model_tier: str = "balanced"
+    # Optional concrete model within model_tier. Empty keeps the tier's primary.
+    model_name: str = ""
     # Per-role native-tool overrides; absent keys inherit catalog defaults.
     tool_settings: dict[str, bool] = field(default_factory=dict)
 
@@ -813,6 +815,7 @@ def _parse_ai_role(raw: Any) -> AIRoleData | None:
         mcp_servers=_parse_mcp_servers(raw.get("mcp_servers")),
         speak_as_owner=speak_as_owner,
         model_tier=model_tier,
+        model_name=str(raw.get("model_name", "")).strip(),
         tool_settings=tool_settings,
     )
 

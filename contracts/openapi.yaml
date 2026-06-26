@@ -145,6 +145,14 @@ components:
             smart: highest capability, highest cost (MODEL_TIER_SMART).
             Absent or unrecognised value falls back to the task-level
             MODEL_DRAFT / OPENROUTER_MODEL (backward-compatible).
+        model_name:
+          type: string
+          default: ""
+          description: >
+            Optional concrete model slug or LiteLLM alias selected inside
+            model_tier. Empty means the tier's primary model. If stale or not
+            present in the selected tier env list, Python falls back to the
+            tier default without failing generation.
         tool_settings:
           type: object
           additionalProperties:

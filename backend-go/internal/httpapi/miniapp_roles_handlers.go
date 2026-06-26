@@ -25,6 +25,9 @@ const roleContextMaxRunes = 20000
 // whole-role context cap so the prompt stays within budget.
 const roleCustomFieldMaxRunes = 5000
 
+// roleModelNameMaxRunes caps the stored env-provided model slug/alias.
+const roleModelNameMaxRunes = 200
+
 const (
 	roleDraftTextMaxRunes = 8000
 	roleDraftAudioMaxB64  = 14 * 1024 * 1024
@@ -48,6 +51,8 @@ type roleJSON struct {
 	SpeakAsOwner bool `json:"speak_as_owner"`
 	// ModelTier selects the LLM quality tier: "fast", "balanced" (default), or "smart".
 	ModelTier string `json:"model_tier,omitempty"`
+	// ModelName optionally pins a concrete model within ModelTier.
+	ModelName string `json:"model_name,omitempty"`
 	// ToolSettings contains explicit per-role overrides; absent keys inherit
 	// defaults from the catalog returned by /api/v1/tool-catalog.
 	ToolSettings map[string]bool `json:"tool_settings"`
@@ -73,6 +78,7 @@ func roleToJSON(role store.AIRoleRecord) roleJSON {
 		StreamingEnabled:      cloneBoolPtr(role.StreamingEnabled),
 		SpeakAsOwner:          role.SpeakAsOwner,
 		ModelTier:             role.ModelTier,
+		ModelName:             role.ModelName,
 		ToolSettings:          toolSettings,
 	}
 }
@@ -95,6 +101,9 @@ type roleRequest struct {
 	// ModelTier selects the LLM quality tier: "fast", "balanced", or "smart".
 	// Absent means keep the existing value (update) or "balanced" (create).
 	ModelTier *string `json:"model_tier"`
+	// ModelName optionally pins a concrete model within ModelTier. Membership is
+	// intentionally validated by Python, which owns the env model lists.
+	ModelName *string `json:"model_name"`
 	// ToolSettings is a pointer so legacy updates that omit it preserve the
 	// role's existing overrides. An explicit empty object resets to defaults.
 	ToolSettings *map[string]bool `json:"tool_settings"`
@@ -107,6 +116,10 @@ func (req *roleRequest) normalize() {
 	req.Goals = strings.TrimSpace(req.Goals)
 	req.Constraints = strings.TrimSpace(req.Constraints)
 	req.Context = strings.TrimSpace(req.Context)
+	if req.ModelName != nil {
+		modelName := strings.TrimSpace(*req.ModelName)
+		req.ModelName = &modelName
+	}
 	// Drop fully-empty rows (the UI may leave a trailing blank one) and trim the rest.
 	kept := req.CustomFields[:0]
 	for _, f := range req.CustomFields {
@@ -133,6 +146,16 @@ func (req *roleRequest) validate() string {
 	}
 	if len([]rune(req.Context)) > roleContextMaxRunes {
 		return "context is too long (max 20000 characters)"
+	}
+	if req.ModelTier != nil {
+		tier := strings.ToLower(strings.TrimSpace(*req.ModelTier))
+		if tier != "fast" && tier != "balanced" && tier != "smart" {
+			return "model_tier must be fast, balanced, or smart"
+		}
+		*req.ModelTier = tier
+	}
+	if req.ModelName != nil && len([]rune(*req.ModelName)) > roleModelNameMaxRunes {
+		return "model_name is too long (max 200 characters)"
 	}
 	if req.ToolSettings != nil {
 		if msg := validateToolSettings(*req.ToolSettings); msg != "" {
@@ -298,6 +321,7 @@ func (s *Server) apiDraftRole(w http.ResponseWriter, r *http.Request) {
 		CustomFields:  fields,
 		SpeakAsOwner:  true,
 		ModelTier:     "balanced",
+		ModelName:     "",
 	})
 }
 
@@ -338,6 +362,7 @@ func (s *Server) apiCreateRole(w http.ResponseWriter, r *http.Request) {
 		StreamingEnabled:      req.StreamingEnabled.Apply(nil),
 		SpeakAsOwner:          boolOrDefault(req.SpeakAsOwner, true),
 		ModelTier:             stringOrDefault(req.ModelTier, "balanced"),
+		ModelName:             stringOrDefault(req.ModelName, ""),
 		ToolSettings:          toolSettingsOrDefault(req.ToolSettings, nil),
 	})
 	if role.ID == 0 {
@@ -389,6 +414,7 @@ func (s *Server) apiUpdateRole(w http.ResponseWriter, r *http.Request) {
 		StreamingEnabled:      req.StreamingEnabled.Apply(existing.StreamingEnabled),
 		SpeakAsOwner:          boolOrDefault(req.SpeakAsOwner, existing.SpeakAsOwner),
 		ModelTier:             stringOrDefault(req.ModelTier, existing.ModelTier),
+		ModelName:             stringOrDefault(req.ModelName, existing.ModelName),
 		ToolSettings:          toolSettingsOrDefault(req.ToolSettings, existing.ToolSettings),
 	}
 	if !s.service.Repository().UpdateAIRole(role) {
@@ -732,15 +758,18 @@ func (s *Server) apiSaveUserSettings(w http.ResponseWriter, r *http.Request) {
 	tenantID := tenantFromContext(r.Context())
 	defer r.Body.Close()
 	var req struct {
-		DisplayName            string `json:"display_name"`
-		Bio                    string `json:"bio"`
-		Timezone               string `json:"timezone"`
-		PrimaryLanguage        string `json:"primary_language"`
-		DefaultModeForNewChats string `json:"default_mode_for_new_chats"`
-		LearningEnabled        *bool  `json:"learning_enabled"`
-		RichFormattingEnabled  *bool  `json:"rich_formatting_enabled"`
-		StreamingEnabled       *bool  `json:"streaming_enabled"`
-		LanguageForDrafts      string `json:"language_for_drafts"`
+		// DisplayName/Bio use *string so a partial PUT (e.g. timezone-only, from
+		// the Mini App's background timezone sync) can omit them without wiping
+		// the stored value — nil means "field absent", "" means "explicitly cleared".
+		DisplayName            *string `json:"display_name"`
+		Bio                    *string `json:"bio"`
+		Timezone               string  `json:"timezone"`
+		PrimaryLanguage        string  `json:"primary_language"`
+		DefaultModeForNewChats string  `json:"default_mode_for_new_chats"`
+		LearningEnabled        *bool   `json:"learning_enabled"`
+		RichFormattingEnabled  *bool   `json:"rich_formatting_enabled"`
+		StreamingEnabled       *bool   `json:"streaming_enabled"`
+		LanguageForDrafts      string  `json:"language_for_drafts"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
@@ -759,10 +788,20 @@ func (s *Server) apiSaveUserSettings(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	settings.UserID = strings.TrimPrefix(tenantID, "tenant:user:")
-	settings.DisplayName = strings.TrimSpace(req.DisplayName)
-	settings.Bio = strings.TrimSpace(req.Bio)
+	if req.DisplayName != nil {
+		settings.DisplayName = strings.TrimSpace(*req.DisplayName)
+	}
+	if req.Bio != nil {
+		settings.Bio = strings.TrimSpace(*req.Bio)
+	}
 	if req.Timezone != "" {
-		settings.Timezone = req.Timezone
+		// Reject unknown IANA names instead of failing the whole request — a
+		// stale or malformed browser-detected zone should not block saving the
+		// rest of the settings, and the prompt builder already falls back to
+		// UTC for an empty/invalid timezone.
+		if _, err := time.LoadLocation(req.Timezone); err == nil {
+			settings.Timezone = req.Timezone
+		}
 	}
 	if req.PrimaryLanguage != "" {
 		settings.PrimaryLanguage = req.PrimaryLanguage

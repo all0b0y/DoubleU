@@ -18,7 +18,13 @@ services:
   litellm:
     image: ghcr.io/berriai/litellm-database:main-stable
     restart: unless-stopped
-    command: ["--config", "/etc/litellm/config.yaml", "--port", "4000"]
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        /app/.venv/bin/python /opt/doubleu/render_litellm_config.py
+        --base /etc/litellm/config.base.yaml
+        --output /tmp/litellm.config.yaml &&
+        exec /app/.venv/bin/litellm --config /tmp/litellm.config.yaml --port 4000
     environment:
       # Resolved by os.environ/* references in config.yaml.
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-sk-doubleu-local-master}
@@ -32,13 +38,22 @@ services:
       # auto-route deepseek/ model names directly to api.deepseek.com, bypassing
       # OpenRouter.  All DeepSeek traffic must go through OpenRouter.
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-}
+      OPENROUTER_FALLBACK_MODEL: ${OPENROUTER_FALLBACK_MODEL:-}
+      MODEL_DRAFT: ${MODEL_DRAFT:-}
+      MODEL_CRITIC: ${MODEL_CRITIC:-}
+      MODEL_CHEAP: ${MODEL_CHEAP:-}
+      MODEL_TIER_FAST: ${MODEL_TIER_FAST:-}
+      MODEL_TIER_BALANCED: ${MODEL_TIER_BALANCED:-}
+      MODEL_TIER_SMART: ${MODEL_TIER_SMART:-}
       # Langfuse success-callback target (full request/response logging).
       LANGFUSE_HOST: ${LITELLM_LANGFUSE_HOST:-http://langfuse-web:3000}
       LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-pk-lf-doubleu-local}
       LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-sk-lf-doubleu-local}
     volumes:
-      - ./infra/litellm/config.yaml:/etc/litellm/config.yaml:ro
+      - ./infra/litellm/config.yaml:/etc/litellm/config.base.yaml:ro
       - ./infra/litellm/budgets.yaml:/etc/litellm/budgets.yaml:ro
+      - ./scripts/render_litellm_config.py:/opt/doubleu/render_litellm_config.py:ro
     ports:
       - "${LITELLM_PORT:-4000}:4000"
     depends_on:

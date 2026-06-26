@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
-from ai_agent.http_server import make_handler
+from ai_agent.http_server import _build_model_config, make_handler
 from ai_agent.observability.trace import derive_trace_id
 from ai_agent.service import AIService
 
@@ -65,7 +66,7 @@ class HTTPServerTests(unittest.TestCase):
             {
                 "decision", "response_text", "confidence", "risk_level", "intent",
                 "text_format", "model_used", "usage", "memory_used", "flagged",
-                "owner_note", "options", "response_plan", "topic",
+                "owner_note", "options", "response_plan", "scheduled_jobs", "topic",
             },
         )
         self.assertEqual(response["decision"], "auto_reply")
@@ -73,6 +74,7 @@ class HTTPServerTests(unittest.TestCase):
         self.assertFalse(response["flagged"])
         self.assertEqual(response["owner_note"], "")
         self.assertIsNone(response["response_plan"])
+        self.assertEqual(response["scheduled_jobs"], [])
 
 
     def test_extract_media_endpoint_matches_shape(self) -> None:
@@ -134,6 +136,57 @@ class HTTPServerTests(unittest.TestCase):
         )
         self.assertTrue(response["blocked_by_privacy"])
         self.assertEqual(response["pattern"], "")
+
+
+class ModelConfigTests(unittest.TestCase):
+    """Tests for _build_model_config and the /ai/model-config GET endpoint."""
+
+    def test_splits_comma_separated_models(self) -> None:
+        """MODEL_TIER_* env vars are split on commas and whitespace-trimmed."""
+        env = {
+            "MODEL_TIER_FAST": "deepseek/fast-a, deepseek/fast-b",
+            "MODEL_TIER_BALANCED": "deepseek/balanced",
+            "MODEL_TIER_SMART": "deepseek/smart",
+            "OPENROUTER_MODEL": "deepseek/default",
+        }
+        with mock.patch.dict("os.environ", env, clear=False):
+            cfg = _build_model_config()
+
+        self.assertEqual(cfg.fast, ["deepseek/fast-a", "deepseek/fast-b"])
+        self.assertEqual(cfg.balanced, ["deepseek/balanced"])
+        self.assertEqual(cfg.smart, ["deepseek/smart"])
+        self.assertEqual(cfg.default, "deepseek/default")
+
+    def test_empty_env_produces_empty_lists(self) -> None:
+        """Unset tier env vars produce empty lists; unset OPENROUTER_MODEL produces empty string."""
+        env = {
+            "MODEL_TIER_FAST": "",
+            "MODEL_TIER_BALANCED": "",
+            "MODEL_TIER_SMART": "",
+            "OPENROUTER_MODEL": "",
+        }
+        with mock.patch.dict("os.environ", env, clear=False):
+            cfg = _build_model_config()
+
+        self.assertEqual(cfg.fast, [])
+        self.assertEqual(cfg.balanced, [])
+        self.assertEqual(cfg.smart, [])
+        self.assertEqual(cfg.default, "")
+
+    def test_to_dict_matches_wire_shape(self) -> None:
+        """to_dict must return exactly the four expected keys."""
+        env = {
+            "MODEL_TIER_FAST": "m/fast",
+            "MODEL_TIER_BALANCED": "m/balanced",
+            "MODEL_TIER_SMART": "m/smart",
+            "OPENROUTER_MODEL": "m/default",
+        }
+        with mock.patch.dict("os.environ", env, clear=False):
+            result = _build_model_config().to_dict()
+
+        self.assertEqual(set(result.keys()), {"fast", "balanced", "smart", "default"})
+        self.assertEqual(result["fast"], ["m/fast"])
+        self.assertEqual(result["default"], "m/default")
 
 
 class TraceIDPropagationTests(unittest.TestCase):

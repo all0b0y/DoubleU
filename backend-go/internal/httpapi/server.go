@@ -133,6 +133,9 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/v1/settings/user", s.tmaAuth(s.apiGetUserSettings))
 	s.mux.HandleFunc("PUT /api/v1/settings/user", s.tmaAuth(s.apiSaveUserSettings))
 
+	// Config endpoints: proxied from the AI service (internal, no side effects).
+	s.mux.HandleFunc("GET /api/v1/config/models", s.tmaAuth(s.apiModelConfig))
+
 	// Bot ingestion settings (UI is the configuration surface; the bot is the
 	// communication channel).
 	s.mux.HandleFunc("GET /api/v1/bots", s.tmaAuth(s.apiListBots))

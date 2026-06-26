@@ -14,8 +14,56 @@ const MODE_OPTIONS = [
   { value: 'auto',      label: 'auto — отвечает сам' },
 ];
 
+// Curated list of major IANA zones for the manual override — kept short on
+// purpose (full tz database is 400+ entries and unusable in a <select>).
+// The owner's actual auto-detected zone is injected at render time even when
+// it isn't in this list, so the dropdown never silently shows the wrong value.
+const TIMEZONE_OPTIONS = [
+  ['UTC', 'UTC'],
+  ['Europe/Kaliningrad', 'Калининград'],
+  ['Europe/Kyiv', 'Киев'],
+  ['Europe/Minsk', 'Минск'],
+  ['Europe/Moscow', 'Москва'],
+  ['Europe/Samara', 'Самара'],
+  ['Asia/Yekaterinburg', 'Екатеринбург'],
+  ['Asia/Almaty', 'Алматы'],
+  ['Asia/Omsk', 'Омск'],
+  ['Asia/Krasnoyarsk', 'Красноярск'],
+  ['Asia/Irkutsk', 'Иркутск'],
+  ['Asia/Yakutsk', 'Якутск'],
+  ['Asia/Vladivostok', 'Владивосток'],
+  ['Asia/Magadan', 'Магадан'],
+  ['Asia/Kamchatka', 'Камчатка'],
+  ['Asia/Tashkent', 'Ташкент'],
+  ['Asia/Bishkek', 'Бишкек'],
+  ['Asia/Dushanbe', 'Душанбе'],
+  ['Asia/Baku', 'Баку'],
+  ['Asia/Yerevan', 'Ереван'],
+  ['Asia/Tbilisi', 'Тбилиси'],
+  ['Europe/Warsaw', 'Варшава'],
+  ['Europe/Berlin', 'Берлин'],
+  ['Europe/London', 'Лондон'],
+  ['Europe/Istanbul', 'Стамбул'],
+  ['Asia/Dubai', 'Дубай'],
+  ['Asia/Bangkok', 'Бангкок'],
+  ['Asia/Shanghai', 'Пекин/Шанхай'],
+  ['Asia/Tokyo', 'Токио'],
+  ['America/New_York', 'Нью-Йорк'],
+  ['America/Los_Angeles', 'Лос-Анджелес'],
+];
+
 function esc(str) {
   return String(str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+// Renders <option>s for the timezone <select>, injecting the current value
+// when it falls outside the curated list so the dropdown is never wrong.
+function timezoneOptionsHTML(current) {
+  const known = TIMEZONE_OPTIONS.some(([iana]) => iana === current);
+  const all = current && !known ? [[current, current], ...TIMEZONE_OPTIONS] : TIMEZONE_OPTIONS;
+  return all.map(([iana, label]) => `
+    <option value="${esc(iana)}" ${iana === current ? 'selected' : ''}>${esc(label)} (${esc(iana)})</option>
+  `).join('');
 }
 
 function suggestionCardHTML(s) {
@@ -157,6 +205,15 @@ export function renderMe(navigate) {
                 <option value="primary" ${settings.language_for_drafts === 'primary' ? 'selected' : ''}>всегда мой язык</option>
               </select>
             </div>
+            <div class="field-group">
+              <div class="field-label">часовой пояс</div>
+              <select class="field-select" id="f-timezone">
+                ${timezoneOptionsHTML(settings.timezone || 'UTC')}
+              </select>
+              <div style="font-size:11px;color:var(--muted);line-height:1.4;margin-top:6px;">
+                Определяется автоматически по устройству — используется для напоминаний. Можно задать вручную.
+              </div>
+            </div>
             <div class="st-row" style="padding:0;cursor:default;">
               <div class="st-row-body">
                 <p class="st-row-title">учиться на моих правках</p>
@@ -276,6 +333,7 @@ export function renderMe(navigate) {
           // so saving behaviour settings doesn't wipe the existing profile.
           display_name:               settings.display_name,
           bio:                        settings.bio,
+          timezone:                   el.querySelector('#f-timezone').value,
           default_mode_for_new_chats: el.querySelector('#f-default-mode').value,
           language_for_drafts:        el.querySelector('#f-draft-lang').value,
           learning_enabled:           el.querySelector('#f-learning').checked,

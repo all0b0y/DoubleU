@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -255,6 +256,63 @@ def test_bimodal_orchestrator_tools_writer_bundle_tier_and_critic(monkeypatch) -
     assert "smart" in recorded_models
 
 
+def test_two_stage_named_role_model_routes_writer_and_logs_concrete_slug(monkeypatch) -> None:
+    writer_model = structured({
+        "reply": "Да, встречаемся в 19:00.",
+        "intent": "scheduling",
+        "options": [],
+        "confidence": 0.9,
+        "topic": "время встречи",
+    })
+    captured: dict[str, tuple[str, str]] = {}
+
+    def named_model(tier: str, model_name: str):
+        captured["selected"] = (tier, model_name)
+        return writer_model
+
+    monkeypatch.setattr(runtime_module, "build_named_model", named_model)
+    monkeypatch.setattr(
+        runtime_module,
+        "model_name_for_tier",
+        lambda tier, model_name: model_name,
+    )
+    monkeypatch.setenv("MODEL_ROUTER", "router-constant")
+    sink = _FakeSink()
+    request = replace(
+        process_request("Встреча точно в семь?"),
+        ai_role=AIRoleData(
+            name="Support",
+            description="Помогает клиентам.",
+            model_tier="smart",
+            model_name="model-b",
+        ),
+    )
+    runtime = make_runtime(
+        two_stage_draft=True,
+        orchestrator_model=structured({
+            "gathered_context": [],
+            "suggested_intent": "scheduling",
+            "notes": "",
+        }),
+        draft_model=structured({
+            "reply": "wrong default writer",
+            "intent": "general_message",
+            "options": [],
+            "confidence": 0.9,
+            "topic": "",
+        }),
+        sink=sink,
+    )
+
+    with with_context(LLMCallContext(trace_id="trace-named-model")):
+        outcome = runtime.draft_outcome(request, RiskLevel.LOW)
+
+    assert captured["selected"] == ("smart", "model-b")
+    assert outcome.text == "Да, встречаемся в 19:00."
+    assert outcome.model_used == "orchestrate(router-constant)+draft(model-b)"
+    assert "model-b" in [generation["model"] for generation in sink.generations]
+
+
 def test_interaction_tool_forms_choice_question_without_sending() -> None:
     calls = {"orchestrator": 0}
 
@@ -303,6 +361,63 @@ def test_interaction_tool_forms_choice_question_without_sending() -> None:
     assert outcome.response_plan is not None
     assert outcome.response_plan.shape == "buttons"
     assert outcome.response_plan.options == ("Сегодня", "Завтра")
+
+
+def test_scheduler_tool_returns_job_for_go_persistence() -> None:
+    calls = {"orchestrator": 0}
+    fire_at = (datetime.now(timezone.utc) + timedelta(days=1)).replace(microsecond=0)
+
+    def orchestrator(messages, info: AgentInfo) -> ModelResponse:
+        calls["orchestrator"] += 1
+        if calls["orchestrator"] == 1:
+            return ModelResponse(parts=[ToolCallPart(
+                tool_name="create_reminder",
+                args={
+                    "fire_at_iso": fire_at.isoformat(),
+                    "text": "Позвонить клиенту",
+                    "target": "owner",
+                },
+            )])
+        return ModelResponse(parts=[ToolCallPart(tool_name="final_result", args={
+            "gathered_context": ["Напоминание подготовлено."],
+            "suggested_intent": "scheduling",
+            "notes": "",
+            "response_plan": None,
+        })])
+
+    request = replace(
+        process_request("Поставь напоминание завтра"),
+        ai_role=AIRoleData(
+            name="Scheduler",
+            tool_settings={
+                **{entry.key: False for entry in TOOL_CATALOG},
+                "scheduler.create_reminder": True,
+            },
+        ),
+    )
+    runtime = make_runtime(
+        two_stage_draft=True,
+        orchestrator_model=FunctionModel(orchestrator),
+        draft_model=structured({
+            "reply": "Готово, напомню.",
+            "intent": "scheduling",
+            "options": [],
+            "confidence": 0.9,
+            "topic": "напоминание клиенту",
+        }),
+    )
+
+    outcome = runtime.draft_outcome(request, RiskLevel.LOW)
+
+    assert calls["orchestrator"] == 2
+    assert outcome.scheduled_jobs
+    job = outcome.scheduled_jobs[0]
+    assert job.kind == "reminder"
+    assert job.target == "owner"
+    assert job.fire_at == fire_at.isoformat()
+    assert job.payload == {"text": "Позвонить клиенту"}
+    assert job.created_by == "ai"
+    assert job.idempotency_key.startswith("scheduler:")
 
 
 def test_orchestrator_model_name_defaults_to_cheap(monkeypatch) -> None:

@@ -487,6 +487,9 @@ type AIRole struct {
 	// Empty string means fall back to the DRAFT task model (MODEL_DRAFT /
 	// OPENROUTER_MODEL), preserving backward compatibility with existing roles.
 	ModelTier string `json:"model_tier,omitempty"`
+	// ModelName optionally pins a concrete model inside ModelTier. Empty keeps
+	// the tier primary; stale values are ignored by Python model routing.
+	ModelName string `json:"model_name,omitempty"`
 	// ToolSettings contains per-role native-tool overrides. Missing keys inherit
 	// the corresponding catalog entry's DefaultEnabled value.
 	ToolSettings map[string]bool `json:"tool_settings,omitempty"`

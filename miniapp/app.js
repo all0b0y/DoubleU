@@ -153,12 +153,31 @@ function connectSSE() {
   });
 }
 
+// ── Timezone auto-detection ──────────────────────────────────────────────────
+// The scheduler prompt (ai-python _current_time_instruction) needs the owner's
+// IANA timezone to compute fire_at correctly; without it reminders fall back
+// to UTC. Runs once per detected zone (cached in localStorage) and never blocks
+// boot — it's a best-effort background sync, not part of the critical path.
+async function syncTimezone() {
+  try {
+    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    if (!tz) return;
+    if (localStorage.getItem('tz_synced') === tz) return;
+    const s = await api.userSettings();
+    await api.saveUserSettings({ ...s, timezone: tz });
+    localStorage.setItem('tz_synced', tz);
+  } catch (_) {
+    // Background sync — never surface a failure to the user.
+  }
+}
+
 // ── Boot ─────────────────────────────────────────────────────────────────────
 async function boot() {
   if (!window.location.hash || window.location.hash === '#/') {
     // Land straight in the app; fall back to the splash if the API is down.
     try {
       await api.me();
+      syncTimezone(); // fire-and-forget; must not delay navigation
       navigate('/chats');
     } catch (_) {
       navigate('/');

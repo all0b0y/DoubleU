@@ -11,16 +11,63 @@ the legacy ``notes`` JSON is never echoed raw.
 from __future__ import annotations
 
 import unittest
+from datetime import datetime, timezone
 
+from pydantic_ai.messages import ModelResponse, ToolCallPart
+from pydantic_ai.models.function import AgentInfo, FunctionModel
+
+from ai_agent.agents.tool_catalog import TOOL_CATALOG
 from ai_agent.pipelines import draft as draft_pipeline
-from ai_agent.schemas import AIRoleData, ContactProfileData
+from ai_agent.schemas import (
+    AIProcessMessageRequest,
+    AIRoleData,
+    ChatMode,
+    ChatSettings,
+    ContactProfileData,
+    NormalizedTelegramEvent,
+    RiskLevel,
+    UserSettingsData,
+)
 from ai_agent.schemas import _parse_ai_role, _parse_contact_profile
+from ai_agent.security import PromptBuilder
+
+from agent_helpers import make_test_runtime, structured
 
 # Opaque markers: if one appears in the prompt it can only have come from the
 # matching profile field — never from a hard-coded default.
 OWNER_STYLE = "owner-style-sentinel-α"
 CONTACT_CONTEXT = "chat-context-sentinel-β"
 TABOO_TOPIC = "taboo-sentinel-γ"
+
+
+def _process_request(
+    text: str = "Когда созвонимся?",
+    ai_role: AIRoleData | None = None,
+    user_settings: UserSettingsData | None = None,
+) -> AIProcessMessageRequest:
+    return AIProcessMessageRequest(
+        request_id="r1",
+        event=NormalizedTelegramEvent(
+            event_id="e1",
+            tenant_id="tenant:user:77",
+            chat_id="42",
+            telegram_update_id=1,
+            business_connection_id="",
+            source_message_id="m1",
+            sender_id="s1",
+            message_text=text,
+            message_type="text",
+            created_at="2026-06-11T10:00:00Z",
+        ),
+        chat_settings=ChatSettings(
+            tenant_id="tenant:user:77",
+            chat_id="42",
+            mode=ChatMode.MANUAL,
+            privacy_flags=(),
+        ),
+        ai_role=ai_role,
+        user_settings=user_settings,
+    )
 
 
 class ContactProfileParsingTests(unittest.TestCase):
@@ -258,6 +305,76 @@ class AIRolePromptTests(unittest.TestCase):
         self.assertIn("КОНТЕКСТ УЖЕ СОБРАН", two_stage)
         self.assertIn("НЕТ инструментов", two_stage)
 
+    def test_present_buttons_instruction_is_single_stage_only(self) -> None:
+        """Single-stage writer is told to call present_buttons; bimodal writer is not."""
+        role = AIRoleData(
+            name="role-name-sentinel",
+            tool_settings={"interaction.present_buttons": True},
+        )
+        request = _process_request(ai_role=role)
+
+        single_stage, _ = draft_pipeline.build_draft_prompt(request, PromptBuilder())
+        two_stage, _ = draft_pipeline.build_draft_prompt(
+            request, PromptBuilder(), orchestrator_bundle=("context",)
+        )
+
+        self.assertIn("present_buttons(prompt, options[2..4])", single_stage)
+        self.assertIn("Не описывай кнопки словами", single_stage)
+        self.assertNotIn("present_buttons(prompt, options[2..4])", two_stage)
+
+    def test_single_stage_writer_present_buttons_reaches_draft_outcome(self) -> None:
+        """A writer tool call in single-stage mode becomes the final response_plan."""
+        calls = {"writer": 0}
+
+        def writer(messages, info: AgentInfo) -> ModelResponse:
+            calls["writer"] += 1
+            if calls["writer"] == 1:
+                return ModelResponse(parts=[ToolCallPart(
+                    tool_name="present_buttons",
+                    args={
+                        "prompt": "Какой вариант вам удобнее?",
+                        "options": ["Сегодня", "Завтра"],
+                    },
+                )])
+            return ModelResponse(parts=[ToolCallPart(tool_name="final_result", args={
+                "reply": "writer placeholder",
+                "intent": "general_message",
+                "options": [],
+                "confidence": 0.9,
+                "topic": "выбор времени",
+            })])
+
+        request = _process_request(
+            text="Когда созвонимся?",
+            ai_role=AIRoleData(
+                name="Support",
+                tool_settings={
+                    **{entry.key: False for entry in TOOL_CATALOG},
+                    "interaction.present_buttons": True,
+                },
+            ),
+        )
+        runtime = make_test_runtime(
+            two_stage_draft=False,
+            draft_model=FunctionModel(writer),
+            critic_model=structured({
+                "verdict": "approve",
+                "issues": [],
+                "revised_reply": "",
+            }),
+        )
+
+        outcome = runtime.draft_outcome(request, RiskLevel.LOW)
+
+        self.assertEqual(calls["writer"], 2)
+        self.assertEqual(outcome.text, "Какой вариант вам удобнее?")
+        self.assertEqual(outcome.intent, "choice_question")
+        self.assertEqual(outcome.options, ("Сегодня", "Завтра"))
+        self.assertIsNotNone(outcome.response_plan)
+        assert outcome.response_plan is not None
+        self.assertEqual(outcome.response_plan.shape, "buttons")
+        self.assertEqual(outcome.response_plan.options, ("Сегодня", "Завтра"))
+
     def test_no_role_prompt_forbids_markup(self) -> None:
         """The legacy owner-copy path remains plain to match its delivery contract."""
         self.assertIn("Пиши обычным текстом без разметки", self._compose(None))
@@ -277,10 +394,15 @@ class AIRolePromptTests(unittest.TestCase):
         """A role payload without a name is treated as no role at all."""
         self.assertIsNone(_parse_ai_role({"description": "x"}))
         self.assertIsNone(_parse_ai_role(None))
-        parsed = _parse_ai_role({"name": " n ", "constraints": " c "})
+        parsed = _parse_ai_role({
+            "name": " n ",
+            "constraints": " c ",
+            "model_name": " model-b ",
+        })
         assert parsed is not None
         self.assertEqual(parsed.name, "n")
         self.assertEqual(parsed.constraints, "c")
+        self.assertEqual(parsed.model_name, "model-b")
         self.assertTrue(parsed.speak_as_owner)
 
         bot_role = _parse_ai_role({"name": "bot", "speak_as_owner": False})
@@ -323,6 +445,60 @@ class AIRolePromptTests(unittest.TestCase):
         self.assertEqual(len(parsed.custom_fields), 1)
         self.assertEqual(parsed.custom_fields[0].title, "keep")
         self.assertEqual(parsed.custom_fields[0].description, "why")
+
+
+class CurrentTimeInstructionTests(unittest.TestCase):
+    """``_current_time_instruction`` grounds scheduler.create_reminder in the
+    owner's local time: bare times in a message must resolve against the
+    owner's IANA zone (never UTC), and an already-passed time must roll
+    forward or prompt a clarifying question instead of firing in the past."""
+
+    # Fixed instant (not datetime.now()) so the assertions never depend on
+    # the date the suite happens to run on.
+    _NOON_UTC = datetime(2026, 6, 23, 10, 0, tzinfo=timezone.utc)
+
+    def test_local_time_reflects_owner_timezone(self) -> None:
+        """A known UTC instant converts to the owner's zone, not UTC."""
+        request = _process_request(user_settings=UserSettingsData(timezone="Europe/Kyiv"))
+        instruction = draft_pipeline._current_time_instruction(request, self._NOON_UTC)
+        # Europe/Kyiv observes EEST (UTC+3) in June.
+        self.assertIn("2026-06-23T13:00:00+03:00", instruction)
+        self.assertIn("Europe/Kyiv", instruction)
+        self.assertIn("2026-06-23T10:00:00+00:00", instruction)
+
+    def test_invalid_timezone_falls_back_to_utc(self) -> None:
+        """An unknown IANA name degrades to UTC instead of raising."""
+        request = _process_request(user_settings=UserSettingsData(timezone="Not/AZone"))
+        instruction = draft_pipeline._current_time_instruction(request, self._NOON_UTC)
+        self.assertIn("(UTC)", instruction)
+
+    def test_missing_user_settings_falls_back_to_utc(self) -> None:
+        """No user_settings at all (legacy/incomplete request) also defaults to UTC."""
+        request = _process_request()
+        instruction = draft_pipeline._current_time_instruction(request, self._NOON_UTC)
+        self.assertIn("(UTC)", instruction)
+
+    def test_bare_time_is_framed_as_owner_local_never_utc(self) -> None:
+        """The strengthened wording forbids reading a bare time as UTC."""
+        request = _process_request(user_settings=UserSettingsData(timezone="Europe/Kyiv"))
+        instruction = draft_pipeline._current_time_instruction(request, self._NOON_UTC)
+        self.assertIn("локальное", instruction)
+        self.assertIn("никогда не интерпретируй его как UTC", instruction)
+
+    def test_passed_time_must_roll_forward_or_ask(self) -> None:
+        """The strengthened wording requires rolling a passed time forward, or asking."""
+        request = _process_request(user_settings=UserSettingsData(timezone="Europe/Kyiv"))
+        instruction = draft_pipeline._current_time_instruction(request, self._NOON_UTC)
+        self.assertIn("уже прошёл", instruction)
+        self.assertIn("ближайшее будущее наступление", instruction)
+        self.assertIn("уточняющий вопрос", instruction)
+
+    def test_fire_at_iso_stays_an_absolute_offset_timestamp(self) -> None:
+        """fire_at_iso must remain an absolute offset timestamp, not bare local time."""
+        request = _process_request(user_settings=UserSettingsData(timezone="Europe/Kyiv"))
+        instruction = draft_pipeline._current_time_instruction(request, self._NOON_UTC)
+        self.assertIn("fire_at_iso", instruction)
+        self.assertIn("смещением", instruction)
 
 
 class GreetingRuleTests(unittest.TestCase):

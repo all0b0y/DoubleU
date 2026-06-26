@@ -171,6 +171,9 @@ func TestRoleLifecycle(t *testing.T) {
 	if created.RichFormattingEnabled != nil || created.StreamingEnabled != nil {
 		t.Fatalf("new role must inherit delivery settings by default: %+v", created)
 	}
+	if created.ModelTier != "balanced" {
+		t.Fatalf("new role model tier = %q, want balanced", created.ModelTier)
+	}
 
 	// Duplicate name → 409.
 	res = miniappRequest(t, server, http.MethodPost, "/api/v1/roles", `{"name":"менеджер","description":"дубль"}`)
@@ -281,6 +284,44 @@ func TestRoleDeliverySettingsRoundTrip(t *testing.T) {
 	decodeBody(t, res, &created)
 	if created.RichFormattingEnabled != nil || created.StreamingEnabled == nil || *created.StreamingEnabled {
 		t.Fatalf("delivery settings after clear/update = %+v", created)
+	}
+}
+
+func TestRoleModelTierRoundTripAndValidation(t *testing.T) {
+	repo := store.NewRepository()
+	server := NewServer(core.NewService(repo, nil, nil))
+
+	res := miniappRequest(t, server, http.MethodPost, "/api/v1/roles",
+		`{"name":"Быстрая поддержка","description":"Отвечает по FAQ","model_tier":"FAST","model_name":" deepseek/model-a "}`)
+	if res.Code != http.StatusOK {
+		t.Fatalf("create status = %d body=%s", res.Code, res.Body.String())
+	}
+	var created roleJSON
+	decodeBody(t, res, &created)
+	if created.ModelTier != "fast" {
+		t.Fatalf("created model tier = %q, want fast", created.ModelTier)
+	}
+	if created.ModelName != "deepseek/model-a" {
+		t.Fatalf("created model name = %q, want deepseek/model-a", created.ModelName)
+	}
+
+	res = miniappRequest(t, server, http.MethodPut, fmt.Sprintf("/api/v1/roles/%d", created.ID),
+		`{"name":"Быстрая поддержка","description":"Отвечает по FAQ","model_tier":"smart","model_name":"deepseek/model-b"}`)
+	if res.Code != http.StatusOK {
+		t.Fatalf("update status = %d body=%s", res.Code, res.Body.String())
+	}
+	decodeBody(t, res, &created)
+	if created.ModelTier != "smart" {
+		t.Fatalf("updated model tier = %q, want smart", created.ModelTier)
+	}
+	if created.ModelName != "deepseek/model-b" {
+		t.Fatalf("updated model name = %q, want deepseek/model-b", created.ModelName)
+	}
+
+	res = miniappRequest(t, server, http.MethodPost, "/api/v1/roles",
+		`{"name":"Некорректная","description":"x","model_tier":"turbo"}`)
+	if res.Code != http.StatusBadRequest {
+		t.Fatalf("invalid model tier status = %d body=%s", res.Code, res.Body.String())
 	}
 }
 
@@ -455,6 +496,85 @@ func TestUserSettingsRoundTrip(t *testing.T) {
 	res = miniappRequest(t, server, http.MethodPut, "/api/v1/settings/user", `{"default_mode_for_new_chats":"yolo"}`)
 	if res.Code != http.StatusBadRequest {
 		t.Fatalf("invalid mode status = %d", res.Code)
+	}
+}
+
+// TestUserSettingsPartialUpdatePreservesIdentity guards against a regression
+// where a timezone-only PUT (the Mini App's background auto-detect sync)
+// wiped display_name/bio because the request struct used bare strings instead
+// of *string — every omitted field unmarshalled to "" and overwrote the
+// stored value.
+func TestUserSettingsPartialUpdatePreservesIdentity(t *testing.T) {
+	repo := store.NewRepository()
+	server := NewServer(core.NewService(repo, nil, nil))
+
+	res := miniappRequest(t, server, http.MethodPut, "/api/v1/settings/user",
+		`{"display_name":"Алексей","bio":"продакт"}`)
+	if res.Code != http.StatusOK {
+		t.Fatalf("seed save status = %d body=%s", res.Code, res.Body.String())
+	}
+
+	// Partial PUT — only timezone, as the Mini App's syncTimezone() sends —
+	// must not touch display_name/bio.
+	res = miniappRequest(t, server, http.MethodPut, "/api/v1/settings/user", `{"timezone":"Europe/Kyiv"}`)
+	if res.Code != http.StatusOK {
+		t.Fatalf("partial save status = %d body=%s", res.Code, res.Body.String())
+	}
+
+	res = miniappRequest(t, server, http.MethodGet, "/api/v1/settings/user", "")
+	var got contracts.UserSettings
+	decodeBody(t, res, &got)
+	if got.DisplayName != "Алексей" || got.Bio != "продакт" {
+		t.Fatalf("timezone-only update must not wipe identity fields: %+v", got)
+	}
+	if got.Timezone != "Europe/Kyiv" {
+		t.Fatalf("timezone not saved: %+v", got)
+	}
+
+	// An explicit empty string (field present, value "") is a real clear
+	// request and must still work — distinct from omitting the field.
+	res = miniappRequest(t, server, http.MethodPut, "/api/v1/settings/user", `{"display_name":"","bio":""}`)
+	if res.Code != http.StatusOK {
+		t.Fatalf("explicit clear status = %d body=%s", res.Code, res.Body.String())
+	}
+	res = miniappRequest(t, server, http.MethodGet, "/api/v1/settings/user", "")
+	// DisplayName/Bio are `omitempty` on the wire, so a fresh zero-value struct
+	// is required here — reusing `got` would silently keep the stale strings,
+	// since an absent JSON key leaves the destination field untouched.
+	var cleared contracts.UserSettings
+	decodeBody(t, res, &cleared)
+	if cleared.DisplayName != "" || cleared.Bio != "" {
+		t.Fatalf("explicit empty string must clear identity fields: %+v", cleared)
+	}
+	if cleared.Timezone != "Europe/Kyiv" {
+		t.Fatalf("unrelated clear must not touch timezone: %+v", cleared)
+	}
+}
+
+// TestUserSettingsInvalidTimezoneIgnored ensures a malformed/unknown IANA
+// name (e.g. a stale browser-detected value) is dropped silently rather than
+// failing the request or overwriting a previously valid timezone — the
+// scheduler prompt already falls back to UTC for an empty timezone, so
+// rejecting bad input here keeps that fallback the only path to UTC.
+func TestUserSettingsInvalidTimezoneIgnored(t *testing.T) {
+	repo := store.NewRepository()
+	server := NewServer(core.NewService(repo, nil, nil))
+
+	res := miniappRequest(t, server, http.MethodPut, "/api/v1/settings/user", `{"timezone":"Europe/Kyiv"}`)
+	if res.Code != http.StatusOK {
+		t.Fatalf("seed save status = %d body=%s", res.Code, res.Body.String())
+	}
+
+	res = miniappRequest(t, server, http.MethodPut, "/api/v1/settings/user", `{"timezone":"Not/AZone"}`)
+	if res.Code != http.StatusOK {
+		t.Fatalf("invalid timezone must not fail the request: status=%d body=%s", res.Code, res.Body.String())
+	}
+
+	var got contracts.UserSettings
+	res = miniappRequest(t, server, http.MethodGet, "/api/v1/settings/user", "")
+	decodeBody(t, res, &got)
+	if got.Timezone != "Europe/Kyiv" {
+		t.Fatalf("invalid timezone must not overwrite the previous valid value: %+v", got)
 	}
 }
 
