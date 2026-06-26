@@ -5,7 +5,7 @@
 > Контекст: фазы 1–3 rich-форматирования уже в коде (`0f1a5ae`, `e9ec1fb`, phase2/phase3
 > планы). API: Telegram Bot API 10.1 «Rich Messages» — **подтверждён живьём 2026-06-20**
 > (`sendRichMessage` / `sendRichMessageDraft` существуют). Референс схемы:
-> `docs/telegram_rich_messages_api.md`.
+> `docs/reference/telegram_rich_messages_api.md`.
 >
 > Дисциплина исполнения: **одна фаза за запуск. После фазы — прогон тестов; зелёные → СТОП**
 > и отчёт. Имена полей Bot API — только из референса/вендоренных типов; нет в референсе —

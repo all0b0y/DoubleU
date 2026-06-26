@@ -18,7 +18,7 @@
 AI-агента-разработчика (Claude Code / Sonnet)**: контекст → что сделать → файлы → критерии приёмки.
 
 Связанные беклоги: [memory_architecture_backlog.md](memory_architecture_backlog.md) (MEM-1…MEM-13),
-[backlog.md](backlog.md) (LLM Safety & Observability — отдельный трек, сюда не переносится).
+[backlog.md](../backlog.md) (LLM Safety & Observability — отдельный трек, сюда не переносится).
 
 ---
 
@@ -67,10 +67,10 @@ regex-театром. Это даёт ~50-70 % экономии вызовов �
 ### ARCH-1. Canned-предупреждение для critical-risk можно отправить собеседнику
 
 **Контекст.** При critical-risk (профанация/секс-контент) `maybe_generate_response`
-([draft.py](../ai-python/ai_agent/pipelines/draft.py), `_MANUAL_REASONS`) возвращает текст
+([draft.py](../../ai-python/ai_agent/pipelines/draft.py), `_MANUAL_REASONS`) возвращает текст
 «⚠️ Сообщение интимного характера. ИИ не формирует ответ — ответьте вручную» как `response_text`.
 Go `DecisionEngine.Decide` видит непустой `ResponseText` при `RiskCritical` → `AskOwner` →
-`createDraft(event, eventID, proposal.ResponseText)` ([service.go:54-59, 566-612](../backend-go/internal/core/service.go)).
+`createDraft(event, eventID, proposal.ResponseText)` ([service.go:54-59, 566-612](../../backend-go/internal/core/service.go)).
 Кнопка «Approve» на такой карточке **отправит служебное предупреждение собеседнику**.
 
 **Задача.** Раздели owner-facing предупреждение и contact-facing черновик:
@@ -88,9 +88,9 @@ Go `DecisionEngine.Decide` видит непустой `ResponseText` при `Ri
 ### ARCH-2. `choice_question` — мёртвая ветка: интент никто не производит
 
 **Контекст.** Go ждёт `proposal.Intent == "choice_question"` и строит question-card с кнопками
-([service.go:569](../backend-go/internal/core/service.go), `parseOptions`, `sendQuestionToOwner`,
+([service.go:569](../../backend-go/internal/core/service.go), `parseOptions`, `sendQuestionToOwner`,
 `handleChoiceOption` — всё работает), но `IntentClassifier`
-([classifiers.py](../ai-python/ai_agent/classifiers.py)) возвращает только
+([classifiers.py](../../ai-python/ai_agent/classifiers.py)) возвращает только
 question/scheduling/commercial/acknowledgement/request/general_message. Ветка недостижима.
 
 **Задача.** Реализуй производителя интента в рамках ARCH-4 (структурированный выход draft-вызова:
@@ -103,7 +103,7 @@ LLM сам помечает `intent="choice_question"` и кладёт вари�
 
 ### ARCH-3. Confidence — синтетический: авторежим гейтится regex-ключами, а не уверенностью модели
 
-**Контекст.** `confidence_for` ([decisions.py](../ai-python/ai_agent/pipelines/decisions.py)) =
+**Контекст.** `confidence_for` ([decisions.py](../../ai-python/ai_agent/pipelines/decisions.py)) =
 `min(0.96, intent_confidence + 0.1)`, где `intent_confidence` — захардкоженные числа
 regex-классификатора (0.72–0.88). Пороги Go (`SemiAutoMinConfidence=0.85`, `AutoMinConfidence=0.92`)
 сравниваются с этим числом ⇒ авто-ответ де-факто разрешает класс ключевых слов, а не уверенность.
@@ -140,7 +140,7 @@ topic — отдельный LLM-вызов на каждое сообщение
 ```
 Требования:
 1. Жёсткая валидация выхода (по образцу `_normalize_typed_fact` в
-   [extraction.py](../ai-python/ai_agent/pipelines/extraction.py)): невалидный JSON → fallback на
+   [extraction.py](../../ai-python/ai_agent/pipelines/extraction.py)): невалидный JSON → fallback на
    текущее поведение (текст как reply, regex-интент, синтетический confidence). Используй
    `jsonio.strip_code_fences`.
 2. Детерминированный `RiskClassifier` ОСТАЁТСЯ источником risk_level (политика — на бэкенде,
@@ -163,9 +163,9 @@ topic — отдельный LLM-вызов на каждое сообщение
 
 ### ARCH-5. Заменить listwise-LLM-reranking на детерминированный/локальный
 
-**Контекст.** `rerankFacts` ([service.go](../backend-go/internal/core/service.go)) шлёт top-20
+**Контекст.** `rerankFacts` ([service.go](../../backend-go/internal/core/service.go)) шлёт top-20
 кандидатов в `/ai/rerank-facts`, где **LLM** просят отсортировать ID
-([reranking.py](../ai-python/ai_agent/pipelines/reranking.py)). Это +1 LLM-вызов и до 5 s в горячем
+([reranking.py](../../ai-python/ai_agent/pipelines/reranking.py)). Это +1 LLM-вызов и до 5 s в горячем
 пути, при том что: (а) кандидаты уже отранжированы RRF (vector+BM25), (б) у фактов уже есть
 эмбеддинги в `fact_embeddings` — косинус к query-вектору считается в SQL бесплатно.
 
@@ -184,9 +184,9 @@ topic — отдельный LLM-вызов на каждое сообщение
 ### ARCH-6. Topic-tagging: троттлинг и контекст
 
 **Контекст.** LLM-вызов `TagTopic` стреляет на **каждое** входящее сообщение
-([service.go:372-390](../backend-go/internal/core/service.go)), при этом Go передаёт только
+([service.go:372-390](../../backend-go/internal/core/service.go)), при этом Go передаёт только
 `MessageText`, хотя контракт `TopicTaggingRequest.recent_messages` поддерживает историю
-([topic.py](../ai-python/ai_agent/pipelines/topic.py)) — тема по одному сообщению почти всегда шум.
+([topic.py](../../ai-python/ai_agent/pipelines/topic.py)) — тема по одному сообщению почти всегда шум.
 
 **Задача.** (Снимается автоматически, если ARCH-4 переносит topic в draft-ответ.)
 Иначе: тегируй раз в N сообщений (`ep.MessageCount % 5 == 1`) и передавай последние 5 сообщений
@@ -221,14 +221,14 @@ topic — отдельный LLM-вызов на каждое сообщение
 `GreetedToday`, `OpenCommitments`, `SemanticFactsByVector`, `SemanticFactsByBM25`,
 `SemanticFactsByIDs`, `EpisodeSummariesByVector`, `RecentMessages` (×2: limit 20 для контекста и
 limit 5 для extraction-окна), `DraftsForChat`, `RecentFeedback`, `ContactProfile`, `UserSettings`,
-`AIRoleForChat` — все последовательно ([service.go `conversationContext` + `HandleTelegramWebhook`](../backend-go/internal/core/service.go)).
+`AIRoleForChat` — все последовательно ([service.go `conversationContext` + `HandleTelegramWebhook`](../../backend-go/internal/core/service.go)).
 
 **Задача.**
 1. Переиспользуй один фетч `RecentMessages(20)` и для extraction-окна (последние 5 из него).
 2. Сгруппируй независимые чтения в `errgroup`/горутины ИЛИ одну SQL-функцию
    `get_chat_context(tenant_id, chat_id, query_vec)` возвращающую JSON (по образцу
    `view_chat_greeted_today`). Цель: ≤ 3 roundtrip'а до LLM-вызова.
-3. Перенесено из [backlog.md](backlog.md): `ContextScore` пересчитывается на каждый чек выбора
+3. Перенесено из [backlog.md](../backlog.md): `ContextScore` пересчитывается на каждый чек выбора
    режима — кэшируй per chat с коротким TTL.
 
 **Файлы:** `backend-go/internal/core/service.go`, `backend-go/internal/store/store.go`,
@@ -241,7 +241,7 @@ limit 5 для extraction-окна), `DraftsForChat`, `RecentFeedback`, `Contact
 ### ARCH-9. Температура per task (сейчас 0.2 на всё)
 
 `OpenRouterLLMGateway._complete_with_model` хардкодит `temperature: 0.2`
-([llm.py:104](../ai-python/ai_agent/llm.py)) для всех задач. Черновики получаются однообразными —
+([llm.py:104](../../ai-python/ai_agent/llm.py)) для всех задач. Черновики получаются однообразными —
 промпт даже содержит костыль про «не цитируй факт в каждом ответе», а extraction/rerank наоборот
 хотят 0. Добавь `temperature` в `GatewayRequest`, роутер назначает per `ModelTask`
 (DRAFT_REPLY≈0.6, EXTRACT_FACTS/rerank=0.0, SUMMARIZE_CHAT≈0.3); прокинь в OpenRouter и LiteLLM
@@ -250,10 +250,10 @@ limit 5 для extraction-окна), `DraftsForChat`, `RecentFeedback`, `Contact
 
 ### ARCH-10. Суммаризация: structured output вместо англоязычных эвристик и мёртвого поля
 
-**Контекст.** `summarize_chat` ([summarization.py](../ai-python/ai_agent/pipelines/summarization.py)):
+**Контекст.** `summarize_chat` ([summarization.py](../../ai-python/ai_agent/pipelines/summarization.py)):
 action items — substring-эвристика по англоязычным токенам (`please/send/need…`) → для русского
 продукта **никогда не срабатывает**, и возвращает сырые сообщения целиком. Поле
-`Recommendations` есть в Go-контракте ([types.go:576](../backend-go/internal/contracts/types.go))
+`Recommendations` есть в Go-контракте ([types.go:576](../../backend-go/internal/contracts/types.go))
 и используется в `sendRecommendationsToOwner`, но **Python его никогда не заполняет** — мёртвый код.
 
 **Задача.** Один структурированный вызов: `{summary, action_items[], recommendations[]}` JSON
@@ -265,7 +265,7 @@ action items — substring-эвристика по англоязычным то
 
 ### ARCH-11. Subject-метки детерминированного экстрактора неверны
 
-`TypedMemoryExtractor` ([classifiers.py](../ai-python/ai_agent/classifiers.py)) помечает
+`TypedMemoryExtractor` ([classifiers.py](../../ai-python/ai_agent/classifiers.py)) помечает
 commitment/health как `subject="owner"`, но extraction вызывается **только для сообщений
 собеседника** (owner-сообщения выходят раньше — `owner_message_observed`). «Я пришлю договор» от
 контакта записывается как обязательство владельца → `OpenCommitments` подмешивает в промпт чужие
@@ -276,7 +276,7 @@ commitment/health как `subject="owner"`, но extraction вызывается
 ### ARCH-12. Embedding-воркер: 5-минутная дыра в ретривале
 
 Новые факты получают эмбеддинги только тиком воркера раз в 5 минут
-([service.go `StartEmbeddingWorker`](../backend-go/internal/core/service.go)) — до этого они
+([service.go `StartEmbeddingWorker`](../../backend-go/internal/core/service.go)) — до этого они
 невидимы для vector recall (BM25 частично спасает). Добавь nudge-канал: `saveTypedFacts` после
 вставки шлёт неблокирующий сигнал воркеру (`select { case ch <- struct{}{}: default: }`), воркер
 слушает тикер ИЛИ канал. Батч-логика не меняется.
@@ -285,7 +285,7 @@ commitment/health как `subject="owner"`, но extraction вызывается
 ### ARCH-13. In-memory режим Repository (перенесено из backlog.md)
 
 1. `Repository.UpsertSemanticFact` аппендит в in-memory `semanticFacts` даже при настроенной DB —
-   неограниченный рост за жизнь процесса ([store.go:1974-1976](../backend-go/internal/store/store.go));
+   неограниченный рост за жизнь процесса ([store.go:1974-1976](../../backend-go/internal/store/store.go));
    слайс нужен только как no-DB fallback. Убери аппенд на DB-пути (и в `SaveSemanticFact`).
 2. `RecentMessages` в in-memory режиме итерирует все сообщения O(n) на каждый вызов — для больших
    in-memory датасетов перейди на отсортированную структуру per chat.
@@ -299,7 +299,7 @@ commitment/health как `subject="owner"`, но extraction вызывается
    иначе пометь deprecated в openapi.
 2. `ai-python/ai_agent/pipelines/embedding.py` — embed-путь при выключенном LiteLLM ходит в
    OpenRouter напрямую; при cutover-чистке переведи окончательно через LiteLLM
-   (связано с Phase 5 в [backlog.md](backlog.md)).
+   (связано с Phase 5 в [backlog.md](../backlog.md)).
 **Файлы:** `contracts/openapi.yaml`, `ai-python/ai_agent/schemas.py`,
 `ai-python/ai_agent/pipelines/embedding.py`.
 

@@ -4,7 +4,7 @@
 > Предшественники: фаза 1 (`sendRichMessage` строкой + per-owner тумблер),
 > фаза 2 (per-bot/role тумблеры, opt-in `streaming_enabled`, rich-карточки владельцу,
 > псевдо-стрим на send+edit).
-> API: Telegram Bot API 10.1. Референс: `docs/telegram_rich_messages_api.md` (раздел 2 —
+> API: Telegram Bot API 10.1. Референс: `docs/reference/telegram_rich_messages_api.md` (раздел 2 —
 > `sendRichMessageDraft`, ПОДТВЕРЖДЁН официальной докой).
 >
 > **Scope (с пользователем): ВАРИАНТ A — только серверный Telegram draft-стрим уже

@@ -6,8 +6,8 @@ This repository may be edited by multiple implementation agents at the same time
 
 Agent 6 owns only:
 
-- `docs/product_flows.md`
-- `docs/agent_team_operating_model.md`
+- `docs/product/product_flows.md`
+- `docs/process/agent_team_operating_model.md`
 
 Agent 6 must read, but not edit, the contract and architecture files needed to keep UX decisions aligned:
 

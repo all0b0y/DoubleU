@@ -2,7 +2,7 @@
 
 > Исполнитель: **OpenAI Codex**. Дата: 2026-06-18. Предшественник: фаза 1
 > (коммит `0f1a5ae`, `sendRichMessage` строкой + per-owner тумблер, по умолч. ВКЛ).
-> API: Telegram Bot API 10.1, Rich Messages. Референс: `docs/telegram_rich_messages_api.md`.
+> API: Telegram Bot API 10.1, Rich Messages. Референс: `docs/reference/telegram_rich_messages_api.md`.
 >
 > Адаптация под Codex: офлайн-песочница, риск галлюцинаций нового API, дрейф на
 > крупных задачах. API-схема вендорена; работа нарезана на 3 среза; между срезами —
