@@ -12,6 +12,7 @@ import (
 
 	"doubleu/backend-go/internal/contracts"
 	"doubleu/backend-go/internal/store"
+	"doubleu/backend-go/internal/telegram"
 )
 
 // fakeTelegram is a scripted Bot API: each getUpdates call pops the next
@@ -83,6 +84,23 @@ func rawUpdate(t *testing.T, updateID, chatID, messageID int64, text string) jso
 	return payload
 }
 
+func rawCallbackUpdate(t *testing.T, updateID, chatID, messageID int64, queryID, data string) json.RawMessage {
+	t.Helper()
+	payload, err := json.Marshal(map[string]any{
+		"update_id": updateID,
+		"callback_query": map[string]any{
+			"id": queryID, "from": map[string]any{"id": chatID}, "data": data,
+			"message": map[string]any{
+				"message_id": messageID, "chat": map[string]any{"id": chatID},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal callback update: %v", err)
+	}
+	return payload
+}
+
 // collectingHandler records every event and signals when expected count arrives.
 type collectingHandler struct {
 	mu     sync.Mutex
@@ -91,13 +109,29 @@ type collectingHandler struct {
 	want   int
 }
 
-func (c *collectingHandler) HandleBotMessage(_ context.Context, event contracts.NormalizedTelegramEvent) error {
+func (c *collectingHandler) HandleBotMessage(_ context.Context, event contracts.NormalizedTelegramEvent, _ *telegram.MediaDescriptor) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.events = append(c.events, event)
 	if len(c.events) == c.want {
 		close(c.done)
 	}
+	return nil
+}
+
+type collectingCallbackHandler struct {
+	collectingHandler
+	callback telegram.CallbackQueryUpdate
+	tenantID string
+	botID    string
+	done     chan struct{}
+}
+
+func (c *collectingCallbackHandler) HandleBotCallbackQuery(_ context.Context, callback telegram.CallbackQueryUpdate, tenantID, botID string) error {
+	c.callback = callback
+	c.tenantID = tenantID
+	c.botID = botID
+	close(c.done)
 	return nil
 }
 
@@ -161,9 +195,40 @@ func TestPollerDeliversUpdatesAndAdvancesOffset(t *testing.T) {
 		t.Fatalf("idempotency key = %q, want 100:bot:555", key)
 	}
 	// Offset persisted past the last delivered update.
-	bot, ok := repo.UserBotByTenant("tenant:user:77")
+	bot, ok := repo.UserBotByID("tenant:user:77", 555)
 	if !ok || bot.LastUpdateOffset != 102 {
 		t.Fatalf("persisted offset = %d, want 102", bot.LastUpdateOffset)
+	}
+}
+
+func TestPollerDeliversCallbackWithBotScope(t *testing.T) {
+	data := contracts.CallbackDataEncodeAIButton("draft:9600:bot:555:21", 1)
+	api := &fakeTelegram{updateBatches: [][]json.RawMessage{{
+		rawCallbackUpdate(t, 150, 42, 100, "query-1", data),
+	}}}
+	server := httptest.NewServer(api.handler(t))
+	defer server.Close()
+
+	repo := store.NewRepository()
+	repo.SaveUserBot(store.UserBotRecord{
+		TenantID: "tenant:user:77", BotID: 555, Token: "secret-token", Status: "active",
+	})
+	handler := &collectingCallbackHandler{done: make(chan struct{})}
+	manager := NewManager(repo, handler, server.Client(), WithBaseURL(server.URL))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go manager.Run(ctx)
+
+	select {
+	case <-handler.done:
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for callback")
+	}
+	if handler.tenantID != "tenant:user:77" || handler.botID != "555" {
+		t.Fatalf("callback scope = tenant:%q bot:%q", handler.tenantID, handler.botID)
+	}
+	if handler.callback.QueryID != "query-1" || handler.callback.Data != data {
+		t.Fatalf("callback = %+v", handler.callback)
 	}
 }
 
@@ -213,7 +278,7 @@ func TestPollerStopsOnInvalidToken(t *testing.T) {
 
 	deadline := time.After(2 * time.Second)
 	for {
-		bot, _ := repo.UserBotByTenant("tenant:user:77")
+		bot, _ := repo.UserBotByID("tenant:user:77", 555)
 		if bot.Status == "invalid" {
 			return
 		}
@@ -253,10 +318,10 @@ func TestRegisterBotValidatesTokenAndStartsPolling(t *testing.T) {
 	}
 
 	// SenderFor exposes the per-tenant outbound sender.
-	if _, ok := manager.SenderFor("tenant:user:77"); !ok {
+	if _, ok := manager.SenderFor("tenant:user:77", "555"); !ok {
 		t.Fatal("expected sender for registered tenant")
 	}
-	if _, ok := manager.SenderFor("tenant:user:99"); ok {
+	if _, ok := manager.SenderFor("tenant:user:99", "555"); ok {
 		t.Fatal("unexpected sender for unknown tenant")
 	}
 

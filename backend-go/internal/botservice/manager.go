@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -32,27 +33,53 @@ import (
 const defaultAPIBaseURL = "https://api.telegram.org"
 
 // Handler consumes normalized bot-transport events (implemented by
-// core.Service through an adapter in cmd/backend).
+// core.Service through an adapter in cmd/backend). media is the message's
+// downloadable attachment (nil for plain text); the transport parses it here so
+// the core service can turn media into text before AI processing.
 type Handler interface {
-	HandleBotMessage(ctx context.Context, event contracts.NormalizedTelegramEvent) error
+	HandleBotMessage(ctx context.Context, event contracts.NormalizedTelegramEvent, media *telegram.MediaDescriptor) error
+}
+
+// CallbackHandler is an optional extension implemented by handlers that
+// consume contact-facing inline-button callbacks from user-supplied bots.
+type CallbackHandler interface {
+	HandleBotCallbackQuery(ctx context.Context, callback telegram.CallbackQueryUpdate, tenantID, botID string) error
 }
 
 // HandlerFunc adapts a plain function to Handler.
-type HandlerFunc func(ctx context.Context, event contracts.NormalizedTelegramEvent) error
+type HandlerFunc func(ctx context.Context, event contracts.NormalizedTelegramEvent, media *telegram.MediaDescriptor) error
 
 // HandleBotMessage calls f.
-func (f HandlerFunc) HandleBotMessage(ctx context.Context, event contracts.NormalizedTelegramEvent) error {
-	return f(ctx, event)
+func (f HandlerFunc) HandleBotMessage(ctx context.Context, event contracts.NormalizedTelegramEvent, media *telegram.MediaDescriptor) error {
+	return f(ctx, event, media)
+}
+
+// HandlerFuncs adapts message and callback functions to the polling handler.
+type HandlerFuncs struct {
+	Message  HandlerFunc
+	Callback func(context.Context, telegram.CallbackQueryUpdate, string, string) error
+}
+
+func (h HandlerFuncs) HandleBotMessage(ctx context.Context, event contracts.NormalizedTelegramEvent, media *telegram.MediaDescriptor) error {
+	return h.Message(ctx, event, media)
+}
+
+func (h HandlerFuncs) HandleBotCallbackQuery(ctx context.Context, callback telegram.CallbackQueryUpdate, tenantID, botID string) error {
+	if h.Callback == nil {
+		return nil
+	}
+	return h.Callback(ctx, callback, tenantID, botID)
 }
 
 // Store is the persistence surface the manager needs; *store.Repository implements it.
 type Store interface {
 	ActiveUserBots() []store.UserBotRecord
 	SaveUserBot(record store.UserBotRecord)
-	UserBotByTenant(tenantID string) (store.UserBotRecord, bool)
+	UserBotByID(tenantID string, botID int64) (store.UserBotRecord, bool)
+	UserBotsByTenant(tenantID string) []store.UserBotRecord
 	UpdateUserBotOffset(botID int64, offset int64)
 	UpdateUserBotStatus(botID int64, status string)
-	DeleteUserBot(tenantID string)
+	DeleteUserBot(tenantID string, botID int64)
 	TenantIngestionMode(tenantID string) contracts.IngestionMode
 }
 
@@ -144,9 +171,10 @@ func (m *Manager) Run(ctx context.Context) {
 }
 
 // RegisterBot validates the token via getMe, persists the registration and
-// starts polling when the tenant's ingestion mode allows it. An existing
-// registration is replaced; re-registering the same bot keeps its offset so
-// no acknowledged updates are replayed.
+// starts polling when the tenant's ingestion mode allows it. A tenant may own
+// several bots, so this ADDS the bot (it does not replace the others);
+// re-registering the SAME bot keeps its offset so no acknowledged updates are
+// replayed.
 func (m *Manager) RegisterBot(ctx context.Context, tenantID, token string) (store.UserBotRecord, error) {
 	token = strings.TrimSpace(token)
 	if token == "" {
@@ -163,11 +191,10 @@ func (m *Manager) RegisterBot(ctx context.Context, tenantID, token string) (stor
 		Token:       token,
 		Status:      "active",
 	}
-	if existing, ok := m.repo.UserBotByTenant(tenantID); ok {
+	// Only the same bot's poller/offset is touched; sibling bots keep running.
+	if existing, ok := m.repo.UserBotByID(tenantID, record.BotID); ok {
 		m.stopPoller(existing.BotID)
-		if existing.BotID == record.BotID {
-			record.LastUpdateOffset = existing.LastUpdateOffset
-		}
+		record.LastUpdateOffset = existing.LastUpdateOffset
 	}
 	m.repo.SaveUserBot(record)
 	if m.ingestionMode(tenantID).AllowsBot() {
@@ -178,33 +205,36 @@ func (m *Manager) RegisterBot(ctx context.Context, tenantID, token string) (stor
 	return record, nil
 }
 
-// DisconnectBot stops polling and removes the tenant's bot registration.
-func (m *Manager) DisconnectBot(tenantID string) {
-	if existing, ok := m.repo.UserBotByTenant(tenantID); ok {
-		m.stopPoller(existing.BotID)
-	}
-	m.repo.DeleteUserBot(tenantID)
-	m.logger.Info("user bot disconnected", "tenant_id", tenantID)
+// DisconnectBot stops polling and removes one specific bot of the tenant,
+// leaving the tenant's other bots running.
+func (m *Manager) DisconnectBot(tenantID string, botID int64) {
+	m.stopPoller(botID)
+	m.repo.DeleteUserBot(tenantID, botID)
+	m.logger.Info("user bot disconnected", "tenant_id", tenantID, "bot_id", botID)
 }
 
-// Refresh re-evaluates the tenant's poller after an ingestion-mode change:
-// starts it when the mode now allows bot ingestion, stops it otherwise.
+// Refresh re-evaluates every poller of the tenant after an ingestion-mode
+// change: starts each active bot when the mode now allows bot ingestion, stops
+// them otherwise.
 func (m *Manager) Refresh(tenantID string) {
-	bot, ok := m.repo.UserBotByTenant(tenantID)
-	if !ok || bot.Status != "active" {
-		return
-	}
-	if m.ingestionMode(tenantID).AllowsBot() {
-		m.startPoller(bot)
-	} else {
-		m.stopPoller(bot.BotID)
+	allows := m.ingestionMode(tenantID).AllowsBot()
+	for _, bot := range m.repo.UserBotsByTenant(tenantID) {
+		if bot.Status == "active" && allows {
+			m.startPoller(bot)
+		} else {
+			m.stopPoller(bot.BotID)
+		}
 	}
 }
 
-// SenderFor returns a Telegram sender bound to the tenant's bot token.
-// ok is false when the tenant has no active bot.
-func (m *Manager) SenderFor(tenantID string) (telegram.Sender, bool) {
-	bot, found := m.repo.UserBotByTenant(tenantID)
+// SenderFor returns a Telegram sender bound to one specific bot of the tenant.
+// ok is false when that bot is unknown or not active.
+func (m *Manager) SenderFor(tenantID, botID string) (telegram.Sender, bool) {
+	id, err := strconv.ParseInt(botID, 10, 64)
+	if err != nil {
+		return nil, false
+	}
+	bot, found := m.repo.UserBotByID(tenantID, id)
 	if !found || bot.Status != "active" {
 		return nil, false
 	}

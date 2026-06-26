@@ -1,0 +1,1 @@
+ALTER TABLE messages ADD COLUMN quarantined BOOLEAN NOT NULL DEFAULT false;

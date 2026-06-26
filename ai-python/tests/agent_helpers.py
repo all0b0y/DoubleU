@@ -81,6 +81,22 @@ def make_test_runtime(**overrides) -> AgentRuntime:
         ),
         "topic_model": structured({"topic": "general chat"}),
         "rerank_model": structured({"ranked_ids": []}),
+        "role_draft_model": structured(
+            {
+                "name": "Менеджер поддержки",
+                "description": "Помогает клиентам разобраться с продуктом.",
+                "speaking_style": "Спокойно и по делу, на вы.",
+                "goals": "Решить вопрос клиента.",
+                "constraints": "Не выдумывать условия и цены.",
+                "custom_fields": [
+                    {
+                        "title": "Эскалация",
+                        "description": "Когда передавать вопрос человеку.",
+                        "context": "Если данных недостаточно.",
+                    }
+                ],
+            }
+        ),
     }
     defaults.update(overrides)
     return AgentRuntime(run_timeout_seconds=10, **defaults)

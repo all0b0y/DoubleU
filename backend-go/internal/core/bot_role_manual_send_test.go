@@ -14,24 +14,27 @@ import (
 // while non-bot chats keep the legacy per-chat role.
 func TestResolveRolePrefersBotRole(t *testing.T) {
 	repo := store.NewRepository()
-	repo.SaveChat(store.ChatRecord{TenantID: "tenant:user:77", ChatID: "42", Transport: contracts.TransportBot})
+	// Bot-transport chats are namespaced by bot id; the governing bot (and its
+	// role) is recovered from the chat id alone.
+	botChat := contracts.BotChatID("555", "42")
+	repo.SaveChat(store.ChatRecord{TenantID: "tenant:user:77", ChatID: botChat, Transport: contracts.TransportBot})
 	botRole := repo.SaveAIRole(store.AIRoleRecord{TenantID: "tenant:user:77", Name: "BotRole", Description: "bd"})
 	chatRole := repo.SaveAIRole(store.AIRoleRecord{TenantID: "tenant:user:77", Name: "ChatRole", Description: "cd"})
 	// A stale per-chat assignment must be ignored for bot chats.
-	repo.AssignAIRoleToChat("tenant:user:77", "42", chatRole.ID)
+	repo.AssignAIRoleToChat("tenant:user:77", botChat, chatRole.ID)
 	repo.SaveUserBot(store.UserBotRecord{TenantID: "tenant:user:77", BotID: 555, Token: "t"})
-	repo.SetUserBotRole("tenant:user:77", botRole.ID)
+	repo.SetUserBotRole("tenant:user:77", 555, botRole.ID)
 
 	svc := newTestService(repo, &fakeAI{}, &fakeSender{})
 
-	role := svc.aiRoleFor("tenant:user:77", "42")
+	role := svc.aiRoleFor("tenant:user:77", botChat)
 	if role == nil || role.Name != "BotRole" {
 		t.Fatalf("bot chat must use the bot role, got %+v", role)
 	}
 
 	// Bot without a role → default persona, never the per-chat role.
-	repo.SetUserBotRole("tenant:user:77", 0)
-	if role := svc.aiRoleFor("tenant:user:77", "42"); role != nil {
+	repo.SetUserBotRole("tenant:user:77", 555, 0)
+	if role := svc.aiRoleFor("tenant:user:77", botChat); role != nil {
 		t.Fatalf("bot chat with no bot role must have no role, got %+v", role)
 	}
 

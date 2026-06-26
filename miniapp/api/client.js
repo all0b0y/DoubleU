@@ -32,6 +32,10 @@ export const api = {
   messages:     (chatId)        => request('GET',   `/api/v1/chats/${chatId}/messages`),
   sendMessage:  (chatId, text)  => request('POST',  `/api/v1/chats/${chatId}/send`, { text }),
   drafts:       (chatId)        => request('GET',   `/api/v1/chats/${chatId}/drafts`),
+  scheduledJobs: (chatId)       => request('GET',   `/api/v1/chats/${chatId}/scheduled-jobs`),
+  cancelScheduledJob: (chatId, jobId) => request(
+    'DELETE', `/api/v1/chats/${chatId}/scheduled-jobs/${jobId}`,
+  ),
   draftAction:  (chatId, draftId, action, editedText) =>
     request('POST', `/api/v1/chats/${chatId}/drafts/${draftId}/action`,
       { action, ...(editedText ? { edited_text: editedText } : {}) }),
@@ -44,9 +48,14 @@ export const api = {
 
   // AI roles (personas)
   roles:          ()              => request('GET',    '/api/v1/roles'),
+  draftRole:      (data)          => request('POST',   '/api/v1/roles/draft', data),
   createRole:     (data)          => request('POST',   '/api/v1/roles', data),
   updateRole:     (roleId, data)  => request('PUT',    `/api/v1/roles/${roleId}`, data),
   deleteRole:     (roleId)        => request('DELETE', `/api/v1/roles/${roleId}`),
+  toolCatalog:    ()              => request('GET',    '/api/v1/tool-catalog'),
+  saveRoleTools:  (roleId, toolSettings) => request(
+    'PUT', `/api/v1/roles/${roleId}/tools`, { tool_settings: toolSettings },
+  ),
   assignRole:     (chatId, roleId) => request('PUT',   `/api/v1/chats/${chatId}/role`, { role_id: roleId }),
 
   // AI profile suggestions
@@ -66,11 +75,12 @@ export const api = {
   userSettings:     ()            => request('GET',   '/api/v1/settings/user'),
   saveUserSettings: (data)        => request('PUT',   '/api/v1/settings/user', data),
 
-  // Bot ingestion (user-supplied bot)
-  getBot:        ()       => request('GET',    '/api/v1/bots'),
-  registerBot:   (token)  => request('POST',   '/api/v1/bots', { token }),
-  setBotRole:    (roleId) => request('PUT',    '/api/v1/bots/role', { role_id: roleId }),
-  disconnectBot: ()       => request('DELETE', '/api/v1/bots'),
+  // Bot ingestion (user-supplied bots — a tenant may connect several)
+  bots:          ()              => request('GET',    '/api/v1/bots'),
+  registerBot:   (token)         => request('POST',   '/api/v1/bots', { token }),
+  setBotRole:    (botId, roleId) => request('PUT',    `/api/v1/bots/${botId}/role`, { role_id: roleId }),
+  updateBotSettings: (botId, data) => request('PUT',  `/api/v1/bots/${botId}/role`, data),
+  disconnectBot: (botId)         => request('DELETE', `/api/v1/bots/${botId}`),
 };
 
 /** Open an SSE stream; returns the EventSource. Caller owns closing it. */

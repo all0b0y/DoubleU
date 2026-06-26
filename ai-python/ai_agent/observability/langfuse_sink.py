@@ -227,6 +227,10 @@ def _to_batch_item(event: _SinkEvent) -> dict[str, Any] | None:
             "timestamp": now,
             "type": "generation-create",
             "body": {
+                # Langfuse requires an observation id on the body; without it the
+                # whole event is rejected (400). The trace body carries its id via
+                # trace_id, which is why traces ingested but generations never did.
+                "id": item_id,
                 "traceId": p.get("trace_id"),
                 "name": "app.llm.complete",
                 "model": p.get("model"),
@@ -247,6 +251,7 @@ def _to_batch_item(event: _SinkEvent) -> dict[str, Any] | None:
             "timestamp": now,
             "type": "span-create",
             "body": {
+                "id": item_id,
                 "traceId": p.get("trace_id"),
                 "name": p.get("name"),
                 "startTime": now,
@@ -271,6 +276,7 @@ def _to_batch_item(event: _SinkEvent) -> dict[str, Any] | None:
             "timestamp": now,
             "type": "score-create",
             "body": {
+                "id": item_id,
                 "traceId": p.get("trace_id"),
                 "name": p.get("name"),
                 "value": p.get("value"),

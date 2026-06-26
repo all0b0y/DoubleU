@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
-from ai_agent.http_server import make_handler
+from ai_agent.http_server import _build_model_config, make_handler
 from ai_agent.observability.trace import derive_trace_id
 from ai_agent.service import AIService
 
@@ -59,18 +60,133 @@ class HTTPServerTests(unittest.TestCase):
             },
         )
 
-        # Phase 3 added "flagged"; ARCH-1/ARCH-4 added owner_note/options/topic.
+        # Interaction tools add response_plan; it stays null for ordinary replies.
         self.assertEqual(
             set(response),
             {
                 "decision", "response_text", "confidence", "risk_level", "intent",
-                "model_used", "usage", "memory_used", "flagged",
-                "owner_note", "options", "topic",
+                "text_format", "model_used", "usage", "memory_used", "flagged",
+                "owner_note", "options", "response_plan", "scheduled_jobs", "topic",
             },
         )
         self.assertEqual(response["decision"], "auto_reply")
+        self.assertEqual(response["text_format"], "plain")
         self.assertFalse(response["flagged"])
         self.assertEqual(response["owner_note"], "")
+        self.assertIsNone(response["response_plan"])
+        self.assertEqual(response["scheduled_jobs"], [])
+
+
+    def test_extract_media_endpoint_matches_shape(self) -> None:
+        """The extract-media route parses the request and returns the frozen shape."""
+        import base64
+
+        response = self.handler._extract_media(
+            {
+                "kind": "voice",
+                "data_base64": base64.b64encode(b"oggbytes").decode("ascii"),
+                "mime_type": "audio/ogg",
+            }
+        )
+        self.assertEqual(set(response), {"text", "provenance", "model_used"})
+        self.assertEqual(response["provenance"], "voice_transcript")
+        self.assertTrue(response["text"])
+
+    def test_draft_role_endpoint_returns_structured_mock_draft(self) -> None:
+        """The draft-role route returns the complete frozen wire shape in mock mode."""
+        response = self.handler._draft_role(
+            {"text": "Нужен менеджер поддержки: спокойно отвечает клиентам на русском."}
+        )
+
+        self.assertEqual(
+            set(response),
+            {
+                "name",
+                "description",
+                "speaking_style",
+                "goals",
+                "constraints",
+                "custom_fields",
+            },
+        )
+        self.assertTrue(response["name"])
+        self.assertTrue(response["description"])
+        self.assertIsInstance(response["custom_fields"], list)
+
+    def test_synthesize_pattern_endpoint_matches_contract_shape(self) -> None:
+        """The synthesize-pattern route parses the request and returns the frozen shape."""
+        response = self.handler._synthesize_pattern(
+            {
+                "cluster_facts": ["опять завал на работе", "устал", "не успеваю"],
+                "tenant_id": "tenant-1",
+                "chat_id": "chat-1",
+                "privacy_flags": [],
+            }
+        )
+        self.assertEqual(
+            set(response),
+            {"pattern", "subject", "confidence", "model_used", "usage", "blocked_by_privacy"},
+        )
+        self.assertFalse(response["blocked_by_privacy"])
+
+    def test_synthesize_pattern_respects_no_memory(self) -> None:
+        """no_memory chats must never be reflected on."""
+        response = self.handler._synthesize_pattern(
+            {"cluster_facts": ["a", "b", "c"], "privacy_flags": ["no_memory"]}
+        )
+        self.assertTrue(response["blocked_by_privacy"])
+        self.assertEqual(response["pattern"], "")
+
+
+class ModelConfigTests(unittest.TestCase):
+    """Tests for _build_model_config and the /ai/model-config GET endpoint."""
+
+    def test_splits_comma_separated_models(self) -> None:
+        """MODEL_TIER_* env vars are split on commas and whitespace-trimmed."""
+        env = {
+            "MODEL_TIER_FAST": "deepseek/fast-a, deepseek/fast-b",
+            "MODEL_TIER_BALANCED": "deepseek/balanced",
+            "MODEL_TIER_SMART": "deepseek/smart",
+            "OPENROUTER_MODEL": "deepseek/default",
+        }
+        with mock.patch.dict("os.environ", env, clear=False):
+            cfg = _build_model_config()
+
+        self.assertEqual(cfg.fast, ["deepseek/fast-a", "deepseek/fast-b"])
+        self.assertEqual(cfg.balanced, ["deepseek/balanced"])
+        self.assertEqual(cfg.smart, ["deepseek/smart"])
+        self.assertEqual(cfg.default, "deepseek/default")
+
+    def test_empty_env_produces_empty_lists(self) -> None:
+        """Unset tier env vars produce empty lists; unset OPENROUTER_MODEL produces empty string."""
+        env = {
+            "MODEL_TIER_FAST": "",
+            "MODEL_TIER_BALANCED": "",
+            "MODEL_TIER_SMART": "",
+            "OPENROUTER_MODEL": "",
+        }
+        with mock.patch.dict("os.environ", env, clear=False):
+            cfg = _build_model_config()
+
+        self.assertEqual(cfg.fast, [])
+        self.assertEqual(cfg.balanced, [])
+        self.assertEqual(cfg.smart, [])
+        self.assertEqual(cfg.default, "")
+
+    def test_to_dict_matches_wire_shape(self) -> None:
+        """to_dict must return exactly the four expected keys."""
+        env = {
+            "MODEL_TIER_FAST": "m/fast",
+            "MODEL_TIER_BALANCED": "m/balanced",
+            "MODEL_TIER_SMART": "m/smart",
+            "OPENROUTER_MODEL": "m/default",
+        }
+        with mock.patch.dict("os.environ", env, clear=False):
+            result = _build_model_config().to_dict()
+
+        self.assertEqual(set(result.keys()), {"fast", "balanced", "smart", "default"})
+        self.assertEqual(result["fast"], ["m/fast"])
+        self.assertEqual(result["default"], "m/default")
 
 
 class TraceIDPropagationTests(unittest.TestCase):

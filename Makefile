@@ -1,6 +1,6 @@
 SHELL := /usr/bin/env bash
 
-.PHONY: contracts contracts-check test test-go test-python migrate-up migrate-down migrate-status
+.PHONY: contracts contracts-check test test-go test-python migrate-up migrate-down migrate-status models-apply
 
 # Regenerate Go + Python enum files from contracts/contracts.json.
 contracts:
@@ -18,6 +18,10 @@ test-go:
 
 test-python:
 	cd ai-python && python3 -m unittest discover -s tests
+
+# Re-render LiteLLM's model_list from .env and recreate both model consumers.
+models-apply:
+	docker compose up -d --force-recreate litellm ai-service
 
 # Migration helpers (require DATABASE_URL).  See cmd/backend/main.go runMigrateCommand.
 migrate-up:

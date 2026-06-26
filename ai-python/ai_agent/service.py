@@ -12,9 +12,12 @@ pipeline module.
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 from uuid import NAMESPACE_URL, uuid5
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:  # pydantic-ai is imported lazily by the HTTP factory
     from .agents.runtime import AgentRuntime
@@ -30,6 +33,7 @@ from .pipelines import (
     draft,
     embedding,
     intent,
+    media,
     memory,
     risk,
 )
@@ -40,8 +44,12 @@ from .schemas import (
     ChatSummaryRequest,
     ChatSummaryResponse,
     Decision,
+    DraftRoleRequest,
+    DraftRoleResponse,
     EmbedTextsRequest,
     EmbedTextsResponse,
+    ExtractMediaRequest,
+    ExtractMediaResponse,
     IntentRequest,
     IntentResponse,
     MemoryExtractionRequest,
@@ -51,6 +59,8 @@ from .schemas import (
     RerankFactsResponse,
     RiskRequest,
     RiskResponse,
+    SynthesizePatternRequest,
+    SynthesizePatternResponse,
     TopicTaggingRequest,
     TopicTaggingResponse,
     TypedExtractionRequest,
@@ -137,6 +147,18 @@ class AIService:
         """Generate embeddings for a batch of texts via the embedding pipeline."""
         return embedding.embed_texts(request)
 
+    def extract_media(self, request: ExtractMediaRequest) -> ExtractMediaResponse:
+        """Turn a media attachment (voice/audio/photo/document) into plain text.
+
+        A direct provider call (like embedding), not an agent task: keeps the
+        agent text-only so the frozen process-message contract is untouched.
+        """
+        return media.extract_media(request)
+
+    def draft_role(self, request: DraftRoleRequest) -> DraftRoleResponse:
+        """Generate an editable AI-role draft from a free-text description."""
+        return self._agents.draft_role(request)
+
     def tag_topic(self, request: TopicTaggingRequest) -> TopicTaggingResponse:
         """Return a short topic label for the active conversation episode."""
         return self._agents.tag_topic(request)
@@ -144,6 +166,10 @@ class AIService:
     def rerank_facts(self, request: RerankFactsRequest) -> RerankFactsResponse:
         """Rerank a set of candidate facts by relevance to a query."""
         return self._agents.rerank_facts(request)
+
+    def synthesize_pattern(self, request: SynthesizePatternRequest) -> SynthesizePatternResponse:
+        """Synthesise a behaviour pattern from a fact cluster (sleep-time reflection)."""
+        return self._agents.synthesize_pattern(request)
 
     def process_message(self, request: AIProcessMessageRequest) -> AIProcessMessageResponse:
         """Process a normalized Telegram event into an AI decision proposal.
@@ -186,7 +212,8 @@ class AIService:
                 risk_response.risk_level,
                 confidence,
             )
-        except RuntimeError:
+        except RuntimeError as exc:
+            logger.exception("draft agent failed — falling back to error_fallback: %s", exc)
             outcome = draft.DraftOutcome(text="", model_used="none", usage=Usage())
             intent = intent_response.intent
             decision = Decision.ERROR_FALLBACK
@@ -204,12 +231,19 @@ class AIService:
             intent=intent,
             model_used=outcome.model_used,
             usage=outcome.usage,
+            text_format=outcome.text_format,
             memory_used=memory_used,
             flagged=flagged,
             owner_note=outcome.owner_note,
             options=outcome.options,
+            response_plan=outcome.response_plan,
+            scheduled_jobs=outcome.scheduled_jobs,
             topic=outcome.topic,
         )
+        # Label the Langfuse trace with the actual decision so an auto-sent reply
+        # is distinguishable from an owner draft (the trace is opened under the
+        # generic "draft" generation purpose otherwise).
+        self._agents.record_decision(decision.value, intent or "", confidence)
         self._record_audit(request, result, ",".join(risk_response.reasons))
         return result
 

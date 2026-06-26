@@ -22,18 +22,36 @@ INSERT INTO telegram_business_connections (
   ('tbc_tenant_b', 'tenant_b', 'biz_conn_tenant_b', '900002', '{"can_reply": true}', true)
 ON CONFLICT (id) DO NOTHING;
 
-INSERT INTO assistant_profiles (
-  id,
+INSERT INTO ai_roles (
   tenant_id,
   name,
-  default_mode,
-  default_model,
-  style_config_json,
-  privacy_config_json
+  description,
+  speaking_style,
+  goals,
+  constraints_text
 ) VALUES
-  ('profile_tenant_a', 'tenant_a', 'Tenant A Assistant', 'semi_auto', 'fast', '{"tone": "concise"}', '{"memory": "allowed"}'),
-  ('profile_tenant_b', 'tenant_b', 'Tenant B Assistant', 'manual', 'fast', '{"tone": "formal"}', '{"memory": "restricted"}')
-ON CONFLICT (id) DO NOTHING;
+  (
+    'tenant_a',
+    'Tenant A Assistant',
+    'Default semi-auto assistant for Tenant A. Uses the fast response profile from the contract scenarios.',
+    'Concise tone; prefer direct confirmations and short operational replies.',
+    'Confirm routine client requests clearly and keep low-risk replies actionable.',
+    'Memory is allowed unless chat privacy flags disable it.'
+  ),
+  (
+    'tenant_b',
+    'Tenant B Assistant',
+    'Default manual assistant for Tenant B. Uses the fast response profile from the contract scenarios.',
+    'Formal tone; prepare polished drafts for owner review.',
+    'Draft professional replies while leaving final send decisions to the owner.',
+    'Treat memory as restricted and honor privacy flags.'
+  )
+ON CONFLICT (tenant_id, name) DO UPDATE SET
+  description = EXCLUDED.description,
+  speaking_style = EXCLUDED.speaking_style,
+  goals = EXCLUDED.goals,
+  constraints_text = EXCLUDED.constraints_text,
+  updated_at = now();
 
 INSERT INTO chats (tenant_id, chat_id, telegram_chat_id, chat_type, display_name, relationship_type) VALUES
   ('tenant_a', 'disabled_chat', '100100', 'private', 'Disabled Chat', 'private'),
@@ -229,71 +247,88 @@ INSERT INTO idempotency_records (
   )
 ON CONFLICT (idempotency_key) DO NOTHING;
 
-INSERT INTO memory_facts (
+INSERT INTO semantic_facts (
   tenant_id,
   chat_id,
-  scope,
+  scope_kind,
   fact_type,
   fact_text,
+  normalized_fact_hash,
+  subject,
   confidence,
+  source,
   source_message_id,
   metadata
 ) VALUES
   (
     'tenant_a',
     'semi_auto_chat',
-    'conversation',
+    'chat',
     'preference',
     'Client prefers morning meetings.',
+    public.normalize_fact_text('Client prefers morning meetings.'),
+    'contact',
     0.880,
+    'llm_extracted',
     'low_risk_message',
     '{"seed": true}'
   )
-ON CONFLICT DO NOTHING;
+ON CONFLICT (tenant_id, scope_kind, COALESCE(chat_id,''), fact_type, subject, normalized_fact_hash)
+WHERE deleted_at IS NULL AND superseded_by_id IS NULL
+DO NOTHING;
 
-INSERT INTO memory_embeddings (
+INSERT INTO episode_summaries (
   tenant_id,
   chat_id,
-  memory_fact_id,
-  embedding_model,
-  embedding_dimensions,
-  embedding,
-  content_hash
-)
-SELECT
-  tenant_id,
-  chat_id,
-  id,
-  'placeholder',
-  3,
-  ARRAY[0.10, 0.20, 0.30]::float8[],
-  'seed-memory-fact-embedding'
-FROM memory_facts
-WHERE tenant_id = 'tenant_a'
-  AND chat_id = 'semi_auto_chat'
-  AND source_message_id = 'low_risk_message'
-ON CONFLICT DO NOTHING;
-
-INSERT INTO summaries (
-  tenant_id,
-  chat_id,
-  summary_type,
   period_start,
   period_end,
   content,
   source_message_ids,
+  message_count,
+  closure_reason,
   privacy_flags
-) VALUES
+)
+SELECT
+  tenant_id,
+  chat_id,
+  period_start,
+  period_end,
+  content,
+  source_message_ids,
+  message_count,
+  closure_reason,
+  privacy_flags
+FROM (VALUES
   (
     'tenant_a',
     'semi_auto_chat',
-    'conversation',
-    '2026-05-13T00:00:00Z',
-    '2026-05-13T23:59:59Z',
+    '2026-05-13T00:00:00Z'::timestamptz,
+    '2026-05-13T23:59:59Z'::timestamptz,
     'Client is coordinating a meeting and prefers direct confirmation.',
     ARRAY['low_risk_message']::text[],
-    ARRAY[]::privacy_flag[]
+    1,
+    'manual',
+    '{}'::jsonb
   )
-ON CONFLICT DO NOTHING;
+) AS seed_summary(
+  tenant_id,
+  chat_id,
+  period_start,
+  period_end,
+  content,
+  source_message_ids,
+  message_count,
+  closure_reason,
+  privacy_flags
+)
+WHERE NOT EXISTS (
+  SELECT 1
+  FROM episode_summaries existing
+  WHERE existing.tenant_id = seed_summary.tenant_id
+    AND existing.chat_id = seed_summary.chat_id
+    AND existing.period_start = seed_summary.period_start
+    AND existing.period_end = seed_summary.period_end
+    AND existing.content = seed_summary.content
+);
 
 COMMIT;

@@ -30,6 +30,7 @@ class FeatureFlags:
     safety_output_enabled: bool = False
     llm_gateway: GatewayKind = "none"
     observability_sink: ObservabilitySink = "none"
+    two_stage_draft: bool = False
 
 
 def _bool(value: str | None) -> bool:
@@ -57,4 +58,5 @@ def load_from_env() -> FeatureFlags:
         safety_output_enabled=_bool(os.getenv("SAFETY_OUTPUT_ENABLED")),
         llm_gateway=_gateway(os.getenv("LLM_GATEWAY")),
         observability_sink=_sink(os.getenv("OBSERVABILITY_SINK")),
+        two_stage_draft=_bool(os.getenv("TWO_STAGE_DRAFT")),
     )

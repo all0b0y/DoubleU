@@ -1,27 +1,74 @@
-/* DoubleU Mini App — base styles derived from prototypes, mapped to Telegram CSS vars */
+/* DoubleU Mini App — base styles derived from prototypes, mapped to Telegram CSS vars.
+   Theme: the DoubleU design-system brand — warm matcha green + creamy honey, light.
+   (Supersedes the original indigo-dark placeholder; variable NAMES are unchanged so
+   every screen re-skins automatically.) See /contracts and the design system readme. */
+
+@import url('https://fonts.googleapis.com/css2?family=Fredoka:wght@400;500;600;700&family=Nunito+Sans:opsz,wght@6..12,400;6..12,500;6..12,600;6..12,700&display=swap');
 
 :root {
-  /* ── Palette v2 dark ── */
-  --bg:            #14141A;
-  --bg2:           #1F1F28;
-  --surface-active:#2A2A38;
-  --border-color:  #26262F;
-  --accent:        #6366F1;
-  --accent-light:  #C7D2FE;
-  --text:          #F4F4F5;
-  --hint:          #8B8B96;
-  --muted:         #6B6B75;
-  --success:       #10B981;
-  --warning:       #F59E0B;
-  --danger:        #EF4444;
+  /* ── Brand palette: matcha green + creamy honey ── */
+  --matcha-100: #E7ECCF;
+  --matcha-500: #9CA764; /* brand: Matcha Cream */
+  --matcha-600: #818E4F; /* primary action on light */
+  --matcha-700: #66723C;
+  --cream-50:  #FCFAF2;
+  --cream-100: #F7F1DF; /* brand: page background */
+  --cream-200: #F1E8C7; /* brand: Milky Honey */
+  --ink-900:   #25271C; /* warm ink — never pure black */
+  --ink-500:   #797B5C;
+  --ink-400:   #9A9B7E;
+
+  /* ── Semantic surfaces (light, warm) ── */
+  --bg:            #F7F1DF; /* page */
+  --bg2:           #FCFAF2; /* card / raised surface */
+  --surface-active:#ECE3C6; /* pressed / selected row */
+  --border-color:  #E7DCBC; /* hairlines, dividers */
+  --border:        #E0D4B2; /* outlines, toggle track, press wells */
+
+  /* ── Brand / primary (matcha) ── */
+  --accent:        #818E4F;
+  --accent-hover:  #66723C;
+  --accent-light:  #E7ECCF; /* tint text on matcha bubbles/footers */
+  --accent-soft:   #EEF1DE; /* tint backgrounds */
+
+  /* ── Text (warm ink) ── */
+  --text:          #25271C;
+  --hint:          #797B5C; /* secondary */
+  --muted:         #9A9B7E; /* tertiary */
+
+  /* ── Semantic hues (warmed to fit the palette) ── */
+  --success:       #6E9A3E; --success-soft: #E6EFCF;
+  --warning:       #CE9526; --warning-soft: #F6E8C2;
+  --danger:        #C8503C; --danger-soft:  #F4DAD2;
+
+  /* ── Per-chat mode colors (product concept) ── */
+  --mode-auto:     #6E9A3E;
+  --mode-semi:     #66723C;
+  --mode-manual:   #CE9526;
+  --mode-silent:   #9A9B7E;
+  --mode-off:      #C8503C;
+
   /* legacy aliases for Telegram theme tokens */
-  --link:          #6366F1;
-  --btn:           #6366F1;
-  --btn-text:      #FFFFFF;
-  --border:        rgba(255,255,255,0.08);
+  --link:          #818E4F;
+  --btn:           #818E4F;
+  --btn-text:      #FCFAF2;
+
+  /* ── Focus ── */
+  --focus-ring:    rgba(129,142,79,0.45);
+
+  /* ── Shadows (warm-tinted, soft) — depth comes from these + hairlines,
+     not color ramps, since cards are cream-on-cream. ── */
+  --shadow-sm: 0 2px 6px rgba(53,60,36,0.07);
+  --shadow-md: 0 6px 16px rgba(53,60,36,0.09);
+
+  /* ── Radii (rounded, friendly) ── */
   --radius-lg: 16px;
   --radius-md: 12px;
   --radius-sm: 8px;
+
+  /* ── Type ── */
+  --font-display: 'Fredoka', system-ui, sans-serif;
+  --font-body:    'Nunito Sans', system-ui, -apple-system, 'Segoe UI', sans-serif;
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -30,7 +77,7 @@ html, body {
   height: 100%;
   background: var(--bg);
   color: var(--text);
-  font-family: -apple-system, 'SF Pro Text', 'Segoe UI', sans-serif;
+  font-family: var(--font-body);
   font-size: 14px;
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
@@ -129,11 +176,11 @@ html, body {
   border-radius: 20px; flex-shrink: 0;
   text-transform: uppercase; letter-spacing: 0.4px;
 }
-.mode-badge.auto       { background: rgba(16,185,129,0.18); color: var(--success); }
-.mode-badge.semi_auto  { background: rgba(99,102,241,0.18); color: var(--accent); }
-.mode-badge.manual     { background: rgba(245,158,11,0.18); color: var(--warning); }
-.mode-badge.silent     { background: rgba(139,139,150,0.18); color: var(--hint); }
-.mode-badge.disabled   { background: rgba(239,68,68,0.18); color: var(--danger); }
+.mode-badge.auto       { background: var(--success-soft); color: var(--mode-auto); }
+.mode-badge.semi_auto  { background: var(--accent-soft);  color: var(--mode-semi); }
+.mode-badge.manual     { background: var(--warning-soft); color: var(--mode-manual); }
+.mode-badge.silent     { background: var(--surface-active); color: var(--mode-silent); }
+.mode-badge.disabled   { background: var(--danger-soft);  color: var(--mode-off); }
 
 /* ── Draft count badge ── */
 .draft-badge {
@@ -219,6 +266,60 @@ html, body {
 .msg-footer-du   { font-size: 9px; color: var(--accent-light); }
 .msg-footer-time { font-size: 9px; color: var(--accent-light); }
 
+/* ── AI thinking indicator ──
+   Distinct from message bubbles: a left-aligned matcha pill with animated
+   typing dots, so it reads clearly as "the AI is working" in every chat mode. */
+.ai-thinking {
+  align-self: flex-start;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 78%;
+  margin: 2px 0;
+  padding: 8px 12px;
+  background: var(--accent-soft);
+  border: 1px solid var(--accent);
+  border-radius: 16px 16px 16px 4px;
+  animation: aiThinkingIn 160ms ease;
+}
+@keyframes aiThinkingIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.ai-thinking-text {
+  font-size: 12px;
+  color: var(--accent-hover);
+  font-weight: 500;
+}
+.ai-thinking-dots { display: inline-flex; gap: 3px; }
+.ai-thinking-dots span {
+  width: 5px; height: 5px; border-radius: 50%;
+  background: var(--accent);
+  animation: aiDot 1s infinite ease-in-out;
+}
+.ai-thinking-dots span:nth-child(2) { animation-delay: 0.16s; }
+.ai-thinking-dots span:nth-child(3) { animation-delay: 0.32s; }
+@keyframes aiDot {
+  0%, 80%, 100% { opacity: 0.3; transform: translateY(0); }
+  40%           { opacity: 1;   transform: translateY(-3px); }
+}
+
+/* ── AI error notice ──
+   Shown in place of the thinking indicator when an AI turn fails, so the owner
+   sees a retryable message instead of the indicator vanishing silently. */
+.ai-error {
+  align-self: center;
+  max-width: 90%;
+  margin: 6px 0;
+  padding: 8px 12px;
+  background: var(--danger-soft);
+  border: 1px solid var(--danger);
+  border-radius: 12px;
+  font-size: 12px;
+  color: var(--danger);
+  text-align: center;
+}
+
 /* ── Draft panel ── */
 .draft-panel {
   padding: 10px 12px calc(10px + var(--inset-bottom, 0px));
@@ -275,7 +376,7 @@ html, body {
   display: flex; align-items: center; justify-content: center;
   transition: background 120ms;
 }
-.draft-trash-btn:active { background: rgba(239,68,68,0.15); }
+.draft-trash-btn:active { background: var(--danger-soft); }
 .draft-send-btn {
   flex: 1; background: var(--accent); color: #fff;
   border: none; border-radius: 12px; padding: 10px;
@@ -336,7 +437,7 @@ html, body {
 .draft-card-header-title { font-size: 12px; font-weight: 600; color: var(--accent); text-transform: uppercase; letter-spacing: 0.5px; }
 .draft-source { padding: 0 14px 8px; font-size: 12px; color: var(--hint); font-style: italic; }
 .draft-text { padding: 8px 14px 12px; font-size: 14px; line-height: 1.6; color: var(--text); }
-.draft-actions { display: flex; gap: 0; background: rgba(255,255,255,0.03); }
+.draft-actions { display: flex; gap: 0; background: rgba(53,60,36,0.03); }
 .draft-btn {
   flex: 1; background: none; border: none; color: var(--hint); font-size: 13px; font-weight: 500;
   padding: 11px 8px; cursor: pointer; transition: background 120ms;
@@ -350,14 +451,14 @@ html, body {
 /* ── Settings list ── */
 .settings-section { padding: 20px 16px 4px; }
 .settings-label { font-size: 11px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.6px; color: var(--hint); margin-bottom: 6px; }
-.settings-group { background: var(--bg2); border-radius: var(--radius-md); overflow: hidden; }
+.settings-group { background: var(--bg2); border-radius: var(--radius-md); overflow: hidden; box-shadow: var(--shadow-sm); }
 .settings-row {
   display: flex; align-items: center; gap: 12px;
   padding: 13px 16px;
   cursor: pointer;
   transition: background 120ms;
 }
-.settings-row:active { background: rgba(255,255,255,0.04); }
+.settings-row:active { background: var(--surface-active); }
 .settings-row + .settings-row { border-top: none; }
 .settings-row-icon { width: 32px; height: 32px; border-radius: 8px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
 .settings-row-body { flex: 1; }
@@ -392,10 +493,10 @@ html, body {
   background: var(--bg2);
   transition: background 120ms;
 }
-.mode-option.active { background: rgba(99,102,241,0.14); }
-.mode-option:active { background: rgba(99,102,241,0.2); }
+.mode-option.active { background: var(--accent-soft); }
+.mode-option:active { background: var(--surface-active); }
 .mode-option-dot { width: 20px; height: 20px; border-radius: 50%; border: 2px solid var(--border); flex-shrink: 0; transition: all 150ms; }
-.mode-option.active .mode-option-dot { border-color: var(--accent); background: var(--accent); box-shadow: 0 0 0 2px rgba(99,102,241,0.3); }
+.mode-option.active .mode-option-dot { border-color: var(--accent); background: var(--accent); box-shadow: 0 0 0 2px var(--focus-ring); }
 .mode-option-body { flex: 1; }
 .mode-option-title { font-size: 14px; font-weight: 500; }
 .mode-option-desc  { font-size: 12px; color: var(--hint); margin-top: 1px; }
@@ -410,7 +511,7 @@ html, body {
 .btn:active { opacity: 0.85; transform: scale(0.98); }
 .btn-primary { background: var(--btn); color: var(--btn-text); width: 100%; }
 .btn-secondary { background: var(--bg2); color: var(--text); width: 100%; }
-.btn-danger { background: rgba(239,68,68,0.14); color: var(--danger); width: 100%; }
+.btn-danger { background: var(--danger-soft); color: var(--danger); width: 100%; }
 
 /* ── Search ── */
 .search-bar {
@@ -431,12 +532,18 @@ html, body {
 
 /* ── Welcome / Onboarding ── */
 .welcome-screen { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 20px; padding: 32px 24px; text-align: center; }
-.welcome-logo { width: 80px; height: 80px; border-radius: 24px; background: var(--accent); display: flex; align-items: center; justify-content: center; font-size: 40px; }
-.welcome-title { font-size: 26px; font-weight: 700; }
+.welcome-logo {
+  width: 96px; height: 96px; border-radius: 28px;
+  background: var(--cream-200);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 40px; overflow: hidden; box-shadow: var(--shadow-md, 0 6px 16px rgba(53,60,36,0.09));
+}
+.welcome-logo img { width: 76%; height: 76%; object-fit: contain; }
+.welcome-title { font-size: 28px; font-weight: 600; letter-spacing: -0.01em; }
 .welcome-subtitle { font-size: 15px; color: var(--hint); line-height: 1.6; }
 
 .onboarding-steps { display: flex; flex-direction: column; gap: 16px; padding: 20px 16px; }
-.step-card { background: var(--bg2); border-radius: var(--radius-lg); padding: 16px 18px; display: flex; gap: 14px; align-items: flex-start; }
+.step-card { background: var(--bg2); border-radius: var(--radius-lg); padding: 16px 18px; display: flex; gap: 14px; align-items: flex-start; box-shadow: var(--shadow-sm); }
 .step-num { width: 28px; height: 28px; border-radius: 50%; background: var(--accent); color: #fff; font-size: 13px; font-weight: 700; display: flex; align-items: center; justify-content: center; flex-shrink: 0; margin-top: 1px; }
 .step-body-title { font-size: 14px; font-weight: 600; }
 .step-body-text { font-size: 13px; color: var(--hint); margin-top: 4px; line-height: 1.5; }
@@ -471,7 +578,7 @@ html, body {
 
 .success-circle {
   width: 88px; height: 88px; border-radius: 50%;
-  background: rgba(16,185,129,0.14);
+  background: var(--success-soft);
   display: flex; align-items: center; justify-content: center;
   animation: popIn 350ms cubic-bezier(0.34,1.56,0.64,1);
 }
@@ -498,8 +605,8 @@ html, body {
 .revoked-banner {
   margin: 12px 16px;
   padding: 12px 14px;
-  background: rgba(239,68,68,0.12);
-  border: 1px solid rgba(239,68,68,0.3);
+  background: var(--danger-soft);
+  border: 1px solid rgba(200,80,60,0.35);
   border-radius: var(--radius-md);
   font-size: 13px;
   color: var(--danger);
@@ -535,17 +642,17 @@ html, body {
   padding: 12px 14px; color: var(--text); font-size: 14px; width: 100%; outline: none;
   transition: box-shadow 150ms;
 }
-.field-input:focus { box-shadow: 0 0 0 2px rgba(99,102,241,0.4); }
+.field-input:focus { box-shadow: 0 0 0 3px var(--focus-ring); }
 .field-textarea { min-height: 88px; resize: none; line-height: 1.5; }
 .field-select {
   background: var(--bg2); border: none; border-radius: var(--radius-md);
   padding: 12px 14px; color: var(--text); font-size: 14px; width: 100%;
   outline: none; appearance: none;
-  background-image: url("data:image/svg+xml,%3Csvg width='12' height='8' viewBox='0 0 12 8' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1L6 7L11 1' stroke='%238B8B96' stroke-width='1.5' stroke-linecap='round'/%3E%3C/svg%3E");
+  background-image: url("data:image/svg+xml,%3Csvg width='12' height='8' viewBox='0 0 12 8' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1L6 7L11 1' stroke='%23797B5C' stroke-width='1.5' stroke-linecap='round'/%3E%3C/svg%3E");
   background-repeat: no-repeat;
   background-position: right 14px center;
 }
-.field-select option { background: #1F1F28; }
+.field-select option { background: var(--bg2); }
 
 /* ── Suggested section ── */
 .section-header {
@@ -664,7 +771,7 @@ html, body {
   letter-spacing: 0.5px; color: var(--muted);
   padding: 0 4px 8px;
 }
-.st-card { background: var(--bg2); border-radius: 14px; overflow: hidden; }
+.st-card { background: var(--bg2); border-radius: 14px; overflow: hidden; box-shadow: var(--shadow-sm); }
 .st-card-divider-wrap {}
 .st-divider { border-bottom: 0.5px solid var(--border-color); }
 
@@ -717,11 +824,12 @@ html, body {
   background: var(--bg2); border-radius: 14px;
   padding: 14px; margin: 0 12px;
   cursor: pointer; transition: background 120ms;
+  box-shadow: var(--shadow-sm);
 }
 .role-card:active { background: var(--surface-active); }
 .role-card-icon {
   width: 44px; height: 44px; border-radius: 12px; flex-shrink: 0;
-  background: rgba(99,102,241,0.16);
+  background: var(--accent-soft);
   display: flex; align-items: center; justify-content: center;
   font-size: 20px;
 }
@@ -756,11 +864,11 @@ html, body {
   font-size: 10px; font-weight: 500; padding: 1px 7px; border-radius: 8px;
   background: var(--surface-active); color: var(--hint); white-space: nowrap;
 }
-.fact-type-badge.preference   { background: rgba(99,102,241,0.16);  color: var(--accent); }
-.fact-type-badge.commitment   { background: rgba(245,158,11,0.16);  color: var(--warning); }
-.fact-type-badge.event        { background: rgba(16,185,129,0.16);  color: var(--success); }
+.fact-type-badge.preference   { background: var(--accent-soft);   color: var(--accent); }
+.fact-type-badge.commitment   { background: var(--warning-soft);  color: var(--warning); }
+.fact-type-badge.event        { background: var(--success-soft);  color: var(--success); }
 .fact-type-badge.health,
-.fact-type-badge.taboo        { background: rgba(239,68,68,0.16);   color: var(--danger); }
+.fact-type-badge.taboo        { background: var(--danger-soft);   color: var(--danger); }
 .fact-delete-btn {
   background: none; border: none; cursor: pointer;
   font-size: 14px; color: var(--muted); padding: 2px 6px; flex-shrink: 0;
@@ -779,7 +887,7 @@ html, body {
   transition: opacity 120ms;
 }
 .suggestion-btn:active { opacity: 0.75; }
-.suggestion-btn.accept { background: rgba(16,185,129,0.16); color: var(--success); }
+.suggestion-btn.accept { background: var(--success-soft); color: var(--success); }
 .suggestion-btn.reject { background: var(--surface-active); color: var(--hint); }
 
 /* ── Summary result card ── */
@@ -809,13 +917,13 @@ html, body {
   width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
   display: inline-block;
 }
-.status-dot.ok     { background: var(--success); box-shadow: 0 0 6px rgba(16,185,129,0.6); }
+.status-dot.ok     { background: var(--success); box-shadow: 0 0 6px rgba(110,154,62,0.55); }
 .status-dot.bad    { background: var(--danger); }
 .status-dot.idle   { background: var(--muted); }
 
 /* ── Danger zone confirm input ── */
 .danger-confirm-input {
-  background: var(--bg); border: 1px solid rgba(239,68,68,0.4);
+  background: var(--bg); border: 1px solid rgba(200,80,60,0.45);
   border-radius: var(--radius-md);
   padding: 12px 14px; color: var(--text); font-size: 14px; width: 100%;
   outline: none; text-align: center; letter-spacing: 0.5px;
@@ -861,6 +969,7 @@ html, body {
   display: flex; align-items: center; gap: 12px;
   background: var(--bg2); border-radius: 14px;
   padding: 14px; margin: 4px 12px 8px;
+  box-shadow: var(--shadow-sm);
 }
 
 /* ── Locked personal chats ── */
@@ -883,3 +992,36 @@ html, body {
   display: flex; align-items: center; justify-content: center;
   padding: 0 4px;
 }
+
+/* ── Brand glyphs (emoji replacements) ──
+   Self-coloured SVG/PNG sized to the surrounding font (1em), so they scale with
+   whatever context they land in — 22px nav icon, 48px empty-state, 13px inline. */
+.glyph-text { white-space: inherit; }
+.glyph {
+  width: 1.05em; height: 1.05em;
+  display: inline-block; vertical-align: -0.18em;
+  object-fit: contain;
+}
+/* Inactive bottom-nav icons read as muted (we can't recolour the image). */
+.bottom-nav-item:not(.active) .glyph { opacity: 0.5; }
+
+/* ── Cat avatars ──
+   The sunglasses-cat family (matcha stroke) sits on a Milky-Honey circle in
+   place of initials for work chats. */
+.avatar-cat, .chat-av.avatar-cat { background: var(--cream-200); }
+.avatar-cat .cat-face, .chat-av .cat-face {
+  width: 78%; height: 78%; object-fit: contain; display: block;
+}
+
+/* ── Brand display type ──
+   Fredoka (rounded geometric) on titles + the tracked brand kicker, echoing the
+   chunky DoU wordmark. Body/UI stays in Nunito Sans. */
+.topbar-title,
+.chats-header-title,
+.welcome-title,
+.empty-title,
+.success-text,
+.chats-header-brand {
+  font-family: var(--font-display);
+}
+.chats-header-brand { color: var(--accent); }

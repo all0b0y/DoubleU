@@ -11,11 +11,25 @@
 # llm-guard==0.3.*
 # langfuse==2.*
 
+# zoneinfo falls back to this when the OS ships no IANA tz database (true of
+# the python:3.12-alpine runtime image) — required for per-owner timezone math
+# in the scheduler prompt (_current_time_instruction).
+tzdata
+
 pydantic==2.*
-pydantic-ai-slim[openai]==1.*
+# [mcp] adds the `mcp` package so the draft agent can attach per-role MCP
+# toolsets (HTTP/SSE) at request time (#7); degrades to memory-only when absent.
+pydantic-ai-slim[openai,mcp]==1.*
 asyncpg==0.31.*
 pgvector==0.*
 
 # Offline draft-quality evals (evals/eval_drafts.py) and the owner-feedback
 # regression loop (evals/export_feedback.py).
 pydantic-evals==1.*
+
+# Media extract pipeline (/ai/extract-media) document parsers. Optional: the
+# pipeline imports them lazily and degrades to "unsupported" when absent, so
+# voice/photo/text extraction still works without them. Voice (STT) and photo
+# (vision) are plain HTTP calls and need no extra package.
+pdfminer.six>=20240706
+python-docx==1.*

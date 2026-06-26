@@ -7,6 +7,10 @@ import (
 	"doubleu/backend-go/internal/contracts"
 )
 
+func testBoolPtr(value bool) *bool {
+	return &value
+}
+
 func TestRepositoryStateAndIdempotency(t *testing.T) {
 	repository := NewRepository()
 	settings := contracts.ChatSettings{TenantID: "t", ChatID: "c", Mode: contracts.ChatModeAuto}
@@ -59,6 +63,103 @@ func TestAIRoleCustomFieldsRoundTrip(t *testing.T) {
 	}
 }
 
+func TestAIRoleDeliverySettingsRoundTrip(t *testing.T) {
+	repo := NewRepository()
+	saved := repo.SaveAIRole(AIRoleRecord{
+		TenantID:              "t",
+		Name:                  "Менеджер",
+		Description:           "d",
+		RichFormattingEnabled: testBoolPtr(false),
+		StreamingEnabled:      testBoolPtr(true),
+	})
+	if saved.ID == 0 {
+		t.Fatal("role not saved")
+	}
+	got, ok := repo.AIRoleByID("t", saved.ID)
+	if !ok || got.RichFormattingEnabled == nil || *got.RichFormattingEnabled || got.StreamingEnabled == nil || !*got.StreamingEnabled {
+		t.Fatalf("delivery settings not round-tripped: %+v ok=%v", got, ok)
+	}
+	got.RichFormattingEnabled = nil
+	got.StreamingEnabled = testBoolPtr(false)
+	if !repo.UpdateAIRole(got) {
+		t.Fatal("update failed")
+	}
+	after, _ := repo.AIRoleByID("t", saved.ID)
+	if after.RichFormattingEnabled != nil || after.StreamingEnabled == nil || *after.StreamingEnabled {
+		t.Fatalf("delivery settings not updated: %+v", after)
+	}
+}
+
+func TestAIRoleModelNameRoundTrip(t *testing.T) {
+	repo := NewRepository()
+	saved := repo.SaveAIRole(AIRoleRecord{
+		TenantID:    "t",
+		Name:        "Менеджер",
+		Description: "d",
+		ModelTier:   "smart",
+		ModelName:   "deepseek/model-b",
+	})
+	if saved.ID == 0 {
+		t.Fatal("role not saved")
+	}
+	got, ok := repo.AIRoleByID("t", saved.ID)
+	if !ok || got.ModelTier != "smart" || got.ModelName != "deepseek/model-b" {
+		t.Fatalf("model selection not round-tripped: %+v ok=%v", got, ok)
+	}
+	repo.AssignAIRoleToChat("t", "c", saved.ID)
+	assigned, ok := repo.AIRoleForChat("t", "c")
+	if !ok || assigned.ModelName != "deepseek/model-b" {
+		t.Fatalf("assigned role model name = %+v ok=%v", assigned, ok)
+	}
+	got.ModelName = "deepseek/model-c"
+	if !repo.UpdateAIRole(got) {
+		t.Fatal("update failed")
+	}
+	after, _ := repo.AIRoleByID("t", saved.ID)
+	if after.ModelName != "deepseek/model-c" {
+		t.Fatalf("model name not updated: %+v", after)
+	}
+	after.ModelName = ""
+	if !repo.UpdateAIRole(after) {
+		t.Fatal("clear failed")
+	}
+	cleared, _ := repo.AIRoleByID("t", saved.ID)
+	if cleared.ModelName != "" {
+		t.Fatalf("model name not cleared: %+v", cleared)
+	}
+}
+
+func TestAIRoleToolSettingsRoundTrip(t *testing.T) {
+	repo := NewRepository()
+	saved := repo.SaveAIRole(AIRoleRecord{
+		TenantID: "t",
+		Name:     "Менеджер",
+		ToolSettings: map[string]bool{
+			"memory.search_facts": false,
+		},
+	})
+	if saved.ID == 0 {
+		t.Fatal("role not saved")
+	}
+	saved.ToolSettings["memory.search_facts"] = true
+	got, ok := repo.AIRoleByID("t", saved.ID)
+	if !ok || got.ToolSettings["memory.search_facts"] {
+		t.Fatalf("tool settings not round-tripped independently: %+v ok=%v", got.ToolSettings, ok)
+	}
+	if !repo.UpdateAIRoleToolSettings("t", saved.ID, map[string]bool{"memory.save_fact": false}) {
+		t.Fatal("tool settings update failed")
+	}
+	after, _ := repo.AIRoleByID("t", saved.ID)
+	if len(after.ToolSettings) != 1 || after.ToolSettings["memory.save_fact"] {
+		t.Fatalf("tool settings not replaced: %+v", after.ToolSettings)
+	}
+	encoded := encodeRoleToolSettings(after.ToolSettings)
+	decoded := decodeRoleToolSettings(encoded)
+	if len(decoded) != 1 || decoded["memory.save_fact"] {
+		t.Fatalf("tool settings jsonb round-trip failed: %s -> %+v", encoded, decoded)
+	}
+}
+
 func TestRepositoryMessagesAuditsAndDrafts(t *testing.T) {
 	repository := NewRepository()
 	event := contracts.NormalizedTelegramEvent{EventID: "e1", TenantID: "t", ChatID: "c", SourceMessageID: "m"}
@@ -79,9 +180,9 @@ func TestRepositoryMessagesAuditsAndDrafts(t *testing.T) {
 		t.Fatalf("audits = %+v", audits)
 	}
 
-	draft := DraftRecord{DraftID: "d1", TenantID: "t", ChatID: "c", SourceMessageID: "m", Status: DraftPending, CreatedAt: time.Now()}
+	draft := DraftRecord{DraftID: "d1", TenantID: "t", ChatID: "c", SourceMessageID: "m", TextFormat: contracts.TextFormatRich, Status: DraftPending, CreatedAt: time.Now()}
 	repository.SaveDraft(draft)
-	if got, ok := repository.Draft("d1"); !ok || got.Status != DraftPending {
+	if got, ok := repository.Draft("d1"); !ok || got.Status != DraftPending || got.TextFormat != contracts.TextFormatRich {
 		t.Fatalf("draft = %+v ok=%v", got, ok)
 	}
 	if got, ok := repository.DraftByMessage("t", "c", "m"); !ok || got.DraftID != "d1" {
@@ -116,6 +217,14 @@ func TestRepositoryBusinessConnectionAndTenantSettings(t *testing.T) {
 	repository.SaveChatSettings(contracts.ChatSettings{TenantID: "other", ChatID: "chat-c", Mode: contracts.ChatModeAuto})
 	if got := repository.ChatSettingsForTenant("tenant:user:77"); len(got) != 2 {
 		t.Fatalf("settings count = %d", len(got))
+	}
+
+	repository.SaveUserSettings(contracts.UserSettings{
+		TenantID:              "tenant:user:77",
+		RichFormattingEnabled: false,
+	})
+	if got, ok := repository.UserSettings("tenant:user:77"); !ok || got.RichFormattingEnabled {
+		t.Fatalf("user settings rich toggle = %+v ok=%v", got, ok)
 	}
 }
 

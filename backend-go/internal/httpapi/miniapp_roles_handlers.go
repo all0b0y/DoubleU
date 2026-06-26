@@ -1,12 +1,16 @@
 package httpapi
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
+	"doubleu/backend-go/internal/aiclient"
 	"doubleu/backend-go/internal/bot"
 	"doubleu/backend-go/internal/contracts"
 	"doubleu/backend-go/internal/core"
@@ -21,16 +25,37 @@ const roleContextMaxRunes = 20000
 // whole-role context cap so the prompt stays within budget.
 const roleCustomFieldMaxRunes = 5000
 
+// roleModelNameMaxRunes caps the stored env-provided model slug/alias.
+const roleModelNameMaxRunes = 200
+
+const (
+	roleDraftTextMaxRunes = 8000
+	roleDraftAudioMaxB64  = 14 * 1024 * 1024
+	roleDraftHTTPTimeout  = 90 * time.Second
+)
+
 // roleJSON is the wire shape of an AI role in the Mini App API.
 type roleJSON struct {
-	ID            int64                        `json:"id"`
-	Name          string                       `json:"name"`
-	Description   string                       `json:"description"`
-	SpeakingStyle string                       `json:"speaking_style"`
-	Goals         string                       `json:"goals"`
-	Constraints   string                       `json:"constraints"`
-	Context       string                       `json:"context"`
-	CustomFields  []contracts.AIRoleCustomField `json:"custom_fields"`
+	ID                    int64                         `json:"id"`
+	Name                  string                        `json:"name"`
+	Description           string                        `json:"description"`
+	SpeakingStyle         string                        `json:"speaking_style"`
+	Goals                 string                        `json:"goals"`
+	Constraints           string                        `json:"constraints"`
+	Context               string                        `json:"context"`
+	CustomFields          []contracts.AIRoleCustomField `json:"custom_fields"`
+	RichFormattingEnabled *bool                         `json:"rich_formatting_enabled"`
+	StreamingEnabled      *bool                         `json:"streaming_enabled"`
+	// SpeakAsOwner: true = reply as the owner (personal-chat impersonation);
+	// false = reply as the bot/role persona.
+	SpeakAsOwner bool `json:"speak_as_owner"`
+	// ModelTier selects the LLM quality tier: "fast", "balanced" (default), or "smart".
+	ModelTier string `json:"model_tier,omitempty"`
+	// ModelName optionally pins a concrete model within ModelTier.
+	ModelName string `json:"model_name,omitempty"`
+	// ToolSettings contains explicit per-role overrides; absent keys inherit
+	// defaults from the catalog returned by /api/v1/tool-catalog.
+	ToolSettings map[string]bool `json:"tool_settings"`
 }
 
 func roleToJSON(role store.AIRoleRecord) roleJSON {
@@ -39,28 +64,49 @@ func roleToJSON(role store.AIRoleRecord) roleJSON {
 		// Always emit an array so the Mini App can iterate without a nil guard.
 		fields = []contracts.AIRoleCustomField{}
 	}
+	toolSettings := cloneToolSettings(role.ToolSettings)
 	return roleJSON{
-		ID:            role.ID,
-		Name:          role.Name,
-		Description:   role.Description,
-		SpeakingStyle: role.SpeakingStyle,
-		Goals:         role.Goals,
-		Constraints:   role.Constraints,
-		Context:       role.Context,
-		CustomFields:  fields,
+		ID:                    role.ID,
+		Name:                  role.Name,
+		Description:           role.Description,
+		SpeakingStyle:         role.SpeakingStyle,
+		Goals:                 role.Goals,
+		Constraints:           role.Constraints,
+		Context:               role.Context,
+		CustomFields:          fields,
+		RichFormattingEnabled: cloneBoolPtr(role.RichFormattingEnabled),
+		StreamingEnabled:      cloneBoolPtr(role.StreamingEnabled),
+		SpeakAsOwner:          role.SpeakAsOwner,
+		ModelTier:             role.ModelTier,
+		ModelName:             role.ModelName,
+		ToolSettings:          toolSettings,
 	}
 }
 
 // roleRequest is the create/update payload; field trimming happens here so the
 // store always receives normalised values.
 type roleRequest struct {
-	Name          string                        `json:"name"`
-	Description   string                        `json:"description"`
-	SpeakingStyle string                        `json:"speaking_style"`
-	Goals         string                        `json:"goals"`
-	Constraints   string                        `json:"constraints"`
-	Context       string                        `json:"context"`
-	CustomFields  []contracts.AIRoleCustomField `json:"custom_fields"`
+	Name                  string                        `json:"name"`
+	Description           string                        `json:"description"`
+	SpeakingStyle         string                        `json:"speaking_style"`
+	Goals                 string                        `json:"goals"`
+	Constraints           string                        `json:"constraints"`
+	Context               string                        `json:"context"`
+	CustomFields          []contracts.AIRoleCustomField `json:"custom_fields"`
+	RichFormattingEnabled optionalBoolPatch             `json:"rich_formatting_enabled"`
+	StreamingEnabled      optionalBoolPatch             `json:"streaming_enabled"`
+	// SpeakAsOwner is a pointer so an omitted field keeps the create-time
+	// default (true) / the existing value on update, rather than forcing false.
+	SpeakAsOwner *bool `json:"speak_as_owner"`
+	// ModelTier selects the LLM quality tier: "fast", "balanced", or "smart".
+	// Absent means keep the existing value (update) or "balanced" (create).
+	ModelTier *string `json:"model_tier"`
+	// ModelName optionally pins a concrete model within ModelTier. Membership is
+	// intentionally validated by Python, which owns the env model lists.
+	ModelName *string `json:"model_name"`
+	// ToolSettings is a pointer so legacy updates that omit it preserve the
+	// role's existing overrides. An explicit empty object resets to defaults.
+	ToolSettings *map[string]bool `json:"tool_settings"`
 }
 
 func (req *roleRequest) normalize() {
@@ -70,6 +116,10 @@ func (req *roleRequest) normalize() {
 	req.Goals = strings.TrimSpace(req.Goals)
 	req.Constraints = strings.TrimSpace(req.Constraints)
 	req.Context = strings.TrimSpace(req.Context)
+	if req.ModelName != nil {
+		modelName := strings.TrimSpace(*req.ModelName)
+		req.ModelName = &modelName
+	}
 	// Drop fully-empty rows (the UI may leave a trailing blank one) and trim the rest.
 	kept := req.CustomFields[:0]
 	for _, f := range req.CustomFields {
@@ -97,6 +147,21 @@ func (req *roleRequest) validate() string {
 	if len([]rune(req.Context)) > roleContextMaxRunes {
 		return "context is too long (max 20000 characters)"
 	}
+	if req.ModelTier != nil {
+		tier := strings.ToLower(strings.TrimSpace(*req.ModelTier))
+		if tier != "fast" && tier != "balanced" && tier != "smart" {
+			return "model_tier must be fast, balanced, or smart"
+		}
+		*req.ModelTier = tier
+	}
+	if req.ModelName != nil && len([]rune(*req.ModelName)) > roleModelNameMaxRunes {
+		return "model_name is too long (max 200 characters)"
+	}
+	if req.ToolSettings != nil {
+		if msg := validateToolSettings(*req.ToolSettings); msg != "" {
+			return msg
+		}
+	}
 	for _, f := range req.CustomFields {
 		// Each custom field needs a title and a "why it exists" description;
 		// context is optional. Mirrors the Mini App role-edit form rules.
@@ -113,6 +178,30 @@ func (req *roleRequest) validate() string {
 	return ""
 }
 
+func validateToolSettings(settings map[string]bool) string {
+	for key := range settings {
+		if !contracts.IsKnownToolKey(key) {
+			return "unknown tool key: " + key
+		}
+	}
+	return ""
+}
+
+func cloneToolSettings(settings map[string]bool) map[string]bool {
+	cloned := make(map[string]bool, len(settings))
+	for key, enabled := range settings {
+		cloned[key] = enabled
+	}
+	return cloned
+}
+
+func toolSettingsOrDefault(settings *map[string]bool, fallback map[string]bool) map[string]bool {
+	if settings == nil {
+		return cloneToolSettings(fallback)
+	}
+	return cloneToolSettings(*settings)
+}
+
 func (s *Server) apiRoles(w http.ResponseWriter, r *http.Request) {
 	tenantID := tenantFromContext(r.Context())
 	roles := s.service.Repository().AIRoles(tenantID)
@@ -121,6 +210,126 @@ func (s *Server) apiRoles(w http.ResponseWriter, r *http.Request) {
 		items = append(items, roleToJSON(role))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"roles": items})
+}
+
+// apiToolCatalog returns owner-visible metadata for every native AI tool.
+func (s *Server) apiToolCatalog(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"tools": contracts.ToolCatalog()})
+}
+
+type roleDraftRequest struct {
+	Text        string `json:"text"`
+	AudioBase64 string `json:"audio_base64"`
+	MimeType    string `json:"mime_type"`
+}
+
+// apiDraftRole generates an editable role form without writing anything to
+// the repository. Only the existing create endpoint persists the final role.
+func (s *Server) apiDraftRole(w http.ResponseWriter, r *http.Request) {
+	if s.aiBaseURL == "" {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "ai service not configured"})
+		return
+	}
+	defer r.Body.Close()
+	var req roleDraftRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	req.Text = strings.TrimSpace(req.Text)
+	req.AudioBase64 = strings.TrimSpace(req.AudioBase64)
+	req.MimeType = strings.TrimSpace(req.MimeType)
+	if (req.Text == "") == (req.AudioBase64 == "") {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "provide exactly one of text or audio_base64"})
+		return
+	}
+	if len([]rune(req.Text)) > roleDraftTextMaxRunes {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "text is too long (max 8000 characters)"})
+		return
+	}
+	if len(req.AudioBase64) > roleDraftAudioMaxB64 {
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "audio is too large"})
+		return
+	}
+	if req.AudioBase64 != "" {
+		if req.MimeType == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "mime_type is required for audio"})
+			return
+		}
+		if _, err := base64.StdEncoding.DecodeString(req.AudioBase64); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "audio_base64 is invalid"})
+			return
+		}
+	}
+
+	client := aiclient.NewHTTPClient(
+		s.aiBaseURL,
+		&http.Client{Timeout: roleDraftHTTPTimeout},
+	)
+	text := req.Text
+	if req.AudioBase64 != "" {
+		extracted, err := client.ExtractMedia(r.Context(), aiclient.ExtractMediaRequest{
+			Kind:       "voice",
+			DataBase64: req.AudioBase64,
+			MimeType:   req.MimeType,
+		})
+		if err != nil {
+			slog.WarnContext(r.Context(), "role audio transcription failed",
+				"tenant_id", tenantFromContext(r.Context()), "mime_type", req.MimeType, "error", err)
+			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "audio transcription failed"})
+			return
+		}
+		text = strings.TrimSpace(extracted.Text)
+		if text == "" {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "audio contains no recognizable speech"})
+			return
+		}
+	}
+
+	draft, err := client.DraftRole(r.Context(), aiclient.DraftRoleRequest{Text: text})
+	if err != nil {
+		slog.WarnContext(r.Context(), "role drafting failed",
+			"tenant_id", tenantFromContext(r.Context()), "source", roleDraftSource(req), "error", err)
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "role drafting failed"})
+		return
+	}
+	validated := roleRequest{
+		Name:          draft.Name,
+		Description:   draft.Description,
+		SpeakingStyle: draft.SpeakingStyle,
+		Goals:         draft.Goals,
+		Constraints:   draft.Constraints,
+		CustomFields:  draft.CustomFields,
+	}
+	validated.normalize()
+	if msg := validated.validate(); msg != "" {
+		slog.WarnContext(r.Context(), "role drafting returned invalid data",
+			"tenant_id", tenantFromContext(r.Context()), "reason", msg)
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "ai returned an invalid role draft"})
+		return
+	}
+	fields := validated.CustomFields
+	if fields == nil {
+		fields = []contracts.AIRoleCustomField{}
+	}
+	writeJSON(w, http.StatusOK, roleJSON{
+		Name:          validated.Name,
+		Description:   validated.Description,
+		SpeakingStyle: validated.SpeakingStyle,
+		Goals:         validated.Goals,
+		Constraints:   validated.Constraints,
+		CustomFields:  fields,
+		SpeakAsOwner:  true,
+		ModelTier:     "balanced",
+		ModelName:     "",
+	})
+}
+
+func roleDraftSource(req roleDraftRequest) string {
+	if req.AudioBase64 != "" {
+		return "audio"
+	}
+	return "text"
 }
 
 func (s *Server) apiCreateRole(w http.ResponseWriter, r *http.Request) {
@@ -141,14 +350,20 @@ func (s *Server) apiCreateRole(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	role := s.service.Repository().SaveAIRole(store.AIRoleRecord{
-		TenantID:      tenantID,
-		Name:          req.Name,
-		Description:   req.Description,
-		SpeakingStyle: req.SpeakingStyle,
-		Goals:         req.Goals,
-		Constraints:   req.Constraints,
-		Context:       req.Context,
-		CustomFields:  req.CustomFields,
+		TenantID:              tenantID,
+		Name:                  req.Name,
+		Description:           req.Description,
+		SpeakingStyle:         req.SpeakingStyle,
+		Goals:                 req.Goals,
+		Constraints:           req.Constraints,
+		Context:               req.Context,
+		CustomFields:          req.CustomFields,
+		RichFormattingEnabled: req.RichFormattingEnabled.Apply(nil),
+		StreamingEnabled:      req.StreamingEnabled.Apply(nil),
+		SpeakAsOwner:          boolOrDefault(req.SpeakAsOwner, true),
+		ModelTier:             stringOrDefault(req.ModelTier, "balanced"),
+		ModelName:             stringOrDefault(req.ModelName, ""),
+		ToolSettings:          toolSettingsOrDefault(req.ToolSettings, nil),
 	})
 	if role.ID == 0 {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to save role"})
@@ -175,7 +390,8 @@ func (s *Server) apiUpdateRole(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": msg})
 		return
 	}
-	if _, ok := s.service.Repository().AIRoleByID(tenantID, roleID); !ok {
+	existing, ok := s.service.Repository().AIRoleByID(tenantID, roleID)
+	if !ok {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "role not found"})
 		return
 	}
@@ -185,21 +401,65 @@ func (s *Server) apiUpdateRole(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	role := store.AIRoleRecord{
-		ID:            roleID,
-		TenantID:      tenantID,
-		Name:          req.Name,
-		Description:   req.Description,
-		SpeakingStyle: req.SpeakingStyle,
-		Goals:         req.Goals,
-		Constraints:   req.Constraints,
-		Context:       req.Context,
-		CustomFields:  req.CustomFields,
+		ID:                    roleID,
+		TenantID:              tenantID,
+		Name:                  req.Name,
+		Description:           req.Description,
+		SpeakingStyle:         req.SpeakingStyle,
+		Goals:                 req.Goals,
+		Constraints:           req.Constraints,
+		Context:               req.Context,
+		CustomFields:          req.CustomFields,
+		RichFormattingEnabled: req.RichFormattingEnabled.Apply(existing.RichFormattingEnabled),
+		StreamingEnabled:      req.StreamingEnabled.Apply(existing.StreamingEnabled),
+		SpeakAsOwner:          boolOrDefault(req.SpeakAsOwner, existing.SpeakAsOwner),
+		ModelTier:             stringOrDefault(req.ModelTier, existing.ModelTier),
+		ModelName:             stringOrDefault(req.ModelName, existing.ModelName),
+		ToolSettings:          toolSettingsOrDefault(req.ToolSettings, existing.ToolSettings),
 	}
 	if !s.service.Repository().UpdateAIRole(role) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to update role"})
 		return
 	}
 	writeJSON(w, http.StatusOK, roleToJSON(role))
+}
+
+type roleToolsRequest struct {
+	ToolSettings *map[string]bool `json:"tool_settings"`
+}
+
+// apiUpdateRoleTools updates only native-tool overrides for an existing role.
+func (s *Server) apiUpdateRoleTools(w http.ResponseWriter, r *http.Request) {
+	tenantID := tenantFromContext(r.Context())
+	roleID, err := strconv.ParseInt(r.PathValue("role_id"), 10, 64)
+	if err != nil || roleID == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid role_id"})
+		return
+	}
+	defer r.Body.Close()
+	var req roleToolsRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	if req.ToolSettings == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "tool_settings is required"})
+		return
+	}
+	if msg := validateToolSettings(*req.ToolSettings); msg != "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": msg})
+		return
+	}
+	if _, ok := s.service.Repository().AIRoleByID(tenantID, roleID); !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "role not found"})
+		return
+	}
+	settings := cloneToolSettings(*req.ToolSettings)
+	if !s.service.Repository().UpdateAIRoleToolSettings(tenantID, roleID, settings) {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to update role tools"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"tool_settings": settings})
 }
 
 func (s *Server) apiDeleteRole(w http.ResponseWriter, r *http.Request) {
@@ -486,6 +746,8 @@ func (s *Server) apiGetUserSettings(w http.ResponseWriter, r *http.Request) {
 			PrimaryLanguage:        "ru",
 			DefaultModeForNewChats: "manual",
 			LearningEnabled:        true,
+			RichFormattingEnabled:  true,
+			StreamingEnabled:       false,
 			LanguageForDrafts:      "auto",
 		}
 	}
@@ -496,13 +758,18 @@ func (s *Server) apiSaveUserSettings(w http.ResponseWriter, r *http.Request) {
 	tenantID := tenantFromContext(r.Context())
 	defer r.Body.Close()
 	var req struct {
-		DisplayName            string `json:"display_name"`
-		Bio                    string `json:"bio"`
-		Timezone               string `json:"timezone"`
-		PrimaryLanguage        string `json:"primary_language"`
-		DefaultModeForNewChats string `json:"default_mode_for_new_chats"`
-		LearningEnabled        *bool  `json:"learning_enabled"`
-		LanguageForDrafts      string `json:"language_for_drafts"`
+		// DisplayName/Bio use *string so a partial PUT (e.g. timezone-only, from
+		// the Mini App's background timezone sync) can omit them without wiping
+		// the stored value — nil means "field absent", "" means "explicitly cleared".
+		DisplayName            *string `json:"display_name"`
+		Bio                    *string `json:"bio"`
+		Timezone               string  `json:"timezone"`
+		PrimaryLanguage        string  `json:"primary_language"`
+		DefaultModeForNewChats string  `json:"default_mode_for_new_chats"`
+		LearningEnabled        *bool   `json:"learning_enabled"`
+		RichFormattingEnabled  *bool   `json:"rich_formatting_enabled"`
+		StreamingEnabled       *bool   `json:"streaming_enabled"`
+		LanguageForDrafts      string  `json:"language_for_drafts"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
@@ -515,14 +782,26 @@ func (s *Server) apiSaveUserSettings(w http.ResponseWriter, r *http.Request) {
 			PrimaryLanguage:        "ru",
 			DefaultModeForNewChats: "manual",
 			LearningEnabled:        true,
+			RichFormattingEnabled:  true,
+			StreamingEnabled:       false,
 			LanguageForDrafts:      "auto",
 		}
 	}
 	settings.UserID = strings.TrimPrefix(tenantID, "tenant:user:")
-	settings.DisplayName = strings.TrimSpace(req.DisplayName)
-	settings.Bio = strings.TrimSpace(req.Bio)
+	if req.DisplayName != nil {
+		settings.DisplayName = strings.TrimSpace(*req.DisplayName)
+	}
+	if req.Bio != nil {
+		settings.Bio = strings.TrimSpace(*req.Bio)
+	}
 	if req.Timezone != "" {
-		settings.Timezone = req.Timezone
+		// Reject unknown IANA names instead of failing the whole request — a
+		// stale or malformed browser-detected zone should not block saving the
+		// rest of the settings, and the prompt builder already falls back to
+		// UTC for an empty/invalid timezone.
+		if _, err := time.LoadLocation(req.Timezone); err == nil {
+			settings.Timezone = req.Timezone
+		}
 	}
 	if req.PrimaryLanguage != "" {
 		settings.PrimaryLanguage = req.PrimaryLanguage
@@ -536,6 +815,12 @@ func (s *Server) apiSaveUserSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.LearningEnabled != nil {
 		settings.LearningEnabled = *req.LearningEnabled
+	}
+	if req.RichFormattingEnabled != nil {
+		settings.RichFormattingEnabled = *req.RichFormattingEnabled
+	}
+	if req.StreamingEnabled != nil {
+		settings.StreamingEnabled = *req.StreamingEnabled
 	}
 	if req.LanguageForDrafts != "" {
 		if req.LanguageForDrafts != "auto" && req.LanguageForDrafts != "primary" {

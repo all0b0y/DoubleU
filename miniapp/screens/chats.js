@@ -1,5 +1,6 @@
 import { api, openEvents } from '/miniapp/api/client.js';
 import { renderBottomNav } from '/miniapp/components/nav.js';
+import { catImg } from '/miniapp/components/glyphs.js';
 
 const twa = window.Telegram?.WebApp;
 
@@ -10,11 +11,6 @@ const MODE_DISPLAY = {
   silent:    { icon: '',  label: 'silent' },
   disabled:  { icon: '',  label: 'disabled' },
 };
-
-function initials(name) {
-  if (!name) return '?';
-  return name.split(/\s+/).map(w => w[0]).join('').slice(0, 2).toUpperCase();
-}
 
 function timeAgo(iso) {
   if (!iso) return '';
@@ -36,11 +32,10 @@ function modeLabel(mode) {
 
 function chatItemHTML(chat) {
   const hasDrafts = chat.draft_count > 0;
-  const avatarClass = hasDrafts ? 'avatar-accent' : 'avatar-muted';
   const mode = chat.mode || 'disabled';
   return `
     <div class="chat-item ${hasDrafts ? 'has-drafts' : ''}" data-id="${chat.chat_id}">
-      <div class="avatar avatar-md ${avatarClass}">${initials(chat.display_name)}</div>
+      <div class="avatar avatar-md avatar-cat">${catImg(chat.chat_id)}</div>
       <div class="chat-item-body">
         <div class="chat-item-row1">
           <div class="chat-item-name">${chat.display_name || chat.chat_id}</div>
@@ -100,7 +95,7 @@ export function renderChats(navigate) {
   // Personal chats are disabled in this iteration — the bot section is the only
   // surface. The personal tab and its add-chat entry point were removed from the UI.
   let myChats = [];
-  let bot = { connected: false };
+  let bots = []; // a tenant may connect several bots
 
   function refreshList() {
     renderList(el.querySelector('#search-input').value);
@@ -108,8 +103,33 @@ export function renderChats(navigate) {
 
   // ── Bots section ──────────────────────────────────────────────────────────
 
+  // Bot-transport chat ids are namespaced "bot:{botId}:{telegramChatId}", so the
+  // owning bot is recoverable from the chat id alone.
+  function botIdOfChat(chatId) {
+    const m = /^bot:(\d+):/.exec(chatId || '');
+    return m ? m[1] : '';
+  }
+
+  function botCardHTML(b, chatCount) {
+    const statusOk = b.status === 'active' || !b.status;
+    const role = b.ai_role?.name;
+    return `
+      <div class="bot-card" data-bot-id="${b.bot_id}">
+        <div class="role-card-icon" style="background:var(--success-soft);">🤖</div>
+        <div class="chat-item-body">
+          <div class="chat-item-row1">
+            <div class="role-card-name">@${b.bot_username || b.bot_id}</div>
+            <span class="role-card-usage" style="${statusOk ? '' : 'color:var(--danger);'}">
+              ${statusOk ? `${chatCount} ${plural(chatCount, 'чат', 'чата', 'чатов')}` : b.status}
+            </span>
+          </div>
+          <div class="role-card-desc">${role ? `роль: ${role}` : 'ИИ отвечает собеседникам этого бота'}</div>
+        </div>
+      </div>`;
+  }
+
   function botSectionHTML(botChats) {
-    if (!bot.connected) {
+    if (!bots.length) {
       return `
         <div class="empty-state">
           <div class="empty-icon">🤖</div>
@@ -123,29 +143,19 @@ export function renderChats(navigate) {
           </button>
         </div>`;
     }
-    const statusOk = bot.status === 'active' || !bot.status;
-    return `
-      <div class="bot-card" id="bot-card">
-        <div class="role-card-icon" style="background:rgba(16,185,129,0.16);">🤖</div>
-        <div class="chat-item-body">
-          <div class="chat-item-row1">
-            <div class="role-card-name">@${bot.bot_username || bot.bot_id}</div>
-            <span class="role-card-usage" style="${statusOk ? '' : 'color:var(--danger);'}">
-              ${statusOk ? `${botChats.length} ${plural(botChats.length, 'чат', 'чата', 'чатов')}` : bot.status}
-            </span>
-          </div>
-          <div class="role-card-desc">ИИ отвечает собеседникам этого бота</div>
-        </div>
-      </div>
-      ${botChats.length
-        ? `<div style="display:flex;flex-direction:column;gap:2px;padding:4px 0;">
-             ${botChats.map(c => chatItemHTML(c)).join('')}
-           </div>`
-        : `<div class="empty-state" style="padding:24px;">
-             <div class="empty-icon">💬</div>
-             <div class="empty-subtitle">Пока никто не написал боту.<br>Как только придёт сообщение — чат появится здесь.</div>
-           </div>`}
-    `;
+    return bots.map(b => {
+      const chats = botChats.filter(c => botIdOfChat(c.chat_id) === String(b.bot_id));
+      return `
+        ${botCardHTML(b, chats.length)}
+        ${chats.length
+          ? `<div style="display:flex;flex-direction:column;gap:2px;padding:4px 0 8px;">
+               ${chats.map(c => chatItemHTML(c)).join('')}
+             </div>`
+          : `<div class="empty-state" style="padding:16px 24px 20px;">
+               <div class="empty-subtitle">Пока никто не написал боту.</div>
+             </div>`}
+      `;
+    }).join('');
   }
 
   function plural(n, one, few, many) {
@@ -170,22 +180,30 @@ export function renderChats(navigate) {
       navigate('/add-bot');
     });
 
+    // Tapping a bot card opens that bot's settings (its global role + disconnect).
+    list.querySelectorAll('.bot-card[data-bot-id]').forEach(card => {
+      card.addEventListener('click', () => {
+        twa?.HapticFeedback?.selectionChanged();
+        navigate(`/bot/${card.dataset.botId}`);
+      });
+    });
+
     list.querySelectorAll('.chat-item').forEach(item => {
       item.addEventListener('click', () => {
         twa?.HapticFeedback?.selectionChanged();
-        navigate(`/chat/${item.dataset.id}`);
+        navigate(`/chat/${encodeURIComponent(item.dataset.id)}`);
       });
     });
   }
 
   async function loadChats() {
     try {
-      const [chatsData, botData] = await Promise.all([
+      const [chatsData, botsData] = await Promise.all([
         api.chats(),
-        api.getBot().catch(() => ({ connected: false })),
+        api.bots().catch(() => ({ bots: [] })),
       ]);
       myChats = chatsData.chats || [];
-      bot = botData || { connected: false };
+      bots = botsData.bots || [];
       refreshList();
     } catch (err) {
       el.querySelector('#chat-list').innerHTML = `

@@ -3,6 +3,23 @@ info:
   title: DoubleU Technical MVP Contract
   version: 0.1.0
 paths:
+  /ai/draft-role:
+    post:
+      summary: Generate an editable AI-role draft from a free-text description.
+      operationId: draftRole
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DraftRoleRequest"
+      responses:
+        "200":
+          description: Structured role draft.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DraftRoleResponse"
   /ai/process-message:
     post:
       summary: Process a normalized Telegram message and return an AI decision proposal.
@@ -22,6 +39,33 @@ paths:
                 $ref: "#/components/schemas/AIProcessMessageResponse"
 components:
   schemas:
+    DraftRoleRequest:
+      type: object
+      required: [text]
+      properties:
+        text:
+          type: string
+          minLength: 1
+          maxLength: 8000
+        trace_id: { type: string }
+    DraftRoleResponse:
+      type: object
+      required: [name, description, speaking_style, goals, constraints, custom_fields]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 64 }
+        description: { type: string, minLength: 1 }
+        speaking_style: { type: string }
+        goals: { type: string }
+        constraints: { type: string }
+        custom_fields:
+          type: array
+          items:
+            type: object
+            required: [title, description]
+            properties:
+              title: { type: string, minLength: 1, maxLength: 64 }
+              description: { type: string, minLength: 1 }
+              context: { type: string, maxLength: 5000 }
     NormalizedTelegramEvent:
       type: object
       required:
@@ -83,6 +127,40 @@ components:
         speaking_style: { type: string }
         goals: { type: string }
         constraints: { type: string }
+        speak_as_owner:
+          type: boolean
+          default: true
+          description: >
+            true (default): the AI impersonates the owner — the contact perceives
+            the reply as written by a human. false: the AI replies openly as the
+            role persona (assistant/companion), without owner impersonation.
+        model_tier:
+          type: string
+          enum: [fast, balanced, smart]
+          default: balanced
+          description: >
+            LLM quality tier for this role's draft generation.
+            fast: low-latency, lower cost (MODEL_TIER_FAST env list).
+            balanced: default production quality (MODEL_TIER_BALANCED).
+            smart: highest capability, highest cost (MODEL_TIER_SMART).
+            Absent or unrecognised value falls back to the task-level
+            MODEL_DRAFT / OPENROUTER_MODEL (backward-compatible).
+        model_name:
+          type: string
+          default: ""
+          description: >
+            Optional concrete model slug or LiteLLM alias selected inside
+            model_tier. Empty means the tier's primary model. If stale or not
+            present in the selected tier env list, Python falls back to the
+            tier default without failing generation.
+        tool_settings:
+          type: object
+          additionalProperties:
+            type: boolean
+          default: {}
+          description: >
+            Per-role native-tool overrides keyed by catalog key. Missing keys
+            inherit the tool catalog's default_enabled value.
         context:
           type: string
           description: >
@@ -132,6 +210,10 @@ components:
         intent:
           type: string
           enum: [question, scheduling, commercial, acknowledgement, request, choice_question, general_message]
+        text_format:
+          type: string
+          enum: [plain, rich]
+          default: plain
         model_used: { type: string }
         usage:
           type: object
@@ -155,6 +237,19 @@ components:
           type: array
           items: { type: string }
           description: AI-suggested short replies; non-empty only for intent=choice_question.
+        response_plan:
+          type: object
+          required: [shape, options]
+          description: Deferred contact-facing form produced by an interaction tool.
+          properties:
+            shape:
+              type: string
+              enum: [buttons]
+            options:
+              type: array
+              minItems: 2
+              maxItems: 4
+              items: { type: string }
         topic:
           type: string
           description: 3-7 word conversation topic from the same draft call (replaces per-message /ai/tag-topic).

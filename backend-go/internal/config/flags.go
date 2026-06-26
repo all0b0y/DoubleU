@@ -28,6 +28,19 @@ const (
 	MemorySourcePython AIMemorySource = "python"
 )
 
+// ReflectionMode controls sleep-time reflection in the nightly worker (#5).
+type ReflectionMode string
+
+const (
+	// ReflectionOff disables reflection entirely (default, safe-off).
+	ReflectionOff ReflectionMode = "off"
+	// ReflectionShadow synthesises patterns and logs them but writes nothing —
+	// for eval-driven validation before enabling writes.
+	ReflectionShadow ReflectionMode = "shadow"
+	// ReflectionEnabled writes synthesised behaviour_pattern facts to memory.
+	ReflectionEnabled ReflectionMode = "enabled"
+)
+
 // ObservabilitySink selects the trace destination.
 type ObservabilitySink string
 
@@ -58,6 +71,9 @@ type FeatureFlags struct {
 	// AIMemorySource picks who persists extracted memory (Go legacy path or
 	// the Python agent runtime). Defaults to MemorySourceGo (safe-off).
 	AIMemorySource AIMemorySource
+	// ReflectionMode gates sleep-time reflection in the nightly worker.
+	// Defaults to ReflectionOff (safe-off).
+	ReflectionMode ReflectionMode
 }
 
 // LoadFlags reads FeatureFlags from environment variables with safe defaults.
@@ -70,6 +86,18 @@ func LoadFlags() FeatureFlags {
 		ShadowModeOnly:      boolValue(os.Getenv("SHADOW_MODE_ONLY")),
 		Cutover:             boolValue(os.Getenv("CUTOVER")),
 		AIMemorySource:      parseMemorySource(os.Getenv("AI_MEMORY_SOURCE")),
+		ReflectionMode:      parseReflectionMode(os.Getenv("REFLECTION_MODE")),
+	}
+}
+
+func parseReflectionMode(raw string) ReflectionMode {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case string(ReflectionShadow):
+		return ReflectionShadow
+	case string(ReflectionEnabled):
+		return ReflectionEnabled
+	default:
+		return ReflectionOff
 	}
 }
 

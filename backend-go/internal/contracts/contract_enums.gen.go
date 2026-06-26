@@ -10,7 +10,23 @@
 package contracts
 
 // ContractVersion is the version of contracts/contracts.json this code was generated from.
-const ContractVersion = "0.3.0"
+const ContractVersion = "0.4.0"
+
+// ToolCategory values from the frozen contract.
+const (
+	ToolCategoryRead ToolCategory = "read"
+	ToolCategorySchedule ToolCategory = "schedule"
+	ToolCategoryIntegration ToolCategory = "integration"
+	ToolCategoryInteraction ToolCategory = "interaction"
+)
+
+// AllToolCategories lists every legal ToolCategory value.
+var AllToolCategories = []ToolCategory{
+	ToolCategoryRead,
+	ToolCategorySchedule,
+	ToolCategoryIntegration,
+	ToolCategoryInteraction,
+}
 
 // Decision values from the frozen contract.
 const (

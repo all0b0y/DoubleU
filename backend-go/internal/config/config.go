@@ -24,6 +24,10 @@ type Config struct {
 	// "bot" (user-supplied bot, default while the Business path is shelved),
 	// "personal" (Telegram Business webhook) or "full" (both).
 	IngestionModeDefault string
+	// MediaExtractionEnabled is the global kill switch for the media -> text step
+	// (voice/photo/document). Default true; set MEDIA_EXTRACTION_ENABLED=false to
+	// disable all media provider calls (cost control).
+	MediaExtractionEnabled bool
 }
 
 // Load reads configuration from environment variables.
@@ -48,18 +52,32 @@ func Load() Config {
 		}
 	}
 	return Config{
-		HTTPAddr:              valueOrDefault(os.Getenv("BACKEND_HTTP_ADDR"), ":8080"),
-		AIBaseURL:             os.Getenv("AI_BASE_URL"),
-		DatabaseURL:           os.Getenv("DATABASE_URL"),
-		Timeout:               timeout,
-		AITimeout:             aiTimeout,
-		TelegramBotToken:      os.Getenv("TELEGRAM_BOT_TOKEN"),
-		PublicWebhookURL:      os.Getenv("PUBLIC_WEBHOOK_URL"),
-		TelegramWebhookSecret: os.Getenv("TELEGRAM_WEBHOOK_SECRET"),
-		TelegramAutoSetup:     boolValue(os.Getenv("TELEGRAM_AUTO_SETUP")),
-		ReplyDelay:            replyDelay,
-		MiniAppDir:            valueOrDefault(os.Getenv("MINIAPP_DIR"), "./miniapp"),
-		IngestionModeDefault:  valueOrDefault(os.Getenv("INGESTION_MODE_DEFAULT"), "bot"),
+		HTTPAddr:               valueOrDefault(os.Getenv("BACKEND_HTTP_ADDR"), ":8080"),
+		AIBaseURL:              os.Getenv("AI_BASE_URL"),
+		DatabaseURL:            os.Getenv("DATABASE_URL"),
+		Timeout:                timeout,
+		AITimeout:              aiTimeout,
+		TelegramBotToken:       os.Getenv("TELEGRAM_BOT_TOKEN"),
+		PublicWebhookURL:       os.Getenv("PUBLIC_WEBHOOK_URL"),
+		TelegramWebhookSecret:  os.Getenv("TELEGRAM_WEBHOOK_SECRET"),
+		TelegramAutoSetup:      boolValue(os.Getenv("TELEGRAM_AUTO_SETUP")),
+		ReplyDelay:             replyDelay,
+		MiniAppDir:             valueOrDefault(os.Getenv("MINIAPP_DIR"), "./miniapp"),
+		IngestionModeDefault:   valueOrDefault(os.Getenv("INGESTION_MODE_DEFAULT"), "bot"),
+		MediaExtractionEnabled: boolWithDefault(os.Getenv("MEDIA_EXTRACTION_ENABLED"), true),
+	}
+}
+
+// boolWithDefault parses a boolean env value, returning def when unset so a
+// default-on flag stays on unless explicitly disabled.
+func boolWithDefault(value string, def bool) bool {
+	switch value {
+	case "":
+		return def
+	case "1", "true", "TRUE", "yes", "YES", "on", "ON":
+		return true
+	default:
+		return false
 	}
 }
 

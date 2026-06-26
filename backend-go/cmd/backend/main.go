@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	_ "time/tzdata" // embed the IANA zone database — the alpine runtime image ships none
 
 	"doubleu/backend-go/internal/aiclient"
 	"doubleu/backend-go/internal/botservice"
@@ -98,14 +99,23 @@ func main() {
 	// handler closes over the service variable assigned right below.
 	var service *core.Service
 	botManager := botservice.NewManager(repository,
-		botservice.HandlerFunc(func(ctx context.Context, event contracts.NormalizedTelegramEvent) error {
+		botservice.HandlerFuncs{Message: botservice.HandlerFunc(func(ctx context.Context, event contracts.NormalizedTelegramEvent, media *telegram.MediaDescriptor) error {
+			// Turn any voice/photo/document into text before AI processing so the
+			// agent stays text-only (media -> text). Best-effort: never blocks the
+			// message on extraction failure.
+			event = service.EnrichBotMedia(ctx, event, media)
 			_, err := service.HandleBotMessage(ctx, event)
 			return err
-		}),
+		}), Callback: func(ctx context.Context, callback telegram.CallbackQueryUpdate, tenantID, botID string) error {
+			_, err := service.HandleBotCallbackQuery(ctx, callback, tenantID, botID)
+			return err
+		}},
 		telegramHTTPClient,
 		botservice.WithLogger(logger),
 		botservice.WithDefaultIngestionMode(ingestionDefault),
 	)
+	mediaCfg := core.DefaultMediaConfig()
+	mediaCfg.Enabled = cfg.MediaExtractionEnabled
 	service = core.NewService(repository, ai, sender,
 		core.WithLogger(logger),
 		core.WithReplyDelay(cfg.ReplyDelay),
@@ -113,6 +123,8 @@ func main() {
 		core.WithBotSenderProvider(botManager),
 		core.WithDefaultIngestionMode(ingestionDefault),
 		core.WithAIMemorySource(string(flags.AIMemorySource)),
+		core.WithReflectionMode(string(flags.ReflectionMode)),
+		core.WithMediaConfig(mediaCfg),
 	)
 	server := httpapi.NewServer(service,
 		httpapi.WithHub(hub),
@@ -120,6 +132,7 @@ func main() {
 		httpapi.WithWebhookSecret(cfg.TelegramWebhookSecret),
 		httpapi.WithMiniAppDir(cfg.MiniAppDir),
 		httpapi.WithBotManager(botManager),
+		httpapi.WithAIBaseURL(cfg.AIBaseURL),
 	)
 	serverCtx, serverCancel := context.WithCancel(context.Background())
 	defer serverCancel()
@@ -128,6 +141,7 @@ func main() {
 	go service.StartEmbeddingWorker(serverCtx)
 	go service.StartEpisodeCloser(serverCtx)
 	go service.StartDailySummaryScheduler(serverCtx)
+	go service.StartScheduler(serverCtx)
 	go service.StartConsolidationWorker(serverCtx)
 	logger.Info("backend storage configured", "storage", storage, "database_url_configured", cfg.DatabaseURL != "")
 	logger.Info("backend listening", "addr", cfg.HTTPAddr, "ai_base_url", cfg.AIBaseURL)

@@ -27,6 +27,7 @@ from ai_agent.pipelines import (
 )
 from ai_agent.schemas import (
     AIProcessMessageRequest,
+    AIRoleData,
     ChatMode,
     ChatSettings,
     ChatSummaryRequest,
@@ -60,6 +61,33 @@ class ServicePolicyTests(unittest.TestCase):
         self.assertGreaterEqual(response.confidence, 0.92)
         self.assertTrue(response.response_text)
         self.assertEqual(len(self.audit_sink.events()), 1)
+
+    def test_auto_mode_sends_even_below_old_confidence_bar(self) -> None:
+        """Auto mode has no confidence gate: a low-risk reply auto-sends even when
+        the model's self-assessed confidence (here 0.8) is below the old 0.92 bar.
+
+        The owner opts into unsupervised replies in auto mode and accepts the risk
+        (owner decision, 2026-06-16). Risk gates still protect medium/high/critical.
+        """
+        response = self.service.process_message(
+            _process_request(mode=ChatMode.AUTO, text="Спасибо, понял")
+        )
+
+        self.assertEqual(response.risk_level, RiskLevel.LOW)
+        self.assertLess(response.confidence, 0.92)
+        self.assertEqual(response.decision, Decision.AUTO_REPLY)
+        self.assertTrue(response.response_text)
+
+    def test_semi_auto_below_threshold_still_drafts(self) -> None:
+        """Semi-auto keeps the confidence gate: the same low-confidence low-risk
+        reply that auto-sends in AUTO mode must fall back to a draft in SEMI_AUTO."""
+        response = self.service.process_message(
+            _process_request(mode=ChatMode.SEMI_AUTO, text="Спасибо, понял")
+        )
+
+        self.assertEqual(response.risk_level, RiskLevel.LOW)
+        self.assertLess(response.confidence, 0.85)
+        self.assertEqual(response.decision, Decision.DRAFT)
 
     def test_no_memory_and_private_force_draft_without_memory_context(self) -> None:
         """Private chats must not auto-reply and no_memory must suppress memory use."""
@@ -148,6 +176,44 @@ class ServicePolicyTests(unittest.TestCase):
 
         self.assertEqual(response.intent, "choice_question")
         self.assertGreaterEqual(len(response.options), 2)
+
+    def test_role_structured_answer_sets_rich_text_format(self) -> None:
+        """Assigned role answers carry text_format=rich for structured answer intents."""
+        response = self.service.process_message(
+            _process_request(
+                mode=ChatMode.MANUAL,
+                text="Can you explain the pricing?",
+                ai_role=AIRoleData(
+                    name="Support",
+                    description="Answers product FAQ and pricing questions.",
+                ),
+            )
+        )
+
+        self.assertEqual(response.intent, "question")
+        self.assertEqual(response.text_format, "rich")
+
+    def test_legacy_owner_copy_defaults_to_plain_text_format(self) -> None:
+        """Without ai_role the service keeps the legacy digital-copy path plain."""
+        response = self.service.process_message(
+            _process_request(mode=ChatMode.MANUAL, text="Can you explain the pricing?")
+        )
+
+        self.assertEqual(response.text_format, "plain")
+
+    def test_response_text_format_default_is_plain_for_old_construction(self) -> None:
+        """Back-compat: callers that omit text_format get the contract default."""
+        response = schemas.AIProcessMessageResponse(
+            decision=Decision.DRAFT,
+            response_text="ok",
+            confidence=0.9,
+            risk_level=RiskLevel.LOW,
+            intent="question",
+            model_used="test",
+            usage=schemas.Usage(),
+        )
+
+        self.assertEqual(response.text_format, "plain")
 
     def test_agent_failure_yields_error_fallback(self) -> None:
         """A draft the agent cannot produce surfaces as the error_fallback decision."""
@@ -347,6 +413,7 @@ def _process_request(
     text: str,
     privacy_flags: tuple[PrivacyFlag, ...] = (),
     memory_context: tuple[str, ...] = ("Customer prefers short replies.",),
+    ai_role: AIRoleData | None = None,
 ) -> AIProcessMessageRequest:
     return AIProcessMessageRequest(
         request_id="req-1",
@@ -369,6 +436,7 @@ def _process_request(
             privacy_flags=privacy_flags,
         ),
         memory_context=memory_context,
+        ai_role=ai_role,
     )
 
 

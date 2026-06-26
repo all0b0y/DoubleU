@@ -4,15 +4,20 @@ package core
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/fnv"
 	"log/slog"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"golang.org/x/time/rate"
 
 	"doubleu/backend-go/internal/aiclient"
 	"doubleu/backend-go/internal/bot"
@@ -75,36 +80,43 @@ func (DecisionEngine) Decide(settings contracts.ChatSettings, proposal contracts
 	if settings.PrivacyFlags.Contains(contracts.PrivacyPrivate) {
 		return contracts.DecisionDraft, "private_chat_blocks_auto_reply"
 	}
+	// AUTO mode: the owner explicitly opts into unsupervised replies and accepts
+	// the risk, so the confidence gate is removed — every low-risk message
+	// auto-sends (owner decision, 2026-06-16). MEDIUM/HIGH/CRITICAL risk already
+	// returned a draft/ask_owner above, so only low risk reaches here. The empty
+	// guard keeps a model that produced no text from sending a blank message.
+	if settings.Mode == contracts.ChatModeAuto {
+		if strings.TrimSpace(proposal.ResponseText) == "" {
+			return contracts.DecisionDraft, "auto_mode_no_reply_text"
+		}
+		return contracts.DecisionAutoReply, "auto_mode_low_risk_send"
+	}
+	// SEMI-AUTO (and any other mode) still defer to the AI's auto-reply request
+	// and the confidence threshold: send only when the model is confident.
 	if proposal.Decision != contracts.DecisionAutoReply {
 		return contracts.DecisionDraft, "ai_did_not_request_auto_reply"
 	}
-	switch settings.Mode {
-	case contracts.ChatModeSemiAuto:
+	if settings.Mode == contracts.ChatModeSemiAuto {
 		if proposal.Confidence >= contracts.SemiAutoMinConfidence {
 			return contracts.DecisionAutoReply, "semi_auto_confidence_met"
 		}
 		return contracts.DecisionDraft, "semi_auto_confidence_below_threshold"
-	case contracts.ChatModeAuto:
-		if proposal.Confidence >= contracts.AutoMinConfidence {
-			return contracts.DecisionAutoReply, "auto_confidence_met"
-		}
-		return contracts.DecisionDraft, "auto_confidence_below_threshold"
-	default:
-		return contracts.DecisionDraft, "safe_default_draft"
 	}
+	return contracts.DecisionDraft, "safe_default_draft"
 }
 
 // Service coordinates Telegram inbound handling, AI calls, audit, and approvals.
 type Service struct {
-	repository *store.Repository
-	ai         aiclient.Client
-	sender     telegram.Sender
-	botLayer   *bot.Layer
-	engine     DecisionEngine
-	logger     *slog.Logger
-	now        func() time.Time
-	debounce   sync.Map      // map[chatKey]string — latest event_id per chat for typing-delay debounce
-	replyDelay time.Duration // wait before calling AI (lets users finish sending multi-message bursts)
+	repository       *store.Repository
+	ai               aiclient.Client
+	sender           telegram.Sender
+	botLayer         *bot.Layer
+	engine           DecisionEngine
+	logger           *slog.Logger
+	now              func() time.Time
+	debounce         sync.Map      // map[chatKey]string — latest event_id per chat for typing-delay debounce
+	replyDelay       time.Duration // wait before calling AI (lets users finish sending multi-message bursts)
+	streamFramePause time.Duration // pause between rich draft preview frames; 0 = no pause (tests)
 	// notify pushes real-time events to connected Mini App clients.
 	// When set, bot draft cards are suppressed — the Mini App is the primary UI.
 	notify func(tenantID, eventType string, payload any)
@@ -119,6 +131,22 @@ type Service struct {
 	// asyncLLM bounds concurrent fire-and-forget LLM tasks (extraction,
 	// episode summarisation) so a message burst cannot become a request storm.
 	asyncLLM chan struct{}
+	// tenantLimiters gives each tenant its own token bucket over the shared
+	// asyncLLM pool so one noisy tenant cannot starve the others (fair-share,
+	// ARCH-7). Keyed by tenant id -> *rate.Limiter; built lazily.
+	tenantLimiters sync.Map
+	tenantRate     rate.Limit // sustained async-LLM tasks/sec per tenant
+	tenantBurst    int        // burst allowance per tenant
+	// chatLimiters bounds inbound message rate per chat+sender to stop a single
+	// user from flooding a bot chat through the full persist→episode→reply path.
+	// Keyed by "tenant|chat" (business) or "tenant|chat|sender" (bot); built lazily.
+	chatLimiters sync.Map
+	chatRate     rate.Limit // sustained messages/sec per chat+sender
+	chatBurst    int        // initial burst allowance
+	// webhookOverflow is a bounded spill queue: updates that cannot enter their
+	// ordered shard land here instead of spawning unbounded goroutines. When it
+	// too is full the enqueue is shed (HTTP 429) and Telegram retries.
+	webhookOverflow chan webhookJob
 	// embedNudge wakes the embedding worker right after new facts are inserted
 	// (ARCH-12) instead of waiting for the next 5-minute tick, closing the
 	// retrieval blind spot for fresh facts. Buffered(1): coalesces bursts.
@@ -126,6 +154,14 @@ type Service struct {
 	// botSenders resolves per-tenant outbound senders for bot-transport chats
 	// (replies go out through the same user bot the message arrived from).
 	botSenders BotSenderProvider
+	// schedulerStarted prevents duplicate workers when both Server.Start and
+	// cmd/backend wire the lifecycle hook.
+	schedulerStarted atomic.Bool
+	// media holds the media -> text extraction toggle and limits (Slice 3).
+	media MediaConfig
+	// mediaLimiters gives each tenant a token bucket over media extraction so a
+	// media flood cannot run up provider cost. Keyed by tenant id; built lazily.
+	mediaLimiters sync.Map
 	// defaultIngestionMode applies to tenants that have not chosen a mode
 	// explicitly (env INGESTION_MODE_DEFAULT; "bot" while the Business path
 	// is shelved).
@@ -135,13 +171,41 @@ type Service struct {
 	// access) and Go must skip its own write path to avoid double writes.
 	// Default "go" keeps the legacy flow (AI_MEMORY_SOURCE flag).
 	aiMemorySource string
+	// reflectionMode gates sleep-time reflection in the nightly worker:
+	// "off" (default), "shadow" (synthesise + log, no write), "enabled" (write
+	// behavior_pattern facts). Set via REFLECTION_MODE (#5).
+	reflectionMode string
+	// summaryCache memoises on-demand chat summaries so repeated requests do not
+	// re-call the LLM (and re-bill) when nothing new was said. Keyed by
+	// "tenant:chat"; the entry's marker invalidates it as soon as a new message
+	// lands, so a returned summary is always accurate for the current timeline.
+	summaryCache sync.Map // chatKey -> summaryCacheEntry
 }
 
-// BotSenderProvider resolves the outbound sender bound to a tenant's
-// user-supplied bot. Implemented by botservice.Manager; the interface keeps
-// core decoupled from the polling transport.
+// summaryCacheEntry is one memoised chat summary plus the message-timeline
+// marker it was generated for.
+type summaryCacheEntry struct {
+	marker   string
+	resp     contracts.ChatSummaryResponse
+	msgCount int
+}
+
+// summaryMarker fingerprints a message timeline. It changes whenever a new
+// message is appended (length grows or the latest event id differs), which is
+// exactly when a cached summary must be regenerated.
+func summaryMarker(messages []store.MessageRecord) string {
+	if len(messages) == 0 {
+		return "0"
+	}
+	return fmt.Sprintf("%d:%s", len(messages), messages[len(messages)-1].Event.EventID)
+}
+
+// BotSenderProvider resolves the outbound sender bound to one of a tenant's
+// user-supplied bots. Implemented by botservice.Manager; the interface keeps
+// core decoupled from the polling transport. botID selects which bot answers
+// (a tenant may own several); the reply leaves through that exact bot.
 type BotSenderProvider interface {
-	SenderFor(tenantID string) (telegram.Sender, bool)
+	SenderFor(tenantID, botID string) (telegram.Sender, bool)
 }
 
 // webhookJob is one queued Telegram update awaiting async processing.
@@ -153,12 +217,26 @@ type webhookJob struct {
 const (
 	// webhookWorkerCount is the number of ordered processing shards (ARCH-7).
 	webhookWorkerCount = 4
-	// webhookQueueDepth bounds each shard's backlog; overflow degrades to a
-	// direct goroutine so updates are never dropped.
+	// webhookQueueDepth bounds each shard's backlog; overflow spills to the
+	// bounded overflow pool rather than spawning unbounded goroutines.
 	webhookQueueDepth = 256
+	// webhookOverflowDepth bounds the shared spill queue used when a shard is
+	// full; beyond it the service sheds load (429) and relies on Telegram retry.
+	webhookOverflowDepth = 512
+	// webhookOverflowWorkers drain the overflow queue. Ordering is not preserved
+	// here (it is the overload path), but idempotency keys make reprocessing safe.
+	webhookOverflowWorkers = 4
 	// maxAsyncLLMConcurrency caps simultaneous fire-and-forget LLM calls
 	// (typed extraction, message-limit summarisation) across all chats.
 	maxAsyncLLMConcurrency = 8
+	// defaultTenantAsyncRate / defaultTenantAsyncBurst bound a single tenant's
+	// share of the async-LLM pool: 5 tasks/sec sustained, bursts up to 8.
+	defaultTenantAsyncRate  = rate.Limit(5)
+	defaultTenantAsyncBurst = 8
+	// defaultChatRate / defaultChatBurst bound inbound messages per chat+sender:
+	// 0.5 msg/s sustained (one message per 2 seconds) with an initial burst of 8.
+	defaultChatRate  = rate.Limit(0.5)
+	defaultChatBurst = 8
 )
 
 // OwnerFeedbackSender is implemented by observability.ScoreSender; the
@@ -175,6 +253,15 @@ type Option func(*Service)
 func WithReplyDelay(d time.Duration) Option {
 	return func(service *Service) {
 		service.replyDelay = d
+	}
+}
+
+// WithStreamFramePause sets the pause inserted between consecutive rich draft preview frames.
+// Defaults to zero (no pause) so tests run instantly; production callers should set ~300 ms
+// so the thinking indicator "breathes" visibly before the text appears.
+func WithStreamFramePause(d time.Duration) Option {
+	return func(service *Service) {
+		service.streamFramePause = d
 	}
 }
 
@@ -235,6 +322,79 @@ func WithAIMemorySource(source string) Option {
 	}
 }
 
+// WithReflectionMode sets sleep-time reflection behaviour: "off" (default),
+// "shadow" (synthesise + log only) or "enabled" (write behavior_pattern facts).
+func WithReflectionMode(mode string) Option {
+	return func(service *Service) {
+		service.reflectionMode = mode
+	}
+}
+
+// WithTenantAsyncRate sets the per-tenant fair-share limit on async-LLM tasks
+// (sustained tasks/sec and burst). Zero values keep the defaults.
+func WithTenantAsyncRate(r rate.Limit, burst int) Option {
+	return func(service *Service) {
+		if r > 0 {
+			service.tenantRate = r
+		}
+		if burst > 0 {
+			service.tenantBurst = burst
+		}
+	}
+}
+
+// WithChatRateLimit configures the per-chat+sender inbound message rate limit.
+// Bot chats are keyed per tenant|chat|sender; business chats per tenant|chat.
+// Zero values keep the defaults (0.5 msg/s, burst 8).
+func WithChatRateLimit(r rate.Limit, burst int) Option {
+	return func(service *Service) {
+		if r > 0 {
+			service.chatRate = r
+		}
+		if burst > 0 {
+			service.chatBurst = burst
+		}
+	}
+}
+
+// MediaConfig controls the media -> text extraction step (Slice 3 hardening):
+// a global toggle plus pre-download caps that keep provider cost bounded.
+type MediaConfig struct {
+	// Enabled is the global kill switch. When false the message is labelled with
+	// its media kind (so the bot still acknowledges it) and no provider call is made.
+	Enabled bool
+	// MaxBytes caps any attachment; stays at/under Telegram's 20 MB download hard limit.
+	MaxBytes int64
+	// MaxAudioBytes caps voice/audio specifically (OpenRouter STT rejects >10 MB).
+	MaxAudioBytes int64
+	// MaxAudioSeconds caps voice/audio duration (OpenRouter STT caps at 5 min).
+	MaxAudioSeconds int64
+	// RatePerSec / Burst bound per-tenant extraction frequency; over-rate messages
+	// fall back to a placeholder rather than triggering a provider call.
+	RatePerSec float64
+	Burst      int
+}
+
+// DefaultMediaConfig returns production defaults: extraction on, caps aligned
+// with Telegram (20 MB) and the OpenRouter STT limits (10 MB / 5 min).
+func DefaultMediaConfig() MediaConfig {
+	return MediaConfig{
+		Enabled:         true,
+		MaxBytes:        20 * 1024 * 1024,
+		MaxAudioBytes:   10 * 1024 * 1024,
+		MaxAudioSeconds: 300,
+		RatePerSec:      1,
+		Burst:           5,
+	}
+}
+
+// WithMediaConfig overrides the media-extraction toggle and limits.
+func WithMediaConfig(cfg MediaConfig) Option {
+	return func(service *Service) {
+		service.media = cfg
+	}
+}
+
 // NewService creates a backend core service.
 func NewService(repository *store.Repository, ai aiclient.Client, sender telegram.Sender, options ...Option) *Service {
 	if repository == nil {
@@ -254,6 +414,11 @@ func NewService(repository *store.Repository, ai aiclient.Client, sender telegra
 		asyncLLM:             make(chan struct{}, maxAsyncLLMConcurrency),
 		embedNudge:           make(chan struct{}, 1),
 		defaultIngestionMode: contracts.IngestionModeBot,
+		tenantRate:           defaultTenantAsyncRate,
+		tenantBurst:          defaultTenantAsyncBurst,
+		chatRate:             defaultChatRate,
+		chatBurst:            defaultChatBurst,
+		media:                DefaultMediaConfig(),
 	}
 	for _, option := range options {
 		option(service)
@@ -271,23 +436,31 @@ func (s *Service) StartWebhookWorkers(ctx context.Context) {
 		s.workersMu.Unlock()
 		return
 	}
+	drain := func(jobs <-chan webhookJob) {
+		for {
+			select {
+			case job := <-jobs:
+				if _, err := s.HandleTelegramWebhook(ctx, job.payload, job.tenantHint); err != nil {
+					s.logger.Error("async webhook processing failed", "error", err)
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
 	workers := make([]chan webhookJob, webhookWorkerCount)
 	for i := range workers {
 		workers[i] = make(chan webhookJob, webhookQueueDepth)
-		go func(jobs <-chan webhookJob) {
-			for {
-				select {
-				case job := <-jobs:
-					if _, err := s.HandleTelegramWebhook(ctx, job.payload, job.tenantHint); err != nil {
-						s.logger.Error("async webhook processing failed", "error", err)
-					}
-				case <-ctx.Done():
-					return
-				}
-			}
-		}(workers[i])
+		go drain(workers[i])
+	}
+	// Bounded overflow pool: a fixed set of workers drains the shared spill
+	// queue, replacing the old unbounded one-goroutine-per-update fallback.
+	overflow := make(chan webhookJob, webhookOverflowDepth)
+	for i := 0; i < webhookOverflowWorkers; i++ {
+		go drain(overflow)
 	}
 	s.webhookWorkers = workers
+	s.webhookOverflow = overflow
 	s.workersMu.Unlock()
 }
 
@@ -297,28 +470,40 @@ func (s *Service) StartWebhookWorkers(ctx context.Context) {
 // routed to the same shard to preserve per-chat ordering; non-chat updates
 // (commands, callbacks) have no ordering requirement and spread round-robin
 // via the hash of the raw payload.
-func (s *Service) EnqueueTelegramWebhook(payload []byte, tenantHint string) {
+//
+// Returns false only when both the shard and the bounded overflow pool are
+// saturated; the caller should then answer 429 so Telegram retries the update
+// (idempotency keys make the eventual reprocessing safe). This replaces the old
+// unbounded one-goroutine-per-update fallback that could OOM under burst.
+func (s *Service) EnqueueTelegramWebhook(payload []byte, tenantHint string) bool {
 	s.workersMu.RLock()
 	workers := s.webhookWorkers
+	overflow := s.webhookOverflow
 	s.workersMu.RUnlock()
 	if workers == nil {
 		go func() {
 			_, _ = s.HandleTelegramWebhook(context.Background(), payload, tenantHint)
 		}()
-		return
+		return true
 	}
 	job := webhookJob{payload: payload, tenantHint: tenantHint}
 	shard := webhookShard(payload, tenantHint)
 	select {
 	case workers[shard] <- job:
+		return true
 	default:
-		// Shard backlog full: degrade to a direct goroutine rather than block
-		// the HTTP handler or drop the update. Ordering may suffer under this
-		// overload, but idempotency keys make reprocessing safe.
-		s.logger.Warn("webhook shard queue full, processing out of band", "shard", shard)
-		go func() {
-			_, _ = s.HandleTelegramWebhook(context.Background(), payload, tenantHint)
-		}()
+		// Shard backlog full: spill to the bounded overflow pool. Per-chat
+		// ordering may be lost under this overload, but reprocessing is safe.
+		select {
+		case overflow <- job:
+			s.logger.Warn("webhook shard full, spilled to overflow pool", "shard", shard)
+			return true
+		default:
+			// Overflow saturated too: shed load. Telegram retries within its
+			// window, so the update is deferred, not lost.
+			s.logger.Warn("webhook queues saturated, shedding update", "shard", shard)
+			return false
+		}
 	}
 }
 
@@ -342,10 +527,46 @@ func webhookShard(payload []byte, tenantHint string) int {
 	return int(h.Sum32() % webhookWorkerCount)
 }
 
+// tenantLimiter returns the token bucket for a tenant, creating it on first use.
+func (s *Service) tenantLimiter(tenantID string) *rate.Limiter {
+	if v, ok := s.tenantLimiters.Load(tenantID); ok {
+		return v.(*rate.Limiter)
+	}
+	v, _ := s.tenantLimiters.LoadOrStore(tenantID, rate.NewLimiter(s.tenantRate, s.tenantBurst))
+	return v.(*rate.Limiter)
+}
+
+// chatLimiterFor returns the lazily-built token bucket for the chat+sender key.
+// Bot transport scopes by tenant|chat|sender (each person gets their own bucket).
+// Business transport scopes by tenant|chat (the owner's conversation unit).
+func (s *Service) chatLimiterFor(event contracts.NormalizedTelegramEvent) *rate.Limiter {
+	var key string
+	if event.Transport == contracts.TransportBot {
+		key = event.TenantID + "|" + event.ChatID + "|" + event.SenderID
+	} else {
+		key = event.TenantID + "|" + event.ChatID
+	}
+	if v, ok := s.chatLimiters.Load(key); ok {
+		return v.(*rate.Limiter)
+	}
+	v, _ := s.chatLimiters.LoadOrStore(key, rate.NewLimiter(s.chatRate, s.chatBurst))
+	return v.(*rate.Limiter)
+}
+
 // runAsyncLLMTask executes fn in the background under the shared LLM
 // concurrency cap (ARCH-7): the goroutine is cheap, but the LLM call inside
 // fn waits for a slot so bursts cannot fan out into a request storm.
-func (s *Service) runAsyncLLMTask(fn func()) {
+//
+// A per-tenant token bucket gates entry first, so one noisy tenant cannot take
+// every slot and starve the others (fair-share). These tasks are best-effort
+// background work (fact extraction, summarisation), so when a tenant exceeds
+// its rate the task is dropped rather than queued — a later message re-triggers
+// the same extraction, and the daily summariser backstops episode summaries.
+func (s *Service) runAsyncLLMTask(tenantID string, fn func()) {
+	if tenantID != "" && !s.tenantLimiter(tenantID).Allow() {
+		s.logger.Warn("async LLM task shed: tenant rate exceeded", "tenant_id", tenantID)
+		return
+	}
 	go func() {
 		s.asyncLLM <- struct{}{}
 		defer func() { <-s.asyncLLM }()
@@ -532,10 +753,269 @@ func (s *Service) HandleBotMessage(ctx context.Context, event contracts.Normaliz
 	return s.processContactMessage(ctx, event, ownerID, "")
 }
 
+// HandleBotCallbackQuery processes a callback received by a tenant's own bot.
+// Tenant/bot scope comes from the poller registration, never from callback data.
+func (s *Service) HandleBotCallbackQuery(ctx context.Context, callback telegram.CallbackQueryUpdate, tenantID, botID string) (InboundResult, error) {
+	callback.TenantID = tenantID
+	callback.BotID = botID
+	callback.Transport = contracts.TransportBot
+	return s.handleCallbackQuery(ctx, callback), nil
+}
+
+// mediaExtractTimeout bounds the download + extract step so a slow or oversized
+// attachment never stalls a bot poller's sequential loop indefinitely.
+const mediaExtractTimeout = 60 * time.Second
+
+// EnrichBotMedia turns a bot message's media attachment into text before AI
+// processing so the agent stays text-only (media -> text). The enriched text is
+// written to event.MessageText, where it flows through drafting, memory and
+// embeddings unchanged.
+//
+// It is best-effort and never fails the message: with no media, no downloader,
+// no media-capable AI client, or an extraction error/timeout it leaves a short
+// placeholder so the bot still acknowledges the message instead of going silent.
+// Raw media bytes are held only in memory for the call and never persisted.
+func (s *Service) EnrichBotMedia(ctx context.Context, event contracts.NormalizedTelegramEvent, media *telegram.MediaDescriptor) contracts.NormalizedTelegramEvent {
+	if media == nil {
+		return event
+	}
+	// Pre-download gates (toggle, size, duration, rate) so an oversized or flood
+	// of media never triggers a wasted download or provider call.
+	if reason := s.mediaRejectReason(event.TenantID, media); reason != "" {
+		s.logger.Info("bot media skipped before extraction",
+			"tenant_id", event.TenantID, "chat_id", event.ChatID,
+			"kind", media.Kind, "size", media.FileSize, "duration", media.Duration, "reason", reason)
+		return s.placeholderEvent(event, media, reason)
+	}
+	extractor, ok := s.ai.(aiclient.MediaExtractor)
+	if !ok {
+		return s.placeholderEvent(event, media, mediaReasonUnprocessable)
+	}
+	text, err := s.extractBotMedia(ctx, event, media, extractor)
+	if err != nil || text == "" {
+		s.logger.Warn("bot media extraction failed; using placeholder",
+			"tenant_id", event.TenantID, "chat_id", event.ChatID,
+			"kind", media.Kind, "error", err)
+		return s.placeholderEvent(event, media, mediaReasonUnprocessable)
+	}
+	event.MessageText = mergeMediaText(event.MessageText, text, media.Kind)
+	s.logger.Info("bot media extracted to text",
+		"tenant_id", event.TenantID, "chat_id", event.ChatID,
+		"kind", media.Kind, "chars", len(text))
+	return event
+}
+
+// Placeholder reasons shown (as a label suffix) when media is not turned into
+// text, so the contact-facing model can respond appropriately.
+const (
+	mediaReasonUnprocessable = "не удалось обработать"
+	mediaReasonDisabled      = "обработка медиа отключена"
+	mediaReasonTooLarge      = "слишком большое"
+	mediaReasonTooLong       = "слишком длинное"
+	mediaReasonRateLimited   = "слишком много медиа"
+)
+
+// mediaRejectReason returns a non-empty placeholder reason when the attachment
+// must be skipped before any download (disabled, oversized, too long, or the
+// tenant is over its media rate), or "" when it may be extracted. Missing size
+// or duration (0) never rejects — the download hard cap still backstops size.
+func (s *Service) mediaRejectReason(tenantID string, media *telegram.MediaDescriptor) string {
+	if !s.media.Enabled {
+		return mediaReasonDisabled
+	}
+	isAudio := media.Kind == "voice" || media.Kind == "audio"
+	maxBytes := s.media.MaxBytes
+	if isAudio && s.media.MaxAudioBytes > 0 && (maxBytes == 0 || s.media.MaxAudioBytes < maxBytes) {
+		maxBytes = s.media.MaxAudioBytes
+	}
+	if maxBytes > 0 && media.FileSize > maxBytes {
+		return mediaReasonTooLarge
+	}
+	if isAudio && s.media.MaxAudioSeconds > 0 && media.Duration > s.media.MaxAudioSeconds {
+		return mediaReasonTooLong
+	}
+	// Rate gate last so a token is consumed only for an otherwise-acceptable
+	// attachment we are about to extract.
+	if tenantID != "" && !s.mediaLimiter(tenantID).Allow() {
+		return mediaReasonRateLimited
+	}
+	return ""
+}
+
+// mediaLimiter returns the per-tenant media-extraction token bucket, creating it
+// on first use. A non-positive configured rate disables the gate (infinite).
+func (s *Service) mediaLimiter(tenantID string) *rate.Limiter {
+	if v, ok := s.mediaLimiters.Load(tenantID); ok {
+		return v.(*rate.Limiter)
+	}
+	limit := rate.Limit(s.media.RatePerSec)
+	if s.media.RatePerSec <= 0 {
+		limit = rate.Inf
+	}
+	burst := s.media.Burst
+	if burst <= 0 {
+		burst = 1
+	}
+	v, _ := s.mediaLimiters.LoadOrStore(tenantID, rate.NewLimiter(limit, burst))
+	return v.(*rate.Limiter)
+}
+
+// extractBotMedia downloads the attachment through the message's own bot and
+// converts it to text via the Python AI service. The download uses the per-bot
+// token resolved by SenderFor (multibot), keeping the token on the Go side.
+func (s *Service) extractBotMedia(ctx context.Context, event contracts.NormalizedTelegramEvent, media *telegram.MediaDescriptor, extractor aiclient.MediaExtractor) (string, error) {
+	if s.botSenders == nil {
+		return "", fmt.Errorf("no bot sender provider")
+	}
+	sender, ok := s.botSenders.SenderFor(event.TenantID, event.BotID)
+	if !ok {
+		return "", fmt.Errorf("no sender for bot %s", event.BotID)
+	}
+	downloader, ok := sender.(telegram.FileDownloader)
+	if !ok {
+		return "", fmt.Errorf("sender does not support file download")
+	}
+	dlCtx, cancel := context.WithTimeout(ctx, mediaExtractTimeout)
+	defer cancel()
+	path, err := downloader.GetFilePath(dlCtx, media.FileID)
+	if err != nil {
+		return "", err
+	}
+	data, downloadedMime, err := downloader.DownloadFile(dlCtx, path)
+	if err != nil {
+		return "", err
+	}
+	// The message's declared mime (voice.mime_type, document.mime_type) is more
+	// reliable than the download response's generic Content-Type.
+	mime := media.MimeType
+	if mime == "" {
+		mime = downloadedMime
+	}
+	resp, err := extractor.ExtractMedia(dlCtx, aiclient.ExtractMediaRequest{
+		Kind:       media.Kind,
+		DataBase64: base64.StdEncoding.EncodeToString(data),
+		MimeType:   mime,
+		Duration:   media.Duration,
+		TraceID:    tracepkg.DeriveTraceID(event.EventID),
+	})
+	if err != nil {
+		return "", err
+	}
+	return resp.Text, nil
+}
+
+// placeholderEvent labels the message with its media kind and the reason the
+// content was not extracted, so the AI can still respond (e.g. ask the user to
+// resend as text) rather than seeing an empty message.
+func (s *Service) placeholderEvent(event contracts.NormalizedTelegramEvent, media *telegram.MediaDescriptor, reason string) contracts.NormalizedTelegramEvent {
+	placeholder := "[" + mediaLabel(media.Kind) + " — " + reason + "]"
+	if existing := strings.TrimSpace(event.MessageText); existing != "" {
+		event.MessageText = existing + "\n" + placeholder
+	} else {
+		event.MessageText = placeholder
+	}
+	return event
+}
+
+// mergeMediaText combines any caption with the extracted media text under a
+// label so the model knows the content was transcribed/OCR'd from an attachment
+// rather than typed by the contact.
+func mergeMediaText(caption, extracted, kind string) string {
+	var b strings.Builder
+	if c := strings.TrimSpace(caption); c != "" {
+		b.WriteString(c)
+		b.WriteString("\n\n")
+	}
+	b.WriteString("[")
+	b.WriteString(mediaLabel(kind))
+	b.WriteString("]: ")
+	b.WriteString(extracted)
+	return b.String()
+}
+
+// mediaLabel is the contact-language (Russian) label for a media kind, used in
+// the text handed to the model.
+func mediaLabel(kind string) string {
+	switch kind {
+	case "voice":
+		return "голосовое сообщение"
+	case "audio":
+		return "аудио"
+	case "photo":
+		return "изображение"
+	case "document":
+		return "документ"
+	default:
+		return "вложение"
+	}
+}
+
 // pythonOwnsMemory reports whether fact persistence is delegated to the
 // Python agent runtime (AI_MEMORY_SOURCE=python).
 func (s *Service) pythonOwnsMemory() bool {
 	return s.aiMemorySource == "python"
+}
+
+func (s *Service) saveAIScheduledJobs(event contracts.NormalizedTelegramEvent, settings contracts.ChatSettings, jobs []contracts.ScheduledJob) error {
+	if len(jobs) == 0 {
+		return nil
+	}
+	settings = settings.WithDefaults()
+	if settings.PrivacyFlags.Contains(contracts.PrivacyNoMemory) ||
+		settings.PrivacyFlags.Contains(contracts.PrivacyPrivate) {
+		return fmt.Errorf("chat privacy blocks AI-created scheduled job")
+	}
+	now := s.now()
+	for _, job := range jobs {
+		payload := make(map[string]any, len(job.Payload))
+		for key, value := range job.Payload {
+			payload[key] = value
+		}
+		text, ok := payload["text"].(string)
+		if !ok || strings.TrimSpace(text) == "" {
+			return fmt.Errorf("scheduled job payload text is empty")
+		}
+		payload["text"] = strings.TrimSpace(text)
+		createdBy := strings.TrimSpace(job.CreatedBy)
+		if createdBy == "" {
+			createdBy = "ai"
+		}
+		if createdBy != "ai" {
+			return fmt.Errorf("invalid AI scheduled job creator %q", job.CreatedBy)
+		}
+		fireAt := job.FireAt.UTC()
+		if !fireAt.After(now) {
+			return fmt.Errorf("scheduled job fire_at must be in the future")
+		}
+		if fireAt.After(now.Add(365 * 24 * time.Hour)) {
+			return fmt.Errorf("scheduled job fire_at must be no more than 1 year in the future")
+		}
+		botID := event.BotID
+		if botID == "" {
+			if parsed, _, botChat := contracts.ParseBotChatID(event.ChatID); botChat {
+				botID = parsed
+			}
+		}
+		if _, err := s.repository.InsertScheduledJob(store.ScheduledJobRecord{
+			TenantID:       event.TenantID,
+			ChatID:         event.ChatID,
+			BotID:          botID,
+			Kind:           strings.TrimSpace(job.Kind),
+			Target:         strings.TrimSpace(job.Target),
+			FireAt:         fireAt,
+			Payload:        payload,
+			CreatedBy:      createdBy,
+			IdempotencyKey: strings.TrimSpace(job.IdempotencyKey),
+		}); err != nil {
+			return err
+		}
+	}
+	s.logger.Info("scheduled jobs persisted from AI response",
+		"tenant_id", event.TenantID,
+		"chat_id", event.ChatID,
+		"count", len(jobs),
+	)
+	return nil
 }
 
 // ingestionModeFor resolves the tenant's effective ingestion mode
@@ -569,8 +1049,20 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 	// keys from message_states and audit_events back to messages always resolve.
 	// no_memory chats skip persistence — for those, AppendState / AppendAudit
 	// silently fall back to in-memory tracking inside the repository.
+	// quarantined: exact duplicate of a recent contact message → stored for audit
+	// but excluded from every memory surface (window-20, episode summaries, extraction).
+	quarantined := false
 	if !settings.PrivacyFlags.Contains(contracts.PrivacyNoMemory) {
-		s.repository.SaveMessage(event)
+		recent := s.repository.RecentMessages(event.TenantID, event.ChatID, 5)
+		quarantined = classifyQuarantine(event.MessageText, recent)
+		s.repository.SaveMessageQuarantined(event, quarantined)
+		if quarantined {
+			s.logger.Info("message quarantined as duplicate",
+				"tenant_id", event.TenantID,
+				"chat_id", event.ChatID,
+				"source_message_id", event.SourceMessageID,
+			)
+		}
 	}
 	s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateReceived)
 	s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateNormalized)
@@ -622,16 +1114,29 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 		// concurrent handler cannot create a duplicate; summarisation runs in a goroutine.
 		if ep.MessageCount >= episodeMessageLimit {
 			s.repository.CloseActiveEpisode(event.TenantID, event.ChatID)
-			s.logger.Info("episode closed by message limit",
-				"tenant_id", event.TenantID,
-				"chat_id", event.ChatID,
-				"message_count", ep.MessageCount,
-			)
 			startedAt, closedAt := ep.StartedAt, ep.LastMessageAt
-			tenantID, chatID := event.TenantID, event.ChatID
-			s.runAsyncLLMTask(func() {
-				s.summarizeEpisode(context.Background(), tenantID, chatID, startedAt, closedAt, "message_count")
-			})
+			span := closedAt.Sub(startedAt)
+			if span < minEpisodeSpan {
+				// A sub-minEpisodeSpan burst of 40 is a flood, not a conversation.
+				// Closing the episode resets the runtime counter; real content (if any)
+				// is captured later by the time-based daily fallback (summarizeChatDay).
+				s.logger.Info("episode closed by flood, summary skipped",
+					"tenant_id", event.TenantID,
+					"chat_id", event.ChatID,
+					"message_count", ep.MessageCount,
+					"span_seconds", span.Seconds(),
+				)
+			} else {
+				s.logger.Info("episode closed by message limit",
+					"tenant_id", event.TenantID,
+					"chat_id", event.ChatID,
+					"message_count", ep.MessageCount,
+				)
+				tenantID, chatID := event.TenantID, event.ChatID
+				s.runAsyncLLMTask(event.TenantID, func() {
+					s.summarizeEpisode(context.Background(), tenantID, chatID, startedAt, closedAt, "message_count")
+				})
+			}
 		}
 	}
 	s.repository.IncrementChatMessageCount(event.TenantID, event.ChatID)
@@ -639,9 +1144,11 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 		s.notify(event.TenantID, "new_message", map[string]any{"chat_id": event.ChatID})
 	}
 	s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StatePolicyChecked)
-	if isOwnerAuthoredMessage(event, ownerID) {
+	if isOwnerSideMessage(event, ownerID, event.Transport) {
 		// The owner replied themselves: the open question is answered and no
-		// owner action is pending any more (§6.2 lifecycle, MEM-5).
+		// owner action is pending any more (§6.2 lifecycle, MEM-5). On bot
+		// transport this only fires for synthetic system messages — a human
+		// (incl. the owner testing the bot) is a contact the AI answers.
 		s.repository.ClearEpisodeRuntimeState(event.TenantID, event.ChatID)
 		s.repository.AppendAudit(s.auditEvent(event, contracts.DecisionObserve, "owner_message_observed"))
 		s.logger.Info("owner-authored business message stored as context without ai reply",
@@ -653,8 +1160,24 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 		return InboundResult{Event: event, Decision: contracts.DecisionObserve, Reason: "owner_message_observed"}, nil
 	}
 
+	// Per chat+sender rate limit: owner messages are already handled above (returned early).
+	// Bot chats key by tenant|chat|sender (each user gets an independent bucket).
+	// Business chats key by tenant|chat. Excess messages are quarantined and skipped —
+	// backpressure, not a block; the chat remains open for the next in-window message.
+	if !s.chatLimiterFor(event).Allow() {
+		if !settings.PrivacyFlags.Contains(contracts.PrivacyNoMemory) {
+			s.repository.SaveMessageQuarantined(event, true)
+		}
+		s.logger.Info("message rate_limited",
+			"tenant_id", event.TenantID,
+			"chat_id", event.ChatID,
+			"sender_id", event.SenderID,
+		)
+		return InboundResult{Event: event, Decision: contracts.DecisionObserve, Reason: "rate_limited"}, nil
+	}
+
 	if replyBlockNote != "" {
-		draft := s.createDraft(event, event.EventID, replyBlockNote)
+		draft := s.createDraft(event, event.EventID, replyBlockNote, contracts.TextFormatPlain)
 		s.repository.SaveDraft(draft)
 		s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateDraftSentToOwner)
 		s.repository.AppendAudit(s.auditEvent(event, contracts.DecisionAskOwner, "business_connection_cannot_reply"))
@@ -699,28 +1222,51 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 		}
 	}
 
+	aiRole := s.aiRoleFor(event.TenantID, event.ChatID)
+	effectiveSettings, botPersonaAuto := botPersonaEffectiveSettings(event, settings, aiRole)
 	s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateAIRequested)
-	s.logger.Info("ai analysis started", "tenant_id", event.TenantID, "chat_id", event.ChatID, "mode", settings.Mode)
+	s.logger.Info("ai analysis started",
+		"tenant_id", event.TenantID,
+		"chat_id", event.ChatID,
+		"mode", settings.Mode,
+		"effective_mode", effectiveSettings.Mode,
+	)
 	if s.notify != nil {
 		s.notify(event.TenantID, "ai_thinking", map[string]any{"chat_id": event.ChatID})
 	}
 	memoryContext, recentRecords := s.conversationContextAndMessages(ctx, event, ownerID, 20)
 	request := contracts.AIProcessMessageRequest{
-		RequestID:       event.EventID,
-		TraceID:         tracepkg.DeriveTraceID(event.EventID),
-		Event:           event,
-		ChatSettings:    settings,
-		MemoryContext:   memoryContext,
-		FeedbackContext: s.feedbackContext(event.TenantID, event.ChatID, 5),
+		RequestID:     event.EventID,
+		TraceID:       tracepkg.DeriveTraceID(event.EventID),
+		Event:         event,
+		ChatSettings:  effectiveSettings,
+		MemoryContext: memoryContext,
+	}
+	if personaSpeaksAsOwner(aiRole) {
+		request.FeedbackContext = s.feedbackContext(event.TenantID, event.ChatID, 5)
 	}
 	if profile, ok := s.repository.ContactProfile(event.TenantID, event.ChatID); ok {
 		request.ContactProfile = &profile
 	}
 	// AI role: the persona assigned to this chat (nil → default assistant persona).
-	request.AIRole = s.aiRoleFor(event.TenantID, event.ChatID)
+	request.AIRole = aiRole
 	// User Layer: owner identity and preferences (§3).
+	// Also pre-compute delivery settings from the same read so sendRecipient below
+	// does not need a second UserSettings lookup on this hot path.
+	var hotDelivery deliverySettings
 	if us, ok := s.repository.UserSettings(event.TenantID); ok {
-		request.UserSettings = &us
+		hotDelivery = s.deliverySettingsFromUser(event, &us)
+		if personaSpeaksAsOwner(aiRole) {
+			request.UserSettings = &us
+		} else {
+			// Strip owner identity for bot-persona chats; keep operational defaults.
+			stripped := us
+			stripped.DisplayName = ""
+			stripped.Bio = ""
+			request.UserSettings = &stripped
+		}
+	} else {
+		hotDelivery = s.deliverySettingsFromUser(event, nil)
 	}
 	// Runtime State Layer: current open episode data for AI awareness (§6.2).
 	if ep, ok := s.repository.ActiveEpisodeByChat(event.TenantID, event.ChatID); ok {
@@ -744,6 +1290,7 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 		"message_type", event.MessageType,
 		"message_text", truncateForLog(event.MessageText, 1000),
 		"mode", settings.Mode,
+		"effective_mode", effectiveSettings.Mode,
 		"privacy_flags", settings.PrivacyFlags,
 		"memory_context_count", len(request.MemoryContext),
 	)
@@ -755,9 +1302,17 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 		s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateFailed)
 		s.repository.AppendAudit(s.auditEvent(event, contracts.DecisionErrorFallback, "ai_process_error:"+err.Error()))
 		s.logger.Error("ai analysis failed", "tenant_id", event.TenantID, "chat_id", event.ChatID, "error", err)
+		s.notifyAIError(event)
 		return InboundResult{Event: event, Decision: contracts.DecisionErrorFallback, Reason: "ai_process_error"}, nil
 	}
 	s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateAIGenerated)
+	if err := s.saveAIScheduledJobs(event, settings, proposal.ScheduledJobs); err != nil {
+		s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateFailed)
+		s.repository.AppendAudit(s.auditEvent(event, contracts.DecisionErrorFallback, "scheduled_job_persist_error:"+err.Error()))
+		s.logger.Error("scheduled job persistence failed", "tenant_id", event.TenantID, "chat_id", event.ChatID, "error", err)
+		s.notifyAIError(event)
+		return InboundResult{Event: event, Decision: contracts.DecisionErrorFallback, Reason: "scheduled_job_persist_error"}, nil
+	}
 	// Persist fast (regex) facts returned by process-message synchronously.
 	// LLM-based extraction is fired asynchronously below, after the draft is dispatched,
 	// so it never adds latency to the reply path (see backlog §7.1).
@@ -778,16 +1333,33 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 		"memory_used_count", len(proposal.MemoryUsed),
 	)
 
-	decision, reason := s.engine.Decide(settings, proposal)
+	decision, reason := s.engine.Decide(effectiveSettings, proposal)
+	if botPersonaAuto && decision == contracts.DecisionAutoReply {
+		reason = "bot_persona_low_risk_send"
+	}
 	s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateDecisionMade)
 	s.logger.Info("backend final decision made", "tenant_id", event.TenantID, "chat_id", event.ChatID, "decision", decision, "reason", reason)
 	if !settings.PrivacyFlags.Contains(contracts.PrivacyNoMemory) {
 		s.updateEpisodeRuntime(event, proposal, decision)
 	}
 	result := InboundResult{Event: event, Decision: decision, Reason: reason}
+	interactionOptions, contactInteraction := s.contactInteractionOptions(event, proposal)
 	switch decision {
 	case contracts.DecisionAutoReply:
-		sentMsgID, err := s.sendRecipient(ctx, event, event.EventID, proposal.ResponseText)
+		decisionID := event.EventID
+		var interactionDraft store.DraftRecord
+		if contactInteraction {
+			interactionDraft = s.createDraft(event, decisionID, proposal.ResponseText, proposal.TextFormat)
+			interactionDraft.DraftID = interactionDraftID(decisionID)
+			interactionDraft.SuggestedOptions = interactionOptions
+			s.repository.SaveDraft(interactionDraft)
+			result.DraftID = interactionDraft.DraftID
+		}
+		markup := telegram.ReplyMarkup(nil)
+		if contactInteraction {
+			markup = contactOptionsKeyboard(interactionDraft.DraftID, interactionOptions)
+		}
+		sentMsgID, err := s.sendRecipientWithMarkup(ctx, event, decisionID, proposal.ResponseText, proposal.TextFormat, true, hotDelivery, markup)
 		if err != nil {
 			s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateFailed)
 			s.repository.AppendAudit(s.auditEvent(event, contracts.DecisionErrorFallback, "send_error:"+err.Error()))
@@ -796,7 +1368,13 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 		}
 		s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateSentToRecipient)
 		s.logger.Info("telegram auto reply sent", "tenant_id", event.TenantID, "chat_id", event.ChatID, "source_message_id", event.SourceMessageID)
-		s.saveOutgoingMessage(event, ownerID, sentMsgID, proposal.ResponseText, event.EventID)
+		s.saveOutgoingMessage(event, ownerID, sentMsgID, proposal.ResponseText, event.EventID, proposal.TextFormat)
+		if contactInteraction {
+			interactionDraft.Status = store.DraftSent
+			interactionDraft.SentMessageID = sentMsgID
+			interactionDraft.UpdatedAt = s.now()
+			s.repository.UpdateDraft(interactionDraft)
+		}
 		// A reply went out on the owner's behalf: nothing is awaited from the owner.
 		s.repository.ClearEpisodeRuntimeState(event.TenantID, event.ChatID)
 		if s.notify != nil {
@@ -807,7 +1385,7 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 		// row carries an empty ResponseText and DraftType="warning" so no approval
 		// path can ever deliver the service text to the contact.
 		if ownerNote := s.ownerNoteFor(proposal); decision == contracts.DecisionAskOwner && ownerNote != "" {
-			draft := s.createDraft(event, event.EventID, "")
+			draft := s.createDraft(event, event.EventID, "", contracts.TextFormatPlain)
 			draft.DraftType = "warning"
 			s.repository.SaveDraft(draft)
 			s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateDraftSentToOwner)
@@ -829,7 +1407,7 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 		}
 		// When the AI flags the incoming message as a choice question, replace the normal
 		// draft flow with an interactive question card that lets the owner pick an option.
-		if proposal.Intent == "choice_question" {
+		if proposal.Intent == "choice_question" && proposal.ResponsePlan == nil {
 			// Structured output carries options directly (ARCH-4); the line-split
 			// of ResponseText remains as a legacy fallback.
 			options := proposal.Options
@@ -837,7 +1415,7 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 				options = parseOptions(proposal.ResponseText)
 			}
 			if len(options) > 0 {
-				draft := s.createDraft(event, event.EventID, "")
+				draft := s.createDraft(event, event.EventID, "", contracts.TextFormatPlain)
 				draft.DraftType = "question"
 				draft.SuggestedOptions = options
 				s.repository.SaveDraft(draft)
@@ -859,7 +1437,11 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 				break
 			}
 		}
-		draft := s.createDraft(event, event.EventID, proposal.ResponseText)
+		draft := s.createDraft(event, event.EventID, proposal.ResponseText, proposal.TextFormat)
+		if contactInteraction {
+			draft.DraftID = interactionDraftID(event.EventID)
+			draft.SuggestedOptions = interactionOptions
+		}
 		if proposal.Flagged {
 			draft.ActionHistory = append(draft.ActionHistory, "flagged")
 		}
@@ -882,15 +1464,19 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 		s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateIgnored)
 	case contracts.DecisionErrorFallback:
 		s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateFailed)
+		// The AI produced no usable reply (transient model failure). Tell the
+		// owner so the thinking indicator resolves into a retry notice instead of
+		// silently vanishing, which reads as the bot being dead.
+		s.notifyAIError(event)
 	}
 	s.repository.AppendAudit(s.auditEvent(event, decision, reason))
 
 	// Async LLM fact extraction: fires after the draft is dispatched so it never blocks
 	// the reply path.  Prefers TypedMemoryExtractor (/ai/extract-facts-typed) for proper
 	// scope routing; falls back to MemoryExtractor (/ai/extract-memory) if unavailable.
-	// Only runs when the AI client supports extraction, memory is not disabled, and the
-	// message passes the cheap fact-bearing pre-filter (MEM-13).
-	if !settings.PrivacyFlags.Contains(contracts.PrivacyNoMemory) && shouldExtractFacts(event.MessageText) {
+	// Only runs when the AI client supports extraction, memory is not disabled, the message
+	// is not quarantined (spam duplicate), and it passes the cheap fact-bearing pre-filter (MEM-13).
+	if !settings.PrivacyFlags.Contains(contracts.PrivacyNoMemory) && !quarantined && shouldExtractFacts(event.MessageText) {
 		privacyStrings := make([]string, len(settings.PrivacyFlags))
 		for i, f := range settings.PrivacyFlags {
 			privacyStrings[i] = string(f)
@@ -908,7 +1494,7 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 			if len(recentTexts) > 5 {
 				recentTexts = recentTexts[len(recentTexts)-5:]
 			}
-			s.runAsyncLLMTask(func() {
+			s.runAsyncLLMTask(event.TenantID, func() {
 				extractCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 				defer cancel()
 				start := s.now()
@@ -958,7 +1544,7 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 				})
 			})
 		} else if extractor, ok := s.ai.(aiclient.MemoryExtractor); ok {
-			s.runAsyncLLMTask(func() {
+			s.runAsyncLLMTask(event.TenantID, func() {
 				extractCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 				defer cancel()
 				resp, err := extractor.ExtractMemory(extractCtx, aiclient.MemoryExtractionRequest{
@@ -1169,6 +1755,11 @@ func (s *Service) conversationContextAndMessages(ctx context.Context, event cont
 	}
 
 	// Working layer: recent raw messages from this chat (oldest first).
+	// Transport is chat-fixed; resolve it once so OWNER/CONTACT labelling matches
+	// the bot-vs-business identity rule (see isOwnerSideMessage). On bot transport
+	// the human's messages — even the owner's — are CONTACT, and only the bot's
+	// own replies ("out:" events) are OWNER.
+	transport := s.repository.ChatTransport(event.TenantID, event.ChatID)
 	messageLines := make([]string, 0, len(records))
 	for _, record := range records {
 		if record.Event.SourceMessageID == event.SourceMessageID {
@@ -1179,7 +1770,7 @@ func (s *Service) conversationContextAndMessages(ctx context.Context, event cont
 			continue
 		}
 		role := "CONTACT"
-		if isOwnerAuthoredMessage(record.Event, ownerID) {
+		if isOwnerSideMessage(record.Event, ownerID, transport) {
 			role = "OWNER"
 		}
 		msgDate := record.Event.CreatedAt.UTC().Format("2006-01-02 15:04")
@@ -1359,7 +1950,37 @@ func (s *Service) aiRoleFor(tenantID, chatID string) *contracts.AIRole {
 		Constraints:   role.Constraints,
 		Context:       role.Context,
 		CustomFields:  role.CustomFields,
+		MCPServers:    s.repository.RoleMCPServers(role.ID),
+		SpeakAsOwner:  role.SpeakAsOwner,
+		ModelTier:     role.ModelTier,
+		ModelName:     role.ModelName,
+		ToolSettings:  role.ToolSettings,
 	}
+}
+
+// personaSpeaksAsOwner reports whether the AI should present owner identity.
+// True for the default assistant (nil role) and any role with SpeakAsOwner set.
+// False for bot-persona roles — those get a stripped UserSettings and no FeedbackContext.
+func personaSpeaksAsOwner(role *contracts.AIRole) bool {
+	return role == nil || role.SpeakAsOwner
+}
+
+// botPersonaEffectiveSettings makes an open bot persona conversational by
+// default. Bot chats are otherwise born in conservative manual mode, which
+// would save every generated answer as an owner draft and leave the Telegram
+// user without a reply. Explicit disabled/silent/semi-auto/auto settings,
+// owner-speaking roles, business chats and all risk/privacy gates are preserved.
+func botPersonaEffectiveSettings(
+	event contracts.NormalizedTelegramEvent,
+	settings contracts.ChatSettings,
+	role *contracts.AIRole,
+) (contracts.ChatSettings, bool) {
+	if event.Transport != contracts.TransportBot || role == nil || role.SpeakAsOwner ||
+		settings.Mode != contracts.ChatModeManual {
+		return settings, false
+	}
+	settings.Mode = contracts.ChatModeAuto
+	return settings, true
 }
 
 // resolveRole picks the persona for a chat. Bot-transport chats answer in the
@@ -1368,13 +1989,29 @@ func (s *Service) aiRoleFor(tenantID, chatID string) *contracts.AIRole {
 // Non-bot chats keep the legacy per-chat role assignment.
 func (s *Service) resolveRole(tenantID, chatID string) (store.AIRoleRecord, bool) {
 	if s.repository.ChatTransport(tenantID, chatID) == contracts.TransportBot {
-		bot, ok := s.repository.UserBotByTenant(tenantID)
+		// The chat id is namespaced by bot, so the governing bot — and its role —
+		// is recoverable from the chat alone (multi-bot: each bot its own role).
+		bot, ok := s.botForChat(tenantID, chatID)
 		if !ok || bot.AIRoleID == 0 {
 			return store.AIRoleRecord{}, false
 		}
 		return s.repository.AIRoleByID(tenantID, bot.AIRoleID)
 	}
 	return s.repository.AIRoleForChat(tenantID, chatID)
+}
+
+// botForChat resolves the bot that owns a bot-transport chat from the bot id
+// embedded in its namespaced chat id.
+func (s *Service) botForChat(tenantID, chatID string) (store.UserBotRecord, bool) {
+	botIDStr, _, ok := contracts.ParseBotChatID(chatID)
+	if !ok {
+		return store.UserBotRecord{}, false
+	}
+	botID, err := strconv.ParseInt(botIDStr, 10, 64)
+	if err != nil {
+		return store.UserBotRecord{}, false
+	}
+	return s.repository.UserBotByID(tenantID, botID)
 }
 
 // feedbackContext returns recent draft feedback for this chat to send to the AI.
@@ -1514,7 +2151,7 @@ func (s *Service) processPassive(ctx context.Context, event contracts.Normalized
 		return
 	}
 	if typedExtractor, ok := s.ai.(aiclient.TypedMemoryExtractor); ok {
-		s.runAsyncLLMTask(func() {
+		s.runAsyncLLMTask(event.TenantID, func() {
 			extractCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 			start := s.now()
@@ -1553,7 +2190,7 @@ func (s *Service) processPassive(ctx context.Context, event contracts.Normalized
 			})
 		})
 	} else if extractor, ok := s.ai.(aiclient.MemoryExtractor); ok {
-		s.runAsyncLLMTask(func() {
+		s.runAsyncLLMTask(event.TenantID, func() {
 			extractCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 			resp, err := extractor.ExtractMemory(extractCtx, aiclient.MemoryExtractionRequest{
@@ -1627,6 +2264,22 @@ func (s *Service) saveProfileSuggestions(ctx context.Context, event contracts.No
 			ReplyMarkup: bot.SuggestionKeyboard(id),
 		})
 	}
+}
+
+// classifyQuarantine reports whether text is an exact duplicate of one of the
+// last ~5 contact messages in the chat. Normalisation: lower, collapse whitespace.
+// Cheap and local — no model call. Task ③ adds the rate-limit layer on top.
+func classifyQuarantine(text string, recent []store.MessageRecord) bool {
+	norm := strings.Join(strings.Fields(strings.ToLower(text)), " ")
+	if norm == "" {
+		return false
+	}
+	for _, m := range recent {
+		if strings.Join(strings.Fields(strings.ToLower(m.Event.MessageText)), " ") == norm {
+			return true
+		}
+	}
+	return false
 }
 
 // shouldExtractFacts is the cheap pre-filter before the extraction LLM call
@@ -1745,6 +2398,37 @@ func isOwnerAuthoredMessage(event contracts.NormalizedTelegramEvent, ownerID str
 	return ownerID != "" && event.SenderID == ownerID
 }
 
+// notifyAIError pushes a real-time error notice to connected Mini App clients so
+// a failed AI turn surfaces as a retryable message rather than the thinking
+// indicator disappearing with nothing in its place.
+func (s *Service) notifyAIError(event contracts.NormalizedTelegramEvent) {
+	if s.notify == nil {
+		return
+	}
+	s.notify(event.TenantID, "ai_error", map[string]any{
+		"chat_id": event.ChatID,
+		"message": "ИИ не смог сформировать ответ. Попробуйте отправить сообщение ещё раз.",
+	})
+}
+
+// isOwnerSideMessage reports whether a message belongs to the owner's side of
+// the conversation — i.e. it should be treated as written on the owner's behalf
+// (suppress an AI reply, label OWNER in the AI context, render "outgoing" in the
+// Mini App). The rule depends on transport:
+//
+//   - business: the bot acts AS the owner's own Telegram account, so anything
+//     the owner typed (SenderID == ownerID) is owner-side.
+//   - bot: the bot is a SEPARATE identity. A human DMing the bot — including the
+//     owner testing their own bot — is an incoming contact the AI must answer.
+//     Only system-emitted messages (synthetic "out:" events: auto-replies,
+//     approved drafts, app/manual sends) are owner-side.
+func isOwnerSideMessage(event contracts.NormalizedTelegramEvent, ownerID, transport string) bool {
+	if transport == contracts.TransportBot {
+		return strings.HasPrefix(event.EventID, "out:")
+	}
+	return isOwnerAuthoredMessage(event, ownerID)
+}
+
 func anonymousChatName(chatID string) string {
 	sum := sha256.Sum256([]byte(chatID))
 	return fmt.Sprintf("Собеседник %x", sum[:3])
@@ -1812,6 +2496,16 @@ func (s *Service) SummarizeChat(ctx context.Context, tenantID, chatID string) (c
 	if len(texts) == 0 {
 		return contracts.ChatSummaryResponse{}, 0, ErrSummaryNoMessages
 	}
+
+	// Serve a cached summary when the timeline is unchanged since it was made.
+	cacheKey := tenantID + ":" + chatID
+	marker := summaryMarker(messages)
+	if v, ok := s.summaryCache.Load(cacheKey); ok {
+		if entry := v.(summaryCacheEntry); entry.marker == marker {
+			return entry.resp, entry.msgCount, nil
+		}
+	}
+
 	summarizer, ok := s.ai.(aiclient.ChatSummarizer)
 	if !ok {
 		return contracts.ChatSummaryResponse{}, len(texts), fmt.Errorf("summarizer not available")
@@ -1820,6 +2514,9 @@ func (s *Service) SummarizeChat(ctx context.Context, tenantID, chatID string) (c
 		Messages:     texts,
 		PrivacyFlags: settings.PrivacyFlags,
 	})
+	if err == nil && summ.Summary != "" {
+		s.summaryCache.Store(cacheKey, summaryCacheEntry{marker: marker, resp: summ, msgCount: len(texts)})
+	}
 	return summ, len(texts), err
 }
 
@@ -1959,12 +2656,12 @@ func (s *Service) HandleApprovalCallback(ctx context.Context, payload contracts.
 			return ApprovalResult{}, fmt.Errorf("draft has no sendable text")
 		}
 		s.repository.AppendState(draft.TenantID, draft.ChatID, draft.SourceMessageID, contracts.StateApprovedByOwner)
-		sentMsgID, err := s.sendRecipient(ctx, contracts.NormalizedTelegramEvent{
-			TenantID:             draft.TenantID,
-			ChatID:               draft.ChatID,
-			BusinessConnectionID: draft.BusinessConnectionID,
-			SourceMessageID:      draft.SourceMessageID,
-		}, draft.DecisionID, draft.ResponseText)
+		approvalEvent := s.resolveSourceEvent(draft)
+		markup := telegram.ReplyMarkup(nil)
+		if s.contactInteractionEnabled(approvalEvent) && len(draft.SuggestedOptions) >= 2 {
+			markup = contactOptionsKeyboard(draft.DraftID, draft.SuggestedOptions)
+		}
+		sentMsgID, err := s.sendRecipientWithMarkup(ctx, approvalEvent, draft.DecisionID, draft.ResponseText, draft.TextFormat, false, s.deliverySettingsFor(approvalEvent), markup)
 		if err != nil {
 			s.repository.AppendState(draft.TenantID, draft.ChatID, draft.SourceMessageID, contracts.StateFailed)
 			return ApprovalResult{}, err
@@ -2161,6 +2858,7 @@ func (s *Service) regenerateDraft(ctx context.Context, draft store.DraftRecord) 
 	}
 	s.repository.AppendState(draft.TenantID, draft.ChatID, draft.SourceMessageID, contracts.StateAIGenerated)
 	draft.ResponseText = proposal.ResponseText
+	draft.TextFormat = proposal.TextFormat.Normalize()
 	draft.UpdatedAt = s.now()
 	s.repository.UpdateDraft(draft)
 	s.repository.AppendState(draft.TenantID, draft.ChatID, draft.SourceMessageID, contracts.StateDraftSentToOwner)
@@ -2183,17 +2881,19 @@ func (s *Service) regenerateDraftWithHint(ctx context.Context, draft store.Draft
 		"[OWNER INSTRUCTION] "+hint,
 	)
 	hintRequest := contracts.AIProcessMessageRequest{
-		RequestID:       draft.DecisionID + ":hint",
-		TraceID:         tracepkg.DeriveTraceID(event.EventID),
-		Event:           event,
-		ChatSettings:    settings,
-		MemoryContext:   hintContext,
-		FeedbackContext: s.feedbackContext(draft.TenantID, draft.ChatID, 5),
+		RequestID:     draft.DecisionID + ":hint",
+		TraceID:       tracepkg.DeriveTraceID(event.EventID),
+		Event:         event,
+		ChatSettings:  settings,
+		MemoryContext: hintContext,
 	}
 	if profile, ok := s.repository.ContactProfile(draft.TenantID, draft.ChatID); ok {
 		hintRequest.ContactProfile = &profile
 	}
 	hintRequest.AIRole = s.aiRoleFor(draft.TenantID, draft.ChatID)
+	if personaSpeaksAsOwner(hintRequest.AIRole) {
+		hintRequest.FeedbackContext = s.feedbackContext(draft.TenantID, draft.ChatID, 5)
+	}
 	s.repository.AppendState(draft.TenantID, draft.ChatID, draft.SourceMessageID, contracts.StateAIRequested)
 	proposal, err := s.ai.ProcessMessage(ctx, hintRequest)
 	if err != nil {
@@ -2203,6 +2903,7 @@ func (s *Service) regenerateDraftWithHint(ctx context.Context, draft store.Draft
 	s.repository.AppendState(draft.TenantID, draft.ChatID, draft.SourceMessageID, contracts.StateAIGenerated)
 	draft.ActionHistory = append(draft.ActionHistory, "ai_refine")
 	draft.ResponseText = proposal.ResponseText
+	draft.TextFormat = proposal.TextFormat.Normalize()
 	draft.UpdatedAt = s.now()
 	s.repository.UpdateDraft(draft)
 	s.repository.AppendState(draft.TenantID, draft.ChatID, draft.SourceMessageID, contracts.StateDraftSentToOwner)
@@ -2243,7 +2944,7 @@ func (s *Service) resolveSourceEvent(draft store.DraftRecord) contracts.Normaliz
 	}
 }
 
-func (s *Service) createDraft(event contracts.NormalizedTelegramEvent, decisionID, text string) store.DraftRecord {
+func (s *Service) createDraft(event contracts.NormalizedTelegramEvent, decisionID, text string, textFormat contracts.TextFormat) store.DraftRecord {
 	now := s.now()
 	return store.DraftRecord{
 		DraftID:              "draft:" + decisionID,
@@ -2254,6 +2955,8 @@ func (s *Service) createDraft(event contracts.NormalizedTelegramEvent, decisionI
 		SourceMessageID:      event.SourceMessageID,
 		SourceMessageText:    event.MessageText,
 		ResponseText:         text,
+		TextFormat:           textFormat.Normalize(),
+		DraftType:            "reply",
 		Status:               store.DraftPending,
 		// Persisting trace_id lets owner feedback (approve / thumb) attach a
 		// Langfuse score back to the Phase 4 generation span.
@@ -2274,8 +2977,73 @@ func (s *Service) notifyDraftStatus(draft store.DraftRecord) {
 	})
 }
 
+func (s *Service) contactInteractionOptions(event contracts.NormalizedTelegramEvent, proposal contracts.AIProcessMessageResponse) ([]string, bool) {
+	if proposal.ResponsePlan == nil || proposal.ResponsePlan.Shape != "buttons" || !s.contactInteractionEnabled(event) {
+		return nil, false
+	}
+	if len(proposal.ResponsePlan.Options) < 2 || len(proposal.ResponsePlan.Options) > 4 {
+		return nil, false
+	}
+	options := make([]string, 0, len(proposal.ResponsePlan.Options))
+	seen := make(map[string]struct{}, len(proposal.ResponsePlan.Options))
+	for _, option := range proposal.ResponsePlan.Options {
+		option = strings.TrimSpace(option)
+		if option == "" {
+			return nil, false
+		}
+		if _, duplicate := seen[option]; duplicate {
+			return nil, false
+		}
+		seen[option] = struct{}{}
+		options = append(options, option)
+	}
+	return options, true
+}
+
+func (s *Service) contactInteractionEnabled(event contracts.NormalizedTelegramEvent) bool {
+	transport := event.Transport
+	if transport == "" {
+		transport = s.repository.ChatTransport(event.TenantID, event.ChatID)
+	}
+	if transport != contracts.TransportBot {
+		return false
+	}
+	role, ok := s.resolveRole(event.TenantID, event.ChatID)
+	return ok && contracts.ToolEnabled(role.ToolSettings, "interaction.present_buttons")
+}
+
+func contactOptionsKeyboard(draftID string, options []string) telegram.InlineKeyboardMarkup {
+	rows := make([][]telegram.InlineKeyboardButton, 0, len(options))
+	for index, option := range options {
+		if index > 3 {
+			break
+		}
+		label := []rune(option)
+		if len(label) > 40 {
+			label = append(label[:37], '.', '.', '.')
+		}
+		rows = append(rows, []telegram.InlineKeyboardButton{{
+			Text:         string(label),
+			CallbackData: contracts.CallbackDataEncodeAIButton(draftID, index),
+		}})
+	}
+	return telegram.InlineKeyboardMarkup{InlineKeyboard: rows}
+}
+
+func interactionDraftID(decisionID string) string {
+	hash := fnv.New64a()
+	_, _ = hash.Write([]byte(decisionID)) // hash.Hash never returns an error.
+	return fmt.Sprintf("draft:aibtn-%x", hash.Sum64())
+}
+
 // sendRecipient sends a reply to the contact and returns the Telegram message_id of the sent message.
-func (s *Service) sendRecipient(ctx context.Context, event contracts.NormalizedTelegramEvent, decisionID, text string) (string, error) {
+// delivery holds the pre-computed rich-formatting and streaming toggles; callers on the hot path
+// supply deliverySettingsFromUser (no extra repository read) while others use deliverySettingsFor.
+func (s *Service) sendRecipient(ctx context.Context, event contracts.NormalizedTelegramEvent, decisionID, text string, textFormat contracts.TextFormat, allowStreaming bool, delivery deliverySettings) (string, error) {
+	return s.sendRecipientWithMarkup(ctx, event, decisionID, text, textFormat, allowStreaming, delivery, nil)
+}
+
+func (s *Service) sendRecipientWithMarkup(ctx context.Context, event contracts.NormalizedTelegramEvent, decisionID, text string, textFormat contracts.TextFormat, allowStreaming bool, delivery deliverySettings, replyMarkup telegram.ReplyMarkup) (string, error) {
 	key := contracts.SendIdempotencyKey(event.TenantID, event.ChatID, event.SourceMessageID, decisionID)
 	duplicate := s.repository.MarkSend(store.SendRecord{
 		Key:             key,
@@ -2290,22 +3058,284 @@ func (s *Service) sendRecipient(ctx context.Context, event contracts.NormalizedT
 		return "", nil
 	}
 	msg := telegram.OutboundMessage{
-		TenantID:             event.TenantID,
-		ChatID:               event.ChatID,
+		TenantID: event.TenantID,
+		// Address Telegram with the RAW chat id: bot-transport chat ids are
+		// namespaced ("bot:{botID}:{rawID}") for identity, but the wire id must
+		// be the bare Telegram chat id. Business transport ids pass through.
+		ChatID:               contracts.RawChatID(event.ChatID),
 		BusinessConnectionID: event.BusinessConnectionID,
 		SourceMessageID:      event.SourceMessageID,
 		ReplyToMessageID:     event.SourceMessageID,
 		DecisionID:           decisionID,
 		Text:                 text,
-		// Contact-facing replies carry LLM text that may use Markdown (lists,
-		// bold, code). The sender falls back to plain text if Telegram rejects
-		// the markup, so formatting is best-effort and never loses a reply.
-		ParseMode: "Markdown",
+		ReplyMarkup:          replyMarkup,
+	}
+	if event.MessageType == "callback_query" || event.MessageType == "scheduled" {
+		msg.ReplyToMessageID = ""
 	}
 	sender, err := s.recipientSender(event)
 	if err != nil {
 		return "", err
 	}
+	if textFormat.Normalize() == contracts.TextFormatRich {
+		if !delivery.RichFormattingEnabled {
+			// Rich formatting is disabled; degrade to HTML so the LLM-produced
+			// markdown never appears raw (### ** ~~) in the chat.
+			htmlMsg := msg
+			htmlMsg.Text = telegram.MarkdownToHTML(msg.Text)
+			htmlMsg.ParseMode = "HTML"
+			return sendMessage(ctx, sender, htmlMsg)
+		}
+		if allowStreaming && delivery.StreamingEnabled && s.richDraftStreamingAllowedFor(event) {
+			return s.sendStreamingRichRecipient(ctx, sender, msg)
+		}
+		return s.sendRichRecipient(ctx, sender, msg)
+	}
+	return sendMessage(ctx, sender, msg)
+}
+
+type deliverySettings struct {
+	RichFormattingEnabled bool
+	StreamingEnabled      bool
+}
+
+// deliverySettingsFor resolves rich-formatting and streaming toggles from all config layers.
+// Callers on the hot path that have already fetched UserSettings should call
+// deliverySettingsFromUser instead to avoid a redundant repository read.
+func (s *Service) deliverySettingsFor(event contracts.NormalizedTelegramEvent) deliverySettings {
+	if us, ok := s.repository.UserSettings(event.TenantID); ok {
+		return s.deliverySettingsFromUser(event, &us)
+	}
+	return s.deliverySettingsFromUser(event, nil)
+}
+
+// deliverySettingsFromUser is the core toggle resolver: accepts a pre-loaded user settings
+// value so the hot path (processContactMessage) does not re-read the repository.
+// Pass nil when UserSettings was not found — rich formatting then defaults to enabled.
+func (s *Service) deliverySettingsFromUser(event contracts.NormalizedTelegramEvent, us *contracts.UserSettings) deliverySettings {
+	settings := deliverySettings{RichFormattingEnabled: true}
+	if us != nil {
+		settings.RichFormattingEnabled = us.RichFormattingEnabled
+		settings.StreamingEnabled = us.StreamingEnabled
+	}
+	if role, ok := s.resolveRole(event.TenantID, event.ChatID); ok {
+		settings.RichFormattingEnabled = applyScopedBool(settings.RichFormattingEnabled, role.RichFormattingEnabled)
+		settings.StreamingEnabled = applyScopedBool(settings.StreamingEnabled, role.StreamingEnabled)
+	}
+	if bot, ok := s.botForDeliverySettings(event); ok {
+		settings.RichFormattingEnabled = applyScopedBool(settings.RichFormattingEnabled, bot.RichFormattingEnabled)
+		settings.StreamingEnabled = applyScopedBool(settings.StreamingEnabled, bot.StreamingEnabled)
+	}
+	return settings
+}
+
+func (s *Service) richOwnerDraftCardEnabled(event contracts.NormalizedTelegramEvent, draft store.DraftRecord) bool {
+	return draft.TextFormat.Normalize() == contracts.TextFormatRich && s.deliverySettingsFor(event).RichFormattingEnabled
+}
+
+func (s *Service) sendOwnerCard(ctx context.Context, msg telegram.OutboundMessage, rich bool) (string, error) {
+	if rich {
+		if richSender, ok := s.sender.(interface {
+			SendRichMessage(context.Context, telegram.OutboundMessage) (string, error)
+		}); ok {
+			msgID, err := richSender.SendRichMessage(ctx, msg)
+			if err == nil {
+				return msgID, nil
+			}
+			s.logger.Warn("telegram owner rich card send failed; falling back to plain",
+				"tenant_id", msg.TenantID,
+				"chat_id", msg.ChatID,
+				"decision_id", msg.DecisionID,
+				"error", err,
+			)
+		}
+	}
+	if idSender, ok := s.sender.(interface {
+		SendMessageGetID(context.Context, telegram.OutboundMessage) (string, error)
+	}); ok {
+		return idSender.SendMessageGetID(ctx, msg)
+	}
+	return "", s.sender.SendMessage(ctx, msg)
+}
+
+const richStreamingThinkingMarkdown = "<tg-thinking>Thinking…</tg-thinking>"
+
+func (s *Service) richDraftStreamingAllowedFor(event contracts.NormalizedTelegramEvent) bool {
+	if event.BusinessConnectionID != "" {
+		return false
+	}
+	transport := event.Transport
+	if transport == "" {
+		transport = s.repository.ChatTransport(event.TenantID, event.ChatID)
+	}
+	if transport != contracts.TransportBot {
+		return false
+	}
+	chatID := contracts.RawChatID(event.ChatID)
+	parsedChatID, err := strconv.ParseInt(chatID, 10, 64)
+	return err == nil && parsedChatID > 0
+}
+
+func (s *Service) sendStreamingRichRecipient(ctx context.Context, sender telegram.Sender, msg telegram.OutboundMessage) (string, error) {
+	// Broadcast a native "bot is typing…" indicator immediately — visible on all
+	// Telegram clients while the rich preview frames stream in.
+	if chatActionSender, ok := sender.(interface {
+		SendChatAction(context.Context, string, string) error
+	}); ok {
+		if err := chatActionSender.SendChatAction(ctx, msg.ChatID, "typing"); err != nil {
+			s.logger.Warn("telegram sendChatAction failed; continuing",
+				"tenant_id", msg.TenantID,
+				"chat_id", msg.ChatID,
+				"error", err,
+			)
+		}
+	}
+	draftSender, ok := sender.(interface {
+		SendRichMessageDraft(context.Context, string, int64, string) error
+	})
+	if !ok {
+		s.logger.Warn("telegram rich draft sender unavailable; skipping draft preview",
+			"tenant_id", msg.TenantID,
+			"chat_id", msg.ChatID,
+			"decision_id", msg.DecisionID,
+		)
+		return s.sendRichRecipient(ctx, sender, msg)
+	}
+	s.sendRichDraftPreview(ctx, draftSender, msg)
+	return s.sendRichRecipient(ctx, sender, msg)
+}
+
+func (s *Service) sendRichDraftPreview(ctx context.Context, sender interface {
+	SendRichMessageDraft(context.Context, string, int64, string) error
+}, msg telegram.OutboundMessage) {
+	draftID := richDraftID(msg)
+	for i, markdown := range richDraftFrames(msg.Text) {
+		if i > 0 && s.streamFramePause > 0 {
+			time.Sleep(s.streamFramePause)
+		}
+		if err := sender.SendRichMessageDraft(ctx, msg.ChatID, draftID, markdown); err != nil {
+			s.logger.Warn("telegram rich draft send failed; continuing with final send",
+				"tenant_id", msg.TenantID,
+				"chat_id", msg.ChatID,
+				"decision_id", msg.DecisionID,
+				"draft_id", draftID,
+				"error", err,
+			)
+			return
+		}
+	}
+}
+
+// richDraftFrames returns the ordered sequence of markdown strings to stream as
+// ephemeral draft previews before the final sendRichMessage.
+//
+// Frame 0 is always the thinking indicator (<tg-thinking>). Subsequent frames are
+// cumulative paragraph chunks of finalMarkdown so the user sees the reply build up
+// progressively. The last frame equals finalMarkdown so the draft matches the final
+// message and the animated transition is seamless.
+func richDraftFrames(finalMarkdown string) []string {
+	frames := []string{richStreamingThinkingMarkdown}
+	if finalMarkdown == "" {
+		return frames
+	}
+	for _, chunk := range splitIntoChunks(finalMarkdown) {
+		frames = append(frames, chunk)
+	}
+	return frames
+}
+
+// splitIntoChunks splits markdown into progressive prefix chunks for draft streaming.
+// Short texts (under 120 runes) are returned as a single chunk. Longer texts are split
+// at paragraph breaks (\n\n); each chunk is the accumulated text up to that boundary, so
+// the last chunk always equals the full text.
+func splitIntoChunks(text string) []string {
+	const minTotalRunes = 120
+	if len([]rune(text)) < minTotalRunes {
+		return []string{text}
+	}
+	paragraphs := strings.Split(text, "\n\n")
+	if len(paragraphs) <= 1 {
+		return []string{text}
+	}
+	chunks := make([]string, 0, len(paragraphs))
+	var acc string
+	for i, para := range paragraphs {
+		if i > 0 {
+			acc += "\n\n"
+		}
+		acc += para
+		chunks = append(chunks, acc)
+	}
+	return chunks
+}
+
+func richDraftID(msg telegram.OutboundMessage) int64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(msg.TenantID + "\x00" + msg.ChatID + "\x00" + msg.SourceMessageID + "\x00" + msg.DecisionID)) // hash.Hash never returns an error.
+	id := int64(h.Sum64() & 0x7fffffffffffffff)
+	if id == 0 {
+		return 1
+	}
+	return id
+}
+
+func (s *Service) sendRichRecipient(ctx context.Context, sender telegram.Sender, msg telegram.OutboundMessage) (string, error) {
+	if richSender, ok := sender.(interface {
+		SendRichMessage(context.Context, telegram.OutboundMessage) (string, error)
+	}); ok {
+		msgID, err := richSender.SendRichMessage(ctx, msg)
+		if err == nil {
+			return msgID, nil
+		}
+		s.logger.Warn("telegram rich send failed; falling back to plain text",
+			"tenant_id", msg.TenantID,
+			"chat_id", msg.ChatID,
+			"decision_id", msg.DecisionID,
+			"error", err,
+		)
+	} else {
+		s.logger.Warn("telegram rich sender unavailable; falling back to HTML",
+			"tenant_id", msg.TenantID,
+			"chat_id", msg.ChatID,
+			"decision_id", msg.DecisionID,
+		)
+	}
+	// Degrade through HTML → stripped plain so raw markdown never leaks.
+	htmlMsg := msg
+	htmlMsg.Text = telegram.MarkdownToHTML(msg.Text)
+	htmlMsg.ParseMode = "HTML"
+	if msgID, err := sendMessage(ctx, sender, htmlMsg); err == nil {
+		return msgID, nil
+	}
+	s.logger.Warn("telegram HTML fallback failed; stripping markdown to plain",
+		"tenant_id", msg.TenantID,
+		"chat_id", msg.ChatID,
+		"decision_id", msg.DecisionID,
+	)
+	stripped := msg
+	stripped.Text = telegram.StripMarkdown(msg.Text)
+	stripped.ParseMode = ""
+	return sendMessage(ctx, sender, stripped)
+}
+
+func (s *Service) botForDeliverySettings(event contracts.NormalizedTelegramEvent) (store.UserBotRecord, bool) {
+	if event.BotID != "" {
+		botID, err := strconv.ParseInt(event.BotID, 10, 64)
+		if err == nil {
+			return s.repository.UserBotByID(event.TenantID, botID)
+		}
+	}
+	return s.botForChat(event.TenantID, event.ChatID)
+}
+
+func applyScopedBool(current bool, override *bool) bool {
+	if override == nil {
+		return current
+	}
+	return *override
+}
+
+func sendMessage(ctx context.Context, sender telegram.Sender, msg telegram.OutboundMessage) (string, error) {
 	if idSender, ok := sender.(interface {
 		SendMessageGetID(context.Context, telegram.OutboundMessage) (string, error)
 	}); ok {
@@ -2331,7 +3361,16 @@ func (s *Service) recipientSender(event contracts.NormalizedTelegramEvent) (tele
 	if s.botSenders == nil {
 		return nil, fmt.Errorf("bot transport reply for tenant %s: no bot sender provider configured", event.TenantID)
 	}
-	sender, ok := s.botSenders.SenderFor(event.TenantID)
+	// Reply through the exact bot the message arrived on. The bot id is on the
+	// event; reconstructed events (approval callbacks) recover it from the
+	// namespaced chat id.
+	botID := event.BotID
+	if botID == "" {
+		if id, _, ok := contracts.ParseBotChatID(event.ChatID); ok {
+			botID = id
+		}
+	}
+	sender, ok := s.botSenders.SenderFor(event.TenantID, botID)
 	if !ok {
 		return nil, fmt.Errorf("bot transport reply for tenant %s: no active bot registered", event.TenantID)
 	}
@@ -2451,17 +3490,15 @@ func (s *Service) sendWarningToOwner(ctx context.Context, event contracts.Normal
 		Text:            bot.WarningCardText(event.MessageText, ownerNote, event.ChatDisplayName),
 		ReplyMarkup:     bot.WarningKeyboard(draft.DraftID),
 	}
-	if idSender, ok := s.sender.(interface {
-		SendMessageGetID(context.Context, telegram.OutboundMessage) (string, error)
-	}); ok {
-		msgID, err := idSender.SendMessageGetID(ctx, msg)
-		if err == nil && msgID != "" {
-			draft.OwnerChatID = ownerChatID
-			draft.OwnerMessageID = msgID
-			s.repository.UpdateDraft(draft)
-		}
-	} else {
-		_ = s.sender.SendMessage(ctx, msg)
+	msgID, err := s.sendOwnerCard(ctx, msg, false)
+	if err != nil {
+		s.logger.Warn("failed to deliver warning card to owner", "tenant_id", event.TenantID, "draft_id", draft.DraftID, "error", err)
+		return
+	}
+	if msgID != "" {
+		draft.OwnerChatID = ownerChatID
+		draft.OwnerMessageID = msgID
+		s.repository.UpdateDraft(draft)
 	}
 }
 
@@ -2524,18 +3561,15 @@ func (s *Service) sendDraftToOwner(ctx context.Context, event contracts.Normaliz
 		Text:            cardText,
 		ReplyMarkup:     keyboard,
 	}
-	// If the sender can return a message ID, store it so the card can be deleted later.
-	if idSender, ok := s.sender.(interface {
-		SendMessageGetID(context.Context, telegram.OutboundMessage) (string, error)
-	}); ok {
-		msgID, err := idSender.SendMessageGetID(ctx, msg)
-		if err == nil && msgID != "" {
-			draft.OwnerChatID = ownerChatID
-			draft.OwnerMessageID = msgID
-			s.repository.UpdateDraft(draft)
-		}
-	} else {
-		_ = s.sender.SendMessage(ctx, msg)
+	msgID, err := s.sendOwnerCard(ctx, msg, s.richOwnerDraftCardEnabled(event, draft))
+	if err != nil {
+		s.logger.Warn("failed to deliver draft card to owner", "tenant_id", event.TenantID, "draft_id", draft.DraftID, "error", err)
+		return
+	}
+	if msgID != "" {
+		draft.OwnerChatID = ownerChatID
+		draft.OwnerMessageID = msgID
+		s.repository.UpdateDraft(draft)
 	}
 }
 
@@ -2557,10 +3591,21 @@ func (s *Service) inferOwnerChatID(businessConnectionID string) string {
 func (s *Service) handleCallbackQuery(ctx context.Context, cbq telegram.CallbackQueryUpdate) InboundResult {
 	tenantID := tenantForUser(cbq.SenderID)
 	event := onboardingEvent(tenantID, cbq.ChatID, cbq.OriginalMsgID, cbq.UpdateID)
+	callbackSender := s.sender
+	if cbq.Transport == contracts.TransportBot && s.botSenders != nil {
+		if sender, ok := s.botSenders.SenderFor(cbq.TenantID, cbq.BotID); ok {
+			callbackSender = sender
+		}
+	}
 
 	if duplicate := s.repository.MarkReceive(cbq.ReceiveIdempotencyKey); duplicate {
-		_ = s.sender.AnswerCallbackQuery(ctx, cbq.QueryID)
+		_ = callbackSender.AnswerCallbackQuery(ctx, cbq.QueryID)
 		return InboundResult{Event: event, Decision: contracts.DecisionIgnore, Reason: "duplicate_callback_query", Duplicate: true}
+	}
+
+	if optionIdx, draftID, idempotencyKey, buttonOK := contracts.CallbackDataDecodeAIButton(cbq.Data); buttonOK {
+		_ = callbackSender.AnswerCallbackQuery(ctx, cbq.QueryID)
+		return s.handleAIButton(ctx, cbq, callbackSender, optionIdx, draftID, idempotencyKey)
 	}
 
 	// Handle question-card option selection (format "co:N:bareID") before the regular decode.
@@ -2709,6 +3754,64 @@ func (s *Service) handleCallbackQuery(ctx context.Context, cbq telegram.Callback
 
 	s.logger.Info("callback query handled", "action", result.Action, "draft_id", result.DraftID, "status", result.Status)
 	return InboundResult{Event: event, Decision: contracts.DecisionObserve, Reason: "callback_" + string(result.Action), DraftID: result.DraftID}
+}
+
+func (s *Service) handleAIButton(ctx context.Context, cbq telegram.CallbackQueryUpdate, callbackSender telegram.Sender, optionIdx int, draftID, idempotencyKey string) InboundResult {
+	event := contracts.NormalizedTelegramEvent{
+		EventID:          fmt.Sprintf("%d:callback_query:%s", cbq.UpdateID, cbq.QueryID),
+		TenantID:         cbq.TenantID,
+		ChatID:           contracts.BotChatID(cbq.BotID, cbq.ChatID),
+		TelegramUpdateID: cbq.UpdateID,
+		SourceMessageID:  cbq.QueryID,
+		SenderID:         cbq.SenderID,
+		MessageType:      "callback_query",
+		CreatedAt:        s.now(),
+		Transport:        contracts.TransportBot,
+		BotID:            cbq.BotID,
+	}
+	if cbq.Transport != contracts.TransportBot || cbq.TenantID == "" || cbq.BotID == "" {
+		return InboundResult{Event: event, Decision: contracts.DecisionIgnore, Reason: "aibtn_not_bot_transport"}
+	}
+	if s.repository.MarkCallback(idempotencyKey) {
+		return InboundResult{Event: event, Decision: contracts.DecisionIgnore, Reason: "duplicate_aibtn_callback", Duplicate: true}
+	}
+	draft, ok := s.repository.Draft(draftID)
+	if !ok || draft.DraftType == "question" || draft.TenantID != cbq.TenantID {
+		return InboundResult{Event: event, Decision: contracts.DecisionIgnore, Reason: "aibtn_draft_not_found"}
+	}
+	if draft.ChatID != event.ChatID || contracts.RawChatID(draft.ChatID) != cbq.ChatID {
+		return InboundResult{Event: event, Decision: contracts.DecisionIgnore, Reason: "aibtn_chat_mismatch"}
+	}
+	sourceEvent := s.resolveSourceEvent(draft)
+	if !s.contactInteractionEnabled(sourceEvent) {
+		return InboundResult{Event: event, Decision: contracts.DecisionIgnore, Reason: "aibtn_tool_disabled"}
+	}
+	if optionIdx < 0 || optionIdx >= len(draft.SuggestedOptions) {
+		return InboundResult{Event: event, Decision: contracts.DecisionIgnore, Reason: "aibtn_option_out_of_range"}
+	}
+	option := draft.SuggestedOptions[optionIdx]
+	event.MessageText = option
+	if cbq.OriginalMsgID != "" {
+		selectedText := draft.ResponseText + "\n\n✓ Выбрано: " + option
+		if err := callbackSender.EditMessageText(ctx, cbq.ChatID, cbq.OriginalMsgID, selectedText, telegram.InlineKeyboardMarkup{}); err != nil {
+			s.logger.Warn("contact interaction message edit failed",
+				"tenant_id", cbq.TenantID, "draft_id", draftID, "error", err)
+		}
+	}
+	s.logger.Info("contact interaction option selected",
+		"tenant_id", cbq.TenantID, "chat_id", event.ChatID,
+		"draft_id", draftID, "option_idx", optionIdx)
+	ownerID := strings.TrimPrefix(cbq.TenantID, "tenant:user:")
+	if ownerID == cbq.TenantID {
+		ownerID = ""
+	}
+	result, err := s.processContactMessage(ctx, event, ownerID, "")
+	if err != nil {
+		s.logger.Error("contact interaction follow-up failed",
+			"tenant_id", cbq.TenantID, "draft_id", draftID, "error", err)
+		return InboundResult{Event: event, Decision: contracts.DecisionErrorFallback, Reason: "aibtn_process_error"}
+	}
+	return result
 }
 
 // handleOwnerMessage handles plain (non-command) text from the owner in the bot chat.
@@ -2866,7 +3969,7 @@ func outgoingUpdateID(decisionID string) int64 {
 
 // saveOutgoingMessage persists a synthetic outgoing message and a virtual sent draft so the
 // Mini App can display the AI auto-reply in chat history and label it as "DoubleU".
-func (s *Service) saveOutgoingMessage(event contracts.NormalizedTelegramEvent, ownerID, sentMsgID, text, decisionID string) {
+func (s *Service) saveOutgoingMessage(event contracts.NormalizedTelegramEvent, ownerID, sentMsgID, text, decisionID string, textFormat contracts.TextFormat) {
 	if ownerID == "" || sentMsgID == "" {
 		return
 	}
@@ -2891,6 +3994,7 @@ func (s *Service) saveOutgoingMessage(event contracts.NormalizedTelegramEvent, o
 		BusinessConnectionID: event.BusinessConnectionID,
 		SourceMessageID:      event.SourceMessageID,
 		ResponseText:         text,
+		TextFormat:           textFormat.Normalize(),
 		Status:               store.DraftSent,
 		SentMessageID:        sentMsgID,
 		CreatedAt:            s.now(),
@@ -2944,10 +4048,8 @@ func (s *Service) ManualSend(ctx context.Context, tenantID, chatID, text string)
 	}
 	ownerID := strings.TrimPrefix(tenantID, "tenant:user:")
 	decisionID := fmt.Sprintf("manual:%s:%d", chatID, s.now().UnixNano())
-	sentMsgID, err := s.sendRecipient(ctx, contracts.NormalizedTelegramEvent{
-		TenantID: tenantID,
-		ChatID:   chatID,
-	}, decisionID, text)
+	manualEvent := contracts.NormalizedTelegramEvent{TenantID: tenantID, ChatID: chatID}
+	sentMsgID, err := s.sendRecipient(ctx, manualEvent, decisionID, text, contracts.TextFormatPlain, false, s.deliverySettingsFor(manualEvent))
 	if err != nil {
 		return err
 	}
@@ -3012,6 +4114,12 @@ func truncateForLog(value string, limit int) string {
 // (design §6.2 — episode lifecycle trigger: message_limit).
 const episodeMessageLimit = 40
 
+// minEpisodeSpan is the minimum wall-clock duration between ep.StartedAt and
+// ep.LastMessageAt required to trigger a summary on message-limit close. A
+// 40-message burst arriving within this window is a flood, not a conversation;
+// real content (if any) is captured later by the time-based daily fallback.
+const minEpisodeSpan = 2 * time.Minute
+
 // summarizeEpisode compresses the messages of one closed episode — real
 // episode bounds, not calendar days (MEM-6) — into an episode summary with
 // full provenance (source_message_ids). Idempotency is period-overlap based:
@@ -3038,6 +4146,9 @@ func (s *Service) summarizeEpisode(ctx context.Context, tenantID, chatID string,
 	texts := make([]string, 0, len(messages))
 	sourceIDs := make([]string, 0, len(messages))
 	for _, m := range messages {
+		if m.Quarantined {
+			continue
+		}
 		if t := strings.TrimSpace(m.Event.MessageText); t != "" {
 			texts = append(texts, t)
 			sourceIDs = append(sourceIDs, m.Event.SourceMessageID)
@@ -3202,6 +4313,209 @@ func (s *Service) StartDailySummaryScheduler(ctx context.Context) {
 	}
 }
 
+// StartScheduler dispatches due scheduled_jobs every 45 seconds. It is safe to
+// wire from multiple lifecycle surfaces; only the first caller starts a loop.
+func (s *Service) StartScheduler(ctx context.Context) {
+	if !s.schedulerStarted.CompareAndSwap(false, true) {
+		return
+	}
+	s.runSchedulerOnce(ctx)
+	ticker := time.NewTicker(45 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			s.runSchedulerOnce(ctx)
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (s *Service) runSchedulerOnce(ctx context.Context) {
+	jobs, err := s.repository.DueJobs(s.now(), 50)
+	if err != nil {
+		s.logger.Error("scheduled jobs query failed", "error", err)
+		return
+	}
+	for _, job := range jobs {
+		if !s.repository.ClaimScheduledJob(job.ID, s.now()) {
+			continue
+		}
+		if err := s.dispatchScheduledJob(ctx, job); err != nil {
+			s.repository.MarkJobFailed(job.ID)
+			s.logger.Error("scheduled job failed",
+				"job_id", job.ID, "tenant_id", job.TenantID,
+				"chat_id", job.ChatID, "kind", job.Kind, "target", job.Target,
+				"error", err,
+			)
+			continue
+		}
+		s.repository.MarkJobSent(job.ID, s.now())
+		s.logger.Info("scheduled job sent",
+			"job_id", job.ID, "tenant_id", job.TenantID,
+			"chat_id", job.ChatID, "kind", job.Kind, "target", job.Target,
+		)
+		if s.notify != nil {
+			s.notify(job.TenantID, "scheduled_job", map[string]any{
+				"job_id": job.ID, "chat_id": job.ChatID, "status": "sent",
+			})
+		}
+	}
+}
+
+func (s *Service) dispatchScheduledJob(ctx context.Context, job store.ScheduledJobRecord) error {
+	settings := s.repository.ChatSettings(job.TenantID, job.ChatID).WithDefaults()
+	if job.CreatedBy == "ai" && (settings.PrivacyFlags.Contains(contracts.PrivacyNoMemory) ||
+		settings.PrivacyFlags.Contains(contracts.PrivacyPrivate)) {
+		return fmt.Errorf("chat privacy blocks AI-created scheduled job")
+	}
+	text, _ := job.Payload["text"].(string)
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return fmt.Errorf("scheduled job payload text is empty")
+	}
+	event, err := s.scheduledJobEvent(job, text)
+	if err != nil {
+		return err
+	}
+	if job.Kind == "ai_followup" {
+		ownerID := strings.TrimPrefix(job.TenantID, "tenant:user:")
+		if ownerID == job.TenantID {
+			ownerID = ""
+		}
+		_, err := s.processContactMessage(ctx, event, ownerID, "")
+		return err
+	}
+	if job.Target == "owner" {
+		return s.sendScheduledOwnerNotification(ctx, event, job, text)
+	}
+	if job.Target != "contact" {
+		return fmt.Errorf("unsupported scheduled target %q", job.Target)
+	}
+	switch settings.Mode {
+	case contracts.ChatModeAuto:
+		decisionID := fmt.Sprintf("scheduled-job:%d", job.ID)
+		sentMsgID, sendErr := s.sendRecipient(
+			ctx, event, decisionID, text, contracts.TextFormatPlain, false,
+			s.deliverySettingsFor(event),
+		)
+		if sendErr != nil {
+			return sendErr
+		}
+		ownerID := strings.TrimPrefix(job.TenantID, "tenant:user:")
+		if ownerID == job.TenantID {
+			ownerID = ""
+		}
+		s.saveOutgoingMessage(event, ownerID, sentMsgID, text, decisionID, contracts.TextFormatPlain)
+		if s.notify != nil {
+			s.notify(job.TenantID, "new_message", map[string]any{"chat_id": job.ChatID})
+		}
+		return nil
+	case contracts.ChatModeManual, contracts.ChatModeSemiAuto:
+		return s.createScheduledDraft(ctx, event, job, text)
+	default:
+		return fmt.Errorf("chat mode %q blocks scheduled contact delivery", settings.Mode)
+	}
+}
+
+func (s *Service) scheduledJobEvent(job store.ScheduledJobRecord, text string) (contracts.NormalizedTelegramEvent, error) {
+	chat, ok := s.repository.Chat(job.TenantID, job.ChatID)
+	if !ok {
+		return contracts.NormalizedTelegramEvent{}, fmt.Errorf("scheduled chat not found")
+	}
+	botID := job.BotID
+	if botID == "" {
+		if parsed, _, botChat := contracts.ParseBotChatID(job.ChatID); botChat {
+			botID = parsed
+		}
+	}
+	transport := chat.Transport
+	if transport == "" && botID != "" {
+		transport = contracts.TransportBot
+	}
+	return contracts.NormalizedTelegramEvent{
+		EventID:              fmt.Sprintf("scheduled-job:%d", job.ID),
+		TenantID:             job.TenantID,
+		ChatID:               job.ChatID,
+		ChatDisplayName:      chat.DisplayName,
+		ChatType:             chat.ChatType,
+		TelegramUpdateID:     -job.ID,
+		BusinessConnectionID: chat.BusinessConnectionID,
+		SourceMessageID:      fmt.Sprintf("scheduled:%d", job.ID),
+		SenderID:             contracts.RawChatID(job.ChatID),
+		MessageText:          text,
+		MessageType:          "scheduled",
+		CreatedAt:            s.now(),
+		Transport:            transport,
+		BotID:                botID,
+	}, nil
+}
+
+func (s *Service) sendScheduledOwnerNotification(ctx context.Context, event contracts.NormalizedTelegramEvent, job store.ScheduledJobRecord, text string) error {
+	sender, chatID, err := s.scheduledOwnerNotificationRoute(event)
+	if err != nil {
+		return err
+	}
+	decisionID := fmt.Sprintf("scheduled-owner:%d", job.ID)
+	if s.repository.MarkSend(store.SendRecord{
+		Key:      contracts.SendIdempotencyKey(job.TenantID, job.ChatID, event.SourceMessageID, decisionID),
+		TenantID: job.TenantID, ChatID: job.ChatID, SourceMessageID: event.SourceMessageID,
+		DecisionID: decisionID, Text: text, CreatedAt: s.now(),
+	}) {
+		return nil
+	}
+	_, err = sendMessage(ctx, sender, telegram.OutboundMessage{
+		TenantID: job.TenantID, ChatID: chatID,
+		SourceMessageID: event.SourceMessageID, DecisionID: decisionID,
+		Text: "⏰ " + text,
+	})
+	return err
+}
+
+func (s *Service) scheduledOwnerNotificationRoute(event contracts.NormalizedTelegramEvent) (telegram.Sender, string, error) {
+	if event.Transport == contracts.TransportBot {
+		sender, err := s.recipientSender(event)
+		if err != nil {
+			return nil, "", err
+		}
+		chatID := contracts.RawChatID(event.ChatID)
+		if strings.TrimSpace(chatID) == "" {
+			return nil, "", fmt.Errorf("scheduled bot chat not found")
+		}
+		return sender, chatID, nil
+	}
+	ownerChatID := s.ownerChatIDForEvent(event)
+	if ownerChatID == "" {
+		return nil, "", fmt.Errorf("owner chat not found")
+	}
+	return s.sender, ownerChatID, nil
+}
+
+func (s *Service) createScheduledDraft(ctx context.Context, event contracts.NormalizedTelegramEvent, job store.ScheduledJobRecord, text string) error {
+	decisionID := fmt.Sprintf("scheduled-job:%d", job.ID)
+	draft := s.createDraft(event, decisionID, text, contracts.TextFormatPlain)
+	draft.DraftID = fmt.Sprintf("draft:scheduled:%d", job.ID)
+	s.repository.SaveDraft(draft)
+	if s.notify != nil {
+		s.notify(job.TenantID, "new_draft", map[string]any{
+			"chat_id": job.ChatID, "draft_id": draft.DraftID,
+			"response_text": text, "source_text": event.MessageText,
+			"created_at": draft.CreatedAt.UTC().Format(time.RFC3339),
+		})
+		return nil
+	}
+	ownerID := strings.TrimPrefix(job.TenantID, "tenant:user:")
+	if ownerID == job.TenantID {
+		ownerID = ""
+	}
+	if s.ownerChatIDForEvent(event) == "" {
+		return fmt.Errorf("owner chat not found")
+	}
+	s.sendDraftToOwner(ctx, event, draft, ownerID)
+	return nil
+}
+
 // StartConsolidationWorker runs nightly at 02:00 UTC and calls the consolidate_facts
 // stored procedure for every active tenant to clean up expired and superseded facts
 // and collapse deep supersession chains (design: sleep-time memory consolidation).
@@ -3225,10 +4539,150 @@ func (s *Service) StartConsolidationWorker(ctx context.Context) {
 					s.logger.Info("stale profile suggestions expired",
 						"tenant_id", tenantID, "count", expired)
 				}
+				// Sleep-time reflection: after cleanup, synthesise high-level
+				// behaviour patterns from clusters of recent facts (#5). Off by
+				// default; bounded by candidate selection.
+				s.runReflection(ctx, tenantID)
 			}
 		case <-ctx.Done():
 			return
 		}
+	}
+}
+
+// Reflection (sleep-time insight generation, #5) tunables.
+const (
+	reflectionWindow      = 30 * 24 * time.Hour // only cluster facts this recent
+	reflectionMinFacts    = 3                   // min recent facts for a chat to qualify
+	reflectionMinCluster  = 3                   // min facts in a cluster to synthesise from
+	reflectionMaxSim      = 0.85                // cosine similarity threshold for an edge
+	reflectionConfidence  = 0.5                 // modest confidence for an inferred pattern
+	reflectionTTL         = 60 * 24 * time.Hour // unreinforced patterns decay
+	reflectionMaxClusters = 3                   // cap synthesis calls per chat per run
+)
+
+// runReflection generates behaviour patterns for a tenant's eligible chats.
+// No-op unless REFLECTION_MODE is shadow|enabled and the AI client can synthesise.
+func (s *Service) runReflection(ctx context.Context, tenantID string) {
+	if s.reflectionMode != "shadow" && s.reflectionMode != "enabled" {
+		return
+	}
+	if _, ok := s.ai.(aiclient.PatternSynthesizer); !ok {
+		return
+	}
+	since := s.now().Add(-reflectionWindow)
+	for _, chatID := range s.repository.ReflectionCandidateChats(tenantID, since, reflectionMinFacts) {
+		s.reflectChat(ctx, tenantID, chatID)
+	}
+}
+
+// clusterByPairs groups fact ids into connected components from similarity edges
+// (union-find). Only multi-member components are returned, in deterministic order.
+func clusterByPairs(pairs []store.FactPair) [][]int64 {
+	parent := make(map[int64]int64)
+	var find func(int64) int64
+	find = func(x int64) int64 {
+		p, ok := parent[x]
+		if !ok {
+			parent[x] = x
+			return x
+		}
+		if p != x {
+			parent[x] = find(p)
+		}
+		return parent[x]
+	}
+	for _, pr := range pairs {
+		ra, rb := find(pr.IDA), find(pr.IDB)
+		if ra != rb {
+			parent[ra] = rb
+		}
+	}
+	groups := make(map[int64][]int64)
+	for id := range parent {
+		root := find(id)
+		groups[root] = append(groups[root], id)
+	}
+	var clusters [][]int64
+	for _, members := range groups {
+		if len(members) >= 2 {
+			sort.Slice(members, func(i, j int) bool { return members[i] < members[j] })
+			clusters = append(clusters, members)
+		}
+	}
+	sort.Slice(clusters, func(i, j int) bool { return clusters[i][0] < clusters[j][0] })
+	return clusters
+}
+
+// reflectChat clusters a chat's recent facts and, for each cluster of at least
+// reflectionMinCluster facts, asks the AI service to synthesise one durable
+// behaviour pattern. In "shadow" mode the pattern is only logged; in "enabled"
+// mode it is embedded and written as a behavior_pattern fact (#5). Idempotent
+// across runs: upsert dedup (hash + cosine) collapses a repeated pattern.
+func (s *Service) reflectChat(ctx context.Context, tenantID, chatID string) {
+	synth, ok := s.ai.(aiclient.PatternSynthesizer)
+	if !ok {
+		return
+	}
+	since := s.now().Add(-reflectionWindow)
+	clusters := clusterByPairs(s.repository.SimilarFactPairs(tenantID, chatID, since, reflectionMaxSim))
+	processed := 0
+	for _, cluster := range clusters {
+		if len(cluster) < reflectionMinCluster || processed >= reflectionMaxClusters {
+			continue
+		}
+		texts := s.repository.SemanticFactTextsByIDs(tenantID, cluster)
+		facts := make([]string, 0, len(cluster))
+		for _, id := range cluster {
+			if t := texts[id]; t != "" {
+				facts = append(facts, t)
+			}
+		}
+		if len(facts) < reflectionMinCluster {
+			continue
+		}
+		processed++
+		resp, err := synth.SynthesizePattern(ctx, contracts.SynthesizePatternRequest{
+			ClusterFacts: facts,
+			TenantID:     tenantID,
+			ChatID:       chatID,
+		})
+		if err != nil {
+			s.logger.Warn("pattern synthesis failed",
+				"tenant_id", tenantID, "chat_id", chatID, "error", err)
+			continue
+		}
+		pattern := strings.TrimSpace(resp.Pattern)
+		if pattern == "" || resp.BlockedByPrivacy {
+			continue
+		}
+		if s.reflectionMode != "enabled" {
+			// shadow: record the candidate for eval, write nothing.
+			s.logger.Info("reflection pattern (shadow)",
+				"tenant_id", tenantID, "chat_id", chatID,
+				"pattern", pattern, "cluster_size", len(facts))
+			continue
+		}
+		subject := resp.Subject
+		if subject == "" {
+			subject = "contact"
+		}
+		expiresAt := s.now().Add(reflectionTTL)
+		embedding := embeddingAt(s.embedCandidates([]string{pattern}), 0)
+		result := s.repository.UpsertSemanticFact(store.SemanticFactRecord{
+			TenantID:   tenantID,
+			ScopeKind:  "chat",
+			ChatID:     chatID,
+			FactText:   pattern,
+			FactType:   "behavior_pattern",
+			Subject:    subject,
+			Confidence: reflectionConfidence,
+			Source:     "llm_reflected",
+			ExpiresAt:  &expiresAt,
+		}, embedding)
+		s.logger.Info("reflection pattern written",
+			"tenant_id", tenantID, "chat_id", chatID,
+			"action", result.Action, "pattern", pattern)
 	}
 }
 
@@ -3373,17 +4827,15 @@ func (s *Service) sendQuestionToOwner(ctx context.Context, event contracts.Norma
 		Text:            cardText,
 		ReplyMarkup:     keyboard,
 	}
-	if idSender, ok := s.sender.(interface {
-		SendMessageGetID(context.Context, telegram.OutboundMessage) (string, error)
-	}); ok {
-		msgID, err := idSender.SendMessageGetID(ctx, msg)
-		if err == nil && msgID != "" {
-			draft.OwnerChatID = ownerChatID
-			draft.OwnerMessageID = msgID
-			s.repository.UpdateDraft(draft)
-		}
-	} else {
-		_ = s.sender.SendMessage(ctx, msg)
+	msgID, err := s.sendOwnerCard(ctx, msg, false)
+	if err != nil {
+		s.logger.Warn("failed to deliver question card to owner", "tenant_id", event.TenantID, "draft_id", draft.DraftID, "error", err)
+		return
+	}
+	if msgID != "" {
+		draft.OwnerChatID = ownerChatID
+		draft.OwnerMessageID = msgID
+		s.repository.UpdateDraft(draft)
 	}
 }
 
@@ -3417,7 +4869,7 @@ func (s *Service) handleChoiceOption(ctx context.Context, event contracts.Normal
 	if err != nil {
 		s.logger.Error("choice option: ai hint failed, sending option text directly", "error", err, "draft_id", draftID)
 		srcEvent := s.resolveSourceEvent(draft)
-		_, _ = s.sendRecipient(ctx, srcEvent, draft.DecisionID+":choice_fallback", optionText)
+		_, _ = s.sendRecipient(ctx, srcEvent, draft.DecisionID+":choice_fallback", optionText, contracts.TextFormatPlain, false, s.deliverySettingsFor(srcEvent))
 		return InboundResult{Event: event, Decision: contracts.DecisionAutoReply, Reason: "choice_fallback_sent", DraftID: draftID}
 	}
 
@@ -3428,8 +4880,8 @@ func (s *Service) handleChoiceOption(ctx context.Context, event contracts.Normal
 	}
 	srcEvent := s.resolveSourceEvent(newDraft)
 	if settings.Mode == contracts.ChatModeAuto {
-		_, _ = s.sendRecipient(ctx, srcEvent, newDraft.DecisionID, newDraft.ResponseText)
-		s.saveOutgoingMessage(srcEvent, ownerID, "", newDraft.ResponseText, newDraft.DecisionID)
+		_, _ = s.sendRecipient(ctx, srcEvent, newDraft.DecisionID, newDraft.ResponseText, newDraft.TextFormat, true, s.deliverySettingsFor(srcEvent))
+		s.saveOutgoingMessage(srcEvent, ownerID, "", newDraft.ResponseText, newDraft.DecisionID, newDraft.TextFormat)
 		if s.notify != nil {
 			s.notify(newDraft.TenantID, "new_message", map[string]any{"chat_id": newDraft.ChatID})
 		}

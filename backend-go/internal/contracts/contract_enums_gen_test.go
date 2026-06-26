@@ -12,14 +12,15 @@ import (
 // utility) keeps the test free of dependencies and explicit about what fields
 // participate in the contract.
 type contractJSON struct {
-	Version              string               `json:"version"`
-	Decisions            []string             `json:"decisions"`
-	ChatModes            []string             `json:"chat_modes"`
-	PrivacyFlags         []string             `json:"privacy_flags"`
-	RiskLevels           []string             `json:"risk_levels"`
-	ApprovalActions      []string             `json:"approval_actions"`
-	MessageStates        []string             `json:"message_states"`
-	ConfidenceThresholds map[string]float64   `json:"confidence_thresholds"`
+	Version              string             `json:"version"`
+	ToolCategories       []string           `json:"tool_categories"`
+	Decisions            []string           `json:"decisions"`
+	ChatModes            []string           `json:"chat_modes"`
+	PrivacyFlags         []string           `json:"privacy_flags"`
+	RiskLevels           []string           `json:"risk_levels"`
+	ApprovalActions      []string           `json:"approval_actions"`
+	MessageStates        []string           `json:"message_states"`
+	ConfidenceThresholds map[string]float64 `json:"confidence_thresholds"`
 }
 
 func loadContract(t *testing.T) contractJSON {
@@ -67,6 +68,7 @@ func TestGeneratedEnumsMatchContractJSON(t *testing.T) {
 		t.Errorf("contract version drift: generated=%q contract=%q", ContractVersion, contract.Version)
 	}
 	assertSameSet(t, "decisions", sliceToSet(AllDecisions), contract.Decisions)
+	assertSameSet(t, "tool_categories", sliceToSet(AllToolCategories), contract.ToolCategories)
 	assertSameSet(t, "chat_modes", sliceToSet(AllChatModes), contract.ChatModes)
 	assertSameSet(t, "privacy_flags", sliceToSet(AllPrivacyFlags), contract.PrivacyFlags)
 	assertSameSet(t, "risk_levels", sliceToSet(AllRiskLevels), contract.RiskLevels)

@@ -22,6 +22,20 @@ func (d Decision) IsValid() bool {
 	}
 }
 
+// ToolCategory groups native tools by their execution and visibility semantics.
+// Allowed values are generated from contracts/contracts.json — see contract_enums.gen.go.
+type ToolCategory string
+
+// IsValid reports whether the category is part of the frozen contract.
+func (c ToolCategory) IsValid() bool {
+	switch c {
+	case ToolCategoryRead, ToolCategorySchedule, ToolCategoryIntegration, ToolCategoryInteraction:
+		return true
+	default:
+		return false
+	}
+}
+
 // ChatMode controls the autonomy level for one tenant/chat pair.
 // Allowed values are generated from contracts/contracts.json — see contract_enums.gen.go.
 type ChatMode string
@@ -105,6 +119,24 @@ func (r RiskLevel) IsValid() bool {
 	default:
 		return false
 	}
+}
+
+// TextFormat declares the delivery formatting requested by the AI service.
+type TextFormat string
+
+const (
+	// TextFormatPlain sends the response as plain text with no parse_mode.
+	TextFormatPlain TextFormat = "plain"
+	// TextFormatRich sends the response through Telegram Rich Messages.
+	TextFormatRich TextFormat = "rich"
+)
+
+// Normalize returns a supported text format, defaulting old/unknown values to plain.
+func (f TextFormat) Normalize() TextFormat {
+	if f == TextFormatRich {
+		return TextFormatRich
+	}
+	return TextFormatPlain
 }
 
 // MessageState is an auditable lifecycle state for an inbound message.
@@ -269,6 +301,51 @@ func CallbackDataDecodeChoice(data string) (optionIdx int, draftID string, idemp
 	return n, draftID, idempotencyKey, true
 }
 
+// CallbackDataEncodeAIButton encodes a contact-facing interaction option.
+// The idempotency suffix is stable for the draft, so concurrent presses on
+// different options still resolve to one logical answer.
+func CallbackDataEncodeAIButton(draftID string, optionIdx int) string {
+	bare := strings.TrimPrefix(draftID, "draft:")
+	return fmt.Sprintf("aibtn:%s:%d:%s", bare, optionIdx, aiButtonIdem(bare))
+}
+
+// CallbackDataDecodeAIButton parses "aibtn:{draftId}:{optionIdx}:{idem}".
+// Draft ids may contain colons, so separators are consumed from the right.
+func CallbackDataDecodeAIButton(data string) (optionIdx int, draftID string, idempotencyKey string, ok bool) {
+	if !strings.HasPrefix(data, "aibtn:") {
+		return 0, "", "", false
+	}
+	rest := strings.TrimPrefix(data, "aibtn:")
+	idemSep := strings.LastIndex(rest, ":")
+	if idemSep <= 0 {
+		return 0, "", "", false
+	}
+	idem := rest[idemSep+1:]
+	rest = rest[:idemSep]
+	indexSep := strings.LastIndex(rest, ":")
+	if indexSep <= 0 {
+		return 0, "", "", false
+	}
+	bare := rest[:indexSep]
+	n, err := strconv.Atoi(rest[indexSep+1:])
+	if err != nil || n < 0 || n > 3 || idem != aiButtonIdem(bare) {
+		return 0, "", "", false
+	}
+	draftID = "draft:" + bare
+	return n, draftID, draftID + ":aibtn:" + idem, true
+}
+
+func aiButtonIdem(value string) string {
+	// Small deterministic FNV-1a suffix: compact enough for Telegram's 64-byte
+	// callback_data cap and sufficient to reject malformed/stale payloads.
+	var hash uint32 = 2166136261
+	for index := 0; index < len(value); index++ {
+		hash ^= uint32(value[index])
+		hash *= 16777619
+	}
+	return strconv.FormatUint(uint64(hash), 36)
+}
+
 // ContactProfile is the owner-supplied description of a contact in a specific chat.
 // It maps to the contact_profiles table and covers three concerns:
 //  1. Собеседник — objective facts about the contact.
@@ -397,6 +474,37 @@ type AIRole struct {
 	// fields above. Each carries a title, a "why it exists" description, and
 	// optional context; all are injected into the persona prompt.
 	CustomFields []AIRoleCustomField `json:"custom_fields,omitempty"`
+	// MCPServers are the external MCP toolsets this role may call (#7). Resolved
+	// from role_mcp_access + mcp_servers; empty means the role has no tools.
+	MCPServers []MCPServerSpec `json:"mcp_servers,omitempty"`
+	// SpeakAsOwner controls the AI persona frame. true (default) = impersonate
+	// the owner — the contact perceives the reply as written by a human.
+	// false = the AI responds as the role itself (assistant / companion
+	// scenarios); the reply is clearly from the bot persona, not the owner.
+	SpeakAsOwner bool `json:"speak_as_owner"`
+	// ModelTier selects the LLM quality tier for this role's draft generation:
+	// "fast" (low-latency), "balanced" (default), or "smart" (highest capability).
+	// Empty string means fall back to the DRAFT task model (MODEL_DRAFT /
+	// OPENROUTER_MODEL), preserving backward compatibility with existing roles.
+	ModelTier string `json:"model_tier,omitempty"`
+	// ModelName optionally pins a concrete model inside ModelTier. Empty keeps
+	// the tier primary; stale values are ignored by Python model routing.
+	ModelName string `json:"model_name,omitempty"`
+	// ToolSettings contains per-role native-tool overrides. Missing keys inherit
+	// the corresponding catalog entry's DefaultEnabled value.
+	ToolSettings map[string]bool `json:"tool_settings,omitempty"`
+}
+
+// MCPServerSpec is one MCP server a role may call, with its per-role tool
+// allow-list. Sent to the (internal) Python AI service, which opens the
+// connection. AllowedTools empty = every tool the server exposes; non-empty =
+// only those (deny-by-default). AuthHeader is an optional Authorization value.
+type MCPServerSpec struct {
+	Name         string   `json:"name"`
+	Transport    string   `json:"transport"` // "http" (streamable) or "sse"
+	URL          string   `json:"url"`
+	AuthHeader   string   `json:"auth_header,omitempty"`
+	AllowedTools []string `json:"allowed_tools,omitempty"`
 }
 
 // AIRoleCustomField is an owner-defined extra attribute on a role. Title and
@@ -419,6 +527,8 @@ type UserSettings struct {
 	// DefaultModeForNewChats: off, observe, manual, semi_auto, auto.
 	DefaultModeForNewChats string `json:"default_mode_for_new_chats"`
 	LearningEnabled        bool   `json:"learning_enabled"`
+	RichFormattingEnabled  bool   `json:"rich_formatting_enabled"`
+	StreamingEnabled       bool   `json:"streaming_enabled"`
 	// LanguageForDrafts: auto (detect from contact) or primary (always use PrimaryLanguage).
 	LanguageForDrafts string `json:"language_for_drafts"`
 }
@@ -426,7 +536,7 @@ type UserSettings struct {
 // SemanticFact is a typed, atomic piece of knowledge about the conversation
 // or the owner, stored in the Semantic Layer (semantic_facts table).
 type SemanticFact struct {
-	ID   int64  `json:"id"`
+	ID int64 `json:"id"`
 	// ScopeKind is always "chat": memory is strictly per-chat (migration 011
 	// retired the owner_global scope).
 	ScopeKind string `json:"scope_kind"`
@@ -436,8 +546,8 @@ type SemanticFact struct {
 	// FactType: preference, biographical, commitment, event, relationship, health, taboo.
 	FactType string `json:"fact_type"`
 	// Subject: contact, owner, relationship, third_party.
-	Subject         string   `json:"subject"`
-	Confidence      float64  `json:"confidence"`
+	Subject    string  `json:"subject"`
+	Confidence float64 `json:"confidence"`
 	// Source: llm_extracted, owner_confirmed, owner_authored.
 	Source          string     `json:"source"`
 	SourceMessageID string     `json:"source_message_id,omitempty"`
@@ -602,37 +712,54 @@ func (s ChatSettings) WithDefaults() ChatSettings {
 
 // FeedbackItem carries one owner rating on a past draft for inclusion in the AI context.
 type FeedbackItem struct {
-	Rating       string `json:"rating"`        // "up" or "down"
+	Rating       string `json:"rating"` // "up" or "down"
 	ResponseText string `json:"response_text"`
 	FeedbackText string `json:"feedback_text,omitempty"`
 }
 
 // AIProcessMessageRequest is sent to the Python AI service.
 type AIProcessMessageRequest struct {
-	RequestID       string                  `json:"request_id"`
+	RequestID string `json:"request_id"`
 	// TraceID is the deterministic W3C trace-id derived from Event.EventID.
 	// Propagated to Python via the traceparent header and persisted on every
 	// state/audit row produced for this webhook so all spans correlate.
-	TraceID         string                  `json:"trace_id,omitempty"`
-	Event           NormalizedTelegramEvent `json:"event"`
-	ChatSettings    ChatSettings            `json:"chat_settings"`
+	TraceID      string                  `json:"trace_id,omitempty"`
+	Event        NormalizedTelegramEvent `json:"event"`
+	ChatSettings ChatSettings            `json:"chat_settings"`
 	// MemoryContext is the assembled prompt context (Working + Episodic + Semantic layers).
-	MemoryContext   []string                `json:"memory_context"`
-	FeedbackContext []FeedbackItem          `json:"feedback_context,omitempty"`
-	ContactProfile  *ContactProfile         `json:"contact_profile,omitempty"`
+	MemoryContext   []string        `json:"memory_context"`
+	FeedbackContext []FeedbackItem  `json:"feedback_context,omitempty"`
+	ContactProfile  *ContactProfile `json:"contact_profile,omitempty"`
 	// UserSettings provides the owner's identity and preferences to the AI.
-	UserSettings    *UserSettings           `json:"user_settings,omitempty"`
+	UserSettings *UserSettings `json:"user_settings,omitempty"`
 	// ActiveEpisode gives the AI awareness of the current open conversation episode.
-	ActiveEpisode   *ActiveEpisode          `json:"active_episode,omitempty"`
+	ActiveEpisode *ActiveEpisode `json:"active_episode,omitempty"`
 	// AIRole is the persona assigned to this chat; nil means the default
 	// assistant persona (reply in the owner's observed style).
-	AIRole          *AIRole                 `json:"ai_role,omitempty"`
+	AIRole *AIRole `json:"ai_role,omitempty"`
 }
 
 // TokenUsage contains model input and output token counts.
 type TokenUsage struct {
 	InputTokens  int `json:"input_tokens"`
 	OutputTokens int `json:"output_tokens"`
+}
+
+// ResponsePlan marks Options as a deferred contact-facing response form.
+type ResponsePlan struct {
+	Shape   string   `json:"shape"`
+	Options []string `json:"options"`
+}
+
+// ScheduledJob is a deferred job produced by the Python scheduler tool.
+// Go owns persistence and dispatch through store.ScheduledJobRecord.
+type ScheduledJob struct {
+	Kind           string         `json:"kind"`
+	Target         string         `json:"target"`
+	FireAt         time.Time      `json:"fire_at"`
+	Payload        map[string]any `json:"payload"`
+	CreatedBy      string         `json:"created_by,omitempty"`
+	IdempotencyKey string         `json:"idempotency_key"`
 }
 
 // AIProcessMessageResponse is returned by the Python AI service.
@@ -644,34 +771,41 @@ type AIProcessMessageResponse struct {
 	Intent       string     `json:"intent"`
 	ModelUsed    string     `json:"model_used"`
 	Usage        TokenUsage `json:"usage"`
+	TextFormat   TextFormat `json:"text_format,omitempty"`
 	MemoryUsed   []string   `json:"memory_used"`
 	// Flagged is set by the Phase 3 output-safety layer when a draft contains
 	// toxicity, sensitive content, or schema-invalid output the repair attempt
 	// could not salvage.  Drafts are still returned; the bot UI annotates them.
-	Flagged      bool       `json:"flagged,omitempty"`
+	Flagged bool `json:"flagged,omitempty"`
 	// OwnerNote is an owner-facing service note (e.g. the critical-risk warning).
 	// It is rendered on the owner's card only and must NEVER be sent to the
 	// contact; ResponseText stays empty when this is set (ARCH-1).
-	OwnerNote    string     `json:"owner_note,omitempty"`
+	OwnerNote string `json:"owner_note,omitempty"`
 	// Options are AI-suggested short replies for Intent == "choice_question".
-	Options      []string   `json:"options,omitempty"`
+	Options []string `json:"options,omitempty"`
+	// ResponsePlan is set only for interaction-tool output. Ordinary
+	// choice_question options remain an owner-facing card.
+	ResponsePlan *ResponsePlan `json:"response_plan,omitempty"`
+	// ScheduledJobs are validated deferred jobs from AI tools. The backend
+	// persists them through the repository so Python remains stateless by default.
+	ScheduledJobs []ScheduledJob `json:"scheduled_jobs,omitempty"`
 	// Topic is a 3-7 word label of the current conversation produced by the
 	// same draft call (replaces the per-message /ai/tag-topic call — ARCH-4).
-	Topic        string     `json:"topic,omitempty"`
+	Topic string `json:"topic,omitempty"`
 }
 
 // AuditEvent records the policy outcome for an inbound message.
 type AuditEvent struct {
-	AuditID         string    `json:"audit_id"`
-	TenantID        string    `json:"tenant_id"`
-	ChatID          string    `json:"chat_id"`
-	SourceMessageID string    `json:"source_message_id"`
-	Decision        Decision  `json:"decision"`
-	Reason          string    `json:"reason"`
+	AuditID         string   `json:"audit_id"`
+	TenantID        string   `json:"tenant_id"`
+	ChatID          string   `json:"chat_id"`
+	SourceMessageID string   `json:"source_message_id"`
+	Decision        Decision `json:"decision"`
+	Reason          string   `json:"reason"`
 	// TraceID is the W3C trace-id this audit row belongs to.  Joins audit
 	// rows back to Langfuse spans and message_states for the same event.
-	TraceID         string    `json:"trace_id,omitempty"`
-	CreatedAt       time.Time `json:"created_at"`
+	TraceID   string    `json:"trace_id,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // ApprovalCallbackPayload is the callback payload sent by owner approval controls.
@@ -695,11 +829,32 @@ type ChatSummaryRequest struct {
 
 // ChatSummaryResponse is returned by the Python AI service.
 type ChatSummaryResponse struct {
-	Summary          string     `json:"summary"`
-	ActionItems      []string   `json:"action_items"`
+	Summary     string   `json:"summary"`
+	ActionItems []string `json:"action_items"`
 	// Recommendations are proactive suggestions for the owner based on the contact's interests
 	// and conversation history. Populated by the Python AI service when relevant.
 	Recommendations  []string   `json:"recommendations,omitempty"`
+	ModelUsed        string     `json:"model_used"`
+	Usage            TokenUsage `json:"usage"`
+	BlockedByPrivacy bool       `json:"blocked_by_privacy"`
+}
+
+// SynthesizePatternRequest asks the AI service to condense a cluster of related
+// facts into one durable behaviour pattern (sleep-time reflection, #5).
+type SynthesizePatternRequest struct {
+	ClusterFacts []string     `json:"cluster_facts"`
+	TenantID     string       `json:"tenant_id"`
+	ChatID       string       `json:"chat_id"`
+	PrivacyFlags PrivacyFlags `json:"privacy_flags"`
+	TraceID      string       `json:"trace_id,omitempty"`
+}
+
+// SynthesizePatternResponse carries the synthesised pattern. An empty Pattern
+// means the cluster held no durable signal and nothing should be written.
+type SynthesizePatternResponse struct {
+	Pattern          string     `json:"pattern"`
+	Subject          string     `json:"subject"`
+	Confidence       float64    `json:"confidence"`
 	ModelUsed        string     `json:"model_used"`
 	Usage            TokenUsage `json:"usage"`
 	BlockedByPrivacy bool       `json:"blocked_by_privacy"`

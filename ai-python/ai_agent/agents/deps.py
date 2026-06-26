@@ -10,9 +10,12 @@ or writing memory for a ``no_memory`` chat.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Awaitable, Callable, Sequence
 
 import asyncpg
+
+from .results import ResponsePlan, ScheduledJob
 
 
 @dataclass
@@ -35,6 +38,14 @@ class AgentDeps:
     # Lines the memory tools should treat as already-provided context
     # (prefetched by the Go backend) — used only for diagnostics/logging.
     prefetched_context: tuple[str, ...] = field(default_factory=tuple)
+    # Interaction tools write a deferred contact-facing form here. The tool
+    # itself never performs transport IO; core sends it through approval.
+    response_plan: ResponsePlan | None = None
+    # Scheduler tools write deferred jobs here. Python does not persist them;
+    # Go owns scheduled_jobs DB IO and consumes this accumulator from the response.
+    scheduled_jobs: list[ScheduledJob] = field(default_factory=list)
+    # One stable clock value shared by the scheduler prompt and tool validation.
+    current_time: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     @property
     def no_memory(self) -> bool:
@@ -45,3 +56,8 @@ class AgentDeps:
     def no_summary(self) -> bool:
         """True when the chat forbids summarization."""
         return "no_summary" in self.privacy_flags
+
+    @property
+    def private(self) -> bool:
+        """True when autonomous scheduled persistence is forbidden."""
+        return "private" in self.privacy_flags

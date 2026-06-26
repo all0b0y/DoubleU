@@ -11,7 +11,8 @@ types so a hallucinated value can never widen the contract.
 
 from __future__ import annotations
 
-from typing import Literal
+from datetime import datetime
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -28,6 +29,57 @@ Intent = Literal[
 ]
 
 
+class ResponsePlan(BaseModel):
+    """A contact-facing response form prepared by an interaction tool."""
+
+    model_config = ConfigDict(frozen=True)
+
+    shape: Literal["buttons"] = "buttons"
+    prompt: str = Field(min_length=1, description="Текст вопроса над inline-кнопками.")
+    options: tuple[str, ...] = Field(
+        min_length=2,
+        max_length=4,
+        description="Короткие варианты ответа собеседника.",
+    )
+
+
+class ScheduledJob(BaseModel):
+    """A deferred scheduler job prepared by a tool for Go-owned persistence."""
+
+    model_config = ConfigDict(frozen=True)
+
+    kind: Literal["reminder"] = "reminder"
+    target: Literal["owner", "contact"]
+    fire_at: datetime
+    payload: dict[str, Any] = Field(default_factory=dict)
+    created_by: Literal["ai"] = "ai"
+    idempotency_key: str = Field(min_length=1)
+
+
+class OrchestratorResult(BaseModel):
+    """Tool-stage output consumed by the final writer, never by the contact."""
+
+    model_config = ConfigDict(frozen=True)
+
+    gathered_context: tuple[str, ...] = Field(
+        default=(),
+        description="Собранные инструментами факты и результаты, по одному пункту на строку.",
+    )
+    suggested_intent: str = Field(
+        default="",
+        max_length=100,
+        description="Предполагаемый тип ответа для писателя.",
+    )
+    notes: str = Field(
+        default="",
+        description="Короткие указания писателю о важных ограничениях и пробелах в данных.",
+    )
+    response_plan: ResponsePlan | None = Field(
+        default=None,
+        description="Форма ответа, созданная вызванным interaction-инструментом.",
+    )
+
+
 class DraftResult(BaseModel):
     """Structured draft: reply + intent + options + confidence + topic (ARCH-4)."""
 
@@ -35,7 +87,7 @@ class DraftResult(BaseModel):
 
     reply: str = Field(
         min_length=1,
-        description="Текст ответа собеседнику от лица владельца — только текст сообщения, без пояснений.",
+        description="Текст ответа собеседнику от лица назначенной персоны — без пояснений.",
     )
     intent: Intent = Field(
         default="general_message",
@@ -48,7 +100,7 @@ class DraftResult(BaseModel):
         default=(),
         max_length=4,
         description=(
-            "Для intent=choice_question — 2-4 коротких готовых ответа от лица владельца."
+            "Для intent=choice_question — 2-4 коротких готовых ответа от лица назначенной персоны."
             " Для остальных интентов — пустой список."
         ),
     )
@@ -124,6 +176,32 @@ class ExtractionResult(BaseModel):
     profile_suggestions: tuple[ProfileSuggestionResult, ...] = ()
 
 
+class RoleDraftCustomField(BaseModel):
+    """One owner-editable custom field proposed for an AI role."""
+
+    model_config = ConfigDict(frozen=True)
+
+    title: str = Field(min_length=1, max_length=64)
+    description: str = Field(
+        min_length=1,
+        description="Зачем это поле нужно роли и как оно влияет на ответы.",
+    )
+    context: str = Field(default="", max_length=5000)
+
+
+class RoleDraft(BaseModel):
+    """A complete owner-editable AI-role draft generated from free text."""
+
+    model_config = ConfigDict(frozen=True)
+
+    name: str = Field(min_length=1, max_length=64)
+    description: str = Field(min_length=1)
+    speaking_style: str = ""
+    goals: str = ""
+    constraints: str = ""
+    custom_fields: tuple[RoleDraftCustomField, ...] = ()
+
+
 class SummaryResult(BaseModel):
     """Episode/chat summary with actionable follow-ups (ARCH-10)."""
 
@@ -135,6 +213,34 @@ class SummaryResult(BaseModel):
     )
     recommendations: tuple[str, ...] = Field(
         default=(), description="Проактивные рекомендации владельцу по этому чату."
+    )
+
+
+class PatternResult(BaseModel):
+    """A durable behavioural pattern synthesised from a cluster of facts (#5).
+
+    ``pattern`` is intentionally allowed to be empty: when the facts do not
+    support a stable, non-obvious pattern the model must return "" so the
+    backend writes nothing rather than inventing an insight.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    pattern: str = Field(
+        default="",
+        max_length=200,
+        description=(
+            "Устойчивый поведенческий паттерн контакта в 1 фразе (например"
+            " «регулярно перегружен работой, часто в стрессе»). Пустая строка —"
+            " если факты НЕ образуют устойчивого паттерна. Не выдумывай."
+        ),
+    )
+    subject: Literal["contact", "owner", "relationship", "third_party"] = "contact"
+    confidence: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description="Уверенность 0..1 в том, что это устойчивый паттерн, а не разовость.",
     )
 
 

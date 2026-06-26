@@ -1,4 +1,5 @@
 import { api, openEvents } from '/miniapp/api/client.js';
+import { catImg } from '/miniapp/components/glyphs.js';
 
 const twa = window.Telegram?.WebApp;
 
@@ -15,11 +16,6 @@ const MEDIA_LABEL = {
   caption:    '🖼 Медиа',
   unknown:    '📎 Медиа',
 };
-
-function initials(name) {
-  if (!name) return '?';
-  return name.split(/\s+/).map(w => w[0]).join('').slice(0, 2).toUpperCase();
-}
 
 function formatTime(iso) {
   if (!iso) return '';
@@ -77,12 +73,14 @@ export function renderChat(navigate, chatId) {
 
     <div id="draft-panel"></div>
 
+    <div id="scheduled-jobs"></div>
+
     <div class="chat-composer" id="chat-composer"
-         style="display:flex;gap:8px;align-items:flex-end;padding:8px 12px calc(8px + var(--inset-bottom,0px));border-top:1px solid var(--border,rgba(255,255,255,0.08));">
+         style="display:flex;gap:8px;align-items:flex-end;padding:8px 12px calc(8px + var(--inset-bottom,0px));border-top:1px solid var(--border-color);background:var(--bg);">
       <textarea id="composer-input" rows="1" placeholder="Ответить от имени бота…"
-        style="flex:1;resize:none;max-height:120px;background:var(--card,#1c1c24);color:var(--text,#fff);border:1px solid var(--border,rgba(255,255,255,0.08));border-radius:18px;padding:9px 14px;font-size:14px;line-height:1.3;"></textarea>
+        style="flex:1;resize:none;max-height:120px;background:var(--bg2);color:var(--text);border:1px solid var(--border-color);border-radius:18px;padding:9px 14px;font-size:14px;line-height:1.3;"></textarea>
       <button id="composer-send" title="Отправить" disabled
-        style="flex-shrink:0;width:40px;height:40px;border:none;border-radius:50%;background:var(--accent,#5b8cff);color:#fff;font-size:18px;cursor:pointer;">↑</button>
+        style="flex-shrink:0;width:40px;height:40px;border:none;border-radius:50%;background:var(--accent);color:#fff;font-size:18px;cursor:pointer;">↑</button>
     </div>
   `;
 
@@ -135,6 +133,40 @@ export function renderChat(navigate, chatId) {
 
   let currentDrafts = [];
 
+  function renderScheduledJobs(jobs) {
+    const host = el.querySelector('#scheduled-jobs');
+    const pending = (jobs || []).filter(job => job.status === 'pending');
+    if (!pending.length) {
+      host.innerHTML = '';
+      return;
+    }
+    host.innerHTML = `
+      <div style="padding:8px 12px;border-top:1px solid var(--border-color);background:var(--bg2)">
+        <div style="font-size:12px;color:var(--hint);margin-bottom:6px">⏰ Запланировано</div>
+        ${pending.map(job => `
+          <div style="display:flex;align-items:center;gap:8px;padding:6px 0">
+            <div style="flex:1;min-width:0">
+              <div style="font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(job.payload?.text || 'Напоминание')}</div>
+              <div style="font-size:11px;color:var(--hint)">${new Date(job.fire_at).toLocaleString('ru')} · ${job.target === 'owner' ? 'вам' : 'собеседнику'}</div>
+            </div>
+            <button class="draft-trash-btn" data-cancel-job="${job.id}" title="Отменить">×</button>
+          </div>`).join('')}
+      </div>`;
+    host.querySelectorAll('[data-cancel-job]').forEach(button => {
+      button.addEventListener('click', async () => {
+        button.disabled = true;
+        try {
+          await api.cancelScheduledJob(chatId, button.dataset.cancelJob);
+          twa?.HapticFeedback?.notificationOccurred('success');
+          await loadChatData();
+        } catch (err) {
+          button.disabled = false;
+          twa?.showAlert(`Ошибка: ${err.message}`);
+        }
+      });
+    });
+  }
+
   const THINKING_PHRASES = [
     '✨ ИИ подбирает слова…',
     '🤔 ИИ думает как лучше ответить…',
@@ -148,12 +180,14 @@ export function renderChat(navigate, chatId) {
   function showThinkingIndicator() {
     const list = el.querySelector('#msg-list');
     if (list.querySelector('#ai-thinking-indicator')) return;
+    el.querySelector('#ai-error-notice')?.remove(); // a fresh turn supersedes a prior error
     const phrase = THINKING_PHRASES[Math.floor(Math.random() * THINKING_PHRASES.length)];
     const div = document.createElement('div');
     div.id = 'ai-thinking-indicator';
-    div.className = 'msg-bubble msg-out';
-    div.style.cssText = 'opacity:0.65;font-style:italic;';
-    div.innerHTML = `<p class="msg-text" style="color:var(--hint)">${phrase}</p>`;
+    div.className = 'ai-thinking';
+    div.innerHTML =
+      `<span class="ai-thinking-text">${phrase}</span>` +
+      `<span class="ai-thinking-dots"><span></span><span></span><span></span></span>`;
     const inner = list.querySelector('.msg-list-inner');
     (inner || list).appendChild(div);
     list.scrollTop = list.scrollHeight;
@@ -161,6 +195,21 @@ export function renderChat(navigate, chatId) {
 
   function hideThinkingIndicator() {
     el.querySelector('#ai-thinking-indicator')?.remove();
+  }
+
+  // Replace the thinking indicator with a retryable error notice when an AI
+  // turn fails, so it never just disappears with nothing in its place.
+  function showAIError(message) {
+    hideThinkingIndicator();
+    const list = el.querySelector('#msg-list');
+    el.querySelector('#ai-error-notice')?.remove();
+    const div = document.createElement('div');
+    div.id = 'ai-error-notice';
+    div.className = 'ai-error';
+    div.textContent = message || 'ИИ не смог сформировать ответ. Попробуйте ещё раз.';
+    const inner = list.querySelector('.msg-list-inner');
+    (inner || list).appendChild(div);
+    list.scrollTop = list.scrollHeight;
   }
 
   // ── Avatar (issue 3) ──────────────────────────────────────────────────────
@@ -247,15 +296,21 @@ export function renderChat(navigate, chatId) {
       const out = m.direction === 'outgoing';
       const { html: textHtml } = msgText(m);
       if (out) {
-        const footer = m.label
-          ? `<div class="msg-footer-out">
+        // Distinguish AI/app-sent replies from messages typed straight to the
+        // bot in Telegram, so the owner can tell personal use apart.
+        let footer;
+        if (m.label) {
+          footer = `<div class="msg-footer-out">
                <span class="msg-footer-du">✨ ${m.label}</span>
                <span class="msg-footer-time">${formatTime(m.created_at)} ✓✓</span>
-             </div>`
-          : `<div class="msg-footer-out">
-               <span class="msg-footer-du" style="opacity:0.5">Ты</span>
+             </div>`;
+        } else {
+          const who = m.source === 'telegram' ? 'Ты · в Telegram' : 'Ты · из приложения';
+          footer = `<div class="msg-footer-out">
+               <span class="msg-footer-du" style="opacity:0.6">${who}</span>
                <span class="msg-footer-time">${formatTime(m.created_at)}</span>
              </div>`;
+        }
         html += `
           <div class="msg-bubble msg-out">
             <p class="msg-text">${textHtml}</p>
@@ -462,9 +517,12 @@ export function renderChat(navigate, chatId) {
 
   async function loadChatData() {
     try {
-      const [msgData, draftData] = await Promise.all([api.messages(chatId), api.drafts(chatId)]);
+      const [msgData, draftData, jobsData] = await Promise.all([
+        api.messages(chatId), api.drafts(chatId), api.scheduledJobs(chatId),
+      ]);
       renderMessages(msgData.messages || [], draftData.drafts || []);
       renderDraftPanel(draftData.drafts || []);
+      renderScheduledJobs(jobsData.scheduled_jobs || []);
     } catch (_) {}
   }
 
@@ -474,7 +532,9 @@ export function renderChat(navigate, chatId) {
       const chat = chatsData.chats?.find(c => c.chat_id === chatId);
       if (chat) {
         el.querySelector('#chat-name').textContent = chat.display_name || chatId;
-        el.querySelector('#chat-avatar').textContent = initials(chat.display_name);
+        const av = el.querySelector('#chat-avatar');
+        av.classList.add('avatar-cat');
+        av.innerHTML = catImg(chatId);
       }
       if (settingsData) {
         const modeEl = el.querySelector('#chat-mode');
@@ -494,9 +554,11 @@ export function renderChat(navigate, chatId) {
     draft_status: (d) => {
       if (currentDrafts.find(x => x.draft_id === d.draft_id)) loadChatData();
     },
-    new_message:  (d) => { if (d.chat_id === chatId) loadChatData(); },
+    new_message:  (d) => { if (d.chat_id === chatId) { el.querySelector('#ai-error-notice')?.remove(); loadChatData(); } },
     ai_thinking:  (d) => { if (d.chat_id === chatId) showThinkingIndicator(); },
     ai_done:      (d) => { if (d.chat_id === chatId) hideThinkingIndicator(); },
+    scheduled_job: (d) => { if (d.chat_id === chatId) loadChatData(); },
+    ai_error:     (d) => { if (d.chat_id === chatId) showAIError(d.message); },
     chat_role_changed: (d) => { if (d.chat_id === chatId) loadChatMeta(); },
   });
 

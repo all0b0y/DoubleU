@@ -18,9 +18,10 @@ from ai_agent.contract_enums import (
     LLMPurpose,
     PrivacyFlag,
     RiskLevel,
+    ToolCategory,
 )
 
-__all__ = ["ChatMode", "Decision", "LLMPurpose", "PrivacyFlag", "RiskLevel"]
+__all__ = ["ChatMode", "Decision", "LLMPurpose", "PrivacyFlag", "RiskLevel", "ToolCategory"]
 
 
 class ModelTask(str, Enum):
@@ -45,6 +46,26 @@ class Usage(JsonDataclass):
 
     input_tokens: int = 0
     output_tokens: int = 0
+
+
+@dataclass(frozen=True)
+class ResponsePlanData(JsonDataclass):
+    """Deferred contact-facing form produced by an interaction tool."""
+
+    shape: str
+    options: tuple[str, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
+class ScheduledJobData(JsonDataclass):
+    """Deferred scheduler job produced by an AI tool and persisted by Go."""
+
+    kind: str
+    target: str
+    fire_at: str
+    payload: dict[str, Any]
+    idempotency_key: str
+    created_by: str = "ai"
 
 
 @dataclass(frozen=True)
@@ -133,6 +154,22 @@ class AIRoleCustomFieldData(JsonDataclass):
 
 
 @dataclass(frozen=True)
+class MCPServerSpecData(JsonDataclass):
+    """One MCP server a role may call, with its per-role tool allow-list (#7).
+
+    ``allowed_tools`` empty means every tool the server exposes is allowed; a
+    non-empty tuple restricts the role to exactly those tools (deny-by-default).
+    ``auth_header`` is an optional Authorization header value for the server.
+    """
+
+    name: str = ""
+    transport: str = "http"  # "http" (streamable) or "sse"
+    url: str = ""
+    auth_header: str = ""
+    allowed_tools: tuple[str, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
 class AIRoleData(JsonDataclass):
     """Owner-authored AI persona assigned to the chat.
 
@@ -152,6 +189,20 @@ class AIRoleData(JsonDataclass):
     context: str = ""
     # Owner-defined extra fields beyond the fixed ones above.
     custom_fields: tuple[AIRoleCustomFieldData, ...] = field(default_factory=tuple)
+    # MCP servers this role may call (#7); empty means no external tools.
+    mcp_servers: tuple[MCPServerSpecData, ...] = field(default_factory=tuple)
+    # speak_as_owner=True (default): AI impersonates the owner — contact thinks
+    # they are talking to a human.  False: AI responds as the role persona
+    # itself (assistant / companion); no owner impersonation.
+    speak_as_owner: bool = True
+    # model_tier selects the LLM quality tier for draft generation:
+    # "fast", "balanced" (default), or "smart".  Empty / unrecognised value
+    # degrades to the DRAFT task model (MODEL_DRAFT / OPENROUTER_MODEL).
+    model_tier: str = "balanced"
+    # Optional concrete model within model_tier. Empty keeps the tier's primary.
+    model_name: str = ""
+    # Per-role native-tool overrides; absent keys inherit catalog defaults.
+    tool_settings: dict[str, bool] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -199,6 +250,7 @@ class AIProcessMessageResponse(JsonDataclass):
     intent: str
     model_used: str
     usage: Usage
+    text_format: str = "plain"
     memory_used: tuple[str, ...] = field(default_factory=tuple)
     # Set by the Phase 3 OutputSafetyScanner when toxicity/sensitive is found
     # in the draft but repair could not salvage it.  Bot UI annotates with ⚠.
@@ -209,6 +261,12 @@ class AIProcessMessageResponse(JsonDataclass):
     owner_note: str = ""
     # Suggested short replies when intent == "choice_question" (ARCH-4).
     options: tuple[str, ...] = field(default_factory=tuple)
+    # Present only when options are a contact-facing interaction form rather
+    # than the existing owner-facing choice-question card.
+    response_plan: ResponsePlanData | None = None
+    # Deferred scheduler jobs validated by Python tools; Go persists them
+    # through its repository so Python remains stateless in AI_MEMORY_SOURCE=go.
+    scheduled_jobs: tuple[ScheduledJobData, ...] = field(default_factory=tuple)
     # 3-7 word conversation topic produced by the same draft call; replaces the
     # separate /ai/tag-topic call in the hot path (ARCH-4).
     topic: str = ""
@@ -436,6 +494,95 @@ class ChatSummaryResponse(JsonDataclass):
     recommendations: tuple[str, ...] = field(default_factory=tuple)
 
 
+@dataclass(frozen=True)
+class SynthesizePatternRequest(JsonDataclass):
+    """Request body for `/ai/synthesize-pattern` (sleep-time reflection).
+
+    ``cluster_facts`` is one cluster of semantically-related facts the backend
+    found; the service returns a single durable behavioural pattern (or empty).
+    """
+
+    cluster_facts: tuple[str, ...] = field(default_factory=tuple)
+    tenant_id: str = ""
+    chat_id: str = ""
+    privacy_flags: tuple[PrivacyFlag, ...] = field(default_factory=tuple)
+    trace_id: str = ""
+
+
+@dataclass(frozen=True)
+class SynthesizePatternResponse(JsonDataclass):
+    """Response body for `/ai/synthesize-pattern`.
+
+    ``pattern`` is empty when the facts do not form a durable pattern — the
+    backend then writes nothing.
+    """
+
+    pattern: str
+    subject: str
+    confidence: float
+    model_used: str
+    usage: Usage
+    blocked_by_privacy: bool = False
+
+
+# Media kinds the extract-media endpoint understands. Mirrors the Go
+# MediaDescriptor.Kind values; anything else routes to "unsupported".
+MEDIA_KINDS = ("voice", "audio", "photo", "document")
+
+
+@dataclass(frozen=True)
+class ExtractMediaRequest(JsonDataclass):
+    """Request body for `/ai/extract-media`.
+
+    The Go transport layer downloads a Telegram attachment (it owns the bot
+    token) and posts the raw bytes here as base64. The AI service — which already
+    holds the provider credentials — turns the media into plain text BEFORE the
+    frozen `/ai/process-message` call, keeping the agent text-only. ``kind`` is
+    one of :data:`MEDIA_KINDS`; ``duration`` is voice/audio seconds (0 otherwise).
+    """
+
+    kind: str
+    data_base64: str
+    mime_type: str = ""
+    duration: int = 0
+    trace_id: str = ""
+
+
+@dataclass(frozen=True)
+class ExtractMediaResponse(JsonDataclass):
+    """Response body for `/ai/extract-media`.
+
+    ``text`` is the extracted plain text (voice transcript / image OCR+caption /
+    document text), empty when nothing could be extracted. ``provenance`` labels
+    how it was produced so the caller wraps it with the right untrusted-input
+    marker and the model never mistakes transcribed user content for instructions.
+    """
+
+    text: str
+    provenance: str  # voice_transcript|image_caption|document_text|unsupported|error
+    model_used: str
+
+
+@dataclass(frozen=True)
+class DraftRoleRequest(JsonDataclass):
+    """Request body for `/ai/draft-role`."""
+
+    text: str
+    trace_id: str = ""
+
+
+@dataclass(frozen=True)
+class DraftRoleResponse(JsonDataclass):
+    """Generated role fields returned by `/ai/draft-role`."""
+
+    name: str
+    description: str
+    speaking_style: str = ""
+    goals: str = ""
+    constraints: str = ""
+    custom_fields: tuple[AIRoleCustomFieldData, ...] = field(default_factory=tuple)
+
+
 def parse_process_message_request(payload: dict[str, Any]) -> AIProcessMessageRequest:
     """Parse a process-message JSON object into a typed request."""
     event = payload.get("event") or {}
@@ -554,6 +701,54 @@ def parse_summary_request(payload: dict[str, Any]) -> ChatSummaryRequest:
     )
 
 
+def parse_synthesize_pattern_request(payload: dict[str, Any]) -> SynthesizePatternRequest:
+    """Parse a synthesize-pattern JSON object into a typed request."""
+    raw_facts = payload.get("cluster_facts") or []
+    if isinstance(raw_facts, str):
+        cluster_facts = (raw_facts,)
+    else:
+        cluster_facts = tuple(str(fact) for fact in raw_facts)
+    return SynthesizePatternRequest(
+        cluster_facts=cluster_facts,
+        tenant_id=str(payload.get("tenant_id", "")),
+        chat_id=str(payload.get("chat_id", "")),
+        privacy_flags=_parse_privacy_flags(payload.get("privacy_flags", [])),
+        trace_id=str(payload.get("trace_id", "")),
+    )
+
+
+def parse_extract_media_request(payload: dict[str, Any]) -> ExtractMediaRequest:
+    """Parse an extract-media JSON object into a typed request.
+
+    Validates the boundary: ``kind`` and ``data_base64`` are required (untrusted
+    input from the transport layer). An unknown ``kind`` is allowed through so a
+    new Telegram media type degrades to "unsupported" rather than a 400.
+    """
+    kind = str(payload.get("kind", "")).strip()
+    data_base64 = str(payload.get("data_base64", ""))
+    if not kind:
+        raise ValueError("kind is required")
+    if not data_base64:
+        raise ValueError("data_base64 is required")
+    return ExtractMediaRequest(
+        kind=kind,
+        data_base64=data_base64,
+        mime_type=str(payload.get("mime_type", "")),
+        duration=int(payload.get("duration", 0) or 0),
+        trace_id=str(payload.get("trace_id", "")),
+    )
+
+
+def parse_draft_role_request(payload: dict[str, Any]) -> DraftRoleRequest:
+    """Parse and validate a free-text role description."""
+    text = str(payload.get("text", "")).strip()
+    if not text:
+        raise ValueError("text is required")
+    if len(text) > 8000:
+        raise ValueError("text is too long (max 8000 characters)")
+    return DraftRoleRequest(text=text, trace_id=str(payload.get("trace_id", "")))
+
+
 def _parse_contact_profile(raw: Any) -> ContactProfileData | None:
     """Parse an optional contact_profile dict into a typed dataclass.
 
@@ -594,6 +789,21 @@ def _parse_ai_role(raw: Any) -> AIRoleData | None:
     name = str(raw.get("name", "")).strip()
     if not name:
         return None
+    # speak_as_owner defaults to True when absent (backward compat with existing
+    # roles that predate migration 111).
+    speak_as_owner = raw.get("speak_as_owner")
+    if not isinstance(speak_as_owner, bool):
+        speak_as_owner = True
+    # model_tier: accept only the three known values; anything else degrades to
+    # "balanced" so existing roles without the field keep working.
+    raw_tier = str(raw.get("model_tier", "")).strip().lower()
+    model_tier = raw_tier if raw_tier in {"fast", "balanced", "smart"} else "balanced"
+    raw_tool_settings = raw.get("tool_settings")
+    tool_settings = (
+        {str(key): value for key, value in raw_tool_settings.items() if isinstance(value, bool)}
+        if isinstance(raw_tool_settings, dict)
+        else {}
+    )
     return AIRoleData(
         name=name,
         description=str(raw.get("description", "")).strip(),
@@ -602,7 +812,40 @@ def _parse_ai_role(raw: Any) -> AIRoleData | None:
         constraints=str(raw.get("constraints", "")).strip(),
         context=str(raw.get("context", "")).strip(),
         custom_fields=_parse_role_custom_fields(raw.get("custom_fields")),
+        mcp_servers=_parse_mcp_servers(raw.get("mcp_servers")),
+        speak_as_owner=speak_as_owner,
+        model_tier=model_tier,
+        model_name=str(raw.get("model_name", "")).strip(),
+        tool_settings=tool_settings,
     )
+
+
+def _parse_mcp_servers(raw: Any) -> tuple[MCPServerSpecData, ...]:
+    """Parse the optional mcp_servers list; entries without a url are dropped."""
+    if not isinstance(raw, list):
+        return ()
+    servers: list[MCPServerSpecData] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url", "")).strip()
+        if not url:
+            continue
+        transport = str(item.get("transport", "http")).strip().lower()
+        if transport not in ("http", "sse"):
+            transport = "http"
+        allowed = item.get("allowed_tools")
+        allowed_tools = tuple(str(t) for t in allowed) if isinstance(allowed, list) else ()
+        servers.append(
+            MCPServerSpecData(
+                name=str(item.get("name", "")).strip(),
+                transport=transport,
+                url=url,
+                auth_header=str(item.get("auth_header", "")).strip(),
+                allowed_tools=allowed_tools,
+            )
+        )
+    return tuple(servers)
 
 
 def _parse_role_custom_fields(raw: Any) -> tuple[AIRoleCustomFieldData, ...]:

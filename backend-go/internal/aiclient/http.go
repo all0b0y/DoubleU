@@ -64,6 +64,19 @@ func (c *HTTPClient) SummarizeChat(ctx context.Context, request contracts.ChatSu
 	return response, nil
 }
 
+// SynthesizePattern condenses a cluster of related facts into one behaviour
+// pattern via the Python AI service (sleep-time reflection, #5).
+func (c *HTTPClient) SynthesizePattern(ctx context.Context, request contracts.SynthesizePatternRequest) (contracts.SynthesizePatternResponse, error) {
+	var response contracts.SynthesizePatternResponse
+	if c.baseURL == "" {
+		return response, fmt.Errorf("ai base url is empty")
+	}
+	if err := c.postJSON(ctx, "/ai/synthesize-pattern", request, &response); err != nil {
+		return response, err
+	}
+	return response, nil
+}
+
 // ExtractMemory calls the Python AI /ai/extract-memory endpoint to extract facts from a message.
 // This is designed for async use: callers should fire-and-forget via a goroutine.
 func (c *HTTPClient) ExtractMemory(ctx context.Context, request MemoryExtractionRequest) (MemoryExtractionResponse, error) {
@@ -136,6 +149,45 @@ func (c *HTTPClient) RerankFacts(ctx context.Context, request RerankFactsRequest
 		return response, fmt.Errorf("ai base url is empty")
 	}
 	if err := c.postJSON(ctx, "/ai/rerank-facts", request, &response); err != nil {
+		return response, err
+	}
+	return response, nil
+}
+
+// extractMediaTimeout is the per-call deadline for /ai/extract-media. Speech-to-
+// text and vision through a remote provider routinely exceed the default 10s
+// client timeout, so the call gets the same headroom as embedding.
+const extractMediaTimeout = 60 * time.Second
+
+// draftRoleTimeout allows a cheap structured-output model enough time to
+// produce and validate the complete role shape.
+const draftRoleTimeout = 60 * time.Second
+
+// ExtractMedia calls the Python AI /ai/extract-media endpoint to turn a media
+// attachment (voice/audio/photo/document) into plain text.
+func (c *HTTPClient) ExtractMedia(ctx context.Context, request ExtractMediaRequest) (ExtractMediaResponse, error) {
+	var response ExtractMediaResponse
+	if c.baseURL == "" {
+		return response, fmt.Errorf("ai base url is empty")
+	}
+	mediaCtx, cancel := context.WithTimeout(ctx, extractMediaTimeout)
+	defer cancel()
+	if err := c.postJSON(mediaCtx, "/ai/extract-media", request, &response); err != nil {
+		return response, err
+	}
+	return response, nil
+}
+
+// DraftRole calls the Python AI /ai/draft-role endpoint to generate editable
+// role fields from a free-text description.
+func (c *HTTPClient) DraftRole(ctx context.Context, request DraftRoleRequest) (DraftRoleResponse, error) {
+	var response DraftRoleResponse
+	if c.baseURL == "" {
+		return response, fmt.Errorf("ai base url is empty")
+	}
+	draftCtx, cancel := context.WithTimeout(ctx, draftRoleTimeout)
+	defer cancel()
+	if err := c.postJSON(draftCtx, "/ai/draft-role", request, &response); err != nil {
 		return response, err
 	}
 	return response, nil

@@ -6,7 +6,8 @@ const twa = window.Telegram?.WebApp;
 const NAV_ITEMS = [
   { id: 'chats', icon: '💬', label: 'чаты', path: '/chats' },
   { id: 'roles', icon: '🎭', label: 'роли', path: '/roles' },
-  { id: 'me',    icon: '👤', label: 'я',    path: '/me' },
+  // "Я" uses the sunglasses-cat mascot instead of a generic person glyph.
+  { id: 'me',    icon: '<img class="glyph" src="/miniapp/assets/cats/cat-glasses.svg" alt="">', label: 'я', path: '/me' },
 ];
 
 /**

@@ -1,6 +1,5 @@
 import { api, openEvents } from '/miniapp/api/client.js';
 import { renderWelcome }   from '/miniapp/screens/welcome.js';
-import { renderOnboarding } from '/miniapp/screens/onboarding.js';
 import { renderChats }     from '/miniapp/screens/chats.js';
 import { renderChat }      from '/miniapp/screens/chat.js';
 import { renderSettings }  from '/miniapp/screens/settings.js';
@@ -8,11 +7,24 @@ import { renderAddChat }   from '/miniapp/screens/add-chat.js';
 import { renderProfile }   from '/miniapp/screens/profile.js';
 import { renderRoles }     from '/miniapp/screens/roles.js';
 import { renderRoleEdit }  from '/miniapp/screens/role-edit.js';
+import { renderRoleTools } from '/miniapp/screens/role-tools.js';
 import { renderMe }        from '/miniapp/screens/me.js';
-import { renderAddBot }    from '/miniapp/screens/add-bot.js';
+import { renderAddBot, renderBotSettings } from '/miniapp/screens/add-bot.js';
+import { brandify }        from '/miniapp/components/glyphs.js';
 
 const twa = window.Telegram?.WebApp;
 const app = document.getElementById('app');
+
+// Swap system emoji for brand glyphs across every screen, including content
+// rendered asynchronously (chat lists, messages, drafts). One central pass keeps
+// the templates readable and guarantees nothing slips through. brandify mutates
+// the DOM, so we detach the observer while it runs to avoid re-triggering.
+const glyphObserver = new MutationObserver(() => {
+  glyphObserver.disconnect();
+  brandify(app);
+  glyphObserver.observe(app, { childList: true, subtree: true, characterData: true });
+});
+glyphObserver.observe(app, { childList: true, subtree: true, characterData: true });
 
 // ── TMA initialisation ────────────────────────────────────────────────────────
 twa?.ready();
@@ -21,9 +33,10 @@ twa?.expand();
 // which would abort this whole module and leave a black screen.
 try { twa?.requestFullscreen?.(); } catch (_) { /* older Telegram client */ }
 try {
-  twa?.setHeaderColor?.('#14141A');
-  twa?.setBackgroundColor?.('#14141A');
-  twa?.setBottomBarColor?.('#14141A');
+  // Cream brand surface — match --bg in styles/main.css.
+  twa?.setHeaderColor?.('#F7F1DF');
+  twa?.setBackgroundColor?.('#F7F1DF');
+  twa?.setBottomBarColor?.('#F7F1DF');
 } catch (_) { /* older Telegram client */ }
 
 // Push our UI below Telegram's native header in fullscreen mode.
@@ -54,16 +67,17 @@ export function on(type, fn)       { bus.addEventListener(type, (e) => fn(e.deta
 // ── Router ───────────────────────────────────────────────────────────────────
 const routes = {
   '/':                    () => renderWelcome(navigate),
-  '/onboarding':          (_, q) => renderOnboarding(navigate, q?.reason),
   '/chats':               () => renderChats(navigate),
   '/chat/:id':            (p) => renderChat(navigate, p.id),
   '/chat/:id/settings':   (p) => renderSettings(navigate, p.id),
   '/chat/:id/profile':    (p) => renderProfile(navigate, p.id),
   '/add-chat':            () => renderAddChat(navigate),
   '/add-bot':             () => renderAddBot(navigate),
+  '/bot/:id':             (p) => renderBotSettings(navigate, p.id),
   // '/roles/new' must precede '/roles/:id' — the router matches in order.
   '/roles':               () => renderRoles(navigate),
   '/roles/new':           () => renderRoleEdit(navigate, null),
+  '/roles/:id/tools':     (p) => renderRoleTools(navigate, p.id),
   '/roles/:id':           (p) => renderRoleEdit(navigate, p.id),
   '/me':                  () => renderMe(navigate),
 };
@@ -99,18 +113,16 @@ async function route() {
   const found = matchRoute(hash);
   if (!found) { navigate('/chats'); return; }
 
-  // Guard: check connection status before any protected route
+  // Guard: if the API is unreachable, fall back to the splash so the user
+  // isn't left on a blank screen. Connection status no longer gates routing —
+  // the Telegram-setup onboarding screen has been removed.
   const protected_ = ['/chats', '/chat', '/add-chat', '/add-bot', '/chat/:id/settings', '/roles', '/me'];
   const needsAuth = protected_.some(p => hash.replace('#', '').startsWith(p.replace(':id', '')));
   if (needsAuth) {
     try {
-      const me = await api.me();
-      if (me.connection.status === 'revoked') { navigate('/onboarding?reason=revoked'); return; }
-      if (me.connection.status === 'not_found') { navigate('/onboarding'); return; }
+      await api.me();
     } catch (_) {
-      // If API is down, show welcome so the user knows the app is loading.
-      renderWelcome(navigate);
-      return;
+      navigate('/'); return;
     }
   }
 
@@ -118,6 +130,7 @@ async function route() {
   if (screen) {
     app.innerHTML = '';
     app.appendChild(screen);
+    brandify(screen); // swap emoji before first paint (observer covers async updates)
   }
 }
 
@@ -140,19 +153,32 @@ function connectSSE() {
   });
 }
 
+// ── Timezone auto-detection ──────────────────────────────────────────────────
+// The scheduler prompt (ai-python _current_time_instruction) needs the owner's
+// IANA timezone to compute fire_at correctly; without it reminders fall back
+// to UTC. Runs once per detected zone (cached in localStorage) and never blocks
+// boot — it's a best-effort background sync, not part of the critical path.
+async function syncTimezone() {
+  try {
+    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    if (!tz) return;
+    if (localStorage.getItem('tz_synced') === tz) return;
+    const s = await api.userSettings();
+    await api.saveUserSettings({ ...s, timezone: tz });
+    localStorage.setItem('tz_synced', tz);
+  } catch (_) {
+    // Background sync — never surface a failure to the user.
+  }
+}
+
 // ── Boot ─────────────────────────────────────────────────────────────────────
 async function boot() {
   if (!window.location.hash || window.location.hash === '#/') {
-    // Check auth before deciding where to land
+    // Land straight in the app; fall back to the splash if the API is down.
     try {
-      const me = await api.me();
-      if (me.connection.status === 'connected') {
-        navigate('/chats');
-      } else if (me.connection.status === 'revoked') {
-        navigate('/onboarding?reason=revoked');
-      } else {
-        navigate('/onboarding');
-      }
+      await api.me();
+      syncTimezone(); // fire-and-forget; must not delay navigation
+      navigate('/chats');
     } catch (_) {
       navigate('/');
     }

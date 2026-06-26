@@ -7,14 +7,17 @@ cd "$ROOT_DIR"
 POSTGRES_USER="${POSTGRES_USER:-doubleu}"
 POSTGRES_DB="${POSTGRES_DB:-doubleu}"
 
+SCHEMA_FILE="infra/migrations/100_clean_schema_v2.sql"
+SEED_FILE="infra/seed/001_contract_scenarios.sql"
+
 if ! docker info >/dev/null 2>&1; then
-  test -f infra/migrations/001_core_schema.sql
-  test -f infra/seed/001_contract_scenarios.sql
-  grep -q "CREATE TABLE IF NOT EXISTS tenants" infra/migrations/001_core_schema.sql
-  grep -q "CREATE TABLE IF NOT EXISTS audit_events" infra/migrations/001_core_schema.sql
-  grep -q "tenant_a" infra/seed/001_contract_scenarios.sql
-  grep -q "tenant_b" infra/seed/001_contract_scenarios.sql
-  grep -q "no_memory_chat" infra/seed/001_contract_scenarios.sql
+  test -f "$SCHEMA_FILE"
+  test -f "$SEED_FILE"
+  grep -q "CREATE TABLE IF NOT EXISTS public.tenants" "$SCHEMA_FILE"
+  grep -q "CREATE TABLE IF NOT EXISTS public.audit_events" "$SCHEMA_FILE"
+  grep -q "tenant_a" "$SEED_FILE"
+  grep -q "tenant_b" "$SEED_FILE"
+  grep -q "no_memory_chat" "$SEED_FILE"
   echo "Docker daemon unavailable; static migration and seed smoke checks passed."
   exit 0
 fi
@@ -28,8 +31,12 @@ for _ in {1..60}; do
   sleep 1
 done
 
-docker compose exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -v ON_ERROR_STOP=1 -f /migrations/001_core_schema.sql
-docker compose exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -v ON_ERROR_STOP=1 -f /seed/001_contract_scenarios.sql
+# Apply every up-migration in lexical order (skip the *.down.sql rollbacks).
+for migration in $(ls infra/migrations/*.sql | grep -v '\.down\.sql$' | sort); do
+  docker compose exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+    -v ON_ERROR_STOP=1 -f "/migrations/$(basename "$migration")"
+done
+docker compose exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -v ON_ERROR_STOP=1 -f "/seed/$(basename "$SEED_FILE")"
 
 docker compose exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -v ON_ERROR_STOP=1 <<'SQL'
 DO $$
@@ -59,12 +66,37 @@ BEGIN
 
   IF EXISTS (
     SELECT 1
-    FROM memory_facts
+    FROM semantic_facts
     WHERE tenant_id = 'tenant_a'
+      AND scope_kind = 'chat'
       AND chat_id = 'no_memory_chat'
   ) THEN
     RAISE EXCEPTION 'no_memory_chat must not have persisted memory facts';
   END IF;
+
+  INSERT INTO drafts (
+    draft_id,
+    tenant_id,
+    chat_id,
+    source_message_id,
+    source_message_text,
+    response_text,
+    draft_type
+  ) VALUES (
+    'smoke_warning_draft',
+    'tenant_a',
+    'semi_auto_chat',
+    'high_risk_message',
+    'Smoke warning draft',
+    '',
+    'warning'
+  )
+  ON CONFLICT (draft_id) DO UPDATE SET
+    draft_type = EXCLUDED.draft_type,
+    updated_at = now();
+
+  DELETE FROM drafts
+  WHERE draft_id = 'smoke_warning_draft';
 
   IF NOT EXISTS (
     SELECT 1

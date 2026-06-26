@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import time
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Any
 
@@ -19,16 +20,51 @@ from .safety.input import InputSafetyScanner
 from .safety.output import OutputSafetyScanner
 from .schemas import (
     parse_embed_texts_request,
+    parse_draft_role_request,
+    parse_extract_media_request,
     parse_intent_request,
     parse_memory_request,
     parse_process_message_request,
     parse_rerank_facts_request,
     parse_risk_request,
     parse_summary_request,
+    parse_synthesize_pattern_request,
     parse_topic_tagging_request,
     parse_typed_extraction_request,
 )
 from .service import AIService, build_service
+
+
+@dataclass(frozen=True)
+class ModelConfigResponse:
+    """Wire shape of the GET /ai/model-config response."""
+
+    fast: list[str]
+    balanced: list[str]
+    smart: list[str]
+    default: str
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return the model configuration in its JSON wire shape."""
+        return {
+            "fast": self.fast,
+            "balanced": self.balanced,
+            "smart": self.smart,
+            "default": self.default,
+        }
+
+
+def _build_model_config() -> ModelConfigResponse:
+    """Read MODEL_TIER_* and OPENROUTER_MODEL env vars and build the config response."""
+    def _split(val: str) -> list[str]:
+        return [m.strip() for m in val.split(",") if m.strip()]
+
+    return ModelConfigResponse(
+        fast=_split(os.getenv("MODEL_TIER_FAST", "")),
+        balanced=_split(os.getenv("MODEL_TIER_BALANCED", "")),
+        smart=_split(os.getenv("MODEL_TIER_SMART", "")),
+        default=os.getenv("OPENROUTER_MODEL", ""),
+    )
 
 
 class AIHTTPHandler(BaseHTTPRequestHandler):
@@ -39,12 +75,15 @@ class AIHTTPHandler(BaseHTTPRequestHandler):
     flags: FeatureFlags = FeatureFlags()
 
     def do_GET(self) -> None:
-        """Handle liveness and readiness requests."""
+        """Handle liveness, readiness, and config requests."""
         if self.path == "/health":
             self._write_json(200, self.service.health())
             return
         if self.path == "/ready":
             self._write_json(200, self.service.ready(self.mock_llm))
+            return
+        if self.path == "/ai/model-config":
+            self._write_json(200, _build_model_config().to_dict())
             return
         self._write_json(404, {"error": "not_found"})
 
@@ -57,9 +96,12 @@ class AIHTTPHandler(BaseHTTPRequestHandler):
             "/ai/extract-memory": self._extract_memory,
             "/ai/extract-facts-typed": self._extract_facts_typed,
             "/ai/embed-texts": self._embed_texts,
+            "/ai/extract-media": self._extract_media,
+            "/ai/draft-role": self._draft_role,
             "/ai/summarize-chat": self._summarize_chat,
             "/ai/tag-topic": self._tag_topic,
             "/ai/rerank-facts": self._rerank_facts,
+            "/ai/synthesize-pattern": self._synthesize_pattern,
         }
         route = routes.get(self.path)
         if route is None:
@@ -112,6 +154,12 @@ class AIHTTPHandler(BaseHTTPRequestHandler):
     def _embed_texts(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self.service.embed_texts(parse_embed_texts_request(payload)).to_dict()
 
+    def _extract_media(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self.service.extract_media(parse_extract_media_request(payload)).to_dict()
+
+    def _draft_role(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self.service.draft_role(parse_draft_role_request(payload)).to_dict()
+
     def _summarize_chat(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self.service.summarize_chat(parse_summary_request(payload)).to_dict()
 
@@ -120,6 +168,9 @@ class AIHTTPHandler(BaseHTTPRequestHandler):
 
     def _rerank_facts(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self.service.rerank_facts(parse_rerank_facts_request(payload)).to_dict()
+
+    def _synthesize_pattern(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self.service.synthesize_pattern(parse_synthesize_pattern_request(payload)).to_dict()
 
     # _PURPOSE_BY_PATH maps each endpoint to the LLMPurpose tag the safety /
     # observability layers will see in the call context.
@@ -130,9 +181,12 @@ class AIHTTPHandler(BaseHTTPRequestHandler):
         "/ai/extract-memory": LLMPurpose.EXTRACT,
         "/ai/extract-facts-typed": LLMPurpose.EXTRACT,
         "/ai/embed-texts": LLMPurpose.EMBED,
+        "/ai/extract-media": LLMPurpose.EXTRACT,
+        "/ai/draft-role": LLMPurpose.DRAFT,
         "/ai/summarize-chat": LLMPurpose.SUMMARIZE,
         "/ai/tag-topic": LLMPurpose.EXTRACT,
         "/ai/rerank-facts": LLMPurpose.EXTRACT,
+        "/ai/synthesize-pattern": LLMPurpose.EXTRACT,
     }
 
     def _build_call_context(self, payload: dict[str, Any]) -> tuple[str, LLMCallContext]:
@@ -203,7 +257,12 @@ def create_service_from_env() -> tuple[AIService, bool, FeatureFlags]:
     # Imported lazily so importing the HTTP module never hard-requires pydantic-ai.
     from .agents import build_runtime
 
-    agents = build_runtime(input_safety=input_safety, output_safety=output_safety, sink=sink)
+    agents = build_runtime(
+        input_safety=input_safety,
+        output_safety=output_safety,
+        sink=sink,
+        two_stage_draft=flags.two_stage_draft,
+    )
     return build_service(agents), mock_llm, flags
 
 
@@ -274,11 +333,22 @@ def _extract_context(path: str, payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _request_summary(path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    # Elide raw media bytes from the request preview: base64 blobs are large and
+    # are private user content, not useful in logs.
+    preview = payload
+    if path == "/ai/draft-role" and "text" in preview:
+        preview = {**preview, "text": f"<{len(str(payload.get('text', '')))} chars>"}
+    for field_name in ("data_base64", "audio_base64"):
+        if field_name in preview:
+            preview = {
+                **preview,
+                field_name: f"<{len(str(payload.get(field_name, '')))} b64 chars>",
+            }
     return {
         "path": path,
         "request_id": payload.get("request_id", ""),
         **_extract_context(path, payload),
-        "request_body_preview": _truncate(json.dumps(payload, ensure_ascii=False), 2000),
+        "request_body_preview": _truncate(json.dumps(preview, ensure_ascii=False), 2000),
     }
 
 
@@ -301,7 +371,11 @@ def _response_summary(path: str, payload: dict[str, Any], response: dict[str, An
         "usage_output_tokens": usage.get("output_tokens", 0),
         "memory_used_count": len(response.get("memory_used", []) or []),
         "latency_ms": round(latency_ms, 1),
-        "response_body_preview": _truncate(json.dumps(response, ensure_ascii=False), 2000),
+        "response_body_preview": (
+            "<role draft omitted>"
+            if path == "/ai/draft-role"
+            else _truncate(json.dumps(response, ensure_ascii=False), 2000)
+        ),
     }
 
 

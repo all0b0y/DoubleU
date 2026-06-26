@@ -6,13 +6,29 @@ function esc(str) {
   return String(str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
+function nullableBoolMode(value) {
+  if (value === true) return 'on';
+  if (value === false) return 'off';
+  return 'inherit';
+}
+
+function modeToNullableBool(mode) {
+  if (mode === 'on') return true;
+  if (mode === 'off') return false;
+  return null;
+}
+
 /**
  * Create (roleId == null) or edit a role. The five labeled fields map 1:1 to
  * the ai_roles columns — a guided replacement for the old pipe-syntax command.
  */
 export function renderRoleEdit(navigate, roleId) {
   const isNew = roleId === null;
-  let role = { name: '', description: '', speaking_style: '', goals: '', constraints: '', context: '', custom_fields: [] };
+  let role = {
+    name: '', description: '', speaking_style: '', goals: '', constraints: '',
+    context: '', custom_fields: [], rich_formatting_enabled: null, streaming_enabled: null,
+    speak_as_owner: true, model_tier: 'balanced', model_name: '',
+  };
   // Owner-defined extra fields (title + why + optional context), edited live.
   let customFields = [];
 
@@ -23,6 +39,15 @@ export function renderRoleEdit(navigate, roleId) {
       try { role = { ...role, ...JSON.parse(raw) }; } catch (_) { /* ignore */ }
       sessionStorage.removeItem('role_template');
     }
+  }
+
+  let modelsConfig = null;
+
+  async function fetchModelsConfig() {
+    try {
+      const resp = await fetch('/api/v1/config/models');
+      if (resp.ok) modelsConfig = await resp.json();
+    } catch (_) { /* fallback: static tier labels */ }
   }
 
   const el = document.createElement('div');
@@ -39,7 +64,8 @@ export function renderRoleEdit(navigate, roleId) {
     <div class="scroll" id="re-scroll">
       <div class="loading-row"><div class="spinner"></div></div>
     </div>
-    <div style="padding:12px 16px calc(12px + var(--inset-bottom,0px));flex-shrink:0;">
+    <div style="padding:12px 16px calc(12px + var(--inset-bottom,0px));flex-shrink:0;display:flex;gap:8px;">
+      <button id="btn-tools" class="btn btn-secondary">Инструменты</button>
       <button id="btn-save" class="btn btn-primary">${isNew ? 'Создать роль' : 'Сохранить'}</button>
     </div>
   `;
@@ -49,6 +75,10 @@ export function renderRoleEdit(navigate, roleId) {
   twa?.BackButton?.onClick(handleBack);
   const obs = new MutationObserver(() => {
     if (!document.body.contains(el)) {
+      screenDisposed = true;
+      if (recordingTimeout) clearTimeout(recordingTimeout);
+      if (mediaRecorder?.state === 'recording') mediaRecorder.stop();
+      audioStream?.getTracks().forEach(track => track.stop());
       twa?.BackButton?.offClick(handleBack);
       obs.disconnect();
     }
@@ -64,6 +94,100 @@ export function renderRoleEdit(navigate, roleId) {
         <div class="field-label">${label}${required ? ' *' : ''}</div>
         ${input}
         <div style="font-size:11px;color:var(--muted);line-height:1.4;">${hint}</div>
+      </div>`;
+  }
+
+  function deliverySelectHTML(id, label, hint, value) {
+    const mode = nullableBoolMode(value);
+    return `
+      <div class="field-group">
+        <div class="field-label">${label}</div>
+        <select class="field-select" id="${id}">
+          <option value="inherit" ${mode === 'inherit' ? 'selected' : ''}>наследовать</option>
+          <option value="on" ${mode === 'on' ? 'selected' : ''}>включено</option>
+          <option value="off" ${mode === 'off' ? 'selected' : ''}>выключено</option>
+        </select>
+        <div style="font-size:11px;color:var(--muted);line-height:1.4;margin-top:6px;">${hint}</div>
+      </div>`;
+  }
+
+  // speak_as_owner toggle: ON = "личный чат" (AI replies as the owner, an
+  // invisible human stand-in); OFF = "как бот" (AI replies openly as the role
+  // persona). Mirrors AIRole.speak_as_owner on the backend.
+  function speakAsSection() {
+    const asOwner = role.speak_as_owner !== false; // default ON
+    return `
+      <div class="st-section">
+        <p class="st-section-label">от чьего лица отвечать</p>
+        <div class="st-card">
+          <div class="st-row" style="cursor:default;">
+            <span class="st-row-icon">🎭</span>
+            <div class="st-row-body">
+              <p class="st-row-title">Личный чат — от вашего лица</p>
+              <p class="st-row-desc">Вкл: ИИ пишет как вы, собеседник думает, что общается с вами. Выкл: ИИ отвечает открыто как бот-ассистент в этой роли.</p>
+            </div>
+            <label class="toggle">
+              <input type="checkbox" id="f-speak-as-owner" ${asOwner ? 'checked' : ''}>
+              <div class="toggle-track"></div>
+              <div class="toggle-knob"></div>
+            </label>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  function deliverySettingsHTML() {
+    return `
+      <div class="st-section">
+        <p class="st-section-label">формат ответов</p>
+        <div class="st-card" style="padding:14px;display:flex;flex-direction:column;gap:14px;">
+          ${deliverySelectHTML('f-rich-formatting', 'rich-форматирование', 'таблицы, списки и код в ответах этой роли', role.rich_formatting_enabled)}
+          ${deliverySelectHTML('f-streaming', 'потоковый AI-режим', 'псевдо-стриминг готового безопасного ответа', role.streaming_enabled)}
+        </div>
+      </div>`;
+  }
+
+  function modelTierSettingsHTML() {
+    const tier = ['fast', 'balanced', 'smart'].includes(role.model_tier)
+      ? role.model_tier
+      : 'balanced';
+    const mc = modelsConfig;
+    const tierModels = Array.isArray(mc?.[tier]) ? mc[tier] : [];
+    const selectedModel = role.model_name || '';
+    const fastLabel    = mc?.fast?.[0]     ? `Быстрая — ${mc.fast[0]}`                       : 'Быстрая — экономно';
+    const balancedLabel = mc?.balanced?.[0] ? `Баланс — ${mc.balanced[0]} (по умолчанию)`    : 'Баланс — по умолчанию';
+    const smartLabel   = mc?.smart?.[0]    ? `Умная — ${mc.smart[0]}`                        : 'Умная — максимум качества';
+    const staleModelOption = selectedModel && !tierModels.includes(selectedModel)
+      ? `<option value="${esc(selectedModel)}" selected>${esc(selectedModel)} (недоступна)</option>`
+      : '';
+    const modelSelect = mc ? `
+          <div class="field-group">
+            <div class="field-label">конкретная модель</div>
+            <select class="field-select" id="f-model-name">
+              <option value="" ${selectedModel ? '' : 'selected'}>Авто (по умолчанию)</option>
+              ${tierModels.map(model => `
+                <option value="${esc(model)}" ${selectedModel === model ? 'selected' : ''}>${esc(model)}</option>
+              `).join('')}
+              ${staleModelOption}
+            </select>
+          </div>` : '';
+    return `
+      <div class="st-section">
+        <p class="st-section-label">модель ответов</p>
+        <div class="st-card" style="padding:14px;display:flex;flex-direction:column;gap:14px;">
+          <div class="field-group">
+            <div class="field-label">уровень модели</div>
+            <select class="field-select" id="f-model-tier">
+              <option value="fast" ${tier === 'fast' ? 'selected' : ''}>${esc(fastLabel)}</option>
+              <option value="balanced" ${tier === 'balanced' ? 'selected' : ''}>${esc(balancedLabel)}</option>
+              <option value="smart" ${tier === 'smart' ? 'selected' : ''}>${esc(smartLabel)}</option>
+            </select>
+            <div style="font-size:11px;color:var(--muted);line-height:1.4;margin-top:6px;">
+              Конкретные модели и их резервный порядок задаются на сервере через MODEL_TIER_FAST, MODEL_TIER_BALANCED и MODEL_TIER_SMART.
+            </div>
+          </div>
+          ${modelSelect}
+        </div>
       </div>`;
   }
 
@@ -107,6 +231,31 @@ export function renderRoleEdit(navigate, roleId) {
       </div>`;
   }
 
+  function roleDraftToolsHTML() {
+    if (!isNew) return '';
+    return `
+      <div class="st-section">
+        <p class="st-section-label">создать роль с AI</p>
+        <div class="st-card" style="padding:14px;display:flex;flex-direction:column;gap:10px;">
+          <textarea class="field-input field-textarea" id="role-draft-text" style="min-height:96px;"
+            placeholder="Опиши роль свободно: кто она, как говорит, чего должна добиваться и чего делать нельзя."></textarea>
+          <button type="button" class="btn btn-secondary" id="btn-draft-text">
+            ✍️ Сгенерировать из текста
+          </button>
+          <button type="button" class="btn btn-secondary" id="btn-draft-voice">
+            🎙 Описать голосом
+          </button>
+          <div id="role-draft-status" style="min-height:16px;font-size:11px;color:var(--muted);line-height:1.4;"></div>
+        </div>
+      </div>`;
+  }
+
+  let mediaRecorder = null;
+  let audioStream = null;
+  let audioChunks = [];
+  let recordingTimeout = null;
+  let screenDisposed = false;
+
   // Read the live input values back into customFields so add/remove/save never
   // lose what the user has typed.
   function collectCustomFields() {
@@ -149,6 +298,7 @@ export function renderRoleEdit(navigate, roleId) {
 
     el.querySelector('#re-scroll').innerHTML = `
       <div class="st-content">
+        ${roleDraftToolsHTML()}
         <div class="st-section" style="display:flex;flex-direction:column;gap:16px;">
           ${fieldHTML('f-name', 'имя роли', 'Короткое название — как ты будешь её узнавать.', role.name,
             { required: true, placeholder: 'Менеджер, Техподдержка…' })}
@@ -161,6 +311,10 @@ export function renderRoleEdit(navigate, roleId) {
           ${fieldHTML('f-constraints', 'ограничения', 'Что роли нельзя делать или обсуждать. Необязательно.', role.constraints,
             { textarea: true, placeholder: 'Не обещать скидки, не обсуждать конкурентов…' })}
         </div>
+
+        ${speakAsSection()}
+        ${modelTierSettingsHTML()}
+        ${deliverySettingsHTML()}
 
         <div class="st-section">
           <p class="st-section-label">материалы роли (контекст)</p>
@@ -203,6 +357,36 @@ export function renderRoleEdit(navigate, roleId) {
   function wireForm() {
     updateContextCounter();
     el.querySelector('#f-context')?.addEventListener('input', updateContextCounter);
+    el.querySelector('#f-model-tier')?.addEventListener('change', event => {
+      role = {
+        ...role,
+        ...collectRoleData(),
+        model_tier: event.target.value || 'balanced',
+        model_name: '',
+      };
+      renderForm();
+    });
+    el.querySelector('#f-model-name')?.addEventListener('change', event => {
+      role.model_name = event.target.value || '';
+    });
+
+    el.querySelector('#btn-draft-text')?.addEventListener('click', async () => {
+      const text = el.querySelector('#role-draft-text')?.value.trim() || '';
+      if (!text) {
+        twa?.HapticFeedback?.notificationOccurred('error');
+        twa?.showAlert('Сначала опиши роль текстом.');
+        return;
+      }
+      await generateRoleDraft({ text });
+    });
+
+    el.querySelector('#btn-draft-voice')?.addEventListener('click', async () => {
+      if (mediaRecorder?.state === 'recording') {
+        mediaRecorder.stop();
+        return;
+      }
+      await startRoleRecording();
+    });
 
     // File attach: read text files in-browser and append their content to the
     // context. No upload endpoint — the text rides along in the role's context
@@ -260,13 +444,130 @@ export function renderRoleEdit(navigate, roleId) {
     });
   }
 
-  el.querySelector('#btn-save').addEventListener('click', async () => {
+  function setDraftBusy(busy, status = '') {
+    const textBtn = el.querySelector('#btn-draft-text');
+    const voiceBtn = el.querySelector('#btn-draft-voice');
+    if (textBtn) textBtn.disabled = busy;
+    if (voiceBtn) voiceBtn.disabled = busy;
+    const statusEl = el.querySelector('#role-draft-status');
+    if (statusEl) statusEl.textContent = status;
+  }
+
+  function applyRoleDraft(draft) {
+    role = {
+      ...role,
+      name: draft.name || '',
+      description: draft.description || '',
+      speaking_style: draft.speaking_style || '',
+      goals: draft.goals || '',
+      constraints: draft.constraints || '',
+      custom_fields: draft.custom_fields || [],
+    };
+    const fields = [
+      ['#f-name', role.name],
+      ['#f-desc', role.description],
+      ['#f-style', role.speaking_style],
+      ['#f-goals', role.goals],
+      ['#f-constraints', role.constraints],
+    ];
+    fields.forEach(([selector, value]) => {
+      const input = el.querySelector(selector);
+      if (input) input.value = value;
+    });
+    customFields = role.custom_fields.map(field => ({
+      title: field.title || '',
+      description: field.description || '',
+      context: field.context || '',
+    }));
+    renderCustomFieldRows();
+    el.querySelector('#f-name')?.focus();
+  }
+
+  async function generateRoleDraft(payload) {
+    setDraftBusy(true, 'AI собирает черновик роли…');
+    try {
+      const draft = await api.draftRole(payload);
+      applyRoleDraft(draft);
+      twa?.HapticFeedback?.notificationOccurred('success');
+      setDraftBusy(false, 'Черновик готов — проверь поля и сохрани роль.');
+    } catch (err) {
+      twa?.HapticFeedback?.notificationOccurred('error');
+      setDraftBusy(false, 'Не удалось создать черновик.');
+      twa?.showAlert(`Ошибка: ${err.message}`);
+    }
+  }
+
+  async function startRoleRecording() {
+    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
+      twa?.showAlert('Запись голоса не поддерживается в этом браузере.');
+      return;
+    }
+    try {
+      audioStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const preferred = 'audio/webm;codecs=opus';
+      const options = MediaRecorder.isTypeSupported?.(preferred) ? { mimeType: preferred } : {};
+      mediaRecorder = new MediaRecorder(audioStream, options);
+      audioChunks = [];
+      mediaRecorder.addEventListener('dataavailable', event => {
+        if (event.data.size) audioChunks.push(event.data);
+      });
+      mediaRecorder.addEventListener('stop', async () => {
+        if (recordingTimeout) clearTimeout(recordingTimeout);
+        recordingTimeout = null;
+        audioStream?.getTracks().forEach(track => track.stop());
+        const mimeType = mediaRecorder.mimeType || audioChunks[0]?.type || 'audio/webm';
+        const blob = new Blob(audioChunks, { type: mimeType });
+        mediaRecorder = null;
+        audioStream = null;
+        audioChunks = [];
+        if (screenDisposed || !blob.size) return;
+        const voiceBtn = el.querySelector('#btn-draft-voice');
+        if (voiceBtn) voiceBtn.textContent = '🎙 Описать голосом';
+        setDraftBusy(true, 'Обрабатываю запись…');
+        try {
+          const audioBase64 = await blobToBase64(blob);
+          await generateRoleDraft({ audio_base64: audioBase64, mime_type: mimeType });
+        } catch (err) {
+          setDraftBusy(false, 'Не удалось обработать запись.');
+          twa?.HapticFeedback?.notificationOccurred('error');
+          twa?.showAlert(err.message);
+        }
+      });
+      mediaRecorder.start();
+      const voiceBtn = el.querySelector('#btn-draft-voice');
+      if (voiceBtn) voiceBtn.textContent = '⏹ Завершить запись';
+      const textBtn = el.querySelector('#btn-draft-text');
+      if (textBtn) textBtn.disabled = true;
+      const status = el.querySelector('#role-draft-status');
+      if (status) status.textContent = 'Идёт запись — нажми ещё раз, чтобы завершить.';
+      recordingTimeout = setTimeout(() => {
+        if (mediaRecorder?.state === 'recording') mediaRecorder.stop();
+      }, 60000);
+    } catch (err) {
+      audioStream?.getTracks().forEach(track => track.stop());
+      audioStream = null;
+      twa?.HapticFeedback?.notificationOccurred('error');
+      twa?.showAlert(`Не удалось начать запись: ${err.message}`);
+    }
+  }
+
+  function blobToBase64(blob) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result).split(',', 2)[1] || '');
+      reader.onerror = () => reject(new Error('Не удалось прочитать аудиозапись.'));
+      reader.readAsDataURL(blob);
+    });
+  }
+
+  function collectRoleData() {
     collectCustomFields();
+    const modelNameSelect = el.querySelector('#f-model-name');
     // Keep only fields the user actually filled, and require title + why on each.
     const cleaned = customFields
       .map(f => ({ title: f.title.trim(), description: f.description.trim(), context: f.context.trim() }))
       .filter(f => f.title || f.description || f.context);
-    const data = {
+    return {
       name:           el.querySelector('#f-name')?.value.trim() || '',
       description:    el.querySelector('#f-desc')?.value.trim() || '',
       speaking_style: el.querySelector('#f-style')?.value.trim() || '',
@@ -274,42 +575,77 @@ export function renderRoleEdit(navigate, roleId) {
       constraints:    el.querySelector('#f-constraints')?.value.trim() || '',
       context:        el.querySelector('#f-context')?.value.trim() || '',
       custom_fields:  cleaned,
+      rich_formatting_enabled: modeToNullableBool(el.querySelector('#f-rich-formatting')?.value),
+      streaming_enabled:       modeToNullableBool(el.querySelector('#f-streaming')?.value),
+      speak_as_owner:  el.querySelector('#f-speak-as-owner')?.checked ?? true,
+      model_tier:      el.querySelector('#f-model-tier')?.value || 'balanced',
+      model_name:      modelNameSelect ? modelNameSelect.value : (role.model_name || ''),
     };
+  }
+
+  function validateRoleData(data, openingTools) {
+    const badField = data.custom_fields.find(f => !f.title || !f.description);
+    if (openingTools && (!data.name || !data.description || badField)) {
+      twa?.HapticFeedback?.notificationOccurred('error');
+      twa?.showAlert('сначала заполните имя и описание и сохраните роль');
+      return false;
+    }
     if (!data.name) {
       twa?.HapticFeedback?.notificationOccurred('error');
       twa?.showAlert('Укажи имя роли.');
-      return;
+      return false;
     }
     if (!data.description) {
       twa?.HapticFeedback?.notificationOccurred('error');
       twa?.showAlert('Опиши, кто эта роль — это главный материал для ИИ.');
-      return;
+      return false;
     }
-    const badField = cleaned.find(f => !f.title || !f.description);
     if (badField) {
       twa?.HapticFeedback?.notificationOccurred('error');
       twa?.showAlert('У каждого доп. поля должны быть заголовок и описание (зачем оно).');
-      return;
+      return false;
     }
-    const btn = el.querySelector('#btn-save');
-    btn.textContent = '…'; btn.disabled = true;
+    return true;
+  }
+
+  async function saveRole(openingTools) {
+    const data = collectRoleData();
+    if (!validateRoleData(data, openingTools)) return;
+    const saveBtn = el.querySelector('#btn-save');
+    const toolsBtn = el.querySelector('#btn-tools');
+    const activeBtn = openingTools ? toolsBtn : saveBtn;
+    activeBtn.textContent = '…';
+    saveBtn.disabled = true;
+    toolsBtn.disabled = true;
     try {
+      let saved;
       if (isNew) {
-        const created = await api.createRole(data);
-        twa?.HapticFeedback?.notificationOccurred('success');
-        // Land on the edit screen so the user can keep refining the role.
-        navigate(`/roles/${created.id}`);
+        saved = await api.createRole(data);
       } else {
-        await api.updateRole(roleId, data);
-        twa?.HapticFeedback?.notificationOccurred('success');
-        navigate('/roles');
+        saved = await api.updateRole(roleId, data);
       }
+      twa?.HapticFeedback?.notificationOccurred('success');
+      navigate(openingTools ? `/roles/${saved.id || roleId}/tools` : '/roles');
     } catch (err) {
       twa?.HapticFeedback?.notificationOccurred('error');
       twa?.showAlert(`Ошибка: ${err.message}`);
-      btn.textContent = isNew ? 'Создать роль' : 'Сохранить';
-      btn.disabled = false;
+      saveBtn.textContent = isNew ? 'Создать роль' : 'Сохранить';
+      toolsBtn.textContent = 'Инструменты';
+      saveBtn.disabled = false;
+      toolsBtn.disabled = false;
     }
+  }
+
+  el.querySelector('#btn-save').addEventListener('click', async () => {
+    await saveRole(false);
+  });
+
+  el.querySelector('#btn-tools').addEventListener('click', async () => {
+    if (isNew) {
+      await saveRole(true);
+      return;
+    }
+    navigate(`/roles/${roleId}/tools`);
   });
 
   async function load() {
@@ -318,11 +654,13 @@ export function renderRoleEdit(navigate, roleId) {
       customFields = (role.custom_fields || []).map(f => ({
         title: f.title || '', description: f.description || '', context: f.context || '',
       }));
+      await fetchModelsConfig();
       renderForm();
       return;
     }
     try {
-      const rolesData = await api.roles();
+      // Fetch role data and model config in parallel; config failure is silent.
+      const [rolesData] = await Promise.all([api.roles(), fetchModelsConfig()]);
       const found = (rolesData.roles || []).find(r => String(r.id) === String(roleId));
       if (!found) {
         navigate('/roles');

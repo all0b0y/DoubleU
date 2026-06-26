@@ -10,11 +10,17 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/time/rate"
+
 	"doubleu/backend-go/internal/aiclient"
 	"doubleu/backend-go/internal/contracts"
 	"doubleu/backend-go/internal/store"
 	"doubleu/backend-go/internal/telegram"
 )
+
+func testBoolPtr(value bool) *bool {
+	return &value
+}
 
 func TestDecisionEngineContractCombinations(t *testing.T) {
 	engine := NewDecisionEngine()
@@ -72,8 +78,11 @@ func TestDecisionEngineContractCombinations(t *testing.T) {
 						if privacy.Contains(contracts.PrivacyPrivate) {
 							t.Fatalf("auto_reply allowed for private chat")
 						}
-						if proposed != contracts.DecisionAutoReply {
-							t.Fatalf("auto_reply allowed without AI auto proposal")
+						// SEMI_AUTO still defers to the AI's auto-reply request; AUTO
+						// does not — the owner accepted unsupervised replies, so a
+						// low-risk message auto-sends regardless of the AI proposal.
+						if mode == contracts.ChatModeSemiAuto && proposed != contracts.DecisionAutoReply {
+							t.Fatalf("semi-auto auto_reply allowed without AI auto proposal")
 						}
 					}
 					if risk == contracts.RiskCritical && proposed != contracts.DecisionIgnore && proposed != contracts.DecisionErrorFallback && mode != contracts.ChatModeDisabled && mode != contracts.ChatModeSilent {
@@ -121,12 +130,91 @@ func TestHandleTelegramWebhookAutoReplyAndDuplicateAudit(t *testing.T) {
 	if sender.calls != 1 {
 		t.Fatalf("sender calls = %d", sender.calls)
 	}
+	if sender.richCalls != 0 {
+		t.Fatalf("rich sender calls = %d, want 0", sender.richCalls)
+	}
+	if len(sender.sent) != 1 || sender.sent[0].ParseMode != "" {
+		t.Fatalf("plain auto reply must not set parse_mode, sent = %+v", sender.sent)
+	}
 	audits := repository.Audits()
 	if len(audits) != 2 {
 		t.Fatalf("audit count = %d", len(audits))
 	}
 	if audits[1].Reason != "duplicate_receive" {
 		t.Fatalf("duplicate audit reason = %s", audits[1].Reason)
+	}
+}
+
+func TestHandleTelegramWebhookPersistsAIScheduledJobsIdempotently(t *testing.T) {
+	repository := store.NewRepository()
+	repository.SaveChatSettings(contracts.ChatSettings{TenantID: "tenant-1", ChatID: "42", Mode: contracts.ChatModeAuto})
+	repository.SaveChat(store.ChatRecord{TenantID: "tenant-1", ChatID: "42"})
+	fireAt := time.Unix(1700000000, 0).UTC().Add(10 * time.Minute)
+	ai := &fakeAI{response: contracts.AIProcessMessageResponse{
+		Decision:     contracts.DecisionAutoReply,
+		ResponseText: "Напоминание поставлено",
+		Confidence:   0.99,
+		RiskLevel:    contracts.RiskLow,
+		ScheduledJobs: []contracts.ScheduledJob{{
+			Kind: "reminder", Target: "owner", FireAt: fireAt,
+			Payload:   map[string]any{"text": " Позвонить клиенту "},
+			CreatedBy: "ai", IdempotencyKey: "scheduler:same-request",
+		}},
+	}}
+	sender := &fakeSender{}
+	service := newTestService(repository, ai, sender)
+
+	first, err := service.HandleTelegramWebhook(context.Background(), telegramPayload(1101, "bc-1", 42, 7, "напомни"), "tenant-1")
+	if err != nil || first.Decision != contracts.DecisionAutoReply {
+		t.Fatalf("first webhook: result=%+v err=%v", first, err)
+	}
+	second, err := service.HandleTelegramWebhook(context.Background(), telegramPayload(1102, "bc-1", 42, 8, "напомни"), "tenant-1")
+	if err != nil || second.Decision != contracts.DecisionAutoReply {
+		t.Fatalf("second webhook: result=%+v err=%v", second, err)
+	}
+
+	jobs := repository.ListJobs("tenant-1", "42")
+	if len(jobs) != 1 {
+		t.Fatalf("scheduled jobs = %+v", jobs)
+	}
+	job := jobs[0]
+	if job.Status != "pending" || job.CreatedBy != "ai" || job.Kind != "reminder" ||
+		job.Target != "owner" || !job.FireAt.Equal(fireAt) ||
+		job.IdempotencyKey != "scheduler:same-request" ||
+		job.Payload["text"] != "Позвонить клиенту" {
+		t.Fatalf("scheduled job = %+v", job)
+	}
+}
+
+func TestInteractionButtonsNeverSendOnBusinessTransport(t *testing.T) {
+	repository := store.NewRepository()
+	repository.SaveChatSettings(contracts.ChatSettings{
+		TenantID: "tenant-1", ChatID: "42", Mode: contracts.ChatModeAuto,
+	})
+	repository.SaveChat(store.ChatRecord{
+		TenantID: "tenant-1", ChatID: "42", Transport: contracts.TransportBusiness,
+	})
+	role := repository.SaveAIRole(store.AIRoleRecord{
+		TenantID: "tenant-1", Name: "Interactive",
+		ToolSettings: map[string]bool{"interaction.present_buttons": true},
+	})
+	repository.AssignAIRoleToChat("tenant-1", "42", role.ID)
+	ai := &fakeAI{response: contracts.AIProcessMessageResponse{
+		Decision: contracts.DecisionAutoReply, ResponseText: "Выберите вариант",
+		Confidence: 0.99, RiskLevel: contracts.RiskLow, Intent: "choice_question",
+		ResponsePlan: &contracts.ResponsePlan{Shape: "buttons", Options: []string{"Один", "Два"}},
+	}}
+	sender := &fakeSender{}
+	service := newTestService(repository, ai, sender)
+
+	result, err := service.HandleTelegramWebhook(
+		context.Background(), telegramPayload(1002, "bc-1", 42, 8, "вопрос"), "tenant-1",
+	)
+	if err != nil || result.Decision != contracts.DecisionAutoReply {
+		t.Fatalf("business interaction fallback: %+v err=%v", result, err)
+	}
+	if len(sender.sent) != 1 || sender.sent[0].ReplyMarkup != nil {
+		t.Fatalf("business transport must send plain text without buttons: %+v", sender.sent)
 	}
 }
 
@@ -142,6 +230,8 @@ func TestHandleTelegramWebhookSendsAssignedAIRole(t *testing.T) {
 		Name:        "Техподдержка",
 		Description: "Вежливый сотрудник поддержки, отвечает от лица владельца",
 		Constraints: "не обещать возвраты",
+		ModelTier:   "smart",
+		ModelName:   "deepseek/model-b",
 	})
 	repository.AssignAIRoleToChat("tenant-1", "42", role.ID)
 	ai := &fakeAI{response: contracts.AIProcessMessageResponse{
@@ -156,7 +246,8 @@ func TestHandleTelegramWebhookSendsAssignedAIRole(t *testing.T) {
 		t.Fatalf("webhook: %v", err)
 	}
 	got := ai.lastRequest.AIRole
-	if got == nil || got.Name != "Техподдержка" || got.Constraints != "не обещать возвраты" {
+	if got == nil || got.Name != "Техподдержка" || got.Constraints != "не обещать возвраты" ||
+		got.ModelTier != "smart" || got.ModelName != "deepseek/model-b" {
 		t.Fatalf("ai_role in request = %+v", got)
 	}
 
@@ -167,6 +258,499 @@ func TestHandleTelegramWebhookSendsAssignedAIRole(t *testing.T) {
 	}
 	if ai.lastRequest.AIRole != nil {
 		t.Fatalf("expected no ai_role after clear, got %+v", ai.lastRequest.AIRole)
+	}
+}
+
+func TestDeliverySettingsResolveDefaultOwnerRoleBotScopes(t *testing.T) {
+	repository := store.NewRepository()
+	service := newTestService(repository, &fakeAI{}, &fakeSender{})
+
+	defaults := service.deliverySettingsFor(contracts.NormalizedTelegramEvent{TenantID: "tenant-1", ChatID: "42"})
+	if !defaults.RichFormattingEnabled || defaults.StreamingEnabled {
+		t.Fatalf("default delivery settings = %+v", defaults)
+	}
+
+	repository.SaveUserSettings(contracts.UserSettings{
+		TenantID:               "tenant-1",
+		RichFormattingEnabled:  true,
+		StreamingEnabled:       true,
+		DefaultModeForNewChats: "manual",
+		LearningEnabled:        true,
+		LanguageForDrafts:      "auto",
+	})
+	role := repository.SaveAIRole(store.AIRoleRecord{
+		TenantID:              "tenant-1",
+		Name:                  "Техподдержка",
+		Description:           "d",
+		RichFormattingEnabled: testBoolPtr(false),
+		StreamingEnabled:      testBoolPtr(false),
+	})
+	repository.AssignAIRoleToChat("tenant-1", "42", role.ID)
+
+	roleScoped := service.deliverySettingsFor(contracts.NormalizedTelegramEvent{TenantID: "tenant-1", ChatID: "42"})
+	if roleScoped.RichFormattingEnabled || roleScoped.StreamingEnabled {
+		t.Fatalf("role-scoped delivery settings = %+v", roleScoped)
+	}
+
+	botChatID := contracts.BotChatID("555", "42")
+	repository.SaveUserBot(store.UserBotRecord{
+		TenantID:              "tenant-1",
+		BotID:                 555,
+		BotUsername:           "helper",
+		Token:                 "secret",
+		AIRoleID:              role.ID,
+		RichFormattingEnabled: testBoolPtr(true),
+		StreamingEnabled:      testBoolPtr(true),
+	})
+	repository.SaveChat(store.ChatRecord{TenantID: "tenant-1", ChatID: botChatID, Transport: contracts.TransportBot})
+
+	botScoped := service.deliverySettingsFor(contracts.NormalizedTelegramEvent{
+		TenantID: "tenant-1",
+		ChatID:   botChatID,
+		BotID:    "555",
+	})
+	if !botScoped.RichFormattingEnabled || !botScoped.StreamingEnabled {
+		t.Fatalf("bot-scoped delivery settings = %+v", botScoped)
+	}
+}
+
+func TestHandleTelegramWebhookRichAutoReplyUsesRichSend(t *testing.T) {
+	repository := store.NewRepository()
+	repository.SaveChatSettings(contracts.ChatSettings{TenantID: "tenant-1", ChatID: "42", Mode: contracts.ChatModeAuto})
+	repository.SaveChat(store.ChatRecord{TenantID: "tenant-1", ChatID: "42"})
+	ai := &fakeAI{response: contracts.AIProcessMessageResponse{
+		Decision:     contracts.DecisionAutoReply,
+		ResponseText: "# План\n\n- A\n- B",
+		TextFormat:   contracts.TextFormatRich,
+		Confidence:   0.99,
+		RiskLevel:    contracts.RiskLow,
+	}}
+	sender := &fakeSender{}
+	service := newTestService(repository, ai, sender)
+
+	result, err := service.HandleTelegramWebhook(context.Background(), telegramPayload(1006, "bc-1", 42, 7, "hi"), "tenant-1")
+	if err != nil {
+		t.Fatalf("webhook: %v", err)
+	}
+	if result.Decision != contracts.DecisionAutoReply {
+		t.Fatalf("decision = %s", result.Decision)
+	}
+	if sender.richCalls != 1 || sender.calls != 0 {
+		t.Fatalf("rich calls=%d plain calls=%d", sender.richCalls, sender.calls)
+	}
+	if len(sender.richDrafts) != 0 {
+		t.Fatalf("rich drafts = %+v, want none", sender.richDrafts)
+	}
+	if got := sender.richSent[0].Text; got != "# План\n\n- A\n- B" {
+		t.Fatalf("rich text = %q", got)
+	}
+}
+
+func TestHandleBotMessageRichStreamingSendsDraftsThenFinal(t *testing.T) {
+	repository := store.NewRepository()
+	repository.SaveChatSettings(contracts.ChatSettings{TenantID: "tenant:user:77", ChatID: contracts.BotChatID("555", "42"), Mode: contracts.ChatModeAuto})
+	repository.SaveUserSettings(contracts.UserSettings{
+		TenantID:               "tenant:user:77",
+		RichFormattingEnabled:  true,
+		StreamingEnabled:       true,
+		DefaultModeForNewChats: "manual",
+		LearningEnabled:        true,
+		LanguageForDrafts:      "auto",
+	})
+	ai := &fakeAI{response: contracts.AIProcessMessageResponse{
+		Decision:     contracts.DecisionAutoReply,
+		ResponseText: "## Финал\n\n- безопасный текст",
+		TextFormat:   contracts.TextFormatRich,
+		Confidence:   0.99,
+		RiskLevel:    contracts.RiskLow,
+	}}
+	controlSender := &fakeSender{}
+	botSender := &fakeSender{}
+	service := NewService(repository, ai, controlSender,
+		WithClock(func() time.Time { return time.Unix(1700000000, 0).UTC() }),
+		WithDefaultIngestionMode(contracts.IngestionModeFull),
+		WithBotSenderProvider(&fakeBotSenders{sender: botSender}),
+	)
+
+	result, err := service.HandleBotMessage(context.Background(), botEvent(t, 1012, 42, 7, "hi"))
+	if err != nil {
+		t.Fatalf("bot message: %v", err)
+	}
+	if result.Decision != contracts.DecisionAutoReply {
+		t.Fatalf("decision = %s", result.Decision)
+	}
+	if botSender.richCalls != 1 || len(botSender.richDrafts) != 2 || botSender.calls != 0 {
+		t.Fatalf("rich calls=%d rich drafts=%d plain calls=%d", botSender.richCalls, len(botSender.richDrafts), botSender.calls)
+	}
+	if botSender.richDrafts[0].markdown != richStreamingThinkingMarkdown {
+		t.Fatalf("thinking markdown = %q", botSender.richDrafts[0].markdown)
+	}
+	if botSender.richDrafts[1].markdown != "## Финал\n\n- безопасный текст" {
+		t.Fatalf("final draft markdown = %q", botSender.richDrafts[1].markdown)
+	}
+	if botSender.richDrafts[0].draftID == 0 || botSender.richDrafts[0].draftID != botSender.richDrafts[1].draftID {
+		t.Fatalf("draft ids = %+v", botSender.richDrafts)
+	}
+	if botSender.richDrafts[0].chatID != "42" || botSender.richDrafts[1].chatID != "42" {
+		t.Fatalf("draft chat ids = %+v", botSender.richDrafts)
+	}
+	if botSender.richSent[0].Text != "## Финал\n\n- безопасный текст" {
+		t.Fatalf("final rich text = %q", botSender.richSent[0].Text)
+	}
+	// Phase D: typing indicator must fire exactly once, before draft frames.
+	if len(botSender.chatActions) != 1 || botSender.chatActions[0] != "typing" {
+		t.Fatalf("chat actions = %v, want [typing]", botSender.chatActions)
+	}
+
+	_, err = service.HandleBotMessage(context.Background(), botEvent(t, 1012, 42, 7, "hi"))
+	if err != nil {
+		t.Fatalf("duplicate bot message: %v", err)
+	}
+	if botSender.richCalls != 1 || len(botSender.richDrafts) != 2 {
+		t.Fatalf("duplicate must not send again: rich calls=%d drafts=%d", botSender.richCalls, len(botSender.richDrafts))
+	}
+	if len(botSender.chatActions) != 1 {
+		t.Fatalf("duplicate must not send chat action again: chat actions = %v", botSender.chatActions)
+	}
+}
+
+func TestHandleBotMessageRichStreamingDraftFailureStillSendsFinalText(t *testing.T) {
+	repository := store.NewRepository()
+	repository.SaveChatSettings(contracts.ChatSettings{TenantID: "tenant:user:77", ChatID: contracts.BotChatID("555", "42"), Mode: contracts.ChatModeAuto})
+	repository.SaveUserSettings(contracts.UserSettings{
+		TenantID:               "tenant:user:77",
+		RichFormattingEnabled:  true,
+		StreamingEnabled:       true,
+		DefaultModeForNewChats: "manual",
+		LearningEnabled:        true,
+		LanguageForDrafts:      "auto",
+	})
+	ai := &fakeAI{response: contracts.AIProcessMessageResponse{
+		Decision:     contracts.DecisionAutoReply,
+		ResponseText: "## Финал",
+		TextFormat:   contracts.TextFormatRich,
+		Confidence:   0.99,
+		RiskLevel:    contracts.RiskLow,
+	}}
+	controlSender := &fakeSender{}
+	botSender := &fakeSender{richDraftErr: errors.New("draft failed")}
+	service := NewService(repository, ai, controlSender,
+		WithClock(func() time.Time { return time.Unix(1700000000, 0).UTC() }),
+		WithDefaultIngestionMode(contracts.IngestionModeFull),
+		WithBotSenderProvider(&fakeBotSenders{sender: botSender}),
+	)
+
+	result, err := service.HandleBotMessage(context.Background(), botEvent(t, 1013, 42, 7, "hi"))
+	if err != nil {
+		t.Fatalf("bot message: %v", err)
+	}
+	if result.Decision != contracts.DecisionAutoReply {
+		t.Fatalf("decision = %s", result.Decision)
+	}
+	if botSender.richCalls != 1 || len(botSender.richDrafts) != 1 || botSender.calls != 0 {
+		t.Fatalf("rich calls=%d rich drafts=%d plain calls=%d", botSender.richCalls, len(botSender.richDrafts), botSender.calls)
+	}
+	if botSender.richDrafts[0].markdown != richStreamingThinkingMarkdown {
+		t.Fatalf("draft markdown = %q", botSender.richDrafts[0].markdown)
+	}
+	if botSender.richSent[0].Text != "## Финал" {
+		t.Fatalf("final rich text = %+v", botSender.richSent)
+	}
+}
+
+func TestHandleTelegramWebhookRichStreamingNeverRunsForDigitalCopy(t *testing.T) {
+	repository := store.NewRepository()
+	repository.SaveChatSettings(contracts.ChatSettings{TenantID: "tenant-1", ChatID: "42", Mode: contracts.ChatModeAuto})
+	repository.SaveChat(store.ChatRecord{TenantID: "tenant-1", ChatID: "42"})
+	repository.SaveUserSettings(contracts.UserSettings{
+		TenantID:               "tenant-1",
+		RichFormattingEnabled:  true,
+		StreamingEnabled:       true,
+		DefaultModeForNewChats: "manual",
+		LearningEnabled:        true,
+		LanguageForDrafts:      "auto",
+	})
+	ai := &fakeAI{response: contracts.AIProcessMessageResponse{
+		Decision:     contracts.DecisionAutoReply,
+		ResponseText: "## Rich but no role",
+		TextFormat:   contracts.TextFormatRich,
+		Confidence:   0.99,
+		RiskLevel:    contracts.RiskLow,
+	}}
+	sender := &fakeSender{}
+	service := newTestService(repository, ai, sender)
+
+	result, err := service.HandleTelegramWebhook(context.Background(), telegramPayload(1014, "bc-1", 42, 7, "hi"), "tenant-1")
+	if err != nil {
+		t.Fatalf("webhook: %v", err)
+	}
+	if result.Decision != contracts.DecisionAutoReply {
+		t.Fatalf("decision = %s", result.Decision)
+	}
+	if sender.richCalls != 1 || len(sender.richDrafts) != 0 {
+		t.Fatalf("digital copy must use phase-1 rich send without streaming: rich calls=%d drafts=%d", sender.richCalls, len(sender.richDrafts))
+	}
+	if sender.richSent[0].Text != "## Rich but no role" {
+		t.Fatalf("rich text = %q", sender.richSent[0].Text)
+	}
+}
+
+func TestHandleTelegramWebhookRichSendFallsBackToPlain(t *testing.T) {
+	repository := store.NewRepository()
+	repository.SaveChatSettings(contracts.ChatSettings{TenantID: "tenant-1", ChatID: "42", Mode: contracts.ChatModeAuto})
+	repository.SaveChat(store.ChatRecord{TenantID: "tenant-1", ChatID: "42"})
+	ai := &fakeAI{response: contracts.AIProcessMessageResponse{
+		Decision:     contracts.DecisionAutoReply,
+		ResponseText: "Use <tag> & table",
+		TextFormat:   contracts.TextFormatRich,
+		Confidence:   0.99,
+		RiskLevel:    contracts.RiskLow,
+	}}
+	sender := &fakeSender{richErr: errors.New("rich unavailable")}
+	service := newTestService(repository, ai, sender)
+
+	result, err := service.HandleTelegramWebhook(context.Background(), telegramPayload(1007, "bc-1", 42, 7, "hi"), "tenant-1")
+	if err != nil {
+		t.Fatalf("webhook: %v", err)
+	}
+	if result.Decision != contracts.DecisionAutoReply {
+		t.Fatalf("decision = %s", result.Decision)
+	}
+	if sender.richCalls != 1 || sender.calls != 1 {
+		t.Fatalf("rich calls=%d fallback calls=%d", sender.richCalls, sender.calls)
+	}
+	// Rich failed → must degrade to HTML, never dump raw markdown.
+	if sender.sent[0].ParseMode != "HTML" {
+		t.Fatalf("fallback parse_mode = %q, want HTML", sender.sent[0].ParseMode)
+	}
+	// HTML special chars in the original text must be escaped.
+	if sender.sent[0].Text != "Use &lt;tag&gt; &amp; table" {
+		t.Fatalf("fallback text = %q", sender.sent[0].Text)
+	}
+}
+
+func TestHandleTelegramWebhookRichFormattingToggleOffForcesPlainSend(t *testing.T) {
+	repository := store.NewRepository()
+	repository.SaveChatSettings(contracts.ChatSettings{TenantID: "tenant-1", ChatID: "42", Mode: contracts.ChatModeAuto})
+	repository.SaveChat(store.ChatRecord{TenantID: "tenant-1", ChatID: "42"})
+	repository.SaveUserSettings(contracts.UserSettings{
+		TenantID:               "tenant-1",
+		RichFormattingEnabled:  false,
+		DefaultModeForNewChats: "manual",
+		LearningEnabled:        true,
+		LanguageForDrafts:      "auto",
+	})
+	ai := &fakeAI{response: contracts.AIProcessMessageResponse{
+		Decision:     contracts.DecisionAutoReply,
+		ResponseText: "# План\n\n- A\n- B",
+		TextFormat:   contracts.TextFormatRich,
+		Confidence:   0.99,
+		RiskLevel:    contracts.RiskLow,
+	}}
+	sender := &fakeSender{}
+	service := newTestService(repository, ai, sender)
+
+	result, err := service.HandleTelegramWebhook(context.Background(), telegramPayload(1009, "bc-1", 42, 7, "hi"), "tenant-1")
+	if err != nil {
+		t.Fatalf("webhook: %v", err)
+	}
+	if result.Decision != contracts.DecisionAutoReply {
+		t.Fatalf("decision = %s", result.Decision)
+	}
+	if sender.richCalls != 0 || sender.calls != 1 {
+		t.Fatalf("rich calls=%d plain calls=%d", sender.richCalls, sender.calls)
+	}
+	// Toggled-off rich must degrade to HTML, never dump raw markdown (### • …).
+	if sender.sent[0].ParseMode != "HTML" {
+		t.Fatalf("parse_mode = %q, want HTML", sender.sent[0].ParseMode)
+	}
+	want := "<b>План</b>\n\n• A\n• B"
+	if sender.sent[0].Text != want {
+		t.Fatalf("text = %q, want %q", sender.sent[0].Text, want)
+	}
+}
+
+// TestHandleBotMessageStreamingTypingActionNotSentWhenOff verifies that sendChatAction
+// is never called when streaming is disabled — the Phase A plain rich path must stay clean.
+func TestHandleBotMessageStreamingTypingActionNotSentWhenOff(t *testing.T) {
+	repository := store.NewRepository()
+	repository.SaveChatSettings(contracts.ChatSettings{TenantID: "tenant:user:77", ChatID: contracts.BotChatID("555", "42"), Mode: contracts.ChatModeAuto})
+	repository.SaveUserSettings(contracts.UserSettings{
+		TenantID:              "tenant:user:77",
+		RichFormattingEnabled: true,
+		StreamingEnabled:      false, // OFF
+		LearningEnabled:       true,
+		LanguageForDrafts:     "auto",
+	})
+	ai := &fakeAI{response: contracts.AIProcessMessageResponse{
+		Decision:     contracts.DecisionAutoReply,
+		ResponseText: "## Ответ",
+		TextFormat:   contracts.TextFormatRich,
+		Confidence:   0.99,
+		RiskLevel:    contracts.RiskLow,
+	}}
+	controlSender := &fakeSender{}
+	botSender := &fakeSender{}
+	service := NewService(repository, ai, controlSender,
+		WithClock(func() time.Time { return time.Unix(1700000000, 0).UTC() }),
+		WithDefaultIngestionMode(contracts.IngestionModeFull),
+		WithBotSenderProvider(&fakeBotSenders{sender: botSender}),
+	)
+
+	if _, err := service.HandleBotMessage(context.Background(), botEvent(t, 1100, 42, 7, "hi")); err != nil {
+		t.Fatalf("bot message: %v", err)
+	}
+	if len(botSender.chatActions) != 0 {
+		t.Fatalf("streaming off: expected no chat action, got %v", botSender.chatActions)
+	}
+	if len(botSender.richDrafts) != 0 {
+		t.Fatalf("streaming off: expected no rich drafts, got %d", len(botSender.richDrafts))
+	}
+	if botSender.richCalls != 1 {
+		t.Fatalf("streaming off: expected 1 rich send (phase A path), got %d", botSender.richCalls)
+	}
+}
+
+// TestRichDraftFramesNeverContainsHalfAnswer verifies that richDraftFrames no longer
+// emits the old "first half of text" frame — only the thinking indicator and full-text
+// paragraph chunks are allowed.
+func TestRichDraftFramesNeverContainsHalfAnswer(t *testing.T) {
+	// Use a deliberately short first paragraph so it clearly cannot match the rune-midpoint.
+	long := "Intro.\n\n" +
+		"Этот абзац значительно длиннее первого и содержит достаточно текста чтобы весь ответ " +
+		"превысил порог в сто двадцать рун для активации механизма разбивки по абзацам."
+	if len([]rune(long)) < 120 {
+		t.Skip("test text is too short — adjust it")
+	}
+	frames := richDraftFrames(long)
+	if len(frames) < 3 {
+		t.Fatalf("expected ≥ 3 frames (thinking + chunks), got %d: %v", len(frames), frames)
+	}
+	if frames[0] != richStreamingThinkingMarkdown {
+		t.Fatalf("frame[0] must be thinking indicator, got %q", frames[0])
+	}
+	// Old half-answer was text[:len/2] — the new frames must never equal that exact truncation.
+	runes := []rune(long)
+	oldHalf := string(runes[:len(runes)/2])
+	for i, f := range frames[1:] {
+		if f == oldHalf {
+			t.Fatalf("frame[%d] is the old rune-midpoint half-answer %q; that pattern must be gone", i+1, f)
+		}
+	}
+	// Last frame must be the full text.
+	if last := frames[len(frames)-1]; last != long {
+		t.Fatalf("last frame must equal full text; got %q", last)
+	}
+}
+
+// TestRichDraftFramesShortTextTwoFrames verifies short texts still produce exactly two frames:
+// the thinking indicator and the full text (no unnecessary chunking).
+func TestRichDraftFramesShortTextTwoFrames(t *testing.T) {
+	short := "Привет!"
+	frames := richDraftFrames(short)
+	if len(frames) != 2 {
+		t.Fatalf("short text: expected 2 frames, got %d: %v", len(frames), frames)
+	}
+	if frames[0] != richStreamingThinkingMarkdown {
+		t.Fatalf("frame[0] must be thinking indicator, got %q", frames[0])
+	}
+	if frames[1] != short {
+		t.Fatalf("frame[1] must equal input text, got %q", frames[1])
+	}
+}
+
+func TestHandleTelegramWebhookRichDraftCardUsesRichSend(t *testing.T) {
+	repository := store.NewRepository()
+	repository.SaveChatSettings(contracts.ChatSettings{TenantID: "tenant-1", ChatID: "42", Mode: contracts.ChatModeManual})
+	repository.SaveChat(store.ChatRecord{TenantID: "tenant-1", ChatID: "42"})
+	repository.SaveBusinessConnection(store.BusinessConnectionRecord{
+		ConnectionID: "bc-1",
+		TenantID:     "tenant-1",
+		UserID:       "77",
+		UserChatID:   "77",
+		CanReply:     true,
+		IsEnabled:    true,
+		UpdatedAt:    time.Unix(1700000000, 0).UTC(),
+	})
+	ai := &fakeAI{response: contracts.AIProcessMessageResponse{
+		Decision:     contracts.DecisionDraft,
+		ResponseText: "## Ответ\n\n| A | B |\n|---|---|",
+		TextFormat:   contracts.TextFormatRich,
+		Confidence:   0.9,
+		RiskLevel:    contracts.RiskLow,
+	}}
+	sender := &fakeSender{}
+	service := newTestService(repository, ai, sender)
+
+	result, err := service.HandleTelegramWebhook(context.Background(), telegramPayload(1010, "bc-1", 42, 7, "hi"), "tenant-1")
+	if err != nil {
+		t.Fatalf("webhook: %v", err)
+	}
+	if result.Decision != contracts.DecisionDraft {
+		t.Fatalf("decision = %s", result.Decision)
+	}
+	if sender.richCalls != 1 || sender.calls != 0 {
+		t.Fatalf("owner card rich calls=%d plain calls=%d", sender.richCalls, sender.calls)
+	}
+	card := sender.richSent[0]
+	if card.ChatID != "77" || !strings.Contains(card.Text, "## Ответ") {
+		t.Fatalf("rich owner card = %+v", card)
+	}
+	if markup, ok := card.ReplyMarkup.(telegram.InlineKeyboardMarkup); !ok || len(markup.InlineKeyboard) == 0 {
+		t.Fatalf("rich owner card must preserve inline keyboard, markup=%+v", card.ReplyMarkup)
+	}
+	draft, ok := repository.Draft(result.DraftID)
+	if !ok || draft.OwnerChatID != "77" || draft.OwnerMessageID == "" {
+		t.Fatalf("draft owner card ids = %+v ok=%v", draft, ok)
+	}
+}
+
+func TestHandleTelegramWebhookRichDraftCardToggleOffUsesPlainSend(t *testing.T) {
+	repository := store.NewRepository()
+	repository.SaveChatSettings(contracts.ChatSettings{TenantID: "tenant-1", ChatID: "42", Mode: contracts.ChatModeManual})
+	repository.SaveChat(store.ChatRecord{TenantID: "tenant-1", ChatID: "42"})
+	repository.SaveUserSettings(contracts.UserSettings{
+		TenantID:               "tenant-1",
+		RichFormattingEnabled:  false,
+		DefaultModeForNewChats: "manual",
+		LearningEnabled:        true,
+		LanguageForDrafts:      "auto",
+	})
+	repository.SaveBusinessConnection(store.BusinessConnectionRecord{
+		ConnectionID: "bc-1",
+		TenantID:     "tenant-1",
+		UserID:       "77",
+		UserChatID:   "77",
+		CanReply:     true,
+		IsEnabled:    true,
+		UpdatedAt:    time.Unix(1700000000, 0).UTC(),
+	})
+	ai := &fakeAI{response: contracts.AIProcessMessageResponse{
+		Decision:     contracts.DecisionDraft,
+		ResponseText: "## Ответ\n\n- A\n- B",
+		TextFormat:   contracts.TextFormatRich,
+		Confidence:   0.9,
+		RiskLevel:    contracts.RiskLow,
+	}}
+	sender := &fakeSender{}
+	service := newTestService(repository, ai, sender)
+
+	result, err := service.HandleTelegramWebhook(context.Background(), telegramPayload(1011, "bc-1", 42, 7, "hi"), "tenant-1")
+	if err != nil {
+		t.Fatalf("webhook: %v", err)
+	}
+	if result.Decision != contracts.DecisionDraft {
+		t.Fatalf("decision = %s", result.Decision)
+	}
+	if sender.richCalls != 0 || sender.calls != 1 {
+		t.Fatalf("owner card rich calls=%d plain calls=%d", sender.richCalls, sender.calls)
+	}
+	card := sender.sent[0]
+	if card.ParseMode != "" || !strings.Contains(card.Text, "## Ответ") {
+		t.Fatalf("plain owner card = %+v", card)
+	}
+	if markup, ok := card.ReplyMarkup.(telegram.InlineKeyboardMarkup); !ok || len(markup.InlineKeyboard) == 0 {
+		t.Fatalf("plain owner card must preserve inline keyboard, markup=%+v", card.ReplyMarkup)
 	}
 }
 
@@ -283,6 +867,51 @@ func TestApprovalApproveIsIdempotent(t *testing.T) {
 	}
 	if sender.calls != 1 || repository.SendCount() != 1 {
 		t.Fatalf("sender calls=%d send count=%d", sender.calls, repository.SendCount())
+	}
+}
+
+func TestApprovalApproveUsesSavedRichTextFormat(t *testing.T) {
+	repository := store.NewRepository()
+	repository.SaveChatSettings(contracts.ChatSettings{TenantID: "tenant-1", ChatID: "42", Mode: contracts.ChatModeManual})
+	repository.SaveChat(store.ChatRecord{TenantID: "tenant-1", ChatID: "42"})
+	ai := &fakeAI{response: contracts.AIProcessMessageResponse{
+		Decision:     contracts.DecisionDraft,
+		ResponseText: "## Ответ\n\n| A | B |\n|---|---|",
+		TextFormat:   contracts.TextFormatRich,
+		Confidence:   0.9,
+		RiskLevel:    contracts.RiskLow,
+	}}
+	sender := &fakeSender{}
+	service := newTestService(repository, ai, sender)
+
+	inbound, err := service.HandleTelegramWebhook(context.Background(), telegramPayload(1008, "bc-1", 42, 7, "hi"), "tenant-1")
+	if err != nil {
+		t.Fatalf("webhook: %v", err)
+	}
+	draft, ok := repository.Draft(inbound.DraftID)
+	if !ok {
+		t.Fatalf("draft not found")
+	}
+	if draft.TextFormat != contracts.TextFormatRich {
+		t.Fatalf("draft text format = %q", draft.TextFormat)
+	}
+	_, err = service.HandleApprovalCallback(context.Background(), contracts.ApprovalCallbackPayload{
+		Action:          contracts.ApprovalApprove,
+		TenantID:        "tenant-1",
+		ChatID:          "42",
+		SourceMessageID: "7",
+		DraftID:         inbound.DraftID,
+		DecisionID:      inbound.Event.EventID,
+		IdempotencyKey:  "callback-rich-approve",
+	})
+	if err != nil {
+		t.Fatalf("approval: %v", err)
+	}
+	if sender.richCalls != 1 || sender.calls != 0 {
+		t.Fatalf("rich calls=%d plain calls=%d", sender.richCalls, sender.calls)
+	}
+	if sender.richSent[0].Text != draft.ResponseText {
+		t.Fatalf("sent rich text = %q want %q", sender.richSent[0].Text, draft.ResponseText)
 	}
 }
 
@@ -1305,6 +1934,46 @@ func (f *summarizingAI) SummarizeChat(ctx context.Context, request contracts.Cha
 	}, nil
 }
 
+// TestSummarizeChatCaches verifies the on-demand summary is memoised: a second
+// request over the same timeline reuses the cached result (no extra LLM call),
+// while a new message invalidates the cache and forces a fresh summary.
+func TestSummarizeChatCaches(t *testing.T) {
+	repository := store.NewRepository()
+	repository.SaveChat(store.ChatRecord{TenantID: "tenant-1", ChatID: "42"})
+	ai := &summarizingAI{}
+	service := newTestService(repository, ai, &fakeSender{})
+	ctx := context.Background()
+
+	save := func(id string) {
+		repository.SaveMessage(contracts.NormalizedTelegramEvent{
+			EventID: id, TenantID: "tenant-1", ChatID: "42",
+			SourceMessageID: id, MessageText: "содержательное сообщение для сводки",
+			CreatedAt: time.Now(),
+		})
+	}
+	save("e1")
+	save("e2")
+
+	if _, _, err := service.SummarizeChat(ctx, "tenant-1", "42"); err != nil {
+		t.Fatalf("first summarize: %v", err)
+	}
+	if _, _, err := service.SummarizeChat(ctx, "tenant-1", "42"); err != nil {
+		t.Fatalf("second summarize: %v", err)
+	}
+	if ai.summaries != 1 {
+		t.Fatalf("cached second request must not re-call the LLM: got %d calls, want 1", ai.summaries)
+	}
+
+	// A new message changes the timeline marker → cache miss → fresh summary.
+	save("e3")
+	if _, _, err := service.SummarizeChat(ctx, "tenant-1", "42"); err != nil {
+		t.Fatalf("third summarize: %v", err)
+	}
+	if ai.summaries != 2 {
+		t.Fatalf("new message must invalidate cache: got %d calls, want 2", ai.summaries)
+	}
+}
+
 // TestEpisodeSummariesPerEpisodeIdempotency verifies the MEM-6 contract:
 // two episodes closed on the same day produce two summaries with real episode
 // bounds and provenance; re-closing the same episode adds nothing; the daily
@@ -1442,8 +2111,28 @@ func (f *fakeAI) ProcessMessage(ctx context.Context, request contracts.AIProcess
 }
 
 type fakeSender struct {
-	calls int
-	sent  []telegram.OutboundMessage
+	calls        int
+	richCalls    int
+	sent         []telegram.OutboundMessage
+	richSent     []telegram.OutboundMessage
+	richErr      error
+	richDrafts   []richDraftCall
+	richDraftErr error
+	chatActions  []string // action values passed to SendChatAction, in order
+	answered     []string
+	edits        []editedMessage
+}
+
+type editedMessage struct {
+	chatID    string
+	messageID string
+	text      string
+}
+
+type richDraftCall struct {
+	chatID   string
+	draftID  int64
+	markdown string
 }
 
 func (f *fakeSender) SendMessage(ctx context.Context, message telegram.OutboundMessage) error {
@@ -1452,7 +2141,27 @@ func (f *fakeSender) SendMessage(ctx context.Context, message telegram.OutboundM
 	return nil
 }
 
+func (f *fakeSender) SendRichMessage(ctx context.Context, message telegram.OutboundMessage) (string, error) {
+	f.richCalls++
+	f.richSent = append(f.richSent, message)
+	if f.richErr != nil {
+		return "", f.richErr
+	}
+	return "rich:" + strconv.Itoa(f.richCalls), nil
+}
+
+func (f *fakeSender) SendRichMessageDraft(ctx context.Context, chatID string, draftID int64, markdown string) error {
+	f.richDrafts = append(f.richDrafts, richDraftCall{chatID: chatID, draftID: draftID, markdown: markdown})
+	return f.richDraftErr
+}
+
+func (f *fakeSender) SendChatAction(_ context.Context, _ string, action string) error {
+	f.chatActions = append(f.chatActions, action)
+	return nil
+}
+
 func (f *fakeSender) AnswerCallbackQuery(ctx context.Context, queryID string) error {
+	f.answered = append(f.answered, queryID)
 	return nil
 }
 
@@ -1461,6 +2170,7 @@ func (f *fakeSender) EditMessageReplyMarkup(ctx context.Context, chatID, message
 }
 
 func (f *fakeSender) EditMessageText(ctx context.Context, chatID, messageID, text string, markup telegram.InlineKeyboardMarkup) error {
+	f.edits = append(f.edits, editedMessage{chatID: chatID, messageID: messageID, text: text})
 	return nil
 }
 
@@ -1522,4 +2232,490 @@ func TestSaveTypedFactsOutcomeSkipCounting(t *testing.T) {
 	if got := len(repo.SemanticFacts(event.TenantID, event.ChatID, 10)); got != 1 {
 		t.Errorf("expected 1 persisted fact, got %d", got)
 	}
+}
+
+// TestEpisodeFloodGateSuppressesSummary verifies the episode-write gate (spam-protection §②):
+// a 40-message burst within minEpisodeSpan closes the episode but produces no summary,
+// while a normal conversation spanning ≥ minEpisodeSpan still produces exactly one summary.
+// Uses the injectable clock to control span deterministically.
+func TestEpisodeFloodGateSuppressesSummary(t *testing.T) {
+	const (
+		tenant = "tenant-1"
+		chatID = "55"
+	)
+
+	setupRepo := func() *store.Repository {
+		r := store.NewRepository()
+		// ChatModeDisabled: episode tracking runs but no AI call is made, keeping
+		// the test fast and independent of AI behaviour.
+		r.SaveChatSettings(contracts.ChatSettings{TenantID: tenant, ChatID: chatID, Mode: contracts.ChatModeDisabled})
+		r.SaveChat(store.ChatRecord{TenantID: tenant, ChatID: chatID})
+		return r
+	}
+
+	// flood40 sends exactly episodeMessageLimit messages from the same clock time.
+	flood40 := func(t *testing.T, svc *Service) {
+		t.Helper()
+		for i := 0; i < episodeMessageLimit; i++ {
+			if _, err := svc.HandleTelegramWebhook(
+				context.Background(),
+				telegramPayload(int64(i+1), "bc-flood", 55, int64(i+1), "spam"),
+				tenant,
+			); err != nil {
+				t.Fatalf("webhook %d: %v", i+1, err)
+			}
+		}
+	}
+
+	t.Run("short span suppresses summary", func(t *testing.T) {
+		repo := setupRepo()
+		ai := &summarizingAI{}
+		clock := time.Unix(1700000000, 0).UTC() // fixed: all 40 messages land at T0
+		svc := NewService(repo, ai, &fakeSender{},
+			WithClock(func() time.Time { return clock }),
+			WithDefaultIngestionMode(contracts.IngestionModeFull),
+		)
+
+		flood40(t, svc)
+
+		if _, ok := repo.ActiveEpisodeByChat(tenant, chatID); ok {
+			t.Error("episode must be closed after 40 messages")
+		}
+		// No goroutine is spawned in the flood path — check is immediate.
+		if s := repo.EpisodeSummaries(tenant, chatID, 10); len(s) != 0 {
+			t.Fatalf("flood: got %d episode summaries, want 0", len(s))
+		}
+	})
+
+	t.Run("long span produces one summary", func(t *testing.T) {
+		repo := setupRepo()
+		ai := &summarizingAI{}
+		base := time.Unix(1700000000, 0).UTC()
+		clock := base
+		svc := NewService(repo, ai, &fakeSender{},
+			WithClock(func() time.Time { return clock }),
+			WithDefaultIngestionMode(contracts.IngestionModeFull),
+		)
+
+		// Send 39 messages at base time (episode.StartedAt = base).
+		for i := 0; i < episodeMessageLimit-1; i++ {
+			if _, err := svc.HandleTelegramWebhook(
+				context.Background(),
+				telegramPayload(int64(i+1), "bc-flood", 55, int64(i+1), "spam"),
+				tenant,
+			); err != nil {
+				t.Fatalf("webhook %d: %v", i+1, err)
+			}
+		}
+		// Advance clock past minEpisodeSpan (3 min > 2 min).
+		clock = base.Add(3 * time.Minute)
+		// Message 40: LastMessageAt = base+3min, span = 3min ≥ 2min → summarize.
+		if _, err := svc.HandleTelegramWebhook(
+			context.Background(),
+			telegramPayload(int64(episodeMessageLimit), "bc-flood", 55, int64(episodeMessageLimit), "spam"),
+			tenant,
+		); err != nil {
+			t.Fatalf("webhook 40: %v", err)
+		}
+
+		if _, ok := repo.ActiveEpisodeByChat(tenant, chatID); ok {
+			t.Error("episode must be closed after 40 messages")
+		}
+		// Poll for the async summary (spawned in a goroutine).
+		deadline := time.Now().Add(2 * time.Second)
+		var summaries []store.EpisodeSummaryRecord
+		for time.Now().Before(deadline) {
+			summaries = repo.EpisodeSummaries(tenant, chatID, 10)
+			if len(summaries) > 0 {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if len(summaries) != 1 {
+			t.Fatalf("normal: got %d episode summaries, want 1", len(summaries))
+		}
+	})
+}
+
+// TestMessageQuarantine verifies the spam-tag contract (spam-protection §①):
+//   - An exact duplicate of a recent contact message is quarantined (Quarantined==true).
+//   - Quarantined messages are absent from RecentMessages (memory window).
+//   - The raw audit row is still retrievable via Message() (audit intact).
+//   - Quarantined messages are excluded from summarizeEpisode input.
+//   - Unique messages are unaffected.
+func TestMessageQuarantine(t *testing.T) {
+	const (
+		tenant       = "tenant-1"
+		chatID       = "66"
+		uniqueText   = "Добрый день, когда будет готов заказ?"
+		spamText     = "привет"
+		spamSourceID = "m-spam"
+	)
+	repo := store.NewRepository()
+
+	// Seed a first message with spamText — this is NOT a duplicate yet.
+	firstMsg := contracts.NormalizedTelegramEvent{
+		EventID: "e1", TenantID: tenant, ChatID: chatID,
+		SourceMessageID: "m1", MessageText: spamText,
+		CreatedAt: time.Unix(1700000000, 0).UTC(),
+	}
+	repo.SaveMessage(firstMsg)
+
+	// Second message with spamText is a duplicate → must be quarantined.
+	dupMsg := contracts.NormalizedTelegramEvent{
+		EventID: "e2", TenantID: tenant, ChatID: chatID,
+		SourceMessageID: spamSourceID, MessageText: spamText,
+		CreatedAt: time.Unix(1700000001, 0).UTC(),
+	}
+	recent := repo.RecentMessages(tenant, chatID, 5)
+	quarantined := classifyQuarantine(dupMsg.MessageText, recent)
+	if !quarantined {
+		t.Fatal("duplicate message must be classified as quarantined")
+	}
+	repo.SaveMessageQuarantined(dupMsg, true)
+
+	// Quarantined message is absent from RecentMessages (memory window).
+	window := repo.RecentMessages(tenant, chatID, 20)
+	for _, m := range window {
+		if m.Event.SourceMessageID == spamSourceID {
+			t.Error("quarantined message must not appear in RecentMessages")
+		}
+	}
+
+	// Audit access: the raw row is still retrievable via Message().
+	record, ok := repo.Message(tenant, chatID, spamSourceID)
+	if !ok {
+		t.Fatal("quarantined message must be retrievable via Message() for audit")
+	}
+	if !record.Quarantined {
+		t.Error("Message() must return Quarantined==true for a quarantined row")
+	}
+
+	// Unique message: not a duplicate → unaffected.
+	uniqueMsg := contracts.NormalizedTelegramEvent{
+		EventID: "e3", TenantID: tenant, ChatID: chatID,
+		SourceMessageID: "m3", MessageText: uniqueText,
+		CreatedAt: time.Unix(1700000002, 0).UTC(),
+	}
+	recent = repo.RecentMessages(tenant, chatID, 5) // only m1 (m-spam excluded)
+	if classifyQuarantine(uniqueMsg.MessageText, recent) {
+		t.Error("unique message must not be quarantined")
+	}
+
+	// summarizeEpisode: quarantined message is excluded from the texts input.
+	repo.SaveMessage(uniqueMsg)
+	// Add a quarantined message directly via SaveMessageQuarantined.
+	repo.SaveMessageQuarantined(contracts.NormalizedTelegramEvent{
+		EventID: "e4", TenantID: tenant, ChatID: chatID,
+		SourceMessageID: "m4", MessageText: "SPAM SPAM SPAM",
+		CreatedAt: time.Unix(1700000003, 0).UTC(),
+	}, true)
+
+	from := time.Unix(1699999999, 0).UTC()
+	to := time.Unix(1700009999, 0).UTC()
+	msgs := repo.MessagesByDateRange(tenant, chatID, from, to)
+	// m-spam and m4 are quarantined; m1 and m3 are not.
+	quarantinedInRange := 0
+	for _, m := range msgs {
+		if m.Quarantined {
+			quarantinedInRange++
+		}
+	}
+	if quarantinedInRange != 2 {
+		t.Fatalf("expected 2 quarantined messages in date range, got %d", quarantinedInRange)
+	}
+
+	// summarizeEpisode loop excludes quarantined: only non-quarantined texts are collected.
+	var collectedTexts []string
+	for _, m := range msgs {
+		if m.Quarantined {
+			continue
+		}
+		if t2 := strings.TrimSpace(m.Event.MessageText); t2 != "" {
+			collectedTexts = append(collectedTexts, t2)
+		}
+	}
+	for _, text := range collectedTexts {
+		if text == spamText && text != uniqueText {
+			// spamText == "привет" which is also in m1 (not quarantined), so this check
+			// only ensures quarantined-only texts ("SPAM SPAM SPAM") are absent.
+		}
+	}
+	for _, text := range collectedTexts {
+		if text == "SPAM SPAM SPAM" {
+			t.Error("quarantined text must be excluded from summarizeEpisode input")
+		}
+	}
+}
+
+// telegramPayloadWithSender is like telegramPayload but lets the caller set the
+// Telegram sender (from) id, enabling owner-vs-contact distinctions in tests.
+func telegramPayloadWithSender(updateID int64, bc string, chatID, msgID, senderID int64, text string) []byte {
+	return []byte(`{
+		"update_id": ` + intString(updateID) + `,
+		"business_message": {
+			"message_id": ` + intString(msgID) + `,
+			"business_connection_id": "` + bc + `",
+			"chat": {"id": ` + intString(chatID) + `},
+			"from": {"id": ` + intString(senderID) + `},
+			"text": "` + text + `",
+			"date": 1700000000
+		}
+	}`)
+}
+
+// TestChatRateLimit verifies the per-chat+sender inbound rate limit (spam-protection §③):
+// excess messages are quarantined and return DecisionObserve/"rate_limited";
+// owner messages bypass the limiter; distinct bot-chat senders have independent buckets.
+func TestChatRateLimit(t *testing.T) {
+	t.Run("business: burst exceeded is rate_limited and quarantined", func(t *testing.T) {
+		tenant, chatID := "tenant-1", "42"
+		repo := store.NewRepository()
+		repo.SaveChatSettings(contracts.ChatSettings{TenantID: tenant, ChatID: chatID, Mode: contracts.ChatModeAuto})
+		repo.SaveChat(store.ChatRecord{TenantID: tenant, ChatID: chatID})
+		ai := &fakeAI{response: contracts.AIProcessMessageResponse{
+			Decision: contracts.DecisionObserve, Confidence: 0.5, RiskLevel: contracts.RiskLow,
+		}}
+		// burst=2; rate so slow it never meaningfully refills during the test
+		svc := NewService(repo, ai, &fakeSender{},
+			WithChatRateLimit(rate.Every(time.Hour), 2),
+			WithDefaultIngestionMode(contracts.IngestionModeFull),
+			WithClock(func() time.Time { return time.Unix(1700000000, 0).UTC() }),
+		)
+
+		send := func(n int) InboundResult {
+			res, err := svc.HandleTelegramWebhook(context.Background(),
+				telegramPayload(int64(n), "bc-1", 42, int64(n), "hello"), tenant)
+			if err != nil {
+				t.Fatalf("webhook %d: %v", n, err)
+			}
+			return res
+		}
+
+		r1, r2 := send(1), send(2)
+		if r1.Reason == "rate_limited" {
+			t.Fatalf("message 1 (within burst) must not be rate_limited")
+		}
+		if r2.Reason == "rate_limited" {
+			t.Fatalf("message 2 (within burst) must not be rate_limited")
+		}
+
+		r3 := send(3)
+		if r3.Reason != "rate_limited" {
+			t.Fatalf("message 3 (over burst) must be rate_limited; got reason=%s decision=%s", r3.Reason, r3.Decision)
+		}
+		if r3.Decision != contracts.DecisionObserve {
+			t.Fatalf("rate_limited result must carry DecisionObserve, got %s", r3.Decision)
+		}
+
+		// Message 3 must be stored for audit but absent from the memory window.
+		if rec, ok := repo.Message(tenant, chatID, "3"); !ok || !rec.Quarantined {
+			t.Fatal("rate_limited message must be quarantined and retrievable via Message()")
+		}
+		for _, m := range repo.RecentMessages(tenant, chatID, 20) {
+			if m.Event.SourceMessageID == "3" {
+				t.Error("quarantined (rate_limited) message must be absent from RecentMessages")
+			}
+		}
+	})
+
+	t.Run("business: owner messages bypass limiter", func(t *testing.T) {
+		// tenant:user:77 → ownerID="77"; sender 99 is non-owner; sender 77 is owner.
+		tenant, chatID := "tenant:user:77", "42"
+		repo := store.NewRepository()
+		repo.SaveChatSettings(contracts.ChatSettings{TenantID: tenant, ChatID: chatID, Mode: contracts.ChatModeAuto})
+		repo.SaveChat(store.ChatRecord{TenantID: tenant, ChatID: chatID})
+		ai := &fakeAI{response: contracts.AIProcessMessageResponse{
+			Decision: contracts.DecisionObserve, Confidence: 0.5, RiskLevel: contracts.RiskLow,
+		}}
+		// burst=1: one non-owner message exhausts the shared tenant|chat bucket.
+		svc := NewService(repo, ai, &fakeSender{},
+			WithChatRateLimit(rate.Every(time.Hour), 1),
+			WithDefaultIngestionMode(contracts.IngestionModeFull),
+			WithClock(func() time.Time { return time.Unix(1700000000, 0).UTC() }),
+		)
+
+		// Non-owner message (sender=99) exhausts the burst.
+		nonOwner, err := svc.HandleTelegramWebhook(context.Background(),
+			telegramPayloadWithSender(1, "bc-1", 42, 1, 99, "hi"), tenant)
+		if err != nil {
+			t.Fatalf("non-owner webhook: %v", err)
+		}
+		if nonOwner.Reason == "rate_limited" {
+			t.Fatal("first message (within burst) must not be rate_limited")
+		}
+
+		// Owner message (sender=77) must bypass the exhausted limiter.
+		owner, err := svc.HandleTelegramWebhook(context.Background(),
+			telegramPayloadWithSender(2, "bc-1", 42, 2, 77, "owner reply"), tenant)
+		if err != nil {
+			t.Fatalf("owner webhook: %v", err)
+		}
+		if owner.Reason == "rate_limited" {
+			t.Fatalf("owner message must NOT be rate_limited; got reason=%s", owner.Reason)
+		}
+		// Owner messages return "owner_message_observed" (isOwnerSideMessage returns early).
+		if owner.Reason != "owner_message_observed" {
+			t.Fatalf("owner message must return owner_message_observed; got reason=%s", owner.Reason)
+		}
+	})
+
+	t.Run("bot: distinct senders get independent buckets", func(t *testing.T) {
+		repo := store.NewRepository()
+		ai := &fakeAI{response: contracts.AIProcessMessageResponse{
+			Decision: contracts.DecisionObserve, Confidence: 0.5, RiskLevel: contracts.RiskLow,
+		}}
+		// burst=1: one message per sender before rate-limiting.
+		svc := NewService(repo, ai, &fakeSender{},
+			WithChatRateLimit(rate.Every(time.Hour), 1),
+			WithDefaultIngestionMode(contracts.IngestionModeBot),
+			WithClock(func() time.Time { return time.Unix(1700000000, 0).UTC() }),
+		)
+
+		// Sender A (chatID=42): first message passes, second is rate-limited.
+		evA1 := botEvent(t, 1, 42, 1, "hi")
+		evA2 := botEvent(t, 2, 42, 2, "hi")
+		r1, _ := svc.HandleBotMessage(context.Background(), evA1)
+		if r1.Reason == "rate_limited" {
+			t.Fatal("sender A first message must not be rate_limited")
+		}
+		r2, _ := svc.HandleBotMessage(context.Background(), evA2)
+		if r2.Reason != "rate_limited" {
+			t.Fatalf("sender A second message must be rate_limited; got %s", r2.Reason)
+		}
+
+		// Sender B (chatID=88): independent bucket — first message still passes.
+		evB1 := botEvent(t, 3, 88, 3, "hi")
+		r3, _ := svc.HandleBotMessage(context.Background(), evB1)
+		if r3.Reason == "rate_limited" {
+			t.Fatalf("sender B first message must not be rate_limited (independent bucket); got %s", r3.Reason)
+		}
+	})
+}
+
+// TestPersonaSplit verifies that bot-persona roles (SpeakAsOwner=false) strip
+// owner identity from the AI request while keeping operational defaults intact.
+// Owner-voice roles and the nil-role default must pass identity through unchanged.
+func TestPersonaSplit(t *testing.T) {
+	const tenantID = "tenant-split"
+	const chatID = "99"
+
+	setupRepo := func() *store.Repository {
+		repo := store.NewRepository()
+		repo.SaveChatSettings(contracts.ChatSettings{TenantID: tenantID, ChatID: chatID, Mode: contracts.ChatModeAuto})
+		repo.SaveChat(store.ChatRecord{TenantID: tenantID, ChatID: chatID})
+		repo.SaveBusinessConnection(store.BusinessConnectionRecord{
+			ConnectionID: "bc-split", TenantID: tenantID, UserID: "77",
+			CanReply: true, IsEnabled: true,
+		})
+		repo.SaveUserSettings(contracts.UserSettings{
+			TenantID:           tenantID,
+			DisplayName:        "Alice",
+			Bio:                "founder",
+			Timezone:           "Europe/Kiev",
+			PrimaryLanguage:    "uk",
+			SecondaryLanguages: []string{"en"},
+		})
+		repo.SaveDraftFeedback(contracts.DraftFeedback{
+			DraftID:      "d1",
+			TenantID:     tenantID,
+			ChatID:       chatID,
+			Rating:       "up",
+			ResponseText: "great",
+		})
+		return repo
+	}
+
+	t.Run("bot_persona_strips_identity_and_feedback", func(t *testing.T) {
+		repo := setupRepo()
+		role := repo.SaveAIRole(store.AIRoleRecord{
+			TenantID: tenantID, Name: "BotPersona", SpeakAsOwner: false,
+		})
+		repo.AssignAIRoleToChat(tenantID, chatID, role.ID)
+
+		ai := &fakeAI{response: contracts.AIProcessMessageResponse{
+			Decision: contracts.DecisionAutoReply, ResponseText: "hi", RiskLevel: contracts.RiskLow,
+		}}
+		svc := newTestService(repo, ai, &fakeSender{})
+		if _, err := svc.HandleTelegramWebhook(context.Background(), telegramPayload(5001, "bc-split", 99, 1, "hello"), tenantID); err != nil {
+			t.Fatalf("webhook: %v", err)
+		}
+
+		req := ai.lastRequest
+		if req.UserSettings == nil {
+			t.Fatal("UserSettings must not be nil even for bot-persona")
+		}
+		if req.UserSettings.DisplayName != "" {
+			t.Errorf("DisplayName must be stripped for bot-persona: got %q", req.UserSettings.DisplayName)
+		}
+		if req.UserSettings.Bio != "" {
+			t.Errorf("Bio must be stripped for bot-persona: got %q", req.UserSettings.Bio)
+		}
+		// Operational defaults must survive the strip.
+		if req.UserSettings.Timezone != "Europe/Kiev" {
+			t.Errorf("Timezone stripped unexpectedly: got %q", req.UserSettings.Timezone)
+		}
+		if req.UserSettings.PrimaryLanguage != "uk" {
+			t.Errorf("PrimaryLanguage stripped unexpectedly: got %q", req.UserSettings.PrimaryLanguage)
+		}
+		if len(req.FeedbackContext) != 0 {
+			t.Errorf("FeedbackContext must be nil for bot-persona: got %+v", req.FeedbackContext)
+		}
+	})
+
+	t.Run("speak_as_owner_preserves_identity_and_feedback", func(t *testing.T) {
+		repo := setupRepo()
+		role := repo.SaveAIRole(store.AIRoleRecord{
+			TenantID: tenantID, Name: "OwnerVoice", SpeakAsOwner: true,
+		})
+		repo.AssignAIRoleToChat(tenantID, chatID, role.ID)
+
+		ai := &fakeAI{response: contracts.AIProcessMessageResponse{
+			Decision: contracts.DecisionAutoReply, ResponseText: "hi", RiskLevel: contracts.RiskLow,
+		}}
+		svc := newTestService(repo, ai, &fakeSender{})
+		if _, err := svc.HandleTelegramWebhook(context.Background(), telegramPayload(5002, "bc-split", 99, 2, "hello"), tenantID); err != nil {
+			t.Fatalf("webhook: %v", err)
+		}
+
+		req := ai.lastRequest
+		if req.UserSettings == nil {
+			t.Fatal("UserSettings must not be nil")
+		}
+		if req.UserSettings.DisplayName != "Alice" {
+			t.Errorf("DisplayName unexpectedly stripped for SpeakAsOwner=true: got %q", req.UserSettings.DisplayName)
+		}
+		if req.UserSettings.Bio != "founder" {
+			t.Errorf("Bio unexpectedly stripped for SpeakAsOwner=true: got %q", req.UserSettings.Bio)
+		}
+		if len(req.FeedbackContext) == 0 {
+			t.Error("FeedbackContext must be non-empty for SpeakAsOwner=true")
+		}
+	})
+
+	t.Run("no_role_preserves_identity_and_feedback", func(t *testing.T) {
+		repo := setupRepo()
+		// No role assigned → aiRole=nil → personaSpeaksAsOwner returns true.
+		ai := &fakeAI{response: contracts.AIProcessMessageResponse{
+			Decision: contracts.DecisionAutoReply, ResponseText: "hi", RiskLevel: contracts.RiskLow,
+		}}
+		svc := newTestService(repo, ai, &fakeSender{})
+		if _, err := svc.HandleTelegramWebhook(context.Background(), telegramPayload(5003, "bc-split", 99, 3, "hello"), tenantID); err != nil {
+			t.Fatalf("webhook: %v", err)
+		}
+
+		req := ai.lastRequest
+		if req.UserSettings == nil {
+			t.Fatal("UserSettings must not be nil when no role is set")
+		}
+		if req.UserSettings.DisplayName != "Alice" {
+			t.Errorf("DisplayName unexpectedly stripped for nil role: got %q", req.UserSettings.DisplayName)
+		}
+		if req.UserSettings.Bio != "founder" {
+			t.Errorf("Bio unexpectedly stripped for nil role: got %q", req.UserSettings.Bio)
+		}
+		if len(req.FeedbackContext) == 0 {
+			t.Error("FeedbackContext must be non-empty when no role is set")
+		}
+	})
 }

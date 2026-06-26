@@ -2,7 +2,7 @@ export function renderWelcome(navigate) {
   const el = document.createElement('div');
   el.className = 'screen welcome-screen';
   el.innerHTML = `
-    <div class="welcome-logo">🤖</div>
+    <div class="welcome-logo"><img src="/miniapp/assets/mascot-cat.png" alt="DoubleU"></div>
     <div>
       <div class="welcome-title">DoubleU</div>
       <div class="welcome-subtitle" style="margin-top:8px">
@@ -15,7 +15,7 @@ export function renderWelcome(navigate) {
   `;
   el.querySelector('#btn-start').addEventListener('click', () => {
     window.Telegram?.WebApp?.HapticFeedback?.impactOccurred('medium');
-    navigate('/onboarding');
+    navigate('/chats');
   });
   return el;
 }

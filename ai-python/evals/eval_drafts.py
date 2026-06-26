@@ -85,10 +85,19 @@ class AvoidsRejectedPhrasing(Evaluator[str, DraftOutcome]):
 
 
 def golden_cases() -> list[Case[str, DraftOutcome]]:
+    # NOTE: semantic-recall (#1) and temporal-chain (#3) quality cannot be
+    # exercised here — they need a seeded DB so search_facts has facts to find.
+    # Those live in the DB-backed harness (tests/test_memory_tools_db.py); this
+    # mock-mode set guards the model-contract behaviours instead.
     return [
         Case(
             name="scheduling_question_gets_draft",
             inputs="Привет! Во сколько завтра созвон?",
+            evaluators=(NoAIDisclosure(),),
+        ),
+        Case(
+            name="emotional_message_no_disclosure",
+            inputs="Слушай, мне сегодня правда тяжело, столько всего навалилось…",
             evaluators=(NoAIDisclosure(),),
         ),
         Case(
@@ -118,6 +127,19 @@ def feedback_cases() -> list[Case[str, DraftOutcome]]:
     return cases
 
 
+def _failed_cases(report) -> list[str]:
+    """Names of cases that failed an assertion or whose evaluator errored.
+
+    Drives the process exit code so the eval can gate CI: a regression in any
+    contract (AI disclosure, ARCH-1, rejected-phrasing) fails the build.
+    """
+    failed: list[str] = []
+    for case in report.cases:
+        if case.evaluator_failures or any(not result.value for result in case.assertions.values()):
+            failed.append(case.name)
+    return failed
+
+
 def main() -> None:
     os.environ.setdefault("AI_AGENT_RUNTIME", "pydantic_ai")
     runtime = AgentRuntime()
@@ -131,6 +153,11 @@ def main() -> None:
     dataset: Dataset[str, DraftOutcome] = Dataset(cases=golden_cases() + feedback_cases())
     report = dataset.evaluate_sync(run_draft)
     report.print(include_input=True, include_output=False)
+
+    failures = _failed_cases(report)
+    if failures:
+        print(f"\nEVAL FAILED — {len(failures)} case(s): {', '.join(failures)}", file=sys.stderr)
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

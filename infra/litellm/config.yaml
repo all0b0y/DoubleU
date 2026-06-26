@@ -2,8 +2,9 @@
 #
 # Per-purpose model aliases are defined here; Python sends ``model: <alias>``
 # in the chat-completion body and LiteLLM resolves it to the concrete provider
-# model.  Adding a new alias is a one-line change here plus a one-line addition
-# to ``ai-python/ai_agent/llm.py:ModelRouter.route``.
+# model. Provider model entries from the application's MODEL_* / OPENROUTER_*
+# environment variables are injected into this base file at container startup
+# by ``scripts/render_litellm_config.py``.
 #
 # All model names carry the ``openrouter/`` prefix so LiteLLM routes every call
 # through OpenRouter.  WITHOUT this prefix LiteLLM auto-detects the provider

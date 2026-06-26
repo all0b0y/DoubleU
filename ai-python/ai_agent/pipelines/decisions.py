@@ -5,10 +5,12 @@ from __future__ import annotations
 from ..schemas import ChatMode, Decision, PrivacyFlag, RiskLevel
 
 
-# Confidence thresholds gating auto-reply per chat mode.  Kept here so the
-# policy is reviewable in one place rather than scattered through the service.
+# Confidence threshold gating auto-reply in SEMI_AUTO.  Kept here so the policy
+# is reviewable in one place rather than scattered through the service.  AUTO has
+# no threshold by design: the owner opting into auto mode accepts unsupervised
+# replies (owner decision, 2026-06-16), so only the deterministic risk gates and
+# the MANUAL/PRIVATE blocks above guard it — see :func:`decide`.
 SEMI_AUTO_MIN = 0.85
-AUTO_MIN = 0.92
 
 # Deterministic ceilings on confidence per risk level.  The LLM never raises
 # them: a self-assessed confidence is always capped by the risk classifier so
@@ -41,9 +43,14 @@ def decide(
         return Decision.DRAFT
     if mode == ChatMode.MANUAL or PrivacyFlag.PRIVATE in privacy_flags:
         return Decision.DRAFT
-    if mode == ChatMode.SEMI_AUTO and confidence >= SEMI_AUTO_MIN:
+    # AUTO mode: the owner explicitly opts into unsupervised replies and accepts
+    # the risk, so there is no confidence gate — every low-risk message
+    # auto-sends (owner decision, 2026-06-16). MEDIUM/HIGH/CRITICAL risk already
+    # returned a draft/ask_owner above, so only low risk reaches here. SEMI_AUTO
+    # keeps the confidence threshold: send only when the model is confident.
+    if mode == ChatMode.AUTO:
         return Decision.AUTO_REPLY
-    if mode == ChatMode.AUTO and confidence >= AUTO_MIN:
+    if mode == ChatMode.SEMI_AUTO and confidence >= SEMI_AUTO_MIN:
         return Decision.AUTO_REPLY
     return Decision.DRAFT
 

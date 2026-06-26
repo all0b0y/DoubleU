@@ -7,7 +7,17 @@ import pathlib
 import unittest
 
 from ai_agent import contract_enums
-from ai_agent.schemas import ChatMode, Decision, LLMPurpose, PrivacyFlag, RiskLevel
+from ai_agent.schemas import (
+    AIProcessMessageResponse,
+    ChatMode,
+    Decision,
+    LLMPurpose,
+    PrivacyFlag,
+    ResponsePlanData,
+    RiskLevel,
+    ScheduledJobData,
+    Usage,
+)
 
 CONTRACTS_JSON = (
     pathlib.Path(__file__).resolve().parent.parent.parent / "contracts" / "contracts.json"
@@ -64,6 +74,47 @@ class ContractEnumTests(unittest.TestCase):
         """LLMPurpose("draft").value must equal "draft" (header attribute)."""
         self.assertEqual(LLMPurpose("draft").value, "draft")
 
+    def test_response_plan_serializes_with_options(self) -> None:
+        response = AIProcessMessageResponse(
+            decision=Decision.DRAFT,
+            response_text="Выберите время",
+            confidence=0.9,
+            risk_level=RiskLevel.LOW,
+            intent="choice_question",
+            model_used="test",
+            usage=Usage(),
+            response_plan=ResponsePlanData(shape="buttons", options=("Сегодня", "Завтра")),
+        )
+        self.assertEqual(response.to_dict()["response_plan"], {
+            "shape": "buttons", "options": ["Сегодня", "Завтра"]
+        })
+
+    def test_scheduled_jobs_serialize_for_go_persistence(self) -> None:
+        response = AIProcessMessageResponse(
+            decision=Decision.DRAFT,
+            response_text="Напоминание поставлено",
+            confidence=0.9,
+            risk_level=RiskLevel.LOW,
+            intent="scheduling",
+            model_used="test",
+            usage=Usage(),
+            scheduled_jobs=(ScheduledJobData(
+                kind="reminder",
+                target="owner",
+                fire_at="2026-06-22T15:00:00+00:00",
+                payload={"text": "Позвонить клиенту"},
+                idempotency_key="scheduler:key",
+            ),),
+        )
+        self.assertEqual(response.to_dict()["scheduled_jobs"], [{
+            "kind": "reminder",
+            "target": "owner",
+            "fire_at": "2026-06-22T15:00:00+00:00",
+            "payload": {"text": "Позвонить клиенту"},
+            "idempotency_key": "scheduler:key",
+            "created_by": "ai",
+        }])
+
 
 class GeneratedEnumsMatchContractJSONTests(unittest.TestCase):
     """Guard against drift between contracts.json and the generated Python file.
@@ -80,6 +131,12 @@ class GeneratedEnumsMatchContractJSONTests(unittest.TestCase):
 
     def test_decisions(self) -> None:
         self.assertEqual(_values(contract_enums.Decision), set(self.contract["decisions"]))
+
+    def test_tool_categories(self) -> None:
+        self.assertEqual(
+            _values(contract_enums.ToolCategory),
+            set(self.contract["tool_categories"]),
+        )
 
     def test_chat_modes(self) -> None:
         self.assertEqual(_values(contract_enums.ChatMode), set(self.contract["chat_modes"]))

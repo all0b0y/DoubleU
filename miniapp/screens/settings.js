@@ -5,10 +5,13 @@ const twa = window.Telegram?.WebApp;
 const MODE_INFO = {
   disabled:  { label: 'disabled',  desc: 'DoubleU не работает в этом чате' },
   silent:    { label: 'silent',    desc: 'только анализ, без черновиков' },
-  manual:    { label: 'manual',    desc: 'черновики только по запросу' },
-  semi_auto: { label: 'semi_auto', desc: 'генерит, ты подтверждаешь' },
-  auto:      { label: 'auto',      desc: 'отвечает самостоятельно' },
+  manual:    { label: 'manual',    desc: 'черновик по запросу' },
+  semi_auto: { label: 'semi_auto', desc: 'иногда отправляет черновики' },
+  auto:      { label: 'auto',      desc: 'отвечает сам' },
 };
+
+// Modes that hand control to the AI — selecting them shows an accuracy warning.
+const MODE_WARNS = new Set(['semi_auto', 'auto']);
 const MODE_ORDER = ['disabled', 'silent', 'manual', 'semi_auto', 'auto'];
 
 // Privacy flags shown as positive toggles ("вкл" = удобное состояние), so each
@@ -51,28 +54,14 @@ export function renderSettings(navigate, chatId) {
 
   let currentMode = 'manual';
   let currentFlags = [];
-  let availableModes = new Set(['disabled', 'silent', 'manual']);
-  let contextScore = 0;
 
   // ── Section renderers ───────────────────────────────────────────────────
 
+  // Every mode is always selectable — there are no context-score locks. Modes
+  // that hand control to the AI surface an accuracy warning on selection instead.
   function modeRowHTML(mode) {
     const info = MODE_INFO[mode] || { label: mode, desc: '' };
-    const isActive  = currentMode === mode;
-    const isLocked  = !availableModes.has(mode);
-
-    if (isLocked) {
-      const threshold = mode === 'auto' ? 80 : 50;
-      return `
-        <div class="st-mode-row st-mode-locked">
-          <span class="st-mode-icon">🔒</span>
-          <div class="st-mode-body">
-            <p class="st-mode-name st-mode-name-locked">${info.label}</p>
-            <p class="st-mode-desc">${info.desc}</p>
-          </div>
-          <span class="st-mode-lock-badge">${contextScore} / ${threshold}</span>
-        </div>`;
-    }
+    const isActive = currentMode === mode;
     return `
       <div class="st-mode-row ${isActive ? 'st-mode-active' : ''}" data-mode="${mode}">
         <span class="st-mode-icon">${isActive ? '◉' : '○'}</span>
@@ -81,6 +70,24 @@ export function renderSettings(navigate, chatId) {
           <p class="st-mode-desc">${info.desc}</p>
         </div>
       </div>`;
+  }
+
+  // Warn before handing control to the AI: answers can be inaccurate and the
+  // chat may not give the model enough context. Proceeds only on confirmation.
+  function confirmAiMode(mode, onConfirm) {
+    const name = MODE_INFO[mode]?.label || mode;
+    const message = mode === 'auto'
+      ? 'ИИ будет отвечать собеседнику сам, без твоего подтверждения. Ответы могут быть неточными, а информации в чате — недостаточно.'
+      : 'ИИ будет иногда отправлять ответы сам. Они могут быть неточными, а информации в чате — недостаточно.';
+    if (!twa?.showPopup) { onConfirm(); return; }
+    twa.showPopup({
+      title: `Включить «${name}»?`,
+      message,
+      buttons: [
+        { id: 'cancel', type: 'cancel', text: 'Отмена' },
+        { id: 'on', type: 'default', text: 'Включить' },
+      ],
+    }, (btnId) => { if (btnId === 'on') onConfirm(); });
   }
 
   // Role is bound to the bot now (one role governs all its chats), so this is an
@@ -132,8 +139,6 @@ export function renderSettings(navigate, chatId) {
   function renderContent(settings) {
     currentMode  = settings.mode || 'manual';
     currentFlags = settings.privacy_flags || [];
-    availableModes = new Set(settings.available_modes || ['disabled', 'silent', 'manual']);
-    contextScore = settings.context_score ?? 0;
 
     el.querySelector('#st-scroll').innerHTML = `
       <div class="st-content">
@@ -234,21 +239,33 @@ export function renderSettings(navigate, chatId) {
   // ── Interactions ────────────────────────────────────────────────────────
 
   function wireInteractions() {
-    // Mode selection — immediate save
+    // Mode selection — immediate save. Modes that let the AI send (semi/auto)
+    // require confirming an accuracy warning first.
     el.querySelectorAll('[data-mode]').forEach(row => {
       row.addEventListener('click', async () => {
         const mode = row.dataset.mode;
         if (mode === currentMode) return;
         twa?.HapticFeedback?.selectionChanged();
-        currentMode = mode;
-        el.querySelectorAll('#mode-list .st-card-divider-wrap').forEach((wrap, i) => {
-          wrap.innerHTML = modeRowHTML(MODE_ORDER[i]);
-        });
-        wireInteractions();
-        try {
-          await api.updateSettings(chatId, { mode, privacy_flags: currentFlags });
-        } catch (err) {
-          twa?.showAlert(`Ошибка: ${err.message}`);
+
+        const apply = async () => {
+          const prev = currentMode;
+          currentMode = mode;
+          el.querySelectorAll('#mode-list .st-card-divider-wrap').forEach((wrap, i) => {
+            wrap.innerHTML = modeRowHTML(MODE_ORDER[i]);
+          });
+          wireInteractions();
+          try {
+            await api.updateSettings(chatId, { mode, privacy_flags: currentFlags });
+          } catch (err) {
+            currentMode = prev; // roll back the optimistic switch on failure
+            twa?.showAlert(`Ошибка: ${err.message}`);
+          }
+        };
+
+        if (MODE_WARNS.has(mode)) {
+          confirmAiMode(mode, apply);
+        } else {
+          apply();
         }
       });
     });

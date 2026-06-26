@@ -89,6 +89,20 @@ func (p *poller) run(ctx context.Context) {
 			if updateID > maxUpdateID {
 				maxUpdateID = updateID
 			}
+			if callback, isCallback, callbackErr := telegram.ParseCallbackQueryUpdate(raw); callbackErr != nil {
+				p.logger.Warn("bot callback normalization failed",
+					"bot_id", p.bot.BotID, "update_id", updateID, "error", callbackErr)
+				continue
+			} else if isCallback {
+				if handler, ok := p.handler.(CallbackHandler); ok {
+					if err := handler.HandleBotCallbackQuery(ctx, callback, p.bot.TenantID, fmt.Sprint(p.bot.BotID)); err != nil {
+						p.logger.Error("bot callback processing failed",
+							"tenant_id", p.bot.TenantID, "bot_id", p.bot.BotID,
+							"query_id", callback.QueryID, "error", err)
+					}
+				}
+				continue
+			}
 			event, isMessage, err := telegram.NormalizeBotUpdate(raw, p.bot.BotID, p.bot.TenantID, time.Now().UTC())
 			if err != nil {
 				p.logger.Warn("bot update normalization failed",
@@ -98,7 +112,15 @@ func (p *poller) run(ctx context.Context) {
 			if !isMessage {
 				continue
 			}
-			if err := p.handler.HandleBotMessage(ctx, event); err != nil {
+			// Parse any downloadable attachment so the handler can turn it into
+			// text. A parse failure is non-fatal: the message is still processed
+			// (as text/placeholder), never dropped.
+			media, mediaErr := telegram.MediaFromBotUpdate(raw)
+			if mediaErr != nil {
+				p.logger.Warn("bot media descriptor parse failed",
+					"bot_id", p.bot.BotID, "update_id", updateID, "error", mediaErr)
+			}
+			if err := p.handler.HandleBotMessage(ctx, event, media); err != nil {
 				// The receive idempotency key makes redelivery safe, but we do not
 				// retry here: the next message will surface persistent failures.
 				p.logger.Error("bot message processing failed",
@@ -163,7 +185,7 @@ func getUpdates(ctx context.Context, client *http.Client, baseURL, token string,
 	body := map[string]any{
 		"offset":          offset,
 		"timeout":         longPollTimeoutSeconds,
-		"allowed_updates": []string{"message"},
+		"allowed_updates": []string{"message", "callback_query"},
 	}
 	var result []json.RawMessage
 	err := callAPI(ctx, client, baseURL, token, "getUpdates", body, &result)

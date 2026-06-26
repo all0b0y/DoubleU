@@ -26,12 +26,93 @@ logger = logging.getLogger(__name__)
 # Active (non-deleted, non-superseded) facts of the current chat.
 _FACT_FILTER = "tenant_id = $1 AND chat_id = $2 AND deleted_at IS NULL AND superseded_by_id IS NULL"
 
+# How many supersession/update hops back from a current fact we surface as
+# history. 2 is enough to show "current ← previous ← the one before" without the
+# walk fanning out across long-collapsed chains.
+_GRAPH_MAX_DEPTH = 2
+
+# Graph-aware semantic search (temporal knowledge graph read-path).
+#
+# Seeds with the top-K *current* facts ranked by embedding distance, then walks
+# fact_relations backward (fact_id_to → fact_id_from) along supersedes/updates
+# edges to recover what each current fact replaced. Older facts are soft-deleted
+# by consolidate_facts, so the recursive arm deliberately omits the deleted_at
+# filter — the edge itself (tenant-scoped) bounds what it reaches. Rows come back
+# ordered (similarity, root, depth) so each current fact is followed by its
+# progressively older versions.
+_GRAPH_SEARCH_SQL = """
+WITH RECURSIVE seed AS (
+    SELECT sf.id, sf.fact_text, sf.fact_type, sf.confidence,
+           fe.embedding <=> $3::vector AS dist
+      FROM semantic_facts sf
+      JOIN fact_embeddings fe ON fe.fact_id = sf.id
+     WHERE sf.tenant_id = $1 AND sf.chat_id = $2
+       AND sf.deleted_at IS NULL AND sf.superseded_by_id IS NULL
+     ORDER BY fe.embedding <=> $3::vector
+     LIMIT $4
+),
+chain AS (
+    SELECT s.id, s.fact_text, s.fact_type, s.id AS root_id, s.dist, 0 AS depth
+      FROM seed s
+    UNION ALL
+    SELECT old.id, old.fact_text, old.fact_type, c.root_id, c.dist, c.depth + 1
+      FROM chain c
+      JOIN fact_relations fr
+        ON fr.fact_id_to = c.id
+       AND fr.tenant_id = $1
+       AND fr.relation_type IN ('supersedes', 'updates')
+      JOIN semantic_facts old
+        ON old.id = fr.fact_id_from
+       AND old.tenant_id = $1 AND old.chat_id = $2
+     WHERE c.depth < {max_depth}
+)
+SELECT id, fact_text, fact_type, root_id, depth
+  FROM chain
+ ORDER BY dist, root_id, depth
+""".format(max_depth=_GRAPH_MAX_DEPTH)
+
 memory_toolset: FunctionToolset[AgentDeps] = FunctionToolset()
 
 
 def _vector_literal(embedding: Sequence[float]) -> str:
     """Render an embedding as a pgvector literal so no binary codec is needed."""
     return "[" + ",".join(f"{v:.8f}" for v in embedding) + "]"
+
+
+def _format_fact_chains(rows: Sequence) -> list[str]:
+    """Render graph rows as one line per current fact, with its prior versions.
+
+    Rows are ordered (similarity, root, depth): a current fact (depth 0) is
+    followed by the facts it superseded. History is shown inline ("← ранее: …")
+    so the agent sees how a fact evolved rather than only its latest value. A
+    fact with no history renders exactly as the flat path did, keeping the
+    common case unchanged.
+    """
+    groups: dict[int, list] = {}
+    order: list[int] = []
+    for row in rows:
+        root = row["root_id"]
+        if root not in groups:
+            groups[root] = []
+            order.append(root)
+        groups[root].append(row)
+
+    lines: list[str] = []
+    seen: set[int] = set()
+    for root in order:
+        members = sorted(groups[root], key=lambda r: r["depth"])
+        current = members[0]
+        if current["id"] in seen:
+            continue
+        seen.add(current["id"])
+        history = [r["fact_text"] for r in members[1:] if r["id"] not in seen]
+        for r in members[1:]:
+            seen.add(r["id"])
+        line = f"[{current['fact_type']}] {current['fact_text']}"
+        if history:
+            line += " ← ранее: " + "; ".join(history)
+        lines.append(line)
+    return lines
 
 
 @memory_toolset.tool
@@ -50,30 +131,24 @@ async def search_facts(ctx: RunContext[AgentDeps], query: str, limit: int = 5) -
         embedding = await deps.embedder(query)
     if embedding:
         rows = await deps.pool.fetch(
-            """SELECT sf.fact_text, sf.fact_type, sf.confidence
-                 FROM semantic_facts sf
-                 JOIN fact_embeddings fe ON fe.fact_id = sf.id
-                WHERE sf.tenant_id = $1 AND sf.chat_id = $2
-                  AND sf.deleted_at IS NULL AND sf.superseded_by_id IS NULL
-                ORDER BY fe.embedding <=> $3::vector
-                LIMIT $4""",
+            _GRAPH_SEARCH_SQL,
             deps.tenant_id,
             deps.chat_id,
             _vector_literal(embedding),
             limit,
         )
-    else:
-        rows = await deps.pool.fetch(
-            f"""SELECT fact_text, fact_type, confidence
-                  FROM semantic_facts
-                 WHERE {_FACT_FILTER} AND fact_text ILIKE '%' || $3 || '%'
-                 ORDER BY confidence DESC, created_at DESC
-                 LIMIT $4""",
-            deps.tenant_id,
-            deps.chat_id,
-            query.strip(),
-            limit,
-        )
+        return _format_fact_chains(rows)
+    rows = await deps.pool.fetch(
+        f"""SELECT fact_text, fact_type, confidence
+              FROM semantic_facts
+             WHERE {_FACT_FILTER} AND fact_text ILIKE '%' || $3 || '%'
+             ORDER BY confidence DESC, created_at DESC
+             LIMIT $4""",
+        deps.tenant_id,
+        deps.chat_id,
+        query.strip(),
+        limit,
+    )
     return [f"[{r['fact_type']}] {r['fact_text']}" for r in rows]
 
 

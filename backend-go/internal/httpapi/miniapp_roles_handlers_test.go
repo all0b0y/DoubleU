@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -41,6 +42,116 @@ func decodeBody(t *testing.T, res *httptest.ResponseRecorder, out any) {
 
 const testTenant = "tenant:user:777"
 
+func TestDraftRoleFromTextDoesNotPersist(t *testing.T) {
+	var mu sync.Mutex
+	requestedText := ""
+	aiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/ai/draft-role" {
+			http.NotFound(w, r)
+			return
+		}
+		var request struct {
+			Text string `json:"text"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&request)
+		mu.Lock()
+		requestedText = request.Text
+		mu.Unlock()
+		writeJSON(w, http.StatusOK, map[string]any{
+			"name": "Менеджер", "description": "Помогает клиентам",
+			"speaking_style": "Кратко", "goals": "Решать вопросы",
+			"constraints": "Не выдумывать факты", "custom_fields": []any{},
+		})
+	}))
+	defer aiServer.Close()
+
+	repo := store.NewRepository()
+	server := NewServer(core.NewService(repo, nil, nil), WithAIBaseURL(aiServer.URL))
+	res := miniappRequest(t, server, http.MethodPost, "/api/v1/roles/draft",
+		`{"text":"Нужен менеджер поддержки"}`)
+	if res.Code != http.StatusOK {
+		t.Fatalf("draft text status = %d body=%s", res.Code, res.Body.String())
+	}
+	var draft roleJSON
+	decodeBody(t, res, &draft)
+	if draft.ID != 0 || draft.Name != "Менеджер" || draft.ModelTier != "balanced" {
+		t.Fatalf("draft = %+v", draft)
+	}
+	mu.Lock()
+	gotText := requestedText
+	mu.Unlock()
+	if gotText != "Нужен менеджер поддержки" {
+		t.Fatalf("AI draft text = %q", gotText)
+	}
+	if roles := repo.AIRoles(testTenant); len(roles) != 0 {
+		t.Fatalf("draft endpoint persisted roles: %+v", roles)
+	}
+}
+
+func TestDraftRoleFromAudioTranscribesBeforeDraftAndDoesNotPersist(t *testing.T) {
+	var mu sync.Mutex
+	calls := make([]string, 0, 2)
+	draftedText := ""
+	aiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls = append(calls, r.URL.Path)
+		mu.Unlock()
+		switch r.URL.Path {
+		case "/ai/extract-media":
+			var request struct {
+				Kind       string `json:"kind"`
+				DataBase64 string `json:"data_base64"`
+				MimeType   string `json:"mime_type"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&request)
+			if request.Kind != "voice" || request.DataBase64 != "b2dnYnl0ZXM=" || request.MimeType != "audio/webm" {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unexpected media request"})
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]string{
+				"text": "Голосовое описание роли", "provenance": "voice_transcript", "model_used": "test",
+			})
+		case "/ai/draft-role":
+			var request struct {
+				Text string `json:"text"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&request)
+			mu.Lock()
+			draftedText = request.Text
+			mu.Unlock()
+			writeJSON(w, http.StatusOK, map[string]any{
+				"name": "Консультант", "description": "Консультирует клиентов",
+				"speaking_style": "Спокойно", "goals": "Помочь выбрать",
+				"constraints": "Не давать гарантий", "custom_fields": []any{},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer aiServer.Close()
+
+	repo := store.NewRepository()
+	server := NewServer(core.NewService(repo, nil, nil), WithAIBaseURL(aiServer.URL))
+	res := miniappRequest(t, server, http.MethodPost, "/api/v1/roles/draft",
+		`{"audio_base64":"b2dnYnl0ZXM=","mime_type":"audio/webm"}`)
+	if res.Code != http.StatusOK {
+		t.Fatalf("draft audio status = %d body=%s", res.Code, res.Body.String())
+	}
+	mu.Lock()
+	gotCalls := append([]string(nil), calls...)
+	gotDraftedText := draftedText
+	mu.Unlock()
+	if strings.Join(gotCalls, ",") != "/ai/extract-media,/ai/draft-role" {
+		t.Fatalf("AI call order = %v", gotCalls)
+	}
+	if gotDraftedText != "Голосовое описание роли" {
+		t.Fatalf("drafted transcript = %q", gotDraftedText)
+	}
+	if roles := repo.AIRoles(testTenant); len(roles) != 0 {
+		t.Fatalf("audio draft endpoint persisted roles: %+v", roles)
+	}
+}
+
 func TestRoleLifecycle(t *testing.T) {
 	repo := store.NewRepository()
 	repo.SaveChat(store.ChatRecord{TenantID: testTenant, ChatID: "42", DisplayName: "Иван"})
@@ -56,6 +167,12 @@ func TestRoleLifecycle(t *testing.T) {
 	decodeBody(t, res, &created)
 	if created.ID == 0 || created.Name != "Менеджер" {
 		t.Fatalf("created role = %+v", created)
+	}
+	if created.RichFormattingEnabled != nil || created.StreamingEnabled != nil {
+		t.Fatalf("new role must inherit delivery settings by default: %+v", created)
+	}
+	if created.ModelTier != "balanced" {
+		t.Fatalf("new role model tier = %q, want balanced", created.ModelTier)
 	}
 
 	// Duplicate name → 409.
@@ -130,6 +247,81 @@ func TestRoleLifecycle(t *testing.T) {
 	}
 	if _, ok := repo.AIRoleForChat(testTenant, "42"); ok {
 		t.Fatalf("chat still has a role after role deletion")
+	}
+}
+
+func TestRoleDeliverySettingsRoundTrip(t *testing.T) {
+	repo := store.NewRepository()
+	server := NewServer(core.NewService(repo, nil, nil))
+
+	res := miniappRequest(t, server, http.MethodPost, "/api/v1/roles",
+		`{"name":"Поддержка","description":"Отвечает по FAQ","rich_formatting_enabled":false,"streaming_enabled":true}`)
+	if res.Code != http.StatusOK {
+		t.Fatalf("create status = %d body=%s", res.Code, res.Body.String())
+	}
+	var created roleJSON
+	decodeBody(t, res, &created)
+	if created.RichFormattingEnabled == nil || *created.RichFormattingEnabled || created.StreamingEnabled == nil || !*created.StreamingEnabled {
+		t.Fatalf("created delivery settings = %+v", created)
+	}
+
+	// Old clients that omit new fields must not clobber already saved delivery settings.
+	res = miniappRequest(t, server, http.MethodPut, fmt.Sprintf("/api/v1/roles/%d", created.ID),
+		`{"name":"Поддержка","description":"Отвечает по FAQ","speaking_style":"коротко"}`)
+	if res.Code != http.StatusOK {
+		t.Fatalf("update status = %d body=%s", res.Code, res.Body.String())
+	}
+	role, ok := repo.AIRoleByID(testTenant, created.ID)
+	if !ok || role.RichFormattingEnabled == nil || *role.RichFormattingEnabled || role.StreamingEnabled == nil || !*role.StreamingEnabled {
+		t.Fatalf("delivery settings after legacy update = %+v ok=%v", role, ok)
+	}
+
+	res = miniappRequest(t, server, http.MethodPut, fmt.Sprintf("/api/v1/roles/%d", created.ID),
+		`{"name":"Поддержка","description":"Отвечает по FAQ","rich_formatting_enabled":null,"streaming_enabled":false}`)
+	if res.Code != http.StatusOK {
+		t.Fatalf("clear status = %d body=%s", res.Code, res.Body.String())
+	}
+	decodeBody(t, res, &created)
+	if created.RichFormattingEnabled != nil || created.StreamingEnabled == nil || *created.StreamingEnabled {
+		t.Fatalf("delivery settings after clear/update = %+v", created)
+	}
+}
+
+func TestRoleModelTierRoundTripAndValidation(t *testing.T) {
+	repo := store.NewRepository()
+	server := NewServer(core.NewService(repo, nil, nil))
+
+	res := miniappRequest(t, server, http.MethodPost, "/api/v1/roles",
+		`{"name":"Быстрая поддержка","description":"Отвечает по FAQ","model_tier":"FAST","model_name":" deepseek/model-a "}`)
+	if res.Code != http.StatusOK {
+		t.Fatalf("create status = %d body=%s", res.Code, res.Body.String())
+	}
+	var created roleJSON
+	decodeBody(t, res, &created)
+	if created.ModelTier != "fast" {
+		t.Fatalf("created model tier = %q, want fast", created.ModelTier)
+	}
+	if created.ModelName != "deepseek/model-a" {
+		t.Fatalf("created model name = %q, want deepseek/model-a", created.ModelName)
+	}
+
+	res = miniappRequest(t, server, http.MethodPut, fmt.Sprintf("/api/v1/roles/%d", created.ID),
+		`{"name":"Быстрая поддержка","description":"Отвечает по FAQ","model_tier":"smart","model_name":"deepseek/model-b"}`)
+	if res.Code != http.StatusOK {
+		t.Fatalf("update status = %d body=%s", res.Code, res.Body.String())
+	}
+	decodeBody(t, res, &created)
+	if created.ModelTier != "smart" {
+		t.Fatalf("updated model tier = %q, want smart", created.ModelTier)
+	}
+	if created.ModelName != "deepseek/model-b" {
+		t.Fatalf("updated model name = %q, want deepseek/model-b", created.ModelName)
+	}
+
+	res = miniappRequest(t, server, http.MethodPost, "/api/v1/roles",
+		`{"name":"Некорректная","description":"x","model_tier":"turbo"}`)
+	if res.Code != http.StatusBadRequest {
+		t.Fatalf("invalid model tier status = %d body=%s", res.Code, res.Body.String())
 	}
 }
 
@@ -283,12 +475,12 @@ func TestUserSettingsRoundTrip(t *testing.T) {
 	res := miniappRequest(t, server, http.MethodGet, "/api/v1/settings/user", "")
 	var got contracts.UserSettings
 	decodeBody(t, res, &got)
-	if got.DefaultModeForNewChats != "manual" || !got.LearningEnabled {
+	if got.DefaultModeForNewChats != "manual" || !got.LearningEnabled || !got.RichFormattingEnabled || got.StreamingEnabled {
 		t.Fatalf("defaults = %+v", got)
 	}
 
 	res = miniappRequest(t, server, http.MethodPut, "/api/v1/settings/user",
-		`{"display_name":"Алексей","bio":"продакт","default_mode_for_new_chats":"semi_auto","learning_enabled":false,"language_for_drafts":"primary"}`)
+		`{"display_name":"Алексей","bio":"продакт","default_mode_for_new_chats":"semi_auto","learning_enabled":false,"rich_formatting_enabled":false,"streaming_enabled":true,"language_for_drafts":"primary"}`)
 	if res.Code != http.StatusOK {
 		t.Fatalf("save status = %d body=%s", res.Code, res.Body.String())
 	}
@@ -296,7 +488,7 @@ func TestUserSettingsRoundTrip(t *testing.T) {
 	res = miniappRequest(t, server, http.MethodGet, "/api/v1/settings/user", "")
 	decodeBody(t, res, &got)
 	if got.DisplayName != "Алексей" || got.DefaultModeForNewChats != "semi_auto" ||
-		got.LearningEnabled || got.LanguageForDrafts != "primary" {
+		got.LearningEnabled || got.RichFormattingEnabled || !got.StreamingEnabled || got.LanguageForDrafts != "primary" {
 		t.Fatalf("round-trip settings = %+v", got)
 	}
 
@@ -304,6 +496,85 @@ func TestUserSettingsRoundTrip(t *testing.T) {
 	res = miniappRequest(t, server, http.MethodPut, "/api/v1/settings/user", `{"default_mode_for_new_chats":"yolo"}`)
 	if res.Code != http.StatusBadRequest {
 		t.Fatalf("invalid mode status = %d", res.Code)
+	}
+}
+
+// TestUserSettingsPartialUpdatePreservesIdentity guards against a regression
+// where a timezone-only PUT (the Mini App's background auto-detect sync)
+// wiped display_name/bio because the request struct used bare strings instead
+// of *string — every omitted field unmarshalled to "" and overwrote the
+// stored value.
+func TestUserSettingsPartialUpdatePreservesIdentity(t *testing.T) {
+	repo := store.NewRepository()
+	server := NewServer(core.NewService(repo, nil, nil))
+
+	res := miniappRequest(t, server, http.MethodPut, "/api/v1/settings/user",
+		`{"display_name":"Алексей","bio":"продакт"}`)
+	if res.Code != http.StatusOK {
+		t.Fatalf("seed save status = %d body=%s", res.Code, res.Body.String())
+	}
+
+	// Partial PUT — only timezone, as the Mini App's syncTimezone() sends —
+	// must not touch display_name/bio.
+	res = miniappRequest(t, server, http.MethodPut, "/api/v1/settings/user", `{"timezone":"Europe/Kyiv"}`)
+	if res.Code != http.StatusOK {
+		t.Fatalf("partial save status = %d body=%s", res.Code, res.Body.String())
+	}
+
+	res = miniappRequest(t, server, http.MethodGet, "/api/v1/settings/user", "")
+	var got contracts.UserSettings
+	decodeBody(t, res, &got)
+	if got.DisplayName != "Алексей" || got.Bio != "продакт" {
+		t.Fatalf("timezone-only update must not wipe identity fields: %+v", got)
+	}
+	if got.Timezone != "Europe/Kyiv" {
+		t.Fatalf("timezone not saved: %+v", got)
+	}
+
+	// An explicit empty string (field present, value "") is a real clear
+	// request and must still work — distinct from omitting the field.
+	res = miniappRequest(t, server, http.MethodPut, "/api/v1/settings/user", `{"display_name":"","bio":""}`)
+	if res.Code != http.StatusOK {
+		t.Fatalf("explicit clear status = %d body=%s", res.Code, res.Body.String())
+	}
+	res = miniappRequest(t, server, http.MethodGet, "/api/v1/settings/user", "")
+	// DisplayName/Bio are `omitempty` on the wire, so a fresh zero-value struct
+	// is required here — reusing `got` would silently keep the stale strings,
+	// since an absent JSON key leaves the destination field untouched.
+	var cleared contracts.UserSettings
+	decodeBody(t, res, &cleared)
+	if cleared.DisplayName != "" || cleared.Bio != "" {
+		t.Fatalf("explicit empty string must clear identity fields: %+v", cleared)
+	}
+	if cleared.Timezone != "Europe/Kyiv" {
+		t.Fatalf("unrelated clear must not touch timezone: %+v", cleared)
+	}
+}
+
+// TestUserSettingsInvalidTimezoneIgnored ensures a malformed/unknown IANA
+// name (e.g. a stale browser-detected value) is dropped silently rather than
+// failing the request or overwriting a previously valid timezone — the
+// scheduler prompt already falls back to UTC for an empty timezone, so
+// rejecting bad input here keeps that fallback the only path to UTC.
+func TestUserSettingsInvalidTimezoneIgnored(t *testing.T) {
+	repo := store.NewRepository()
+	server := NewServer(core.NewService(repo, nil, nil))
+
+	res := miniappRequest(t, server, http.MethodPut, "/api/v1/settings/user", `{"timezone":"Europe/Kyiv"}`)
+	if res.Code != http.StatusOK {
+		t.Fatalf("seed save status = %d body=%s", res.Code, res.Body.String())
+	}
+
+	res = miniappRequest(t, server, http.MethodPut, "/api/v1/settings/user", `{"timezone":"Not/AZone"}`)
+	if res.Code != http.StatusOK {
+		t.Fatalf("invalid timezone must not fail the request: status=%d body=%s", res.Code, res.Body.String())
+	}
+
+	var got contracts.UserSettings
+	res = miniappRequest(t, server, http.MethodGet, "/api/v1/settings/user", "")
+	decodeBody(t, res, &got)
+	if got.Timezone != "Europe/Kyiv" {
+		t.Fatalf("invalid timezone must not overwrite the previous valid value: %+v", got)
 	}
 }
 
@@ -347,6 +618,7 @@ func TestMiniAppRoutesRequireAuth(t *testing.T) {
 	for _, route := range []struct{ method, path string }{
 		{http.MethodGet, "/api/v1/roles"},
 		{http.MethodPost, "/api/v1/roles"},
+		{http.MethodPost, "/api/v1/roles/draft"},
 		{http.MethodGet, "/api/v1/suggestions"},
 		{http.MethodPost, "/api/v1/forget-all"},
 		{http.MethodGet, "/api/v1/settings/user"},

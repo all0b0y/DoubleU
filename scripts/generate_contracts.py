@@ -33,6 +33,7 @@ PY_OUT = ROOT / "ai-python" / "ai_agent" / "contract_enums.py"
 # declared (with its IsValid method) in types.go; this generator only emits the
 # value constants and a slice listing every legal value.
 GO_ENUM_TYPES: dict[str, dict[str, str]] = {
+    "tool_categories":   {"type": "ToolCategory",   "const_prefix": "ToolCategory"},
     "decisions":        {"type": "Decision",       "const_prefix": "Decision"},
     "chat_modes":       {"type": "ChatMode",       "const_prefix": "ChatMode"},
     "privacy_flags":    {"type": "PrivacyFlag",    "const_prefix": "Privacy"},
@@ -44,6 +45,7 @@ GO_ENUM_TYPES: dict[str, dict[str, str]] = {
 
 # Map JSON enum keys to the Python Enum class name.
 PY_ENUM_TYPES: dict[str, str] = {
+    "tool_categories":   "ToolCategory",
     "decisions":        "Decision",
     "chat_modes":       "ChatMode",
     "privacy_flags":    "PrivacyFlag",

@@ -14,8 +14,56 @@ const MODE_OPTIONS = [
   { value: 'auto',      label: 'auto — отвечает сам' },
 ];
 
+// Curated list of major IANA zones for the manual override — kept short on
+// purpose (full tz database is 400+ entries and unusable in a <select>).
+// The owner's actual auto-detected zone is injected at render time even when
+// it isn't in this list, so the dropdown never silently shows the wrong value.
+const TIMEZONE_OPTIONS = [
+  ['UTC', 'UTC'],
+  ['Europe/Kaliningrad', 'Калининград'],
+  ['Europe/Kyiv', 'Киев'],
+  ['Europe/Minsk', 'Минск'],
+  ['Europe/Moscow', 'Москва'],
+  ['Europe/Samara', 'Самара'],
+  ['Asia/Yekaterinburg', 'Екатеринбург'],
+  ['Asia/Almaty', 'Алматы'],
+  ['Asia/Omsk', 'Омск'],
+  ['Asia/Krasnoyarsk', 'Красноярск'],
+  ['Asia/Irkutsk', 'Иркутск'],
+  ['Asia/Yakutsk', 'Якутск'],
+  ['Asia/Vladivostok', 'Владивосток'],
+  ['Asia/Magadan', 'Магадан'],
+  ['Asia/Kamchatka', 'Камчатка'],
+  ['Asia/Tashkent', 'Ташкент'],
+  ['Asia/Bishkek', 'Бишкек'],
+  ['Asia/Dushanbe', 'Душанбе'],
+  ['Asia/Baku', 'Баку'],
+  ['Asia/Yerevan', 'Ереван'],
+  ['Asia/Tbilisi', 'Тбилиси'],
+  ['Europe/Warsaw', 'Варшава'],
+  ['Europe/Berlin', 'Берлин'],
+  ['Europe/London', 'Лондон'],
+  ['Europe/Istanbul', 'Стамбул'],
+  ['Asia/Dubai', 'Дубай'],
+  ['Asia/Bangkok', 'Бангкок'],
+  ['Asia/Shanghai', 'Пекин/Шанхай'],
+  ['Asia/Tokyo', 'Токио'],
+  ['America/New_York', 'Нью-Йорк'],
+  ['America/Los_Angeles', 'Лос-Анджелес'],
+];
+
 function esc(str) {
   return String(str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+// Renders <option>s for the timezone <select>, injecting the current value
+// when it falls outside the curated list so the dropdown is never wrong.
+function timezoneOptionsHTML(current) {
+  const known = TIMEZONE_OPTIONS.some(([iana]) => iana === current);
+  const all = current && !known ? [[current, current], ...TIMEZONE_OPTIONS] : TIMEZONE_OPTIONS;
+  return all.map(([iana, label]) => `
+    <option value="${esc(iana)}" ${iana === current ? 'selected' : ''}>${esc(label)} (${esc(iana)})</option>
+  `).join('');
 }
 
 function suggestionCardHTML(s) {
@@ -61,6 +109,9 @@ export function renderMe(navigate) {
 
   let settings = {};
   let roles = [];
+  // The me-screen bot section is single-bot; with multibot we show the tenant's
+  // first bot. Kept here so the role-picker handler (in wire()) has its bot id.
+  let currentBot = { connected: false };
 
   function personalConnectionHTML(me) {
     const status = me?.connection?.status || 'not_found';
@@ -154,6 +205,15 @@ export function renderMe(navigate) {
                 <option value="primary" ${settings.language_for_drafts === 'primary' ? 'selected' : ''}>всегда мой язык</option>
               </select>
             </div>
+            <div class="field-group">
+              <div class="field-label">часовой пояс</div>
+              <select class="field-select" id="f-timezone">
+                ${timezoneOptionsHTML(settings.timezone || 'UTC')}
+              </select>
+              <div style="font-size:11px;color:var(--muted);line-height:1.4;margin-top:6px;">
+                Определяется автоматически по устройству — используется для напоминаний. Можно задать вручную.
+              </div>
+            </div>
             <div class="st-row" style="padding:0;cursor:default;">
               <div class="st-row-body">
                 <p class="st-row-title">учиться на моих правках</p>
@@ -161,6 +221,28 @@ export function renderMe(navigate) {
               </div>
               <label class="toggle">
                 <input type="checkbox" id="f-learning" ${settings.learning_enabled ? 'checked' : ''}>
+                <div class="toggle-track"></div>
+                <div class="toggle-knob"></div>
+              </label>
+            </div>
+            <div class="st-row" style="padding:0;cursor:default;">
+              <div class="st-row-body">
+                <p class="st-row-title">rich-форматирование ответов</p>
+                <p class="st-row-desc">таблицы, списки и код для ролей</p>
+              </div>
+              <label class="toggle">
+                <input type="checkbox" id="f-rich-formatting" ${settings.rich_formatting_enabled !== false ? 'checked' : ''}>
+                <div class="toggle-track"></div>
+                <div class="toggle-knob"></div>
+              </label>
+            </div>
+            <div class="st-row" style="padding:0;cursor:default;">
+              <div class="st-row-body">
+                <p class="st-row-title">потоковый AI-режим</p>
+                <p class="st-row-desc">показывать набор готового ответа</p>
+              </div>
+              <label class="toggle">
+                <input type="checkbox" id="f-streaming" ${settings.streaming_enabled ? 'checked' : ''}>
                 <div class="toggle-track"></div>
                 <div class="toggle-knob"></div>
               </label>
@@ -213,7 +295,7 @@ export function renderMe(navigate) {
     el.querySelector('#f-bot-role')?.addEventListener('change', async (e) => {
       twa?.HapticFeedback?.selectionChanged();
       try {
-        await api.setBotRole(Number(e.target.value));
+        await api.setBotRole(currentBot.bot_id, Number(e.target.value));
         twa?.HapticFeedback?.notificationOccurred('success');
       } catch (err) {
         twa?.HapticFeedback?.notificationOccurred('error');
@@ -251,9 +333,12 @@ export function renderMe(navigate) {
           // so saving behaviour settings doesn't wipe the existing profile.
           display_name:               settings.display_name,
           bio:                        settings.bio,
+          timezone:                   el.querySelector('#f-timezone').value,
           default_mode_for_new_chats: el.querySelector('#f-default-mode').value,
           language_for_drafts:        el.querySelector('#f-draft-lang').value,
           learning_enabled:           el.querySelector('#f-learning').checked,
+          rich_formatting_enabled:    el.querySelector('#f-rich-formatting').checked,
+          streaming_enabled:          el.querySelector('#f-streaming').checked,
         });
         twa?.HapticFeedback?.notificationOccurred('success');
         btn.textContent = '✓ Сохранено';
@@ -281,8 +366,8 @@ export function renderMe(navigate) {
       goBtn.textContent = '…'; goBtn.disabled = true;
       try {
         await api.forgetAll(input.value.trim());
-        // Everything is gone, including the connection — restart onboarding.
-        navigate('/onboarding');
+        // Everything is gone, including the connection — return to the splash.
+        navigate('/');
       } catch (err) {
         twa?.showAlert(`Ошибка: ${err.message}`);
         goBtn.textContent = 'Удалить всё навсегда'; goBtn.disabled = false;
@@ -292,14 +377,15 @@ export function renderMe(navigate) {
 
   async function load() {
     try {
-      const [me, settingsData, suggestionsData, botData, rolesData] = await Promise.all([
+      const [me, settingsData, suggestionsData, botsData, rolesData] = await Promise.all([
         api.me(), api.userSettings(), api.suggestions(),
-        api.getBot().catch(() => ({ connected: false })),
+        api.bots().catch(() => ({ bots: [] })),
         api.roles().catch(() => ({ roles: [] })),
       ]);
       settings = settingsData || {};
       roles = rolesData.roles || [];
-      renderContent(me, suggestionsData.suggestions || [], botData || { connected: false });
+      currentBot = (botsData.bots && botsData.bots[0]) || { connected: false };
+      renderContent(me, suggestionsData.suggestions || [], currentBot);
     } catch (err) {
       el.querySelector('#me-scroll').innerHTML = `
         <div class="empty-state"><div class="empty-icon">⚠️</div><div class="empty-subtitle">${esc(err.message)}</div></div>`;

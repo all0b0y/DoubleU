@@ -20,6 +20,7 @@ func TestHTTPClientProcessMessageAndReviseDraft(t *testing.T) {
 			_ = json.NewEncoder(&body).Encode(contracts.AIProcessMessageResponse{
 				Decision:     contracts.DecisionDraft,
 				ResponseText: "draft",
+				TextFormat:   contracts.TextFormatRich,
 				Confidence:   0.8,
 				RiskLevel:    contracts.RiskLow,
 				Usage:        contracts.TokenUsage{},
@@ -39,6 +40,9 @@ func TestHTTPClientProcessMessageAndReviseDraft(t *testing.T) {
 	}
 	if response.ResponseText != "draft" {
 		t.Fatalf("response = %+v", response)
+	}
+	if response.TextFormat != contracts.TextFormatRich {
+		t.Fatalf("text_format = %q", response.TextFormat)
 	}
 	revised, err := client.ReviseDraft(context.Background(), DraftRevisionRequest{Text: "draft"})
 	if err != nil {
@@ -63,6 +67,43 @@ func TestHTTPClientErrors(t *testing.T) {
 	})})
 	if _, err := client.ProcessMessage(context.Background(), contracts.AIProcessMessageRequest{}); err == nil {
 		t.Fatalf("expected status error")
+	}
+}
+
+func TestHTTPClientDraftRoleContract(t *testing.T) {
+	client := NewHTTPClient("http://ai-service", &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path != "/ai/draft-role" {
+			return responseWithStatus(http.StatusNotFound, "not found"), nil
+		}
+		var request map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if request["text"] != "Нужен менеджер" || len(request) != 1 {
+			t.Fatalf("draft-role request contract = %#v", request)
+		}
+		var body bytes.Buffer
+		_ = json.NewEncoder(&body).Encode(DraftRoleResponse{
+			Name:          "Менеджер",
+			Description:   "Помогает клиентам",
+			SpeakingStyle: "Кратко",
+			Goals:         "Решать вопросы",
+			Constraints:   "Не выдумывать факты",
+			CustomFields: []contracts.AIRoleCustomField{{
+				Title: "Эскалация", Description: "Когда звать человека",
+			}},
+		})
+		return responseWithStatus(http.StatusOK, body.String()), nil
+	})})
+
+	response, err := client.DraftRole(
+		context.Background(), DraftRoleRequest{Text: "Нужен менеджер"},
+	)
+	if err != nil {
+		t.Fatalf("draft role: %v", err)
+	}
+	if response.Name != "Менеджер" || len(response.CustomFields) != 1 {
+		t.Fatalf("draft-role response contract = %+v", response)
 	}
 }
 
