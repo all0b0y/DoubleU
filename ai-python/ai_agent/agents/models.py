@@ -141,6 +141,24 @@ def model_name_for_tier(tier: str, model_name: str = "") -> str:
     return slugs[0]
 
 
+def resolve_model_slug(task: AgentTask, tier: str = "", model_name: str = "") -> str:
+    """Resolve the concrete slug that will actually serve a call for ``task``.
+
+    Mirrors the precedence ``agents/runtime.py`` already applies when
+    building the model object for a request: a non-empty ``tier`` with a
+    configured env list wins (the per-role tier override), otherwise the
+    task's flat env model is used. Callers that don't have a per-role tier
+    (orchestrator, critic) simply omit ``tier``. Used to pick the
+    ``ModelFamily`` a prompt should render for — never to build the model
+    itself (``build_model``/``build_tier_model``/``build_named_model`` do that).
+    """
+    if tier:
+        tier_slug = model_name_for_tier(tier, model_name)
+        if tier_slug:
+            return tier_slug
+    return model_name_for(task)
+
+
 def build_tier_model(tier: str) -> Model | None:
     """Build the pydantic-ai model for a named tier (fast/balanced/smart).
 

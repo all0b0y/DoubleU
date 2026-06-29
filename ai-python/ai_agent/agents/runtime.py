@@ -34,7 +34,7 @@ from datetime import datetime, timezone
 from typing import Awaitable, Callable, Sequence, TypeVar
 
 import asyncpg
-from pydantic_ai import Agent, RunContext, UsageLimits
+from pydantic_ai import Agent, PromptedOutput, RunContext, UsageLimits
 from pydantic_ai.toolsets import CombinedToolset, FilteredToolset
 
 from ..classifiers import TypedMemoryExtractor
@@ -43,6 +43,10 @@ from ..observability.langfuse_sink import LangfuseSink
 from ..observability.results import SafetyBlocked
 from ..pipelines import draft as draft_pipeline
 from ..pipelines.embedding import embed_texts
+from ..prompts import library as prompt_library
+from ..prompts.families import resolve_family
+from ..prompts.profiles import profile_for
+from ..prompts.renderers import render as render_prompt
 from ..safety.input import InputSafetyScanner
 from ..safety.output import OutputSafetyScanner
 from ..schemas import (
@@ -55,11 +59,13 @@ from ..schemas import (
     DraftRoleResponse,
     EmbedTextsRequest,
     ModelTask,
+    OutboundMessageData,
     PrivacyFlag,
     ProfileSuggestion,
     RerankFactsRequest,
     RerankFactsResponse,
     RiskLevel,
+    QuestionData,
     ResponsePlanData,
     ScheduledJobData,
     SynthesizePatternRequest,
@@ -73,6 +79,7 @@ from ..schemas import (
 )
 from ..security import PromptBuilder
 from .deps import AgentDeps
+from .delivery_tools import delivery_toolset
 from .interaction_tools import interaction_toolset
 from .memory_tools import memory_toolset
 from .models import (
@@ -83,6 +90,7 @@ from .models import (
     build_tier_model,
     model_name_for,
     model_name_for_tier,
+    resolve_model_slug,
 )
 from .schedule_tools import schedule_toolset
 from .tool_catalog import TOOL_CATALOG, TOOL_NAME_TO_KEY
@@ -173,24 +181,18 @@ _CRITIC_RISKS = (RiskLevel.MEDIUM, RiskLevel.HIGH)
 # Upper bound on memory tool-calls the draft agent may make in one run. The
 # draft agent owns a 6-tool memory toolset and would otherwise loop unbounded
 # (ReAct failure mode). The cap counts TOTAL calls, not repeats, so it must sit
-# above one legitimate full sweep of the toolset; 8 leaves margin for a re-query
-# while still terminating pathological loops (which run into the dozens).
-_DRAFT_TOOL_CALLS_LIMIT = 8
+# above one legitimate full sweep of the toolset. A memory-heavy turn (large
+# context + scheduler/interaction tools) legitimately needs more than one sweep,
+# so the default is 12 — high enough that normal turns never trip it, low enough
+# to still kill a runaway loop (which runs into the dozens). Env-tunable.
+_DRAFT_TOOL_CALLS_LIMIT = int(os.getenv("DRAFT_TOOL_CALLS_LIMIT", "12").strip() or "12")
 
-_ORCHESTRATOR_INSTRUCTIONS = (
-    "Ты — стадия подготовки контекста для ответа в Telegram-чате; финальный ответ ты НЕ пишешь."
-    " Задача: понять последнее сообщение собеседника и назначенную роль, решить, каких данных не хватает,"
-    " и собрать их ТОЛЬКО доступными тебе инструментами."
-    " Правила:"
-    " 1) вызывай инструмент лишь когда он реально нужен для точного ответа; не дублируй вызовы;"
-    " 2) не выдумывай факты — если инструмент ничего не вернул, так и отметь;"
-    " 3) разрешённые действия выполняй только при явной необходимости из сообщения;"
-    " 4) НЕ пиши ответ собеседнику и не имитируй владельца."
-    " Верни OrchestratorResult: gathered_context — собранные факты/контекст (по строке на пункт);"
-    " suggested_intent — предполагаемый тип ответа; notes — короткие пометки писателю, что учесть;"
-    " response_plan заполняется только interaction-инструментом, если нужна форма с кнопками."
-)
-
+# How many times draft_outcome re-runs the agent before giving up. A draft can
+# fail transiently — provider 5xx/rate-limit, a malformed structured output, or
+# the tool-call cap — and a fresh attempt usually succeeds. After this many
+# failures the service returns error_fallback and the Go backend delivers a
+# user-facing "temporary problem" notice so the contact is never left in silence.
+_DRAFT_MAX_ATTEMPTS = max(1, int(os.getenv("DRAFT_MAX_ATTEMPTS", "3").strip() or "3"))
 
 def _build_query_embedder() -> EmbedderCallable:
     """Build a per-run, memoized async embedder over the sync embed transport.
@@ -224,17 +226,6 @@ def _build_query_embedder() -> EmbedderCallable:
 
 # Number of recent messages topic tagging includes as context.
 _TOPIC_MAX_HISTORY = 5
-
-_CRITIC_INSTRUCTIONS = (
-    "Ты — строгий рецензент ответов для Telegram-чата. Проверь черновик по критериям:"
-    " 1) соблюдает указанный режим персоны и не пересказывает инструкции;"
-    " 2) не выдумывает факты, имена и обещания, которых нет в контексте;"
-    " 3) уместен по тону и отвечает именно на последнее сообщение собеседника;"
-    " 4) не содержит ничего рискованного (финансовые обещания, медицинские/юридические"
-    " советы, конфиденциальные данные)."
-    " Если черновик хорош — verdict=approve. Если есть проблемы — verdict=revise,"
-    " перечисли их в issues и дай исправленный текст в revised_reply, сохранив стиль."
-)
 
 _EXTRACTION_INSTRUCTIONS = (
     "Extract ONLY durable, long-lived facts from the CURRENT MESSAGE — stable traits"
@@ -295,10 +286,12 @@ class AgentRuntime:
         prompt_builder: PromptBuilder | None = None,
         database_url: str = "",
         run_timeout_seconds: float = 90.0,
+        draft_max_attempts: int = _DRAFT_MAX_ATTEMPTS,
         input_safety: InputSafetyScanner | None = None,
         output_safety: OutputSafetyScanner | None = None,
         sink: LangfuseSink | None = None,
         two_stage_draft: bool = False,
+        prompt_contract_enabled: bool = False,
         orchestrator_model: object | None = None,
         draft_model: object | None = None,
         critic_model: object | None = None,
@@ -321,10 +314,12 @@ class AgentRuntime:
         self._prompt_builder = prompt_builder or PromptBuilder()
         self._database_url = database_url
         self._timeout = run_timeout_seconds
+        self._draft_max_attempts = max(1, draft_max_attempts)
         self._input_safety = input_safety
         self._output_safety = output_safety
         self._sink = sink
         self._two_stage_draft = two_stage_draft
+        self._prompt_contract_enabled = prompt_contract_enabled
         self._pool: asyncpg.Pool | None = None
         # Builds a fresh per-request embedder; None keeps memory tools on the
         # lexical fallback (preserved behaviour for direct callers and tests).
@@ -340,19 +335,32 @@ class AgentRuntime:
             orchestrator_model or build_model(AgentTask.ORCHESTRATE),
             deps_type=AgentDeps,
             output_type=OrchestratorResult,
-            instructions=_ORCHESTRATOR_INSTRUCTIONS,
             retries=1,
         )
 
+        # Legacy instructions were a static Agent-level string; the
+        # Prompt-Contract path renders per-request (model family can only be
+        # known once the request's slug is resolved), so both paths now live
+        # in one dynamic hook instead of a static `instructions=` + this hook.
+        # Flag off reproduces the exact old concatenation (legacy text + the
+        # per-request prompt) so the rendered text is unchanged byte-for-byte.
         @self._orchestrator_agent.instructions
         def _orchestrator_context(ctx: RunContext[AgentDeps]) -> str:
-            return ctx.deps.system_instruction
+            if self._prompt_contract_enabled:
+                return ctx.deps.system_instruction
+            return prompt_library.LEGACY_ORCHESTRATOR_INSTRUCTIONS + "\n\n" + ctx.deps.system_instruction
 
+        # PromptedOutput (not the default ToolOutput) is required because per-role
+        # tier models can be reasoning/"thinking" models (qwen3, minimax), which
+        # reject the forced `tool_choice=required` that ToolOutput sends to coerce
+        # the final_result call. PromptedOutput instead asks for the JSON in-prompt
+        # and parses it from plain text — no tool_choice, so it works on every
+        # model. retries=2 keeps one malformed JSON answer from failing the request.
         self._draft_agent: Agent[AgentDeps, DraftResult] = Agent(
             draft_model or build_model(AgentTask.DRAFT),
             deps_type=AgentDeps,
-            output_type=DraftResult,
-            retries=1,
+            output_type=PromptedOutput(DraftResult),
+            retries=2,
         )
 
         @self._draft_agent.instructions
@@ -363,9 +371,23 @@ class AgentRuntime:
             critic_model or build_model(AgentTask.CRITIC),
             deps_type=AgentDeps,
             output_type=CriticVerdict,
-            instructions=_CRITIC_INSTRUCTIONS,
+            # Flag off: identical static instructions as before. Flag on: no
+            # static text — _review_draft renders critic_spec per-request into
+            # deps.system_instruction and the dynamic hook below returns it.
+            instructions=(
+                None if self._prompt_contract_enabled else prompt_library.LEGACY_CRITIC_INSTRUCTIONS
+            ),
             retries=1,
         )
+        if self._prompt_contract_enabled:
+
+            @self._critic_agent.instructions
+            def _critic_context(ctx: RunContext[AgentDeps]) -> str:
+                return ctx.deps.system_instruction
+
+            self._warn_if_tool_output_unsupported("orchestrator", model_name_for(AgentTask.ORCHESTRATE))
+            self._warn_if_tool_output_unsupported("critic", model_name_for(AgentTask.CRITIC))
+
         self._extraction_agent: Agent[AgentDeps, ExtractionResult] = Agent(
             extract_model or build_model(AgentTask.EXTRACT),
             deps_type=AgentDeps,
@@ -439,6 +461,7 @@ class AgentRuntime:
         system_instruction: str = "",
         pool: asyncpg.Pool | None,
         current_time: datetime | None = None,
+        existing_jobs: tuple = (),
     ) -> AgentDeps:
         return AgentDeps(
             tenant_id=tenant_id,
@@ -449,6 +472,7 @@ class AgentRuntime:
             pool=pool,
             embedder=self._query_embedder_factory() if self._query_embedder_factory else None,
             current_time=current_time or datetime.now(timezone.utc),
+            existing_jobs=existing_jobs,
         )
 
     # ----------------------------------------------------------- safety/sink
@@ -545,6 +569,26 @@ class AgentRuntime:
         usage = result.usage  # type: ignore[attr-defined]
         return Usage(input_tokens=usage.input_tokens or 0, output_tokens=usage.output_tokens or 0)
 
+    @staticmethod
+    def _warn_if_tool_output_unsupported(agent_name: str, model_slug: str) -> None:
+        """Guardrail for the orchestrator/critic ToolOutput agents (Prompt Contract phase 1).
+
+        Both stay on ``ToolOutput`` in this phase regardless of model family —
+        unlike the draft agent, which already moved to ``PromptedOutput`` (see
+        ``doubleu-thinking-models-promptedoutput``). A reasoning-family model
+        assigned to either would 400 on the forced ``tool_choice`` ToolOutput
+        sends for the ``final_result`` call; this only logs the misconfiguration
+        instead of switching output modes or raising, since that switch is out
+        of scope for this phase.
+        """
+        profile = profile_for(model_slug)
+        if not profile.supports_forced_tool_choice:
+            logger.warning(
+                "%s model %r resolves to family=%s (output_mode=%s); ToolOutput sends a forced "
+                "tool_choice this family is known to reject — see doubleu-thinking-models-promptedoutput",
+                agent_name, model_slug, profile.family.value, profile.output_mode,
+            )
+
     # ------------------------------------------------------------------ draft
 
     def draft_outcome(
@@ -555,22 +599,40 @@ class AgentRuntime:
     ) -> draft_pipeline.DraftOutcome:
         """Generate the structured draft (and critic review) for process-message.
 
-        Raises RuntimeError on agent failure so the service's error-fallback
-        branch behaves identically to the legacy path.  A safety block is not a
-        failure: it returns a canned-reply outcome (model ``"blocked"``).
+        Retries the agent run up to ``_draft_max_attempts`` (env
+        ``DRAFT_MAX_ATTEMPTS``, default 3): a draft failure is usually transient
+        — a provider 5xx/rate-limit, a malformed structured output, or the
+        tool-call cap — and a fresh attempt typically succeeds. Only after every
+        attempt fails does it raise RuntimeError so the service's error-fallback
+        branch fires (and Go delivers a user-facing notice). A run timeout is NOT
+        retried: the caller (Go) has its own deadline, so re-running a slow agent
+        only piles up wasted work. A safety block is not a failure: it returns a
+        canned-reply outcome (model ``"blocked"``) on the first attempt.
         """
         preflight = draft_pipeline.preflight_outcome(request, risk_level, risk_reasons)
         if preflight is not None:
             return preflight
         ctx = current_context()
-        try:
-            return self._run(self._draft_async(request, risk_level, ctx))
-        except SafetyBlocked as exc:
-            return draft_pipeline.DraftOutcome(
-                text=exc.canned_reply, model_used="blocked", usage=Usage()
-            )
-        except Exception as exc:  # noqa: BLE001 — single conversion point to the contract error
-            raise RuntimeError(f"agent draft failed: {exc}") from exc
+        last_exc: Exception | None = None
+        for attempt in range(1, self._draft_max_attempts + 1):
+            try:
+                return self._run(self._draft_async(request, risk_level, ctx))
+            except SafetyBlocked as exc:
+                return draft_pipeline.DraftOutcome(
+                    text=exc.canned_reply, model_used="blocked", usage=Usage()
+                )
+            except TimeoutError as exc:
+                # The run exceeded its wall-clock budget; the HTTP caller has
+                # almost certainly given up, so retrying wastes a slow LLM call.
+                raise RuntimeError(f"agent draft timed out: {exc}") from exc
+            except Exception as exc:  # noqa: BLE001 — single conversion point to the contract error
+                last_exc = exc
+                logger.warning(
+                    "draft attempt %d/%d failed: %s", attempt, self._draft_max_attempts, exc
+                )
+        raise RuntimeError(
+            f"agent draft failed after {self._draft_max_attempts} attempts: {last_exc}"
+        )
 
     def _resolve_mcp_toolsets(
         self, ai_role: AIRoleData | None, privacy_flags: tuple[PrivacyFlag, ...]
@@ -623,12 +685,21 @@ class AgentRuntime:
         request: AIProcessMessageRequest,
         ctx: LLMCallContext,
         pool: asyncpg.Pool | None,
-    ) -> tuple[OrchestratorResult, Usage, tuple[ScheduledJobData, ...]]:
+    ) -> tuple[OrchestratorResult, Usage, tuple[ScheduledJobData, ...], tuple[int, ...]]:
         """Run the tool-owning context stage without producing a contact reply."""
         current_time = datetime.now(timezone.utc)
-        system_prompt, user_payload = draft_pipeline.build_orchestrator_prompt(
-            request, self._prompt_builder, current_time=current_time
-        )
+        if self._prompt_contract_enabled:
+            family = resolve_family(model_name_for(AgentTask.ORCHESTRATE))
+            rendered = render_prompt(
+                prompt_library.orchestrator_spec(request, current_time=current_time), family
+            )
+            system_prompt, user_payload = self._prompt_builder.build(
+                rendered, request.event.message_text
+            )
+        else:
+            system_prompt, user_payload = draft_pipeline.build_orchestrator_prompt(
+                request, self._prompt_builder, current_time=current_time
+            )
         system_prompt, user_payload = self._scan_input(
             system_prompt, user_payload, ModelTask.DRAFT_REPLY, ctx
         )
@@ -641,6 +712,7 @@ class AgentRuntime:
             system_instruction=system_prompt,
             pool=pool,
             current_time=current_time,
+            existing_jobs=request.existing_scheduled_jobs,
         )
         toolsets = [
             resolve_builtin_toolset(request.ai_role, privacy_flags),
@@ -658,6 +730,7 @@ class AgentRuntime:
             update={"response_plan": deps.response_plan}
         )
         scheduled_jobs = _scheduled_job_data(deps.scheduled_jobs)
+        cancelled_job_ids = tuple(deps.cancelled_job_ids)
         usage = self._usage_of(result)
         completion = "\n".join(
             [
@@ -666,6 +739,7 @@ class AgentRuntime:
                 f"notes: {orchestrated.notes}",
                 f"response_plan: {orchestrated.response_plan}",
                 f"scheduled_jobs: {len(scheduled_jobs)}",
+                f"cancelled_jobs: {len(cancelled_job_ids)}",
             ]
         )
         self._record_run(
@@ -677,7 +751,7 @@ class AgentRuntime:
             usage,
             privacy_flags,
         )
-        return orchestrated, usage, scheduled_jobs
+        return orchestrated, usage, scheduled_jobs, cancelled_job_ids
 
     @staticmethod
     def _orchestrator_bundle(result: OrchestratorResult) -> tuple[str, ...]:
@@ -690,6 +764,57 @@ class AgentRuntime:
             bundle.append("Форма ответа уже задана interaction-инструментом.")
         return tuple(bundle)
 
+    def _build_draft_prompt_contract(
+        self,
+        request: AIProcessMessageRequest,
+        *,
+        orchestrator_bundle: tuple[str, ...] | None,
+        current_time: datetime | None,
+    ) -> tuple[str, str]:
+        """Prompt-Contract equivalent of ``draft_pipeline.build_draft_prompt``.
+
+        Only reached when ``PROMPT_CONTRACT_ENABLED``. Mirrors the same privacy
+        gate and memory split as the legacy function so both paths see
+        identical *data* — they differ only in how the trusted pieces are
+        rendered into the system prompt. The model family is resolved from the
+        concrete slug that will actually serve the writer call (the per-role
+        tier override when the role declares one, else the flat DRAFT model),
+        mirroring the precedence already applied when building the model
+        object further down in ``_draft_async``.
+        """
+        raw_memory = (
+            ()
+            if PrivacyFlag.NO_MEMORY in request.chat_settings.privacy_flags
+            else request.memory_context
+        )
+        feedback_hint = draft_pipeline.build_feedback_hint(request.feedback_context)
+        owner_instruction, current_draft, owner_style_facts, clean_memory = (
+            draft_pipeline._split_memory_context(raw_memory)
+        )
+        role = request.ai_role
+        writer_slug = resolve_model_slug(
+            AgentTask.DRAFT,
+            tier=role.model_tier if role is not None else "",
+            model_name=role.model_name if role is not None else "",
+        )
+        family = resolve_family(writer_slug)
+        spec = prompt_library.draft_spec(
+            request,
+            clean_memory=clean_memory,
+            owner_style_facts=owner_style_facts,
+            current_draft=current_draft,
+            owner_instruction=owner_instruction,
+            feedback_hint=feedback_hint,
+            two_stage=orchestrator_bundle is not None,
+            current_time=current_time,
+        )
+        rendered = render_prompt(spec, family)
+        prompt_context = list(clean_memory)
+        if orchestrator_bundle is not None:
+            bundle = "\n".join(orchestrator_bundle) or "Инструменты не вернули дополнительного контекста."
+            prompt_context.append("[СОБРАННЫЙ КОНТЕКСТ ОРКЕСТРАТОРА]\n" + bundle)
+        return self._prompt_builder.build(rendered, request.event.message_text, tuple(prompt_context))
+
     async def _draft_async(
         self, request: AIProcessMessageRequest, risk_level: RiskLevel, ctx: LLMCallContext
     ) -> draft_pipeline.DraftOutcome:
@@ -701,11 +826,13 @@ class AgentRuntime:
         orchestrator_bundle: tuple[str, ...] | None = None
         orchestrated: OrchestratorResult | None = None
         orchestrator_scheduled_jobs: tuple[ScheduledJobData, ...] = ()
+        orchestrator_cancelled_jobs: tuple[int, ...] = ()
         if two_stage:
             (
                 orchestrated,
                 orchestrator_usage,
                 orchestrator_scheduled_jobs,
+                orchestrator_cancelled_jobs,
             ) = await self._orchestrate_async(
                 request,
                 ctx,
@@ -713,12 +840,17 @@ class AgentRuntime:
             )
             orchestrator_bundle = self._orchestrator_bundle(orchestrated)
         current_time = datetime.now(timezone.utc)
-        system_prompt, user_payload = draft_pipeline.build_draft_prompt(
-            request,
-            self._prompt_builder,
-            orchestrator_bundle=orchestrator_bundle,
-            current_time=current_time,
-        )
+        if self._prompt_contract_enabled:
+            system_prompt, user_payload = self._build_draft_prompt_contract(
+                request, orchestrator_bundle=orchestrator_bundle, current_time=current_time
+            )
+        else:
+            system_prompt, user_payload = draft_pipeline.build_draft_prompt(
+                request,
+                self._prompt_builder,
+                orchestrator_bundle=orchestrator_bundle,
+                current_time=current_time,
+            )
         # Phase 1: may rewrite (anonymize) or raise SafetyBlocked → canned reply.
         system_prompt, user_payload = self._scan_input(
             system_prompt, user_payload, ModelTask.DRAFT_REPLY, ctx
@@ -732,13 +864,20 @@ class AgentRuntime:
             system_instruction=system_prompt,
             pool=pool,
             current_time=current_time,
+            existing_jobs=request.existing_scheduled_jobs,
         )
-        writer_toolsets: list = []
-        if not two_stage:
-            writer_toolsets = [
-                resolve_builtin_toolset(request.ai_role, privacy_flags),
-                *self._resolve_mcp_toolsets(request.ai_role, privacy_flags),
-            ]
+        # Hybrid: the writer always keeps the role's tools. In two-stage the cheap
+        # orchestrator is the primary tool user; the writer's toolset is a fallback
+        # for anything the orchestrator missed (the writer directive tells it not to
+        # duplicate already-gathered context). Reasoning writers can still call these
+        # because native tool calls use tool_choice=auto, which thinking mode allows.
+        writer_toolsets: list = [
+            resolve_builtin_toolset(request.ai_role, privacy_flags),
+            *self._resolve_mcp_toolsets(request.ai_role, privacy_flags),
+            # Always-on, agent-only: lets the writer split a turn into several
+            # ordered messages. Not in TOOL_CATALOG → never shown in the role UI.
+            delivery_toolset,
+        ]
         # Per-role tier override: build a tier-specific model when the role
         # declares one and the env list is configured; otherwise fall back to
         # the DRAFT task model.  The agent is not recreated — only the
@@ -770,21 +909,30 @@ class AgentRuntime:
             run_kwargs["model"] = tier_model
         result = await self._draft_agent.run(user_payload, **run_kwargs)
         drafted: DraftResult = result.output
-        scheduled_jobs = (
-            *orchestrator_scheduled_jobs,
-            *_scheduled_job_data(deps.scheduled_jobs),
+        # Hybrid: both stages may schedule jobs; dedupe by the content-based
+        # idempotency_key so a reminder produced in both stages is sent to Go once.
+        _by_key: dict[str, ScheduledJobData] = {}
+        for job in (*orchestrator_scheduled_jobs, *_scheduled_job_data(deps.scheduled_jobs)):
+            _by_key.setdefault(job.idempotency_key, job)
+        scheduled_jobs = tuple(_by_key.values())
+        # Cancellations may be recorded in either stage's deps; dedupe while
+        # preserving order so Go applies each CancelJob at most once.
+        cancelled_job_ids = tuple(
+            dict.fromkeys((*orchestrator_cancelled_jobs, *deps.cancelled_job_ids))
         )
+        # Hybrid: the orchestrator's plan wins, but if it set none the writer may
+        # have produced one via its fallback ask_questions call — keep that.
         response_plan = (
-            orchestrated.response_plan if orchestrated is not None else deps.response_plan
+            orchestrated.response_plan
+            if (orchestrated is not None and orchestrated.response_plan is not None)
+            else deps.response_plan
         )
         if response_plan is not None:
-            drafted = drafted.model_copy(
-                update={
-                    "reply": response_plan.prompt,
-                    "intent": "choice_question",
-                    "options": response_plan.options,
-                }
-            )
+            # The questionnaire is collected by the Go backend one question at a
+            # time; the per-question options live in response_plan, not the draft.
+            # Keep the writer's reply as a short intro; mark the intent so the
+            # decision engine treats this as an interactive turn.
+            drafted = drafted.model_copy(update={"intent": "choice_question", "options": ()})
         draft_usage = self._usage_of(result)
         if two_stage and request.ai_role is not None:
             router_name = model_name_for(AgentTask.ORCHESTRATE) or "test-model"
@@ -845,22 +993,42 @@ class AgentRuntime:
         if text_format == "rich":
             # Normalize only the final safe text — never raw LLM chunks.
             text = draft_pipeline.normalize_rich_markdown(text)
+        # Prose messages the writer queued via send_message, delivered before the
+        # final reply/questionnaire. They are contact-facing prose, so they take
+        # the role's general formatting (rich when a role is assigned) and the
+        # same rich-normalisation as the final text.
+        msg_format = draft_pipeline.decide_text_format(request.ai_role, "general_message")
+        outbound_messages = tuple(
+            OutboundMessageData(
+                text=(
+                    draft_pipeline.normalize_rich_markdown(m.text)
+                    if msg_format == "rich" else m.text
+                ),
+                text_format=msg_format,
+            )
+            for m in deps.outbound_messages
+        )
         return draft_pipeline.DraftOutcome(
             text=text,
             model_used=model_used,
             usage=total,
             intent=drafted.intent,
             text_format=text_format,
+            messages=outbound_messages,
             options=drafted.options if drafted.intent == "choice_question" else (),
             response_plan=(
                 ResponsePlanData(
                     shape=response_plan.shape,
-                    options=response_plan.options,
+                    questions=tuple(
+                        QuestionData(prompt=q.prompt, options=q.options)
+                        for q in response_plan.questions
+                    ),
                 )
                 if response_plan is not None
                 else None
             ),
             scheduled_jobs=scheduled_jobs,
+            cancelled_job_ids=cancelled_job_ids,
             confidence=confidence,
             topic=drafted.topic,
         )
@@ -900,6 +1068,20 @@ class AgentRuntime:
         )
         if feedback_hint:
             review_payload += "\n\n" + feedback_hint
+        critic_instructions = prompt_library.LEGACY_CRITIC_INSTRUCTIONS
+        if self._prompt_contract_enabled:
+            family = resolve_family(model_name_for(AgentTask.CRITIC))
+            critic_instructions = render_prompt(
+                prompt_library.critic_spec(speak_as_owner=speak_as_owner, feedback_hint=feedback_hint),
+                family,
+            )
+            # The critic reuses the draft's deps object (see _draft_async); its
+            # system_instruction currently holds the WRITER's rendered prompt.
+            # Overwriting it here is safe — nothing reads the old value after
+            # this point in _draft_async — and lets the critic agent's dynamic
+            # instructions hook (registered only when this flag is on) pick up
+            # the critic's own rendered text instead of the writer's.
+            deps.system_instruction = critic_instructions
         try:
             review = await self._critic_agent.run(review_payload, deps=deps)
         except Exception as exc:  # noqa: BLE001 — critic is advisory, never fatal
@@ -908,7 +1090,7 @@ class AgentRuntime:
         verdict: CriticVerdict = review.output
         critic_usage = self._usage_of(review)
         self._record_run(
-            ctx, AgentTask.CRITIC, _CRITIC_INSTRUCTIONS, review_payload,
+            ctx, AgentTask.CRITIC, critic_instructions, review_payload,
             verdict.revised_reply or verdict.verdict, critic_usage, privacy_flags,
         )
         if verdict.verdict == "revise" and verdict.revised_reply.strip():
@@ -1282,6 +1464,7 @@ def build_runtime(
     output_safety: OutputSafetyScanner | None = None,
     sink: LangfuseSink | None = None,
     two_stage_draft: bool = False,
+    prompt_contract_enabled: bool = False,
 ) -> AgentRuntime:
     """Build the agent runtime — the single LLM execution path for the service.
 
@@ -1307,11 +1490,17 @@ def build_runtime(
     # only fall back to lexical ILIKE when an embed call yields nothing.
     mock_llm = os.getenv("MOCK_LLM", "true").strip().lower() in ("1", "true", "yes", "on")
     embedder_factory = None if mock_llm else _build_query_embedder
+    # Two-stage drafting (orchestrator + writer) over a long answer can run for
+    # over a minute; the default 90s silently fell to error_fallback. Env-tunable.
+    run_timeout = float(os.getenv("AGENT_RUN_TIMEOUT_SECONDS", "150").strip() or "150")
     return AgentRuntime(
         database_url=database_url,
         input_safety=input_safety,
         output_safety=output_safety,
         sink=sink,
         two_stage_draft=two_stage_draft,
+        prompt_contract_enabled=prompt_contract_enabled,
         query_embedder_factory=embedder_factory,
+        run_timeout_seconds=run_timeout,
+        draft_max_attempts=_DRAFT_MAX_ATTEMPTS,
     )

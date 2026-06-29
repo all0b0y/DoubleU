@@ -91,6 +91,26 @@
   — отложен до управления пользователями БД в `infra/`.
 - **MEM-2 `export`.** JSONL-дамп tenant'а (`/forget`, `/forget_all` уже реализованы) — отдельная
   невыполненная подзадача deletion-контракта.
+- **Critic-агент получает untrusted-текст без `PromptBuilder`-обёртки.** `AgentRuntime._review_draft`
+  ([runtime.py](../ai-python/ai_agent/agents/runtime.py)) собирает `review_payload` прямой
+  f-строкой из `message_text` (сырое сообщение собеседника) и `drafted.reply`, минуя
+  `PromptBuilder.build` — единственное место в hot path, где untrusted-вход не попадает в
+  `<untrusted_user_message>`. На практике риск ниже, чем у draft/orchestrator (критик не имеет
+  тулов и не может действовать на инъекцию), но потенциально проинструктированный текст в
+  `message_text` может склонить вердикт к `approve`. Обёрнуть `message_text`/`drafted.reply` через
+  `prompt_builder.build(...)` так же, как уже делает draft-путь.
+  _Найдено 2026-06-29 при разработке Prompt Contract (фаза 1); сознательно не исправлено — вне
+  объёма задачи._
+- **`model_used`-лейбл для two-stage writer показывает голый `model_tier`, а не конкретный slug.**
+  В `AgentRuntime._draft_async` ([runtime.py](../ai-python/ai_agent/agents/runtime.py)) `tier_model_label`
+  заполняется только внутри ветки `if role_model_name:` (явный `ai_role.model_name`); когда роль
+  задаёт только `model_tier` (например `"smart"`) без конкретной модели, two-stage лейбл деградирует
+  до `f"orchestrate({router})+draft(smart)"` вместо реального первого slug из `MODEL_TIER_SMART`. Не
+  влияет на то, какая модель реально вызывается (resolution корректен), только на читаемость
+  Langfuse/логов. Чинить через `model_name_for_tier(tier, model_name)` и для случая без
+  `model_name`.
+  _Найдено 2026-06-29 при разработке Prompt Contract (фаза 1); сознательно не исправлено — вне
+  объёма задачи._
 
 ### TOOLS — integration-инструмент не реализован
 

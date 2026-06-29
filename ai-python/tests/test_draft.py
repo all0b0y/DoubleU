@@ -10,10 +10,14 @@ the legacy ``notes`` JSON is never echoed raw.
 
 from __future__ import annotations
 
+import os
 import unittest
 from datetime import datetime, timezone
+from unittest import mock
 
-from pydantic_ai.messages import ModelResponse, ToolCallPart
+import json
+
+from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from ai_agent.agents.tool_catalog import TOOL_CATALOG
@@ -298,18 +302,26 @@ class AIRolePromptTests(unittest.TestCase):
         self.assertIn("Короткий ответ пиши обычным текстом", prompt)
 
     def test_two_stage_writer_directive_is_opt_in(self) -> None:
-        """Only the bimodal writer is told that tools are unavailable."""
+        """Only the bimodal writer gets the context-already-gathered directive.
+
+        Hybrid: the writer keeps its tools as a fallback, so the directive frames
+        them as a backup path rather than removing them.
+        """
         single_stage = self._compose(self.ROLE)
         two_stage = self._compose(self.ROLE, two_stage=True)
         self.assertNotIn("КОНТЕКСТ УЖЕ СОБРАН", single_stage)
         self.assertIn("КОНТЕКСТ УЖЕ СОБРАН", two_stage)
-        self.assertIn("НЕТ инструментов", two_stage)
+        self.assertIn("ЗАПАСНОЙ путь", two_stage)
 
-    def test_present_buttons_instruction_is_single_stage_only(self) -> None:
-        """Single-stage writer is told to call present_buttons; bimodal writer is not."""
+    def test_ask_questions_instruction_present_in_both_stages(self) -> None:
+        """Hybrid: the writer is told the ask_questions schema in both stages.
+
+        The bimodal writer keeps the tool as a fallback, so it needs the schema
+        even when an orchestrator bundle is present.
+        """
         role = AIRoleData(
             name="role-name-sentinel",
-            tool_settings={"interaction.present_buttons": True},
+            tool_settings={"interaction.ask_questions": True},
         )
         request = _process_request(ai_role=role)
 
@@ -318,11 +330,14 @@ class AIRolePromptTests(unittest.TestCase):
             request, PromptBuilder(), orchestrator_bundle=("context",)
         )
 
-        self.assertIn("present_buttons(prompt, options[2..4])", single_stage)
-        self.assertIn("Не описывай кнопки словами", single_stage)
-        self.assertNotIn("present_buttons(prompt, options[2..4])", two_stage)
+        self.assertIn("ask_questions(questions[1..6])", single_stage)
+        self.assertIn("своими словами", single_stage)
+        self.assertIn("ask_questions(questions[1..6])", two_stage)
+        # The question text must not be echoed into the reply (anti-duplicate rule).
+        self.assertIn("ТОЛЬКО в ask_questions", single_stage)
+        self.assertIn("НИКОГДА не повторяй этот вопрос", two_stage)
 
-    def test_single_stage_writer_present_buttons_reaches_draft_outcome(self) -> None:
+    def test_single_stage_writer_ask_questions_reaches_draft_outcome(self) -> None:
         """A writer tool call in single-stage mode becomes the final response_plan."""
         calls = {"writer": 0}
 
@@ -330,19 +345,19 @@ class AIRolePromptTests(unittest.TestCase):
             calls["writer"] += 1
             if calls["writer"] == 1:
                 return ModelResponse(parts=[ToolCallPart(
-                    tool_name="present_buttons",
-                    args={
-                        "prompt": "Какой вариант вам удобнее?",
-                        "options": ["Сегодня", "Завтра"],
-                    },
+                    tool_name="ask_questions",
+                    args={"questions": [
+                        {"prompt": "Какой день удобнее?", "options": ["Сегодня", "Завтра"]},
+                    ]},
                 )])
-            return ModelResponse(parts=[ToolCallPart(tool_name="final_result", args={
+            # Draft uses PromptedOutput → final result is plain-text JSON.
+            return ModelResponse(parts=[TextPart(json.dumps({
                 "reply": "writer placeholder",
                 "intent": "general_message",
                 "options": [],
                 "confidence": 0.9,
                 "topic": "выбор времени",
-            })])
+            }))])
 
         request = _process_request(
             text="Когда созвонимся?",
@@ -350,7 +365,7 @@ class AIRolePromptTests(unittest.TestCase):
                 name="Support",
                 tool_settings={
                     **{entry.key: False for entry in TOOL_CATALOG},
-                    "interaction.present_buttons": True,
+                    "interaction.ask_questions": True,
                 },
             ),
         )
@@ -367,28 +382,31 @@ class AIRolePromptTests(unittest.TestCase):
         outcome = runtime.draft_outcome(request, RiskLevel.LOW)
 
         self.assertEqual(calls["writer"], 2)
-        self.assertEqual(outcome.text, "Какой вариант вам удобнее?")
         self.assertEqual(outcome.intent, "choice_question")
-        self.assertEqual(outcome.options, ("Сегодня", "Завтра"))
         self.assertIsNotNone(outcome.response_plan)
         assert outcome.response_plan is not None
-        self.assertEqual(outcome.response_plan.shape, "buttons")
-        self.assertEqual(outcome.response_plan.options, ("Сегодня", "Завтра"))
+        self.assertEqual(outcome.response_plan.shape, "questions")
+        self.assertEqual(len(outcome.response_plan.questions), 1)
+        self.assertEqual(outcome.response_plan.questions[0].options, ("Сегодня", "Завтра"))
 
     def test_no_role_prompt_forbids_markup(self) -> None:
         """The legacy owner-copy path remains plain to match its delivery contract."""
         self.assertIn("Пиши обычным текстом без разметки", self._compose(None))
 
     def test_decide_text_format_uses_rich_for_role_structured_intents(self) -> None:
-        """Assigned roles may return Rich Markdown for structured answer intents."""
-        for intent in ("question", "scheduling", "commercial", "request", "general_message"):
+        """Assigned roles may return Rich Markdown for structured answer intents.
+
+        choice_question is included: quiz/choice replies carry markdown and must
+        render rich rather than leak raw ** / # into the chat.
+        """
+        for intent in ("question", "scheduling", "commercial", "request",
+                       "general_message", "choice_question"):
             self.assertEqual(draft_pipeline.decide_text_format(self.ROLE, intent), "rich")
 
     def test_decide_text_format_keeps_copy_and_short_replies_plain(self) -> None:
-        """Legacy owner-copy replies and short choice/greeting-style intents stay plain."""
+        """Legacy owner-copy replies and terse acknowledgements stay plain."""
         self.assertEqual(draft_pipeline.decide_text_format(None, "question"), "plain")
-        for intent in ("choice_question", "acknowledgement"):
-            self.assertEqual(draft_pipeline.decide_text_format(self.ROLE, intent), "plain")
+        self.assertEqual(draft_pipeline.decide_text_format(self.ROLE, "acknowledgement"), "plain")
 
     def test_parse_ai_role_requires_name(self) -> None:
         """A role payload without a name is treated as no role at all."""
@@ -606,6 +624,111 @@ class NormalizeRichMarkdownTests(unittest.TestCase):
         )
         self.assertIn("никогда в одной строке", prompt)
         self.assertIn("пустая строка до и после", prompt)
+
+
+class OrchestratorResultCoercionTests(unittest.TestCase):
+    """``response_plan`` must never crash a draft into error_fallback (DATA-1).
+
+    The orchestrator's authoritative plan is set from the interaction tool's
+    deps after the run, so the model's inline ``response_plan`` value is always
+    discarded. Reasoning models nonetheless mis-serialise that nested object —
+    most damagingly as a JSON *string* — and a strict object schema turned that
+    into a validation error → "Exceeded maximum output retries" → empty reply.
+    """
+
+    def test_response_plan_emitted_as_json_string_is_parsed(self) -> None:
+        from ai_agent.agents.results import OrchestratorResult, ResponsePlan
+
+        # Exact failure shape observed in production logs.
+        plan_str = (
+            '{"shape": "questions", "questions": '
+            '[{"prompt": "Кто возглавил Октябрьскую революцию?", '
+            '"options": ["Ленин", "Керенский"]}]}'
+        )
+        result = OrchestratorResult(response_plan=plan_str)
+        self.assertIsInstance(result.response_plan, ResponsePlan)
+        assert result.response_plan is not None
+        self.assertEqual(result.response_plan.shape, "questions")
+        self.assertEqual(result.response_plan.questions[0].options, ("Ленин", "Керенский"))
+
+    def test_response_plan_null_and_unparseable_strings_become_none(self) -> None:
+        from ai_agent.agents.results import OrchestratorResult
+
+        for raw in ("", "null", "None", "not json at all"):
+            with self.subTest(raw=raw):
+                self.assertIsNone(OrchestratorResult(response_plan=raw).response_plan)
+
+
+class DraftRetryTests(unittest.TestCase):
+    """A transient draft failure must be retried, not surfaced immediately.
+
+    Provider 5xx/rate-limit, a malformed structured output, or the tool-call cap
+    fail one attempt; a fresh run usually succeeds. Only after every attempt
+    fails does draft_outcome raise so the service returns error_fallback.
+    """
+
+    @staticmethod
+    def _flaky_writer(fail_times: int) -> tuple[FunctionModel, dict]:
+        calls = {"n": 0}
+
+        def respond(messages, info: AgentInfo) -> ModelResponse:
+            calls["n"] += 1
+            if calls["n"] <= fail_times:
+                raise RuntimeError("simulated provider 5xx")
+            return ModelResponse(parts=[TextPart(json.dumps({
+                "reply": "восстановился после сбоя",
+                "intent": "general_message",
+                "options": [],
+                "confidence": 0.8,
+                "topic": "t",
+            }))])
+
+        return FunctionModel(respond), calls
+
+    def test_transient_failure_is_retried_then_succeeds(self) -> None:
+        writer, calls = self._flaky_writer(fail_times=1)
+        runtime = make_test_runtime(draft_model=writer, draft_max_attempts=3)
+
+        outcome = runtime.draft_outcome(_process_request(), RiskLevel.LOW)
+
+        self.assertEqual(outcome.text, "восстановился после сбоя")
+        self.assertEqual(calls["n"], 2)  # one failure, one success
+
+    def test_exhausted_attempts_raise_runtime_error(self) -> None:
+        writer, calls = self._flaky_writer(fail_times=99)  # never recovers
+        runtime = make_test_runtime(draft_model=writer, draft_max_attempts=3)
+
+        with self.assertRaises(RuntimeError):
+            runtime.draft_outcome(_process_request(), RiskLevel.LOW)
+        self.assertEqual(calls["n"], 3)  # exactly draft_max_attempts tries
+
+
+class PromptContractFlagIsolationTests(unittest.TestCase):
+    """``draft.py``'s legacy ``build_*_prompt`` functions must stay flag-blind.
+
+    All ``PROMPT_CONTRACT_ENABLED`` branching lives in ``agents/runtime.py``
+    (see its module docstring) — these pipeline functions never read the env
+    var, so this locks in that invariant: a future edit that wires
+    flag-awareness in here without preserving the flag-off text would break
+    "flag off == old path unchanged" without any other test noticing, since
+    these functions are exercised directly, not through ``AgentRuntime``.
+    """
+
+    def test_build_draft_prompt_ignores_the_flag(self) -> None:
+        request = _process_request(ai_role=AIRoleData(name="role-name-sentinel", description="d"))
+        with mock.patch.dict(os.environ, {"PROMPT_CONTRACT_ENABLED": "false"}):
+            off_prompt = draft_pipeline.build_draft_prompt(request, PromptBuilder())
+        with mock.patch.dict(os.environ, {"PROMPT_CONTRACT_ENABLED": "true"}):
+            on_prompt = draft_pipeline.build_draft_prompt(request, PromptBuilder())
+        self.assertEqual(off_prompt, on_prompt)
+
+    def test_build_orchestrator_prompt_ignores_the_flag(self) -> None:
+        request = _process_request(ai_role=AIRoleData(name="role-name-sentinel"))
+        with mock.patch.dict(os.environ, {"PROMPT_CONTRACT_ENABLED": "false"}):
+            off_prompt = draft_pipeline.build_orchestrator_prompt(request, PromptBuilder())
+        with mock.patch.dict(os.environ, {"PROMPT_CONTRACT_ENABLED": "true"}):
+            on_prompt = draft_pipeline.build_orchestrator_prompt(request, PromptBuilder())
+        self.assertEqual(off_prompt, on_prompt)
 
 
 def _split_sections(prompt: str) -> tuple[str, str]:

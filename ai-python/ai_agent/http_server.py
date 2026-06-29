@@ -262,6 +262,7 @@ def create_service_from_env() -> tuple[AIService, bool, FeatureFlags]:
         output_safety=output_safety,
         sink=sink,
         two_stage_draft=flags.two_stage_draft,
+        prompt_contract_enabled=flags.prompt_contract_enabled,
     )
     return build_service(agents), mock_llm, flags
 

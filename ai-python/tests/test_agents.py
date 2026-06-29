@@ -9,12 +9,13 @@ prompt internals.
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
-from pydantic_ai.messages import ModelResponse, ToolCallPart
+from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from ai_agent.agents.deps import AgentDeps
@@ -51,10 +52,32 @@ from ai_agent.schemas import (
 
 
 def structured(tool_args: dict) -> FunctionModel:
-    """A model that always answers with the given structured output."""
+    """A model that always answers with the given structured output (ToolOutput).
+
+    Used for every agent except draft, which now uses PromptedOutput.
+    """
 
     def respond(messages, info: AgentInfo) -> ModelResponse:
         return ModelResponse(parts=[ToolCallPart(tool_name="final_result", args=tool_args)])
+
+    return FunctionModel(respond)
+
+
+def draft_output(args: dict) -> ModelResponse:
+    """Final draft output as a PromptedOutput response (plain-text JSON).
+
+    The draft agent uses ``PromptedOutput`` so its result arrives as text the
+    library parses, not a ``final_result`` tool call. Tool-using draft mocks
+    return this as their last turn after any native tool calls.
+    """
+    return ModelResponse(parts=[TextPart(json.dumps(args))])
+
+
+def prompted(args: dict) -> FunctionModel:
+    """A draft model that always answers with the given PromptedOutput JSON."""
+
+    def respond(messages, info: AgentInfo) -> ModelResponse:
+        return draft_output(args)
 
     return FunctionModel(respond)
 
@@ -82,7 +105,7 @@ def process_request(text: str = "Во сколько встречаемся за
 
 def make_runtime(**models) -> AgentRuntime:
     defaults = {
-        "draft_model": structured(
+        "draft_model": prompted(
             {"reply": "Завтра в 19:00, как договаривались.", "intent": "scheduling",
              "options": [], "confidence": 0.9, "topic": "время встречи"}
         ),
@@ -138,13 +161,13 @@ def test_bimodal_gate_keeps_single_stage_path(
 
     def writer(messages, info: AgentInfo) -> ModelResponse:
         calls["writer"] += 1
-        return ModelResponse(parts=[ToolCallPart(tool_name="final_result", args={
+        return draft_output({
             "reply": "Одностадийный ответ.",
             "intent": "general_message",
             "options": [],
             "confidence": 0.9,
             "topic": "проверка gate",
-        })])
+        })
 
     request = replace(
         process_request(),
@@ -192,13 +215,13 @@ def test_bimodal_orchestrator_tools_writer_bundle_tier_and_critic(monkeypatch) -
     def writer(messages, info: AgentInfo) -> ModelResponse:
         captured["writer_tools"] = [tool.name for tool in info.function_tools]
         captured["writer_prompt"] = prompt_text(messages, info)
-        return ModelResponse(parts=[ToolCallPart(tool_name="final_result", args={
+        return draft_output({
             "reply": "Да, встречаемся в 19:00.",
             "intent": "scheduling",
             "options": [],
             "confidence": 0.9,
             "topic": "время встречи",
-        })])
+        })
 
     writer_model = FunctionModel(writer)
 
@@ -222,7 +245,7 @@ def test_bimodal_orchestrator_tools_writer_bundle_tier_and_critic(monkeypatch) -
     runtime = make_runtime(
         two_stage_draft=True,
         orchestrator_model=FunctionModel(orchestrator),
-        draft_model=structured({
+        draft_model=prompted({
             "reply": "wrong default writer",
             "intent": "general_message",
             "options": [],
@@ -245,9 +268,10 @@ def test_bimodal_orchestrator_tools_writer_bundle_tier_and_critic(monkeypatch) -
     assert "финальный ответ ты НЕ пишешь" in str(captured["orchestrator_prompt"])
     assert "Support" in str(captured["orchestrator_prompt"])
     assert "Telegram Rich Markdown" not in str(captured["orchestrator_prompt"])
-    assert captured["writer_tools"] == []
+    # Hybrid: the writer keeps the role's toolset as a fallback (not stripped).
+    assert "get_recent_messages" in captured["writer_tools"]
     assert "bundle-sentinel" in str(captured["writer_prompt"])
-    assert "НЕТ инструментов" in str(captured["writer_prompt"])
+    assert "ЗАПАСНОЙ путь" in str(captured["writer_prompt"])
     assert captured["tier"] == "smart"
     assert outcome.text == "Да, всё подтверждено: встречаемся в 19:00."
     assert outcome.model_used == "orchestrate(router-constant)+draft(smart)+critic"
@@ -257,7 +281,7 @@ def test_bimodal_orchestrator_tools_writer_bundle_tier_and_critic(monkeypatch) -
 
 
 def test_two_stage_named_role_model_routes_writer_and_logs_concrete_slug(monkeypatch) -> None:
-    writer_model = structured({
+    writer_model = prompted({
         "reply": "Да, встречаемся в 19:00.",
         "intent": "scheduling",
         "options": [],
@@ -294,7 +318,7 @@ def test_two_stage_named_role_model_routes_writer_and_logs_concrete_slug(monkeyp
             "suggested_intent": "scheduling",
             "notes": "",
         }),
-        draft_model=structured({
+        draft_model=prompted({
             "reply": "wrong default writer",
             "intent": "general_message",
             "options": [],
@@ -313,15 +337,18 @@ def test_two_stage_named_role_model_routes_writer_and_logs_concrete_slug(monkeyp
     assert "model-b" in [generation["model"] for generation in sink.generations]
 
 
-def test_interaction_tool_forms_choice_question_without_sending() -> None:
+def test_interaction_tool_forms_questionnaire_without_sending() -> None:
     calls = {"orchestrator": 0}
 
     def orchestrator(messages, info: AgentInfo) -> ModelResponse:
         calls["orchestrator"] += 1
         if calls["orchestrator"] == 1:
             return ModelResponse(parts=[ToolCallPart(
-                tool_name="present_buttons",
-                args={"prompt": "Какой вариант вам удобнее?", "options": ["Сегодня", "Завтра"]},
+                tool_name="ask_questions",
+                args={"questions": [
+                    {"prompt": "Какой день удобнее?", "options": ["Сегодня", "Завтра"]},
+                    {"prompt": "Во сколько?"},
+                ]},
             )])
         return ModelResponse(parts=[ToolCallPart(tool_name="final_result", args={
             "gathered_context": [],
@@ -336,14 +363,14 @@ def test_interaction_tool_forms_choice_question_without_sending() -> None:
             name="Support",
             tool_settings={
                 **{entry.key: False for entry in TOOL_CATALOG},
-                "interaction.present_buttons": True,
+                "interaction.ask_questions": True,
             },
         ),
     )
     runtime = make_runtime(
         two_stage_draft=True,
         orchestrator_model=FunctionModel(orchestrator),
-        draft_model=structured({
+        draft_model=prompted({
             "reply": "writer placeholder",
             "intent": "general_message",
             "options": [],
@@ -355,12 +382,132 @@ def test_interaction_tool_forms_choice_question_without_sending() -> None:
     outcome = runtime.draft_outcome(request, RiskLevel.LOW)
 
     assert calls["orchestrator"] == 2
-    assert outcome.text == "Какой вариант вам удобнее?"
     assert outcome.intent == "choice_question"
-    assert outcome.options == ("Сегодня", "Завтра")
     assert outcome.response_plan is not None
-    assert outcome.response_plan.shape == "buttons"
-    assert outcome.response_plan.options == ("Сегодня", "Завтра")
+    assert outcome.response_plan.shape == "questions"
+    assert len(outcome.response_plan.questions) == 2
+    assert outcome.response_plan.questions[0].prompt == "Какой день удобнее?"
+    assert outcome.response_plan.questions[0].options == ("Сегодня", "Завтра")
+    assert outcome.response_plan.questions[1].options == ()
+
+
+def test_two_stage_writer_fallback_tool_call_reaches_outcome() -> None:
+    """Hybrid: if the orchestrator sets no plan, the writer's own ask_questions wins.
+
+    The writer keeps its toolset as a fallback; a response_plan it produces must
+    survive the merge even though the orchestrator returned none.
+    """
+    calls = {"orchestrator": 0, "writer": 0}
+
+    def orchestrator(messages, info: AgentInfo) -> ModelResponse:
+        calls["orchestrator"] += 1
+        # Orchestrator gathers nothing and sets no questionnaire.
+        return ModelResponse(parts=[ToolCallPart(tool_name="final_result", args={
+            "gathered_context": [],
+            "suggested_intent": "general_message",
+            "notes": "",
+            "response_plan": None,
+        })])
+
+    def writer(messages, info: AgentInfo) -> ModelResponse:
+        calls["writer"] += 1
+        if calls["writer"] == 1:
+            return ModelResponse(parts=[ToolCallPart(
+                tool_name="ask_questions",
+                args={"questions": [
+                    {"prompt": "Какой день удобнее?", "options": ["Сегодня", "Завтра"]},
+                ]},
+            )])
+        return draft_output({
+            "reply": "writer placeholder",
+            "intent": "general_message",
+            "options": [],
+            "confidence": 0.9,
+            "topic": "выбор времени",
+        })
+
+    request = replace(
+        process_request("Когда созвонимся?"),
+        ai_role=AIRoleData(
+            name="Support",
+            tool_settings={
+                **{entry.key: False for entry in TOOL_CATALOG},
+                "interaction.ask_questions": True,
+            },
+        ),
+    )
+    runtime = make_runtime(
+        two_stage_draft=True,
+        orchestrator_model=FunctionModel(orchestrator),
+        draft_model=FunctionModel(writer),
+    )
+
+    outcome = runtime.draft_outcome(request, RiskLevel.LOW)
+
+    assert calls == {"orchestrator": 1, "writer": 2}
+    assert outcome.intent == "choice_question"
+    assert outcome.response_plan is not None
+    assert outcome.response_plan.questions[0].prompt == "Какой день удобнее?"
+
+
+def test_orchestrator_result_coerces_null_string_response_plan() -> None:
+    """Models sometimes emit the string "null" for the optional response_plan.
+
+    The real plan is set from the tool's deps afterwards, so a "null"/"none"/""
+    string must coerce to None instead of failing validation → error_fallback.
+    """
+    from ai_agent.agents.results import OrchestratorResult
+
+    for raw in ("null", "None", "", "  NULL  "):
+        result = OrchestratorResult.model_validate({"response_plan": raw})
+        assert result.response_plan is None
+
+
+def test_send_message_splits_turn_into_messages_then_questionnaire() -> None:
+    """The writer can emit a prose message via send_message, then a buttons-question.
+
+    send_message prose lands in outcome.messages (delivered first by Go); the
+    ask_questions form becomes the terminal questionnaire — "text then question"
+    arrives as two messages.
+    """
+    calls = {"writer": 0}
+
+    def writer(messages, info: AgentInfo) -> ModelResponse:
+        calls["writer"] += 1
+        if calls["writer"] == 1:
+            return ModelResponse(parts=[ToolCallPart(
+                tool_name="send_message", args={"text": "Краткая лекция про X."},
+            )])
+        if calls["writer"] == 2:
+            return ModelResponse(parts=[ToolCallPart(
+                tool_name="ask_questions",
+                args={"questions": [{"prompt": "Готов к вопросу?", "options": ["Да", "Нет"]}]},
+            )])
+        return draft_output({
+            "reply": "Поехали.",
+            "intent": "general_message",
+            "options": [],
+            "confidence": 0.9,
+            "topic": "лекция",
+        })
+
+    request = replace(
+        process_request("дай краткую лекцию и потом задай вопрос"),
+        ai_role=AIRoleData(
+            name="Tutor",
+            tool_settings={
+                **{entry.key: False for entry in TOOL_CATALOG},
+                "interaction.ask_questions": True,
+            },
+        ),
+    )
+    runtime = make_runtime(two_stage_draft=False, draft_model=FunctionModel(writer))
+
+    outcome = runtime.draft_outcome(request, RiskLevel.LOW)
+
+    assert [m.text for m in outcome.messages] == ["Краткая лекция про X."]
+    assert outcome.response_plan is not None
+    assert outcome.response_plan.questions[0].prompt == "Готов к вопросу?"
 
 
 def test_scheduler_tool_returns_job_for_go_persistence() -> None:
@@ -398,7 +545,7 @@ def test_scheduler_tool_returns_job_for_go_persistence() -> None:
     runtime = make_runtime(
         two_stage_draft=True,
         orchestrator_model=FunctionModel(orchestrator),
-        draft_model=structured({
+        draft_model=prompted({
             "reply": "Готово, напомню.",
             "intent": "scheduling",
             "options": [],
@@ -434,6 +581,119 @@ def test_two_stage_feature_flag_defaults_off(monkeypatch) -> None:
     assert load_flags_from_env().two_stage_draft is False
     monkeypatch.setenv("TWO_STAGE_DRAFT", "true")
     assert load_flags_from_env().two_stage_draft is True
+
+
+def test_prompt_contract_feature_flag_defaults_off(monkeypatch) -> None:
+    monkeypatch.delenv("PROMPT_CONTRACT_ENABLED", raising=False)
+    assert load_flags_from_env().prompt_contract_enabled is False
+    monkeypatch.setenv("PROMPT_CONTRACT_ENABLED", "true")
+    assert load_flags_from_env().prompt_contract_enabled is True
+
+
+@pytest.mark.parametrize("prompt_contract_enabled", [False, True], ids=("flag-off", "flag-on"))
+def test_prompt_contract_flag_does_not_change_draft_outcome_shape(prompt_contract_enabled: bool) -> None:
+    """The flag only changes how the system prompt is assembled internally —
+    the DraftOutcome contract (text/intent/confidence/topic) must be identical
+    either way for the same deterministic model."""
+    runtime = make_runtime(prompt_contract_enabled=prompt_contract_enabled)
+    outcome = runtime.draft_outcome(process_request(), RiskLevel.LOW)
+    assert outcome.text == "Завтра в 19:00, как договаривались."
+    assert outcome.intent == "scheduling"
+    assert outcome.confidence == 0.9
+    assert outcome.topic == "время встречи"
+
+
+@pytest.mark.parametrize("family", ["gpt", "reasoning", "agentic"])
+def test_prompt_contract_enabled_keeps_outcome_contract_across_families(
+    monkeypatch, family: str
+) -> None:
+    """Forcing every model family via MODEL_FAMILY_OVERRIDES (writer, router,
+    critic) must not change the DraftOutcome contract shape — only the
+    internal system-prompt structure changes per family. Exercises the full
+    bimodal path (orchestrator tool call + writer fallback ask_questions +
+    critic) so the questionnaire/response_plan plumbing is covered too."""
+    monkeypatch.setenv("MODEL_DRAFT", "test-writer-slug")
+    monkeypatch.setenv("MODEL_ROUTER", "test-router-slug")
+    monkeypatch.setenv("MODEL_CRITIC", "test-critic-slug")
+    monkeypatch.setenv(
+        "MODEL_FAMILY_OVERRIDES",
+        f"test-writer-slug={family},test-router-slug={family},test-critic-slug={family}",
+    )
+
+    calls = {"orchestrator": 0}
+
+    def orchestrator(messages, info: AgentInfo) -> ModelResponse:
+        calls["orchestrator"] += 1
+        if calls["orchestrator"] == 1:
+            return ModelResponse(parts=[ToolCallPart(
+                tool_name="ask_questions",
+                args={"questions": [
+                    {"prompt": "Какой день удобнее?", "options": ["Сегодня", "Завтра"]},
+                ]},
+            )])
+        return ModelResponse(parts=[ToolCallPart(tool_name="final_result", args={
+            "gathered_context": ["контекст собран"],
+            "suggested_intent": "scheduling",
+            "notes": "",
+        })])
+
+    request = replace(
+        process_request("Когда созвонимся?"),
+        ai_role=AIRoleData(
+            name="Support",
+            tool_settings={
+                **{entry.key: False for entry in TOOL_CATALOG},
+                "interaction.ask_questions": True,
+            },
+        ),
+    )
+    runtime = make_runtime(
+        two_stage_draft=True,
+        prompt_contract_enabled=True,
+        orchestrator_model=FunctionModel(orchestrator),
+        draft_model=prompted({
+            "reply": "writer placeholder",
+            "intent": "general_message",
+            "options": [],
+            "confidence": 0.9,
+            "topic": "выбор времени",
+        }),
+    )
+
+    outcome = runtime.draft_outcome(request, RiskLevel.LOW)
+
+    assert calls["orchestrator"] == 2
+    assert outcome.intent == "choice_question"
+    assert outcome.response_plan is not None
+    assert outcome.response_plan.shape == "questions"
+    assert outcome.response_plan.questions[0].prompt == "Какой день удобнее?"
+    # The writer's label falls back to the role's bare tier name ("balanced")
+    # when no model_name is set — a pre-existing, unrelated labelling detail
+    # (see test_two_stage_named_role_model_routes_writer_and_logs_concrete_slug
+    # for the concrete-slug case); this test only cares that family resolution
+    # didn't change which model actually serves the call (orchestrator slug).
+    assert outcome.model_used.startswith("orchestrate(test-router-slug)+draft(")
+
+
+def test_prompt_contract_guardrail_warns_for_reasoning_critic(monkeypatch, caplog) -> None:
+    """A reasoning-family critic model must log a guardrail warning (it stays
+    on ToolOutput in this phase) rather than crash or silently misbehave."""
+    monkeypatch.setenv("MODEL_CRITIC", "test-critic-slug")
+    monkeypatch.setenv("MODEL_FAMILY_OVERRIDES", "test-critic-slug=reasoning")
+    with caplog.at_level("WARNING"):
+        make_runtime(prompt_contract_enabled=True)
+    assert "critic" in caplog.text
+    assert "reasoning" in caplog.text
+
+
+def test_prompt_contract_guardrail_silent_when_flag_disabled(monkeypatch, caplog) -> None:
+    """The guardrail is part of the new prompt-contract behaviour, so it must
+    stay silent when the flag is off (zero new side effects, per regression=0)."""
+    monkeypatch.setenv("MODEL_CRITIC", "test-critic-slug")
+    monkeypatch.setenv("MODEL_FAMILY_OVERRIDES", "test-critic-slug=reasoning")
+    with caplog.at_level("WARNING"):
+        make_runtime(prompt_contract_enabled=False)
+    assert "test-critic-slug" not in caplog.text
 
 
 def test_role_draft_is_structured_and_wraps_untrusted_description() -> None:
@@ -492,7 +752,7 @@ def test_critic_reviews_medium_risk_and_revises() -> None:
 
 def test_critic_triggers_on_low_confidence_even_at_low_risk() -> None:
     runtime = make_runtime(
-        draft_model=structured(
+        draft_model=prompted(
             {"reply": "Не уверен, что понял.", "intent": "general_message",
              "options": [], "confidence": 0.3, "topic": ""}
         )
@@ -593,7 +853,7 @@ def test_invalid_structured_output_falls_back_to_error_contract() -> None:
     the same contract the legacy gateway path uses for error_fallback."""
 
     def broken(messages, info: AgentInfo) -> ModelResponse:
-        return ModelResponse(parts=[ToolCallPart(tool_name="final_result", args={"reply": ""})])
+        return draft_output({"reply": ""})
 
     runtime = make_runtime(draft_model=FunctionModel(broken))
     with pytest.raises(RuntimeError):
