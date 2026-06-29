@@ -737,6 +737,20 @@ type AIProcessMessageRequest struct {
 	// AIRole is the persona assigned to this chat; nil means the default
 	// assistant persona (reply in the owner's observed style).
 	AIRole *AIRole `json:"ai_role,omitempty"`
+	// ExistingScheduledJobs are the pending scheduler jobs already persisted for
+	// this chat. They are sent so the scheduler tools can list and cancel
+	// reminders while Python stays stateless (it never reads scheduled_jobs).
+	ExistingScheduledJobs []ExistingScheduledJob `json:"existing_scheduled_jobs,omitempty"`
+}
+
+// ExistingScheduledJob is a pending scheduler job surfaced to the AI tools so
+// they can reference it by id for listing and cancellation.
+type ExistingScheduledJob struct {
+	ID     int64     `json:"id"`
+	Kind   string    `json:"kind"`
+	Target string    `json:"target"`
+	FireAt time.Time `json:"fire_at"`
+	Text   string    `json:"text,omitempty"`
 }
 
 // TokenUsage contains model input and output token counts.
@@ -789,6 +803,9 @@ type AIProcessMessageResponse struct {
 	// ScheduledJobs are validated deferred jobs from AI tools. The backend
 	// persists them through the repository so Python remains stateless by default.
 	ScheduledJobs []ScheduledJob `json:"scheduled_jobs,omitempty"`
+	// CancelledJobIDs are pending scheduler-job ids the AI asked to cancel; the
+	// backend moves each to 'cancelled' via CancelJob within this chat's scope.
+	CancelledJobIDs []int64 `json:"cancelled_job_ids,omitempty"`
 	// Topic is a 3-7 word label of the current conversation produced by the
 	// same draft call (replaces the per-message /ai/tag-topic call — ARCH-4).
 	Topic string `json:"topic,omitempty"`

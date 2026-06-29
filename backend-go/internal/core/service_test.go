@@ -379,19 +379,20 @@ func TestHandleBotMessageRichStreamingSendsDraftsThenFinal(t *testing.T) {
 	if result.Decision != contracts.DecisionAutoReply {
 		t.Fatalf("decision = %s", result.Decision)
 	}
-	if botSender.richCalls != 1 || len(botSender.richDrafts) != 2 || botSender.calls != 0 {
+	last := len(botSender.richDrafts) - 1
+	if botSender.richCalls != 1 || len(botSender.richDrafts) != 3 || botSender.calls != 0 {
 		t.Fatalf("rich calls=%d rich drafts=%d plain calls=%d", botSender.richCalls, len(botSender.richDrafts), botSender.calls)
 	}
 	if botSender.richDrafts[0].markdown != richStreamingThinkingMarkdown {
 		t.Fatalf("thinking markdown = %q", botSender.richDrafts[0].markdown)
 	}
-	if botSender.richDrafts[1].markdown != "## Финал\n\n- безопасный текст" {
-		t.Fatalf("final draft markdown = %q", botSender.richDrafts[1].markdown)
+	if botSender.richDrafts[last].markdown != "## Финал\n\n- безопасный текст" {
+		t.Fatalf("final draft markdown = %q", botSender.richDrafts[last].markdown)
 	}
-	if botSender.richDrafts[0].draftID == 0 || botSender.richDrafts[0].draftID != botSender.richDrafts[1].draftID {
+	if botSender.richDrafts[0].draftID == 0 || botSender.richDrafts[0].draftID != botSender.richDrafts[last].draftID {
 		t.Fatalf("draft ids = %+v", botSender.richDrafts)
 	}
-	if botSender.richDrafts[0].chatID != "42" || botSender.richDrafts[1].chatID != "42" {
+	if botSender.richDrafts[0].chatID != "42" || botSender.richDrafts[last].chatID != "42" {
 		t.Fatalf("draft chat ids = %+v", botSender.richDrafts)
 	}
 	if botSender.richSent[0].Text != "## Финал\n\n- безопасный текст" {
@@ -406,7 +407,7 @@ func TestHandleBotMessageRichStreamingSendsDraftsThenFinal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("duplicate bot message: %v", err)
 	}
-	if botSender.richCalls != 1 || len(botSender.richDrafts) != 2 {
+	if botSender.richCalls != 1 || len(botSender.richDrafts) != 3 {
 		t.Fatalf("duplicate must not send again: rich calls=%d drafts=%d", botSender.richCalls, len(botSender.richDrafts))
 	}
 	if len(botSender.chatActions) != 1 {
@@ -447,7 +448,7 @@ func TestHandleBotMessageRichStreamingDraftFailureStillSendsFinalText(t *testing
 	if result.Decision != contracts.DecisionAutoReply {
 		t.Fatalf("decision = %s", result.Decision)
 	}
-	if botSender.richCalls != 1 || len(botSender.richDrafts) != 1 || botSender.calls != 0 {
+	if botSender.richCalls != 1 || len(botSender.richDrafts) != 2 || botSender.calls != 0 {
 		t.Fatalf("rich calls=%d rich drafts=%d plain calls=%d", botSender.richCalls, len(botSender.richDrafts), botSender.calls)
 	}
 	if botSender.richDrafts[0].markdown != richStreamingThinkingMarkdown {
@@ -603,8 +604,8 @@ func TestHandleBotMessageStreamingTypingActionNotSentWhenOff(t *testing.T) {
 	if len(botSender.chatActions) != 0 {
 		t.Fatalf("streaming off: expected no chat action, got %v", botSender.chatActions)
 	}
-	if len(botSender.richDrafts) != 0 {
-		t.Fatalf("streaming off: expected no rich drafts, got %d", len(botSender.richDrafts))
+	if len(botSender.richDrafts) != 1 || botSender.richDrafts[0].markdown != richStreamingThinkingMarkdown {
+		t.Fatalf("streaming off: expected only the thinking placeholder draft, got %+v", botSender.richDrafts)
 	}
 	if botSender.richCalls != 1 {
 		t.Fatalf("streaming off: expected 1 rich send (phase A path), got %d", botSender.richCalls)

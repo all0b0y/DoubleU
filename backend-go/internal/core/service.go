@@ -1250,6 +1250,9 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 	}
 	// AI role: the persona assigned to this chat (nil → default assistant persona).
 	request.AIRole = aiRole
+	if shouldSurfaceScheduledJobs(aiRole) {
+		request.ExistingScheduledJobs = existingScheduledJobs(s.repository.ListJobs(event.TenantID, event.ChatID))
+	}
 	// User Layer: owner identity and preferences (§3).
 	// Also pre-compute delivery settings from the same read so sendRecipient below
 	// does not need a second UserSettings lookup on this hot path.
@@ -1306,6 +1309,7 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 		return InboundResult{Event: event, Decision: contracts.DecisionErrorFallback, Reason: "ai_process_error"}, nil
 	}
 	s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateAIGenerated)
+	s.cancelAIScheduledJobs(event, proposal.CancelledJobIDs)
 	if err := s.saveAIScheduledJobs(event, settings, proposal.ScheduledJobs); err != nil {
 		s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateFailed)
 		s.repository.AppendAudit(s.auditEvent(event, contracts.DecisionErrorFallback, "scheduled_job_persist_error:"+err.Error()))
@@ -1359,7 +1363,8 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 		if contactInteraction {
 			markup = contactOptionsKeyboard(interactionDraft.DraftID, interactionOptions)
 		}
-		sentMsgID, err := s.sendRecipientWithMarkup(ctx, event, decisionID, proposal.ResponseText, proposal.TextFormat, true, hotDelivery, markup)
+		allowStreaming := proposal.Intent != "choice_question"
+		sentMsgID, err := s.sendRecipientWithMarkup(ctx, event, decisionID, proposal.ResponseText, proposal.TextFormat, allowStreaming, hotDelivery, markup)
 		if err != nil {
 			s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateFailed)
 			s.repository.AppendAudit(s.auditEvent(event, contracts.DecisionErrorFallback, "send_error:"+err.Error()))
@@ -3036,6 +3041,56 @@ func interactionDraftID(decisionID string) string {
 	return fmt.Sprintf("draft:aibtn-%x", hash.Sum64())
 }
 
+func shouldSurfaceScheduledJobs(role *contracts.AIRole) bool {
+	if role == nil {
+		return false
+	}
+	return contracts.ToolEnabled(role.ToolSettings, "scheduler.list_reminders") ||
+		contracts.ToolEnabled(role.ToolSettings, "scheduler.cancel_reminder")
+}
+
+func existingScheduledJobs(jobs []store.ScheduledJobRecord) []contracts.ExistingScheduledJob {
+	existing := make([]contracts.ExistingScheduledJob, 0, len(jobs))
+	for _, job := range jobs {
+		if job.Status != "pending" {
+			continue
+		}
+		existing = append(existing, contracts.ExistingScheduledJob{
+			ID:     job.ID,
+			Kind:   job.Kind,
+			Target: job.Target,
+			FireAt: job.FireAt,
+			Text:   scheduledJobText(job),
+		})
+	}
+	return existing
+}
+
+func scheduledJobText(job store.ScheduledJobRecord) string {
+	if job.Payload == nil {
+		return ""
+	}
+	if text, ok := job.Payload["text"].(string); ok {
+		return text
+	}
+	return ""
+}
+
+func (s *Service) cancelAIScheduledJobs(event contracts.NormalizedTelegramEvent, ids []int64) {
+	for _, id := range ids {
+		if id == 0 {
+			continue
+		}
+		if !s.repository.CancelJob(event.TenantID, event.ChatID, id) {
+			s.logger.Warn("scheduled job cancellation ignored",
+				"tenant_id", event.TenantID,
+				"chat_id", event.ChatID,
+				"job_id", id,
+			)
+		}
+	}
+}
+
 // sendRecipient sends a reply to the contact and returns the Telegram message_id of the sent message.
 // delivery holds the pre-computed rich-formatting and streaming toggles; callers on the hot path
 // supply deliverySettingsFromUser (no extra repository read) while others use deliverySettingsFor.
@@ -3085,6 +3140,9 @@ func (s *Service) sendRecipientWithMarkup(ctx context.Context, event contracts.N
 			htmlMsg.Text = telegram.MarkdownToHTML(msg.Text)
 			htmlMsg.ParseMode = "HTML"
 			return sendMessage(ctx, sender, htmlMsg)
+		}
+		if s.richDraftStreamingAllowedFor(event) {
+			s.sendInitialRichThinkingDraft(ctx, sender, msg)
 		}
 		if allowStreaming && delivery.StreamingEnabled && s.richDraftStreamingAllowedFor(event) {
 			return s.sendStreamingRichRecipient(ctx, sender, msg)
@@ -3174,6 +3232,25 @@ func (s *Service) richDraftStreamingAllowedFor(event contracts.NormalizedTelegra
 	chatID := contracts.RawChatID(event.ChatID)
 	parsedChatID, err := strconv.ParseInt(chatID, 10, 64)
 	return err == nil && parsedChatID > 0
+}
+
+func (s *Service) sendInitialRichThinkingDraft(ctx context.Context, sender telegram.Sender, msg telegram.OutboundMessage) {
+	draftSender, ok := sender.(interface {
+		SendRichMessageDraft(context.Context, string, int64, string) error
+	})
+	if !ok {
+		return
+	}
+	draftID := richDraftID(msg)
+	if err := draftSender.SendRichMessageDraft(ctx, msg.ChatID, draftID, richStreamingThinkingMarkdown); err != nil {
+		s.logger.Warn("telegram rich thinking draft send failed; continuing",
+			"tenant_id", msg.TenantID,
+			"chat_id", msg.ChatID,
+			"decision_id", msg.DecisionID,
+			"draft_id", draftID,
+			"error", err,
+		)
+	}
 }
 
 func (s *Service) sendStreamingRichRecipient(ctx context.Context, sender telegram.Sender, msg telegram.OutboundMessage) (string, error) {
