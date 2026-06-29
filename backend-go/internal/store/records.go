@@ -57,30 +57,6 @@ type ScheduledJobRecord struct {
 	SentAt         *time.Time     `json:"sent_at,omitempty"`
 }
 
-// FormAnswer pairs one questionnaire question with the contact's answer to it.
-type FormAnswer struct {
-	Prompt string `json:"prompt"`
-	Answer string `json:"answer"`
-}
-
-// InteractionFormRecord is the persisted state of a step-by-step questionnaire
-// (interaction.ask_questions). Questions are asked one at a time; Answers grows
-// as the contact replies (by button tap or free text) and len(Answers) equals
-// CurrentIndex. Exactly one form per chat may be active at a time.
-type InteractionFormRecord struct {
-	ID              int64                `json:"id"`
-	TenantID        string               `json:"tenant_id"`
-	ChatID          string               `json:"chat_id"`
-	BotID           string               `json:"bot_id,omitempty"`
-	Questions       []contracts.Question `json:"questions"`
-	CurrentIndex    int                  `json:"current_index"`
-	Answers         []FormAnswer         `json:"answers"`
-	Status          string               `json:"status"`
-	SourceMessageID string               `json:"source_message_id,omitempty"`
-	CreatedAt       time.Time            `json:"created_at"`
-	ExpiresAt       time.Time            `json:"expires_at"`
-}
-
 // SemanticFactRecord stores a typed, atomic fact in the Semantic Layer.
 // It maps to the semantic_facts table and replaces the deprecated MemoryFactRecord.
 type SemanticFactRecord struct {
