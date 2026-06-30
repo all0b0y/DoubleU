@@ -745,6 +745,11 @@ type AIProcessMessageRequest struct {
 	// this chat. They are sent so the scheduler tools can list and cancel
 	// reminders while Python stays stateless (it never reads scheduled_jobs).
 	ExistingScheduledJobs []ExistingScheduledJob `json:"existing_scheduled_jobs,omitempty"`
+	// CurrentTime is Go's authoritative "now" for this turn (RFC3339 UTC), so
+	// the AI container's clock can never skew from the clock that later
+	// validates fire_at. "" means the field was not set (old caller/test);
+	// Python falls back to its own clock in that case.
+	CurrentTime string `json:"current_time,omitempty"`
 }
 
 // ExistingScheduledJob is a pending scheduler job surfaced to the AI tools so
@@ -785,6 +790,12 @@ type ScheduledJob struct {
 	Payload        map[string]any `json:"payload"`
 	CreatedBy      string         `json:"created_by,omitempty"`
 	IdempotencyKey string         `json:"idempotency_key"`
+	// LocalTime/TZName (D) carry the reminder's wall-clock identity ("YYYY-MM-DDTHH:MM:SS"
+	// + IANA name) so the scheduler can recompute the authoritative fire instant from
+	// current tzdata at dispatch time, correcting DST/offset drift since creation.
+	// Both empty keeps FireAt (UTC) authoritative — unchanged legacy behaviour.
+	LocalTime string `json:"local_time,omitempty"`
+	TZName    string `json:"tz_name,omitempty"`
 }
 
 // AIProcessMessageResponse is returned by the Python AI service.

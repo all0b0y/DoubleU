@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
@@ -86,6 +87,10 @@ class ScheduledJobData(JsonDataclass):
     payload: dict[str, Any]
     idempotency_key: str
     created_by: str = "ai"
+    # D: wall-clock identity for DST-safe recompute at dispatch time (Go
+    # ScheduledJob.LocalTime/TZName). Both "" keeps fire_at (UTC) authoritative.
+    local_time: str = ""
+    tz_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -275,6 +280,10 @@ class AIProcessMessageRequest(JsonDataclass):
     # Pending scheduler jobs already persisted by Go for this chat, supplied so
     # the scheduler tools can list and cancel reminders without DB access.
     existing_scheduled_jobs: tuple[ExistingScheduledJob, ...] = field(default_factory=tuple)
+    # Go's authoritative "now" for this turn (ISO-8601 UTC with offset), so the
+    # AI container's clock never skews from the clock that validates fire_at.
+    # "" (old callers / not yet sent) falls back to datetime.now(timezone.utc).
+    current_time: str = ""
 
 
 @dataclass(frozen=True)
@@ -659,7 +668,28 @@ def parse_process_message_request(payload: dict[str, Any]) -> AIProcessMessageRe
         contact_profile=_parse_contact_profile(payload.get("contact_profile")),
         user_settings=_parse_user_settings(payload.get("user_settings")),
         ai_role=_parse_ai_role(payload.get("ai_role")),
+        existing_scheduled_jobs=_parse_existing_scheduled_jobs(
+            payload.get("existing_scheduled_jobs", [])
+        ),
+        current_time=str(payload.get("current_time", "")),
     )
+
+
+def parse_current_time(value: str) -> datetime | None:
+    """Parse the contract's ``current_time`` ISO-8601 string into an aware UTC datetime.
+
+    Returns None when empty or unparseable so callers fall back to their own
+    clock (older Go callers, or a malformed value, must never crash the turn).
+    """
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
 
 
 def parse_risk_request(payload: dict[str, Any]) -> RiskRequest:
@@ -965,6 +995,22 @@ def _parse_privacy_flags(values: Any) -> tuple[PrivacyFlag, ...]:
     if not isinstance(values, list):
         return ()
     return tuple(PrivacyFlag(str(value)) for value in values)
+
+
+def _parse_existing_scheduled_jobs(values: Any) -> tuple[ExistingScheduledJob, ...]:
+    if not isinstance(values, list):
+        return ()
+    items = []
+    for item in values:
+        if isinstance(item, dict):
+            items.append(ExistingScheduledJob(
+                id=int(item.get("id", 0)),
+                kind=str(item.get("kind", "")),
+                target=str(item.get("target", "")),
+                fire_at=str(item.get("fire_at", "")),
+                text=str(item.get("text", "")),
+            ))
+    return tuple(items)
 
 
 def _json_ready(value: Any) -> Any:

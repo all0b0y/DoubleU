@@ -77,6 +77,13 @@ class ScheduledJob(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
     created_by: Literal["ai"] = "ai"
     idempotency_key: str = Field(min_length=1)
+    # D: wall-clock identity ("YYYY-MM-DDTHH:MM:SS" + IANA name) so Go can
+    # recompute the authoritative fire instant from current tzdata at dispatch
+    # time, correcting DST/offset drift between creation and firing. Both ""
+    # keeps fire_at (UTC) authoritative — unset whenever the owner timezone
+    # is unknown (A1 already refuses create_reminder in that case).
+    local_time: str = ""
+    tz_name: str = ""
 
 
 class OutboundMessage(BaseModel):

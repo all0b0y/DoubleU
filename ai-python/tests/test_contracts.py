@@ -124,7 +124,34 @@ class ContractEnumTests(unittest.TestCase):
             "payload": {"text": "Позвонить клиенту"},
             "idempotency_key": "scheduler:key",
             "created_by": "ai",
+            "local_time": "",
+            "tz_name": "",
         }])
+
+    def test_scheduled_jobs_carry_walltime_identity_for_dst_safe_dispatch(self) -> None:
+        """D: local_time/tz_name round-trip through the wire shape so Go can
+        recompute the authoritative fire instant from current tzdata."""
+        response = AIProcessMessageResponse(
+            decision=Decision.DRAFT,
+            response_text="Напоминание поставлено",
+            confidence=0.9,
+            risk_level=RiskLevel.LOW,
+            intent="scheduling",
+            model_used="test",
+            usage=Usage(),
+            scheduled_jobs=(ScheduledJobData(
+                kind="reminder",
+                target="owner",
+                fire_at="2026-06-22T15:00:00+00:00",
+                payload={"text": "Позвонить клиенту"},
+                idempotency_key="scheduler:key",
+                local_time="2026-06-22T18:00:00",
+                tz_name="Europe/Moscow",
+            ),),
+        )
+        job = response.to_dict()["scheduled_jobs"][0]
+        self.assertEqual(job["local_time"], "2026-06-22T18:00:00")
+        self.assertEqual(job["tz_name"], "Europe/Moscow")
 
 
 class GeneratedEnumsMatchContractJSONTests(unittest.TestCase):

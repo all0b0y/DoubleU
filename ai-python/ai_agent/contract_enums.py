@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from enum import Enum
 
-CONTRACT_VERSION = "0.6.0"
+CONTRACT_VERSION = "0.8.0"
 
 class ToolCategory(str, Enum):
     """Generated from contracts.json 'tool_categories'."""

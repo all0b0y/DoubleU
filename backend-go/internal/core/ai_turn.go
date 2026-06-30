@@ -246,6 +246,7 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 		Event:         event,
 		ChatSettings:  effectiveSettings,
 		MemoryContext: memoryContext,
+		CurrentTime:   s.now().UTC().Format(time.RFC3339),
 	}
 	if personaSpeaksAsOwner(aiRole) {
 		request.FeedbackContext = s.feedbackContext(event.TenantID, event.ChatID, 5)

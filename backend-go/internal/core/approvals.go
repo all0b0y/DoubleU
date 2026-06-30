@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"doubleu/backend-go/internal/aiclient"
 	"doubleu/backend-go/internal/bot"
@@ -227,6 +228,7 @@ func (s *Service) regenerateDraft(ctx context.Context, draft store.DraftRecord) 
 		Event:         event,
 		ChatSettings:  settings,
 		MemoryContext: s.conversationContext(ctx, event, ownerID, 20),
+		CurrentTime:   s.now().UTC().Format(time.RFC3339),
 	}
 	if profile, ok := s.repository.ContactProfile(draft.TenantID, draft.ChatID); ok {
 		regenRequest.ContactProfile = &profile
@@ -268,6 +270,7 @@ func (s *Service) regenerateDraftWithHint(ctx context.Context, draft store.Draft
 		Event:         event,
 		ChatSettings:  settings,
 		MemoryContext: hintContext,
+		CurrentTime:   s.now().UTC().Format(time.RFC3339),
 	}
 	if profile, ok := s.repository.ContactProfile(draft.TenantID, draft.ChatID); ok {
 		hintRequest.ContactProfile = &profile
