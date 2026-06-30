@@ -49,6 +49,7 @@ from ai_agent.schemas import (
     SynthesizePatternRequest,
     TopicTaggingRequest,
     TypedExtractionRequest,
+    UserSettingsData,
 )
 
 
@@ -647,6 +648,9 @@ def test_scheduler_tool_returns_job_for_go_persistence() -> None:
                 "scheduler.create_reminder": True,
             },
         ),
+        # A1: create_reminder refuses when the owner timezone is unknown, so
+        # this functional test needs a known one to exercise the happy path.
+        user_settings=UserSettingsData(timezone="Europe/Moscow"),
     )
     runtime = make_runtime(
         two_stage_draft=True,

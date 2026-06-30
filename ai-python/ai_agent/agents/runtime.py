@@ -62,6 +62,7 @@ from ..schemas import (
     OutboundMessageData,
     PrivacyFlag,
     ProfileSuggestion,
+    parse_current_time,
     RerankFactsRequest,
     RerankFactsResponse,
     RiskLevel,
@@ -177,6 +178,8 @@ def _scheduled_job_data(jobs: list[ScheduledJob]) -> tuple[ScheduledJobData, ...
             payload=dict(job.payload),
             created_by=job.created_by,
             idempotency_key=job.idempotency_key,
+            local_time=job.local_time,
+            tz_name=job.tz_name,
         )
         for job in jobs
     )
@@ -474,6 +477,7 @@ class AgentRuntime:
         pool: asyncpg.Pool | None,
         current_time: datetime | None = None,
         existing_jobs: tuple = (),
+        owner_timezone: str = "",
     ) -> AgentDeps:
         return AgentDeps(
             tenant_id=tenant_id,
@@ -485,6 +489,7 @@ class AgentRuntime:
             embedder=self._query_embedder_factory() if self._query_embedder_factory else None,
             current_time=current_time or datetime.now(timezone.utc),
             existing_jobs=existing_jobs,
+            owner_timezone=owner_timezone,
         )
 
     # ----------------------------------------------------------- safety/sink
@@ -775,7 +780,7 @@ class AgentRuntime:
         every tool the role enables.
         """
         orchestrator_slug = model_name_for(AgentTask.ORCHESTRATE)
-        current_time = datetime.now(timezone.utc)
+        current_time = parse_current_time(request.current_time) or datetime.now(timezone.utc)
         family = resolve_family(orchestrator_slug)
         rendered = render_prompt(
             prompt_library.orchestrator_spec(request, current_time=current_time), family
@@ -796,6 +801,9 @@ class AgentRuntime:
             pool=pool,
             current_time=current_time,
             existing_jobs=request.existing_scheduled_jobs,
+            owner_timezone=(
+                request.user_settings.timezone.strip() if request.user_settings is not None else ""
+            ),
         )
         toolsets = [
             resolve_builtin_toolset(
@@ -958,7 +966,7 @@ class AgentRuntime:
                 decision,
             )
             orchestrator_bundle = self._orchestrator_bundle(orchestrated)
-        current_time = datetime.now(timezone.utc)
+        current_time = parse_current_time(request.current_time) or datetime.now(timezone.utc)
         system_prompt, user_payload = self._build_draft_prompt_contract(
             request, orchestrator_bundle=orchestrator_bundle, current_time=current_time
         )
@@ -976,6 +984,9 @@ class AgentRuntime:
             pool=pool,
             current_time=current_time,
             existing_jobs=request.existing_scheduled_jobs,
+            owner_timezone=(
+                request.user_settings.timezone.strip() if request.user_settings is not None else ""
+            ),
         )
         # Strict split (default, see _WRITER_FALLBACK_TOOLS_ENABLED above): in
         # two-stage mode the orchestrator is the ONLY memory/schedule/interaction

@@ -29,7 +29,9 @@ class _RejectingPool:
         raise AssertionError("scheduler tool must not write to Postgres")
 
 
-def _ctx(*, pool=None, flags: tuple[str, ...] = (), existing=()) -> SimpleNamespace:
+def _ctx(
+    *, pool=None, flags: tuple[str, ...] = (), existing=(), owner_timezone: str = "UTC"
+) -> SimpleNamespace:
     return SimpleNamespace(deps=AgentDeps(
         tenant_id="tenant:user:1",
         chat_id="chat-1",
@@ -38,6 +40,7 @@ def _ctx(*, pool=None, flags: tuple[str, ...] = (), existing=()) -> SimpleNamesp
         pool=pool,
         current_time=datetime(2026, 6, 22, 12, 0, tzinfo=timezone.utc),
         existing_jobs=existing,
+        owner_timezone=owner_timezone,
     ))
 
 
@@ -93,6 +96,42 @@ def test_create_reminder_respects_privacy_and_storage_gate() -> None:
     ))
     assert available == "scheduled reminder for 2026-06-23T12:00:00+00:00"
     assert len(ctx.deps.scheduled_jobs) == 1
+
+
+def test_create_reminder_refuses_when_owner_timezone_unknown() -> None:
+    """A1: bot-only owners (timezone never synced) must not get a silent UTC guess."""
+    ctx = _ctx(pool=_RejectingPool(), owner_timezone="")
+    result = asyncio.run(create_reminder(
+        ctx, "2026-06-22T18:00:00+03:00", "Позвонить клиенту", "owner"
+    ))
+
+    assert result.startswith("error: owner timezone unknown")
+    assert "ask_questions" in result
+    assert ctx.deps.scheduled_jobs == []
+
+
+def test_create_reminder_works_as_before_with_known_timezone() -> None:
+    """Known owner timezone (e.g. Europe/Moscow) schedules exactly as before A1."""
+    ctx = _ctx(pool=_RejectingPool(), owner_timezone="Europe/Moscow")
+    result = asyncio.run(create_reminder(
+        ctx, "2026-06-22T18:00:00+03:00", "Позвонить клиенту", "owner"
+    ))
+
+    assert result == "scheduled reminder for 2026-06-22T15:00:00+00:00"
+    assert len(ctx.deps.scheduled_jobs) == 1
+
+
+def test_create_reminder_attaches_walltime_identity_for_dst_safe_dispatch() -> None:
+    """D: the job carries the owner's wall-clock time + zone so Go can
+    recompute the authoritative fire instant from current tzdata."""
+    ctx = _ctx(pool=_RejectingPool(), owner_timezone="Europe/Moscow")
+    asyncio.run(create_reminder(
+        ctx, "2026-06-22T18:00:00+03:00", "Позвонить клиенту", "owner"
+    ))
+
+    job = ctx.deps.scheduled_jobs[0]
+    assert job.local_time == "2026-06-22T18:00:00"
+    assert job.tz_name == "Europe/Moscow"
 
 
 def _existing(job_id: int, text: str = "позвонить") -> ExistingScheduledJob:

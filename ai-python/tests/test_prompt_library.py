@@ -158,16 +158,19 @@ class TestDraftSpecToolGating:
 
     def test_scheduler_instruction_gated_by_privacy_flags(self) -> None:
         role = AIRoleData(name="r", tool_settings={"scheduler.create_reminder": True})
-        open_spec = _draft_spec(_request(ai_role=role))
+        # Known timezone so this test exercises privacy-flag gating only, not
+        # the A1 "unknown timezone" marker (covered separately in test_draft.py).
+        settings = UserSettingsData(timezone="Europe/Moscow")
+        open_spec = _draft_spec(_request(ai_role=role, user_settings=settings))
         assert spec_has(open_spec.context, "ТЕКУЩЕЕ ВРЕМЯ ВЛАДЕЛЬЦА")
 
         private_spec = _draft_spec(
-            _request(ai_role=role, privacy_flags=(PrivacyFlag.PRIVATE,))
+            _request(ai_role=role, user_settings=settings, privacy_flags=(PrivacyFlag.PRIVATE,))
         )
         assert not spec_has(private_spec.context, "ТЕКУЩЕЕ ВРЕМЯ ВЛАДЕЛЬЦА")
 
         no_memory_spec = _draft_spec(
-            _request(ai_role=role, privacy_flags=(PrivacyFlag.NO_MEMORY,))
+            _request(ai_role=role, user_settings=settings, privacy_flags=(PrivacyFlag.NO_MEMORY,))
         )
         assert not spec_has(no_memory_spec.context, "ТЕКУЩЕЕ ВРЕМЯ ВЛАДЕЛЬЦА")
 

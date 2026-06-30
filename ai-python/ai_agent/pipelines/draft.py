@@ -178,20 +178,44 @@ def _message_split_instruction() -> str:
     )
 
 
+_OWNER_TZ_UNKNOWN_MARKER = "ПОЯС ВЛАДЕЛЬЦА НЕИЗВЕСТЕН"
+
+
 def _current_time_instruction(
     request: AIProcessMessageRequest, current_time: datetime | None
 ) -> str:
+    """Ground the prompt in "now" and, when known, the owner's local time.
+
+    ``user_settings.timezone == ""`` means the owner's zone is UNKNOWN (e.g. a
+    bot-only owner who never opened the Mini App, whose browser-IANA sync never
+    ran) — it must never be silently treated as UTC, since that produces a
+    reminder fired hours off the owner's real wall-clock time with no signal to
+    anyone. An IANA name that fails to resolve is treated the same way: the
+    stored value cannot be trusted to mean what the owner thinks it means.
+    """
     now_utc = (current_time or datetime.now(timezone.utc)).astimezone(timezone.utc)
-    timezone_name = (
-        request.user_settings.timezone
-        if request.user_settings is not None and request.user_settings.timezone
-        else "UTC"
+    raw_timezone = (
+        request.user_settings.timezone.strip() if request.user_settings is not None else ""
     )
+    if not raw_timezone:
+        return (
+            f"{_OWNER_TZ_UNKNOWN_MARKER}: текущее время UTC: {now_utc.isoformat()}. "
+            "Часовой пояс владельца не определён (бот-онли пользователь, Mini App ещё не "
+            "синхронизировал IANA-пояс). При просьбе о напоминании на голое локальное время "
+            "(«в 9», «напомни в 18:30», без даты и пояса) сначала уточни пояс или город "
+            "владельца через ask_questions — никогда не предполагай UTC и не подставляй пояс "
+            "собеседника."
+        )
     try:
-        local_now = now_utc.astimezone(ZoneInfo(timezone_name))
+        local_now = now_utc.astimezone(ZoneInfo(raw_timezone))
     except ZoneInfoNotFoundError:
-        timezone_name = "UTC"
-        local_now = now_utc
+        return (
+            f"{_OWNER_TZ_UNKNOWN_MARKER}: текущее время UTC: {now_utc.isoformat()}. "
+            f"Сохранённый часовой пояс владельца ({raw_timezone!r}) не распознан как "
+            "IANA-имя. При просьбе о напоминании на голое локальное время сначала уточни "
+            "пояс или город владельца через ask_questions — никогда не предполагай UTC."
+        )
+    timezone_name = raw_timezone
     return (
         "ТЕКУЩЕЕ ВРЕМЯ ВЛАДЕЛЬЦА: "
         f"{local_now.isoformat()} ({timezone_name}); UTC: {now_utc.isoformat()}. "
@@ -298,7 +322,10 @@ def _greeting_rule(memory_context: tuple[str, ...]) -> str:
 
     for line in memory_context:
         if line.startswith("[CURRENT DATE:"):
-            m = re.search(r"\[CURRENT DATE: (\d{4}-\d{2}-\d{2})\]", line)
+            # B: the header now carries owner-local datetime+offset (or a UTC
+            # "unknown timezone" marker), not just a bare date — match the
+            # leading YYYY-MM-DD regardless of what follows it.
+            m = re.search(r"\[CURRENT DATE: (\d{4}-\d{2}-\d{2})", line)
             if m:
                 try:
                     current_date = date.fromisoformat(m.group(1))

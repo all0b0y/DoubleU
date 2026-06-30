@@ -58,6 +58,10 @@ class AgentDeps:
     cancelled_job_ids: list[int] = field(default_factory=list)
     # One stable clock value shared by the scheduler prompt and tool validation.
     current_time: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    # Owner's IANA timezone name from user_settings.timezone, "" when unknown
+    # (bot-only owner, Mini App browser-tz sync never ran). Never defaulted to
+    # "UTC" here — that silent guess is the bug A1 fixes.
+    owner_timezone: str = ""
     # Tool-call cache keyed by (tool_name, normalized_args) — see
     # ``agents.dedup_toolset.DedupToolset``. A repeat call within this run
     # returns the cached result instead of hitting the DB/tool again.
@@ -77,3 +81,11 @@ class AgentDeps:
     def private(self) -> bool:
         """True when autonomous scheduled persistence is forbidden."""
         return "private" in self.privacy_flags
+
+    @property
+    def owner_timezone_known(self) -> bool:
+        """True when the owner's IANA timezone is known (any non-empty value).
+
+        An explicit "UTC" counts as known; only "" (never synced) is unknown.
+        """
+        return bool(self.owner_timezone)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 from datetime import datetime, timedelta, timezone
 from typing import Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic_ai import RunContext
 from pydantic_ai.toolsets import FunctionToolset
@@ -50,6 +51,11 @@ async def create_reminder(
 
     if ctx.deps.no_memory or ctx.deps.private:
         return "error: scheduler is unavailable for this chat privacy mode"
+    if not ctx.deps.owner_timezone_known:
+        return (
+            "error: owner timezone unknown — ask the owner for their timezone/city via "
+            "ask_questions before scheduling a bare local time"
+        )
     fire_at = _parse_fire_at(fire_at_iso)
     if fire_at is None:
         return "error: fire_at_iso must be an ISO-8601 timestamp with timezone"
@@ -73,6 +79,21 @@ async def create_reminder(
         )
     )
     idempotency_key = "scheduler:" + hashlib.sha256(idem_source.encode()).hexdigest()
+    # D: also carry the wall-clock identity (owner's local civil time + zone) so
+    # Go can recompute the authoritative UTC instant from current tzdata at
+    # dispatch time, correcting any DST/offset drift in the absolute fire_at
+    # this tool (or the model's arithmetic) just computed. A zone that fails to
+    # resolve degrades to "no wall-clock identity" — fire_at (UTC) stays
+    # authoritative, matching legacy behaviour.
+    local_time = ""
+    tz_name = ""
+    try:
+        local_time = fire_at.astimezone(ZoneInfo(ctx.deps.owner_timezone)).strftime(
+            "%Y-%m-%dT%H:%M:%S"
+        )
+        tz_name = ctx.deps.owner_timezone
+    except ZoneInfoNotFoundError:
+        pass
     if not any(job.idempotency_key == idempotency_key for job in ctx.deps.scheduled_jobs):
         ctx.deps.scheduled_jobs.append(
             ScheduledJob(
@@ -82,6 +103,8 @@ async def create_reminder(
                 payload={"text": clean_text},
                 created_by="ai",
                 idempotency_key=idempotency_key,
+                local_time=local_time,
+                tz_name=tz_name,
             )
         )
     return f"scheduled reminder for {fire_at.isoformat()}"

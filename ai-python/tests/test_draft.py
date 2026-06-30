@@ -533,17 +533,30 @@ class CurrentTimeInstructionTests(unittest.TestCase):
         self.assertIn("Europe/Kyiv", instruction)
         self.assertIn("2026-06-23T10:00:00+00:00", instruction)
 
-    def test_invalid_timezone_falls_back_to_utc(self) -> None:
-        """An unknown IANA name degrades to UTC instead of raising."""
+    def test_invalid_timezone_is_treated_as_unknown(self) -> None:
+        """An unrecognised IANA name must NOT silently degrade to UTC (A1):
+        a stored value that fails to resolve cannot be trusted to mean what
+        the owner thinks it means, so it is flagged unknown like an empty one."""
         request = _process_request(user_settings=UserSettingsData(timezone="Not/AZone"))
         instruction = draft_pipeline._current_time_instruction(request, self._NOON_UTC)
-        self.assertIn("(UTC)", instruction)
+        self.assertIn("ПОЯС ВЛАДЕЛЬЦА НЕИЗВЕСТЕН", instruction)
+        self.assertNotIn("ТЕКУЩЕЕ ВРЕМЯ ВЛАДЕЛЬЦА", instruction)
 
-    def test_missing_user_settings_falls_back_to_utc(self) -> None:
-        """No user_settings at all (legacy/incomplete request) also defaults to UTC."""
+    def test_missing_user_settings_is_treated_as_unknown(self) -> None:
+        """No user_settings at all (legacy/incomplete request) is UNKNOWN, not UTC (A1):
+        a bot-only owner who never synced a timezone must never get a silent UTC guess —
+        the instruction must steer the agent toward ask_questions instead."""
         request = _process_request()
         instruction = draft_pipeline._current_time_instruction(request, self._NOON_UTC)
-        self.assertIn("(UTC)", instruction)
+        self.assertIn("ПОЯС ВЛАДЕЛЬЦА НЕИЗВЕСТЕН", instruction)
+        self.assertIn("ask_questions", instruction)
+        self.assertNotIn("ТЕКУЩЕЕ ВРЕМЯ ВЛАДЕЛЬЦА", instruction)
+
+    def test_unknown_timezone_marker_absent_when_timezone_known(self) -> None:
+        """The UNKNOWN marker must appear only when the timezone is actually empty/invalid."""
+        request = _process_request(user_settings=UserSettingsData(timezone="Europe/Kyiv"))
+        instruction = draft_pipeline._current_time_instruction(request, self._NOON_UTC)
+        self.assertNotIn("ПОЯС ВЛАДЕЛЬЦА НЕИЗВЕСТЕН", instruction)
 
     def test_bare_time_is_framed_as_owner_local_never_utc(self) -> None:
         """The strengthened wording forbids reading a bare time as UTC."""

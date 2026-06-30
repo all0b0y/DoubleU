@@ -36,6 +36,7 @@ def test_create_reminder_does_not_write_scheduled_job_from_python() -> None:
                 source_message_id="m1",
                 pool=pool,
                 current_time=now,
+                owner_timezone="UTC",
             )
             ctx = SimpleNamespace(deps=deps)
             result = await create_reminder(
