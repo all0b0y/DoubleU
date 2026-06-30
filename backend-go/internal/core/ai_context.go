@@ -49,15 +49,16 @@ func (s *Service) conversationContextAndMessages(ctx context.Context, event cont
 	// Phase 1 — independent reads in parallel (ARCH-8). The embedding API call
 	// dominates (~2-5 s); everything else is a DB roundtrip that overlaps it.
 	var (
-		queryVector []float64
-		records     []store.MessageRecord
-		greeted     bool
-		pausedHours float64
-		commitments []store.SemanticFactRecord
-		episode     store.ActiveEpisodeRecord
-		hasEpisode  bool
-		drafts      []store.DraftRecord
-		bm25        []store.SemanticFactRecord
+		queryVector  []float64
+		records      []store.MessageRecord
+		greeted      bool
+		pausedHours  float64
+		commitments  []store.SemanticFactRecord
+		episode      store.ActiveEpisodeRecord
+		hasEpisode   bool
+		drafts       []store.DraftRecord
+		bm25         []store.SemanticFactRecord
+		userSettings contracts.UserSettings
 	)
 	var wg sync.WaitGroup
 	run := func(fn func()) {
@@ -91,7 +92,13 @@ func (s *Service) conversationContextAndMessages(ctx context.Context, event cont
 			bm25 = s.repository.SemanticFactsByBM25(event.TenantID, event.ChatID, event.MessageText, 20)
 		}
 	})
+	run(func() { userSettings, _ = s.repository.UserSettings(event.TenantID) })
 	wg.Wait()
+
+	// B: single timezone source for this whole context block (header + transcript).
+	// Empty/invalid IANA name means the owner's zone is UNKNOWN (A1 invariant) —
+	// never silently treated as UTC; rendered with an explicit UTC marker instead.
+	ownerLoc, ownerTZKnown := ownerTimeLocation(userSettings.Timezone)
 
 	// Phase 2 — vector-dependent retrieval.
 	// Memory is strictly per-chat: only facts observed in THIS chat are recalled.
@@ -112,7 +119,15 @@ func (s *Service) conversationContextAndMessages(ctx context.Context, event cont
 
 	// Header: dates, runtime flags, commitments — never trimmed.
 	header := make([]string, 0, len(commitments)+6)
-	header = append(header, fmt.Sprintf("[CURRENT DATE: %s]", now.Format("2006-01-02")))
+	if ownerTZKnown {
+		header = append(header, fmt.Sprintf(
+			"[CURRENT DATE: %s (%s)]", now.In(ownerLoc).Format("2006-01-02T15:04:05Z07:00"), userSettings.Timezone,
+		))
+	} else {
+		header = append(header, fmt.Sprintf(
+			"[CURRENT DATE: %s (UTC, пояс владельца неизвестен)]", now.Format("2006-01-02T15:04:05Z07:00"),
+		))
+	}
 	// Authoritative greeting state from the DB, always emitted (true AND false)
 	// so the Python prompt builder can trust this flag and skip re-deriving it.
 	header = append(header, fmt.Sprintf("[RUNTIME: greeting_sent_today=%t]", greeted))
@@ -184,7 +199,12 @@ func (s *Service) conversationContextAndMessages(ctx context.Context, event cont
 		if isOwnerSideMessage(record.Event, ownerID, transport) {
 			role = "OWNER"
 		}
-		msgDate := record.Event.CreatedAt.UTC().Format("2006-01-02 15:04")
+		var msgDate string
+		if ownerTZKnown {
+			msgDate = record.Event.CreatedAt.In(ownerLoc).Format("2006-01-02 15:04 MST")
+		} else {
+			msgDate = record.Event.CreatedAt.UTC().Format("2006-01-02 15:04 UTC")
+		}
 		messageLines = append(messageLines, fmt.Sprintf("[%s] %s: %s", msgDate, role, text))
 	}
 
@@ -250,6 +270,22 @@ func (s *Service) conversationContextAndMessages(ctx context.Context, event cont
 		parts = append(parts, draftLines...)
 	}
 	return parts, records
+}
+
+// ownerTimeLocation resolves the owner's IANA timezone for prompt rendering
+// (B: unified localized time block). Mirrors the validation in
+// apiSaveUserSettings (time.LoadLocation): an empty or unrecognised name
+// means the zone is UNKNOWN — callers must label times as UTC explicitly
+// rather than silently treating UTC as the owner's true local time (A1).
+func ownerTimeLocation(timezone string) (*time.Location, bool) {
+	if timezone == "" {
+		return nil, false
+	}
+	loc, err := time.LoadLocation(timezone)
+	if err != nil {
+		return nil, false
+	}
+	return loc, true
 }
 
 // rrfFuse merges two ranked ID lists using Reciprocal Rank Fusion (k=60).
