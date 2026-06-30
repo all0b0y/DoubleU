@@ -49,11 +49,31 @@ class Usage(JsonDataclass):
 
 
 @dataclass(frozen=True)
+class QuestionData(JsonDataclass):
+    """One question of a questionnaire form: prompt plus optional quick-reply options."""
+
+    prompt: str
+    options: tuple[str, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
 class ResponsePlanData(JsonDataclass):
-    """Deferred contact-facing form produced by an interaction tool."""
+    """Deferred contact-facing questionnaire produced by an interaction tool."""
 
     shape: str
-    options: tuple[str, ...] = field(default_factory=tuple)
+    questions: tuple[QuestionData, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
+class OutboundMessageData(JsonDataclass):
+    """One ordered contact-facing message produced by the send_message tool.
+
+    Go delivers these in order before the terminal reply/questionnaire so the
+    agent can split a turn into several Telegram messages.
+    """
+
+    text: str
+    text_format: str = "plain"
 
 
 @dataclass(frozen=True)
@@ -66,6 +86,21 @@ class ScheduledJobData(JsonDataclass):
     payload: dict[str, Any]
     idempotency_key: str
     created_by: str = "ai"
+
+
+@dataclass(frozen=True)
+class ExistingScheduledJob(JsonDataclass):
+    """A pending scheduler job the Go backend already persisted for this chat.
+
+    Sent on the request so the scheduler tools can list and cancel reminders;
+    Python stays stateless and never reads ``scheduled_jobs`` itself.
+    """
+
+    id: int
+    kind: str
+    target: str
+    fire_at: str
+    text: str = ""
 
 
 @dataclass(frozen=True)
@@ -237,6 +272,9 @@ class AIProcessMessageRequest(JsonDataclass):
     # trace_id is the deterministic W3C trace-id derived from event.event_id.
     # Default "" keeps positional construction backwards-compatible.
     trace_id: str = ""
+    # Pending scheduler jobs already persisted by Go for this chat, supplied so
+    # the scheduler tools can list and cancel reminders without DB access.
+    existing_scheduled_jobs: tuple[ExistingScheduledJob, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)
@@ -267,9 +305,16 @@ class AIProcessMessageResponse(JsonDataclass):
     # Deferred scheduler jobs validated by Python tools; Go persists them
     # through its repository so Python remains stateless in AI_MEMORY_SOURCE=go.
     scheduled_jobs: tuple[ScheduledJobData, ...] = field(default_factory=tuple)
+    # Pending scheduler-job ids the AI asked to cancel; Go moves them to
+    # 'cancelled' through repository.CancelJob within the chat scope.
+    cancelled_job_ids: tuple[int, ...] = field(default_factory=tuple)
     # 3-7 word conversation topic produced by the same draft call; replaces the
     # separate /ai/tag-topic call in the hot path (ARCH-4).
     topic: str = ""
+    # Ordered prose messages the send_message tool queued; Go delivers them in
+    # order BEFORE response_text/response_plan so the agent can split one turn
+    # into several Telegram messages (e.g. an explanation, then a question).
+    messages: tuple[OutboundMessageData, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)

@@ -10,7 +10,9 @@ meaningful.
 
 from __future__ import annotations
 
-from pydantic_ai.messages import ModelResponse, ToolCallPart, UserPromptPart
+import json
+
+from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart, UserPromptPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from ai_agent.agents.runtime import AgentRuntime
@@ -21,6 +23,20 @@ def structured(tool_args: dict) -> FunctionModel:
 
     def respond(messages, info: AgentInfo) -> ModelResponse:
         return ModelResponse(parts=[ToolCallPart(tool_name="final_result", args=tool_args)])
+
+    return FunctionModel(respond)
+
+
+def prompted(output: dict) -> FunctionModel:
+    """A draft model that answers with PromptedOutput JSON (plain text).
+
+    The draft agent uses ``PromptedOutput``, so its result is parsed from text
+    rather than a ``final_result`` tool call — use this instead of
+    :func:`structured` for any ``draft_model``.
+    """
+
+    def respond(messages, info: AgentInfo) -> ModelResponse:
+        return ModelResponse(parts=[TextPart(json.dumps(output))])
 
     return FunctionModel(respond)
 
@@ -57,10 +73,12 @@ def branching_draft_model() -> FunctionModel:
             reply, intent, confidence, topic = (
                 "Sounds good, that works for me.", "scheduling", 0.95, "scheduling",
             )
-        return ModelResponse(parts=[ToolCallPart(tool_name="final_result", args={
+        # Draft uses PromptedOutput, so the result is plain-text JSON, not a
+        # final_result tool call.
+        return ModelResponse(parts=[TextPart(json.dumps({
             "reply": reply, "intent": intent, "options": options,
             "confidence": confidence, "topic": topic,
-        })])
+        }))])
 
     return FunctionModel(respond)
 

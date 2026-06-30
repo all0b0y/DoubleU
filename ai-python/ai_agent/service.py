@@ -238,7 +238,9 @@ class AIService:
             options=outcome.options,
             response_plan=outcome.response_plan,
             scheduled_jobs=outcome.scheduled_jobs,
+            cancelled_job_ids=outcome.cancelled_job_ids,
             topic=outcome.topic,
+            messages=outcome.messages,
         )
         # Label the Langfuse trace with the actual decision so an auto-sent reply
         # is distinguishable from an owner draft (the trace is opened under the

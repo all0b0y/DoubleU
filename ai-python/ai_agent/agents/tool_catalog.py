@@ -6,7 +6,8 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Mapping
 
-from ai_agent.contract_enums import ToolCategory
+from ai_agent.contract_enums import PrivacyFlag, ToolCategory
+from ai_agent.schemas import AIRoleData
 
 
 @dataclass(frozen=True)
@@ -64,16 +65,30 @@ TOOL_CATALOG: tuple[ToolCatalogEntry, ...] = (
         default_enabled=True,
     ),
     ToolCatalogEntry(
-        key="interaction.present_buttons",
-        label="Кнопки для собеседника",
-        description="Задаёт собеседнику вопрос с вариантами ответа или подтверждением.",
+        key="interaction.ask_questions",
+        label="Вопросы собеседнику",
+        description="Задаёт собеседнику пул вопросов по одному с кнопками-подсказками и ответом своими словами.",
         category=ToolCategory.INTERACTION,
         default_enabled=False,
     ),
     ToolCatalogEntry(
         key="scheduler.create_reminder",
-        label="Напоминания",
+        label="Создание напоминаний",
         description="Создаёт видимые владельцу напоминания для него или собеседника.",
+        category=ToolCategory.SCHEDULE,
+        default_enabled=False,
+    ),
+    ToolCatalogEntry(
+        key="scheduler.list_reminders",
+        label="Список напоминаний",
+        description="Показывает активные напоминания этого чата, чтобы на них ссылаться.",
+        category=ToolCategory.SCHEDULE,
+        default_enabled=False,
+    ),
+    ToolCatalogEntry(
+        key="scheduler.cancel_reminder",
+        label="Отмена напоминаний",
+        description="Отменяет ранее поставленное напоминание этого чата по его номеру.",
         category=ToolCategory.SCHEDULE,
         default_enabled=False,
     ),
@@ -88,12 +103,39 @@ TOOL_NAME_TO_KEY: Mapping[str, str] = MappingProxyType(
         "get_contact_profile": "memory.get_contact_profile",
         "save_fact": "memory.save_fact",
         "suggest_profile_update": "memory.suggest_profile_update",
-        "present_buttons": "interaction.present_buttons",
-        "request_confirmation": "interaction.present_buttons",
+        "ask_questions": "interaction.ask_questions",
+        "request_confirmation": "interaction.ask_questions",
         "create_reminder": "scheduler.create_reminder",
+        "list_reminders": "scheduler.list_reminders",
+        "cancel_reminder": "scheduler.cancel_reminder",
     }
 )
 
 TOOL_CATALOG_BY_KEY: Mapping[str, ToolCatalogEntry] = MappingProxyType(
     {entry.key: entry for entry in TOOL_CATALOG}
 )
+
+
+def enabled_tool_names(
+    ai_role: AIRoleData | None, privacy_flags: tuple[PrivacyFlag, ...] = ()
+) -> frozenset[str]:
+    """Native tool function names enabled for this role/privacy combination.
+
+    Mirrors the exact filter ``agents.runtime.resolve_builtin_toolset`` applies
+    to the real ``FilteredToolset``, so prompt-facing tool policy
+    (``agents.tool_policy``) never describes a tool that isn't actually wired
+    in for this turn. A missing ``tool_settings`` entry inherits
+    ``default_enabled``; ``schedule``-category tools are additionally blocked
+    under ``no_memory``/``private``.
+    """
+    settings = ai_role.tool_settings if ai_role is not None else {}
+    scheduler_blocked = any(
+        flag in (PrivacyFlag.NO_MEMORY, PrivacyFlag.PRIVATE) for flag in privacy_flags
+    )
+    enabled_keys = {
+        entry.key
+        for entry in TOOL_CATALOG
+        if settings.get(entry.key, entry.default_enabled)
+        and not (scheduler_blocked and entry.category.value == "schedule")
+    }
+    return frozenset(name for name, key in TOOL_NAME_TO_KEY.items() if key in enabled_keys)

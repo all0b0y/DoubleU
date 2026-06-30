@@ -31,10 +31,6 @@ class FeatureFlags:
     llm_gateway: GatewayKind = "none"
     observability_sink: ObservabilitySink = "none"
     two_stage_draft: bool = False
-    # Renders agent system prompts through the Prompt Contract (PromptSpec +
-    # model-family renderers) instead of the legacy concatenated instruction
-    # blob. Off by default during rollout; see ai_agent/prompts/.
-    prompt_contract_enabled: bool = False
 
 
 def _bool(value: str | None) -> bool:
@@ -63,5 +59,4 @@ def load_from_env() -> FeatureFlags:
         llm_gateway=_gateway(os.getenv("LLM_GATEWAY")),
         observability_sink=_sink(os.getenv("OBSERVABILITY_SINK")),
         two_stage_draft=_bool(os.getenv("TWO_STAGE_DRAFT")),
-        prompt_contract_enabled=_bool(os.getenv("PROMPT_CONTRACT_ENABLED")),
     )

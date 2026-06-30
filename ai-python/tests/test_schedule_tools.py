@@ -5,17 +5,19 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from ai_agent.agents.deps import AgentDeps
-from ai_agent.agents.schedule_tools import create_reminder
-from ai_agent.pipelines.draft import build_draft_prompt, build_orchestrator_prompt
+from ai_agent.agents.schedule_tools import cancel_reminder, create_reminder, list_reminders
+from ai_agent.prompts.families import ModelFamily
+from ai_agent.prompts.library import draft_spec, orchestrator_spec
+from ai_agent.prompts.renderers import render as render_prompt
 from ai_agent.schemas import (
     AIProcessMessageRequest,
     ChatMode,
     ChatSettings,
+    ExistingScheduledJob,
     NormalizedTelegramEvent,
     UserSettingsData,
     AIRoleData,
 )
-from ai_agent.security import PromptBuilder
 
 
 class _RejectingPool:
@@ -27,7 +29,7 @@ class _RejectingPool:
         raise AssertionError("scheduler tool must not write to Postgres")
 
 
-def _ctx(*, pool=None, flags: tuple[str, ...] = ()) -> SimpleNamespace:
+def _ctx(*, pool=None, flags: tuple[str, ...] = (), existing=()) -> SimpleNamespace:
     return SimpleNamespace(deps=AgentDeps(
         tenant_id="tenant:user:1",
         chat_id="chat-1",
@@ -35,6 +37,7 @@ def _ctx(*, pool=None, flags: tuple[str, ...] = ()) -> SimpleNamespace:
         privacy_flags=flags,
         pool=pool,
         current_time=datetime(2026, 6, 22, 12, 0, tzinfo=timezone.utc),
+        existing_jobs=existing,
     ))
 
 
@@ -92,6 +95,45 @@ def test_create_reminder_respects_privacy_and_storage_gate() -> None:
     assert len(ctx.deps.scheduled_jobs) == 1
 
 
+def _existing(job_id: int, text: str = "позвонить") -> ExistingScheduledJob:
+    return ExistingScheduledJob(
+        id=job_id, kind="reminder", target="owner",
+        fire_at="2026-06-23T12:00:00+00:00", text=text,
+    )
+
+
+def test_list_reminders_formats_pending_jobs() -> None:
+    empty = asyncio.run(list_reminders(_ctx()))
+    assert empty == "Активных напоминаний нет."
+
+    listed = asyncio.run(list_reminders(_ctx(existing=(_existing(7), _existing(9, "встреча")))))
+    assert "#7" in listed and "позвонить" in listed
+    assert "#9" in listed and "встреча" in listed
+
+
+def test_cancel_reminder_records_only_known_pending_ids() -> None:
+    ctx = _ctx(existing=(_existing(7),))
+    ok = asyncio.run(cancel_reminder(ctx, 7))
+    assert ok == "reminder #7 cancelled"
+    assert ctx.deps.cancelled_job_ids == [7]
+
+    # Re-cancelling the same id stays idempotent.
+    asyncio.run(cancel_reminder(ctx, 7))
+    assert ctx.deps.cancelled_job_ids == [7]
+
+    missing = asyncio.run(cancel_reminder(ctx, 42))
+    assert "no pending reminder" in missing
+    assert ctx.deps.cancelled_job_ids == [7]
+
+
+def test_list_and_cancel_respect_privacy_gate() -> None:
+    for flags in (("no_memory",), ("private",)):
+        ctx = _ctx(flags=flags, existing=(_existing(7),))
+        assert "privacy" in asyncio.run(list_reminders(ctx))
+        assert "privacy" in asyncio.run(cancel_reminder(ctx, 7))
+        assert ctx.deps.cancelled_job_ids == []
+
+
 def test_orchestrator_prompt_contains_current_owner_time_and_timezone() -> None:
     request = AIProcessMessageRequest(
         request_id="r1",
@@ -111,8 +153,17 @@ def test_orchestrator_prompt_contains_current_owner_time_and_timezone() -> None:
         ),
     )
     current = datetime(2026, 6, 22, 12, 0, tzinfo=timezone.utc)
-    system, _ = build_orchestrator_prompt(request, PromptBuilder(), current_time=current)
-    writer_system, _ = build_draft_prompt(request, PromptBuilder(), current_time=current)
+    system = render_prompt(orchestrator_spec(request, current_time=current), ModelFamily.GPT)
+    writer_spec = draft_spec(
+        request,
+        clean_memory=[],
+        owner_style_facts=[],
+        current_draft=None,
+        owner_instruction=None,
+        feedback_hint="",
+        current_time=current,
+    )
+    writer_system = render_prompt(writer_spec, ModelFamily.GPT)
 
     assert "2026-06-22T15:00:00+03:00" in system
     assert "Europe/Moscow" in system

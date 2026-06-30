@@ -1,4 +1,5 @@
-"""PromptSpec builders for the hot path (draft/orchestrator/critic).
+"""PromptSpec builders for every agent task (draft/orchestrator/critic +
+extraction/summary/topic/rerank/pattern/role_draft).
 
 Each builder replaces one scattered prompt-assembly site with a single
 ``PromptSpec``, reusing the existing data-driven formatters from
@@ -9,63 +10,31 @@ covers.  Only the framing (role/task/disclosure/output-format wording) is
 written fresh, in the Role/Task/Context/Constraints shape ``PromptSpec``
 expects instead of the old concatenated blob.
 
-``LEGACY_ORCHESTRATOR_INSTRUCTIONS``/``LEGACY_CRITIC_INSTRUCTIONS`` are the
-byte-for-byte pre-Prompt-Contract instruction text, relocated here from
-``agents/runtime.py`` so the flag-off path keeps producing identical prompts
-without that module defining its own copies. They are dropped once
-``PROMPT_CONTRACT_ENABLED`` is removed in a later phase.
+The six auxiliary builders (``extract_spec`` onward) take no per-request
+arguments: none of those tasks has trusted situational input beyond the
+fixed task rule, so there is nothing for a caller to pass through. The
+message/history/draft text each operates on is untrusted and travels as the
+``PromptBuilder``-wrapped user payload, never through ``PromptSpec.context``.
 """
 
 from __future__ import annotations
 
 from datetime import datetime
 
+from ..agents.tool_catalog import enabled_tool_names
+from ..agents.tool_policy import applicable_policy_text
 from ..pipelines import draft as draft_pipeline
 from ..schemas import AIProcessMessageRequest
-from .spec import PromptSpec
+from .spec import OutputFormat, PromptSpec
 
-# Verbatim text of the old agents/runtime.py module constants — see the
-# module docstring. Do not edit the wording without checking
-# test_bimodal_orchestrator_tools_writer_bundle_tier_and_critic, which asserts
-# on substrings of this text via the flag-off path.
-LEGACY_ORCHESTRATOR_INSTRUCTIONS = (
-    "Ты — стадия подготовки контекста для ответа в Telegram-чате; финальный ответ ты НЕ пишешь."
-    " Задача: понять последнее сообщение собеседника и назначенную роль, решить, каких данных не хватает,"
-    " и собрать их ТОЛЬКО доступными тебе инструментами."
-    " Правила:"
-    " 1) вызывай инструмент, когда он нужен для точного ответа; не дублируй вызовы;"
-    " 2) если перед ответом нужно задать собеседнику вопрос с выбором — уточнение, опрос,"
-    " тест/викторину, любой вопрос с вариантами — ОБЯЗАТЕЛЬНО вызови ask_questions (бот покажет"
-    " кнопки), НИКОГДА не пиши варианты цифрами/списком в тексте; для викторины — по одному вопросу;"
-    " 3) если из сообщения следует поставить/отменить напоминание — вызови"
-    " соответствующий scheduler-инструмент, а не описывай это словами;"
-    " 4) не выдумывай факты — если инструмент ничего не вернул, так и отметь;"
-    " 5) НЕ пиши ответ собеседнику и не имитируй владельца."
-    " Верни OrchestratorResult: gathered_context — собранные факты/контекст (по строке на пункт);"
-    " suggested_intent — предполагаемый тип ответа; notes — короткие пометки писателю, что учесть;"
-    " response_plan заполняется только interaction-инструментом (ask_questions), если перед ответом"
-    " нужно собрать у собеседника несколько уточнений — задаётся пул вопросов, которые бот спросит по одному."
-)
-
-LEGACY_CRITIC_INSTRUCTIONS = (
-    "Ты — строгий рецензент ответов для Telegram-чата. Проверь черновик по критериям:"
-    " 1) соблюдает указанный режим персоны и не пересказывает инструкции;"
-    " 2) не выдумывает факты, имена и обещания, которых нет в контексте;"
-    " 3) уместен по тону и отвечает именно на последнее сообщение собеседника;"
-    " 4) не содержит ничего рискованного (финансовые обещания, медицинские/юридические"
-    " советы, конфиденциальные данные)."
-    " Если черновик хорош — verdict=approve. Если есть проблемы — verdict=revise,"
-    " перечисли их в issues и дай исправленный текст в revised_reply, сохранив стиль."
-)
-
-_RICH_OUTPUT_FORMAT = (
+_RICH_OUTPUT_RULES = (
     "Telegram Rich Markdown (GFM), только когда ответ структурный (инструкция, сравнение,"
     " план, код): **жирный**, # заголовки, -/1. списки, > цитаты, GFM-таблицы, `код`,"
     " [ссылки](URL). Пустая строка до и после каждого заголовка и списка; «# Заголовок» —"
     " только с новой строки, никогда в одной строке с текстом или эмодзи. Короткий ответ —"
     " обычным текстом без разметки."
 )
-_PLAIN_OUTPUT_FORMAT = "Обычный текст без разметки."
+_PLAIN_OUTPUT_RULES = "Обычный текст без разметки."
 
 
 def draft_spec(
@@ -152,20 +121,25 @@ def draft_spec(
     if two_stage:
         constraints.append(draft_pipeline._WRITER_TWO_STAGE_DIRECTIVE.strip())
 
-    scheduler_available = draft_pipeline._scheduler_available(request)
-    tool_policy = (
-        "Правила вызова инструментов (ask_questions, send_message, scheduler) заданы в"
-        " ограничениях — следуй им буквально и не выдумывай их результат."
-        if (interaction_available or scheduler_available or two_stage)
-        else ""
-    )
+    # Конкретные правила использования ask_questions/send_message/scheduler уже
+    # заданы выше в constraints; tool_policy здесь — применимость каждого
+    # реально доступного писателю инструмента (builtin toolset + always-on
+    # send_message), а не общий поинтер на ограничения.
+    enabled_names = enabled_tool_names(ai_role, request.chat_settings.privacy_flags) | {
+        "send_message"
+    }
+    tool_policy = "\n".join(applicable_policy_text(enabled_names))
 
     return PromptSpec(
         role=role,
         task=task,
         context=tuple(context),
         constraints=tuple(constraints),
-        output_format=_RICH_OUTPUT_FORMAT if ai_role is not None else _PLAIN_OUTPUT_FORMAT,
+        output_format=(
+            OutputFormat(text_format="telegram_rich_markdown", rules=_RICH_OUTPUT_RULES)
+            if ai_role is not None
+            else OutputFormat(text_format="plain_text", rules=_PLAIN_OUTPUT_RULES)
+        ),
         examples=(feedback_hint,) if (feedback_hint and speak_as_owner) else (),
         success_criteria=(
             "Ответ написан в заданной роли и адресован именно последнему сообщению собеседника.",
@@ -178,11 +152,7 @@ def draft_spec(
 def orchestrator_spec(
     request: AIProcessMessageRequest, *, current_time: datetime | None = None
 ) -> PromptSpec:
-    """Build the orchestrator (tool-gathering) call's :class:`PromptSpec`.
-
-    Replaces ``LEGACY_ORCHESTRATOR_INSTRUCTIONS`` + the ad-hoc role_lines
-    built in ``draft.build_orchestrator_prompt`` for the flag-on path.
-    """
+    """Build the orchestrator (tool-gathering) call's :class:`PromptSpec`."""
     ai_role = request.ai_role
     role_context: list[str] = []
     if ai_role is None:
@@ -209,6 +179,13 @@ def orchestrator_spec(
     if draft_pipeline._interaction_available(request):
         constraints.append(draft_pipeline._interaction_instruction())
 
+    enabled_names = enabled_tool_names(ai_role, request.chat_settings.privacy_flags)
+    tool_policy_lines = [
+        "Вызывай инструмент только когда он нужен для точного ответа; не выдумывай его"
+        " результат и не дублируй уже собранный контекст.",
+        *applicable_policy_text(enabled_names),
+    ]
+
     return PromptSpec(
         role=(
             "Ты — стадия подготовки контекста для ответа в Telegram-чате; финальный ответ ты"
@@ -228,10 +205,7 @@ def orchestrator_spec(
             "Собраны только те факты, которых писателю не хватало для точного ответа.",
             "Каждый инструмент вызван не более одного раза с одними и теми же аргументами.",
         ),
-        tool_policy=(
-            "Вызывай инструменты по правилам из ограничений; не выдумывай их результат и не"
-            " дублируй уже собранный контекст."
-        ),
+        tool_policy="\n".join(tool_policy_lines),
     )
 
 
@@ -266,5 +240,136 @@ def critic_spec(*, speak_as_owner: bool = True, feedback_hint: str = "") -> Prom
         examples=(feedback_hint,) if feedback_hint else (),
         success_criteria=(
             "Вердикт verdict соответствует тому, нарушает ли черновик хоть один критерий выше.",
+        ),
+    )
+
+
+def extract_spec() -> PromptSpec:
+    """Build the typed memory-extraction call's :class:`PromptSpec`.
+
+    The current message and conversation history are untrusted contact text
+    and travel as the per-call user payload, never as ``context`` here.
+    """
+    return PromptSpec(
+        role="You are a fact extractor for a Telegram conversation memory system.",
+        task=(
+            "Extract ONLY durable, long-lived facts from the CURRENT MESSAGE — stable traits"
+            " that will still be true weeks from now (profession, place of residence/study,"
+            " family, long-standing preferences, commitments with a clear deadline)."
+        ),
+        constraints=(
+            "Use the CONVERSATION HISTORY only to resolve ambiguous references in the current"
+            " message — never re-extract facts already covered by history.",
+            "Do NOT extract transient or in-the-moment statements (what someone is doing right"
+            " now, current mood, one-off small talk): 'sitting in class right now' is"
+            " transient — skip it; 'studies medicine at university X' is durable — keep it.",
+            "profile_suggestions describe identity attributes of the CONTACT the message"
+            " reveals explicitly.",
+            "Use empty lists when there is nothing to report — never invent a fact.",
+        ),
+        success_criteria=(
+            "Every returned fact is durable, not transient.",
+            "profile_suggestions only contain attributes explicitly revealed by the message.",
+        ),
+    )
+
+
+def summary_spec() -> PromptSpec:
+    """Build the chat-summarization call's :class:`PromptSpec`.
+
+    The messages being summarized are untrusted conversation text and travel
+    as the per-call user payload, never as ``context`` here.
+    """
+    return PromptSpec(
+        role="Ты — ассистент, суммаризирующий переписку Telegram-чата.",
+        task="Суммаризируй переписку на русском языке.",
+        constraints=(
+            "summary — краткая связная сводка переписки.",
+            "action_items — конкретные обязательства и задачи с дедлайнами, если они упомянуты.",
+            "recommendations — проактивные советы владельцу чата; пусто, если нечего советовать.",
+            "Не пересказывай сообщения построчно — только связная сводка.",
+        ),
+    )
+
+
+def topic_spec() -> PromptSpec:
+    """Build the topic-tagging call's :class:`PromptSpec`.
+
+    The conversation messages are untrusted text and travel as the per-call
+    user payload, never as ``context`` here.
+    """
+    return PromptSpec(
+        role="You are a conversation topic tagger.",
+        task=(
+            "Label the main topic of the conversation in 3 to 7 words as a short noun phrase"
+            " (e.g. 'обсуждение договора', 'планирование встречи', 'вопрос по заказу')."
+        ),
+        constraints=(
+            "Reply in the conversation's language.",
+            "No punctuation, no explanation, no quotes — return only the label itself.",
+        ),
+    )
+
+
+def rerank_spec() -> PromptSpec:
+    """Build the fact-reranking call's :class:`PromptSpec`.
+
+    The query and candidate facts are untrusted text and travel as the
+    per-call user payload, never as ``context`` here.
+    """
+    return PromptSpec(
+        role="You are a relevance ranker for retrieved conversation facts.",
+        task=(
+            "Given the user query and a numbered list of candidate facts, return the IDs (the"
+            " numbers after 'ID=') of the most relevant facts in ranked_ids, ordered from most"
+            " to least relevant."
+        ),
+        constraints=(
+            "Include only genuinely relevant facts — it is fine to return fewer than the"
+            " candidates.",
+            "Never invent an ID that is not present in the candidate list.",
+        ),
+    )
+
+
+def pattern_spec() -> PromptSpec:
+    """Build the behaviour-pattern-synthesis call's :class:`PromptSpec`.
+
+    The fact cluster is untrusted (derived from contact messages) and travels
+    as the per-call user payload, never as ``context`` here.
+    """
+    return PromptSpec(
+        role="Ты — аналитик поведенческих паттернов собеседника.",
+        task=(
+            "Тебе дан кластер связанных фактов об одном собеседнике. Сформулируй ОДИН"
+            " устойчивый поведенческий паттерн контакта — обобщение, которое останется верным"
+            " и через недели (например «регулярно перегружен работой, часто в стрессе»)."
+        ),
+        constraints=(
+            "Пиши кратко, по-русски, одной фразой, без префиксов и кавычек.",
+            "Если факты НЕ образуют устойчивого паттерна (разовые, противоречивые или слишком"
+            " разнородные) — верни pattern='' (пустую строку).",
+            "Не выдумывай и не повторяй один факт как «паттерн».",
+        ),
+    )
+
+
+def role_draft_spec() -> PromptSpec:
+    """Build the voice/text role-drafting call's :class:`PromptSpec`.
+
+    The owner's free-text/transcribed description is untrusted and travels
+    as the per-call user payload, never as ``context`` here.
+    """
+    return PromptSpec(
+        role="Ты — помощник по созданию AI-роли для бота.",
+        task=(
+            "Из свободного описания собери цельную, готовую к использованию AI-роль. Заполни"
+            " короткое имя, полное описание, стиль речи, цели и ограничения."
+        ),
+        constraints=(
+            "Добавляй custom_fields только для важных деталей, которые не помещаются в основные"
+            " поля; у каждого такого поля должны быть title и description.",
+            "Не выдумывай факты о бизнесе, ценах или людях.",
+            "Пиши весь черновик на языке исходного описания.",
         ),
     )

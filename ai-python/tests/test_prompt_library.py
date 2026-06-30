@@ -8,7 +8,21 @@ the renderers) so a test failure points at the mapping, not the rendering.
 
 from __future__ import annotations
 
-from ai_agent.prompts.library import critic_spec, draft_spec, orchestrator_spec
+from ai_agent.agents.tool_catalog import TOOL_CATALOG
+from ai_agent.prompts.families import ModelFamily
+from ai_agent.prompts.library import (
+    critic_spec,
+    draft_spec,
+    extract_spec,
+    orchestrator_spec,
+    pattern_spec,
+    rerank_spec,
+    role_draft_spec,
+    summary_spec,
+    topic_spec,
+)
+from ai_agent.prompts.renderers import render
+from ai_agent.prompts.spec import OutputFormat
 from ai_agent.schemas import (
     AIProcessMessageRequest,
     AIRoleData,
@@ -72,14 +86,17 @@ class TestDraftSpecPersonaFraming:
     def test_no_role_uses_owner_assistant_frame(self) -> None:
         spec = _draft_spec(_request())
         assert "ОТ ЛИЦА ВЛАДЕЛЬЦА" in spec.role
-        assert spec.output_format == "Обычный текст без разметки."
+        assert spec.output_format == OutputFormat(
+            text_format="plain_text", rules="Обычный текст без разметки."
+        )
 
     def test_speak_as_owner_role_keeps_owner_frame(self) -> None:
         role = AIRoleData(name="role-name-sentinel", description="role-desc-sentinel")
         spec = _draft_spec(_request(ai_role=role))
         assert "ОТ ЛИЦА ВЛАДЕЛЬЦА" in spec.role
         assert any("role-name-sentinel" in line for line in spec.context)
-        assert "GFM" in spec.output_format
+        assert spec.output_format.text_format == "telegram_rich_markdown"
+        assert "GFM" in spec.output_format.rules
 
     def test_bot_persona_role_uses_bot_frame_and_disclosure_constraint(self) -> None:
         role = AIRoleData(name="bot-role-sentinel", description="d", speak_as_owner=False)
@@ -131,8 +148,13 @@ class TestDraftSpecToolGating:
         on_spec = _draft_spec(_request(ai_role=role_on))
         assert not spec_has(off_spec.constraints, "ask_questions(questions[1..6])")
         assert spec_has(on_spec.constraints, "ask_questions(questions[1..6])")
-        assert on_spec.tool_policy != ""
-        assert off_spec.tool_policy == ""
+        # tool_policy is never fully empty — default-enabled memory tools and
+        # the always-on send_message get applicability lines either way — but
+        # ask_questions's own line (send_message's policy mentions it by name
+        # too, hence the colon to match only the entry header) only appears
+        # once the role enables it.
+        assert "ask_questions:" not in off_spec.tool_policy
+        assert "ask_questions:" in on_spec.tool_policy
 
     def test_scheduler_instruction_gated_by_privacy_flags(self) -> None:
         role = AIRoleData(name="r", tool_settings={"scheduler.create_reminder": True})
@@ -187,6 +209,32 @@ class TestOrchestratorSpec:
         spec = orchestrator_spec(_request())
         assert "финальный ответ ты НЕ пишешь" in spec.role
 
+    def test_tool_policy_carries_applicability_not_just_short_labels(self) -> None:
+        """2.4 acceptance: the orchestrator's tool_policy must say WHEN to use
+        a tool, not just that it exists — TOOL_CATALOG's short label/description
+        alone would not satisfy this."""
+        spec = orchestrator_spec(_request())
+        assert "Используй когда:" in spec.tool_policy
+        assert "НЕ используй когда:" in spec.tool_policy
+        # search_facts is default-enabled, so its applicability reaches the
+        # prompt even with no role assigned.
+        assert "search_facts:" in spec.tool_policy
+
+    def test_tool_policy_only_describes_tools_actually_enabled_this_turn(self) -> None:
+        role_scheduler_on = AIRoleData(
+            name="r",
+            tool_settings={**{e.key: False for e in TOOL_CATALOG}, "scheduler.create_reminder": True},
+        )
+        role_scheduler_off = AIRoleData(
+            name="r", tool_settings={e.key: False for e in TOOL_CATALOG}
+        )
+        on_spec = orchestrator_spec(_request(ai_role=role_scheduler_on))
+        off_spec = orchestrator_spec(_request(ai_role=role_scheduler_off))
+        assert "create_reminder:" in on_spec.tool_policy
+        assert "create_reminder:" not in off_spec.tool_policy
+        # Every catalog tool disabled → only the generic anti-fabrication line remains.
+        assert "search_facts:" not in off_spec.tool_policy
+
 
 class TestCriticSpec:
     def test_speak_as_owner_persona_rule(self) -> None:
@@ -203,3 +251,72 @@ class TestCriticSpec:
         without_hint = critic_spec(speak_as_owner=True)
         assert spec_has(with_hint.examples, FEEDBACK_HINT)
         assert without_hint.examples == ()
+
+
+# The six auxiliary builders take no arguments: the message/history/draft text
+# each task operates on is untrusted and travels as the per-call user payload
+# (see AgentRuntime._x_async), never through these builders or PromptSpec.context.
+_AUXILIARY_BUILDERS = (extract_spec, summary_spec, topic_spec, rerank_spec, pattern_spec, role_draft_spec)
+
+
+class TestAuxiliaryBuilderSpecsTakeNoUntrustedInput:
+    def test_builders_accept_zero_arguments(self) -> None:
+        """Nothing for a caller to pass through — there is no signature to misuse."""
+        for builder in _AUXILIARY_BUILDERS:
+            spec = builder()
+            assert spec.role
+            assert spec.task
+
+    def test_builders_render_as_a_valid_prompt_contract_envelope_for_every_family(self) -> None:
+        for builder in _AUXILIARY_BUILDERS:
+            spec = builder()
+            for family in (ModelFamily.GPT, ModelFamily.REASONING, ModelFamily.AGENTIC):
+                text = render(spec, family)
+                assert text.startswith("<prompt_contract>")
+                assert text.endswith("</prompt_contract>")
+                assert "<role>" in text and "<task>" in text
+
+
+class TestExtractSpec:
+    def test_extracts_only_durable_facts_not_transient(self) -> None:
+        spec = extract_spec()
+        assert "durable" in spec.task.lower()
+        assert any("transient" in c.lower() for c in spec.constraints)
+
+    def test_uses_empty_lists_rather_than_inventing_facts(self) -> None:
+        spec = extract_spec()
+        assert any("never invent" in c.lower() for c in spec.constraints)
+
+
+class TestSummarySpec:
+    def test_defines_summary_action_items_and_recommendations(self) -> None:
+        spec = summary_spec()
+        assert spec_has(spec.constraints, "summary")
+        assert spec_has(spec.constraints, "action_items")
+        assert spec_has(spec.constraints, "recommendations")
+
+
+class TestTopicSpec:
+    def test_labels_topic_as_short_noun_phrase_in_conversation_language(self) -> None:
+        spec = topic_spec()
+        assert "3 to 7 words" in spec.task
+        assert any("conversation's language" in c for c in spec.constraints)
+
+
+class TestRerankSpec:
+    def test_returns_only_candidate_ids_never_invented(self) -> None:
+        spec = rerank_spec()
+        assert "ranked_ids" in spec.task
+        assert any("never invent" in c.lower() for c in spec.constraints)
+
+
+class TestPatternSpec:
+    def test_empty_pattern_when_no_durable_signal(self) -> None:
+        spec = pattern_spec()
+        assert any("pattern=''" in c for c in spec.constraints)
+
+
+class TestRoleDraftSpec:
+    def test_does_not_invent_business_facts(self) -> None:
+        spec = role_draft_spec()
+        assert any("не выдумывай факты" in c.lower() for c in spec.constraints)

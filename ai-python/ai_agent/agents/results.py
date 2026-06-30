@@ -11,10 +11,11 @@ types so a hallucinated value can never widen the contract.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 # Mirrors the regex classifier intents plus choice_question, which only the
 # LLM can produce (ARCH-2/ARCH-4).
@@ -29,17 +30,39 @@ Intent = Literal[
 ]
 
 
-class ResponsePlan(BaseModel):
-    """A contact-facing response form prepared by an interaction tool."""
+class Question(BaseModel):
+    """One question in a questionnaire form: a prompt plus optional quick-reply options.
+
+    ``options`` may be empty — a question with no options is a pure free-text
+    question. When options are present they are suggested answers; the contact
+    can still reply in their own words.
+    """
 
     model_config = ConfigDict(frozen=True)
 
-    shape: Literal["buttons"] = "buttons"
     prompt: str = Field(min_length=1, description="Текст вопроса над inline-кнопками.")
     options: tuple[str, ...] = Field(
-        min_length=2,
-        max_length=4,
-        description="Короткие варианты ответа собеседника.",
+        default=(),
+        max_length=8,
+        description="Короткие варианты-подсказки ответа (необязательны).",
+    )
+
+
+class ResponsePlan(BaseModel):
+    """A contact-facing questionnaire prepared by an interaction tool.
+
+    The form is collected step-by-step by the Go backend: questions are asked
+    one at a time, each answerable by tapping an option or by free text. Only
+    after every question is answered are the Q&A persisted and a reply drafted.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    shape: Literal["questions"] = "questions"
+    questions: tuple[Question, ...] = Field(
+        min_length=1,
+        max_length=6,
+        description="Упорядоченный пул вопросов, задаваемых собеседнику по одному.",
     )
 
 
@@ -54,6 +77,21 @@ class ScheduledJob(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
     created_by: Literal["ai"] = "ai"
     idempotency_key: str = Field(min_length=1)
+
+
+class OutboundMessage(BaseModel):
+    """One contact-facing message queued by the ``send_message`` tool.
+
+    The writer emits an ordered sequence of these to split a single turn into
+    several Telegram messages (e.g. a prose explanation, then a question). Go
+    delivers them in order BEFORE the terminal reply/questionnaire. The tool
+    records intent only — it performs no transport IO.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    text: str = Field(min_length=1, description="Текст одного сообщения собеседнику.")
+    text_format: Literal["plain", "rich"] = "plain"
 
 
 class OrchestratorResult(BaseModel):
@@ -78,6 +116,26 @@ class OrchestratorResult(BaseModel):
         default=None,
         description="Форма ответа, созданная вызванным interaction-инструментом.",
     )
+
+    @field_validator("response_plan", mode="before")
+    @classmethod
+    def _coerce_plan_string(cls, value: Any) -> Any:
+        # The authoritative plan is set from the interaction tool's deps after
+        # the run (see runtime._orchestrate_async), so the model's inline value
+        # is always discarded — it must never crash the draft into
+        # error_fallback. Models commonly mis-serialise this nested object:
+        # the literal "null"/"none" for an empty optional, or the whole plan as
+        # a JSON *string* instead of an object. Coerce the empties to None and
+        # parse JSON strings back to objects; anything unparseable becomes None.
+        if not isinstance(value, str):
+            return value
+        stripped = value.strip()
+        if stripped.lower() in ("", "null", "none"):
+            return None
+        try:
+            return json.loads(stripped)
+        except (ValueError, TypeError):
+            return None
 
 
 class DraftResult(BaseModel):

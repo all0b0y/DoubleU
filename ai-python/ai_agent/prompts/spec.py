@@ -1,11 +1,12 @@
 """Prompt Contract: the single intermediate format every agent prompt builds.
 
 Replaces ad-hoc string concatenation (the old ``_compose_base_instruction``
-"blob" in :mod:`ai_agent.pipelines.draft`) with an explicit Role/Task/Context/
-Constraints/Output/Examples/Success contract.  A :class:`PromptSpec` is
-family-agnostic: the same instance renders differently for GPT/reasoning/
-agentic models (see :mod:`.renderers`) without the builder having to know
-which family it is talking to.
+blob, removed once every caller migrated to this contract) with an explicit
+Role/Task/Context/Constraints/Output/Examples/Success contract.  A
+:class:`PromptSpec` is family-agnostic: the same instance renders into the
+same ``<prompt_contract>`` XML envelope for GPT/reasoning/agentic models (see
+:mod:`.renderers`) — only the envelope's density (examples included or not,
+an extra no-chain-of-thought constraint) varies by family.
 
 ``context`` is trusted-only by construction: callers populate it from
 situational data the backend already trusts (role description, contact
@@ -20,6 +21,26 @@ rather than left implicit.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Literal
+
+# Telegram-facing reply format the model must follow. Mirrors
+# ``ai_agent.pipelines.draft.TextFormat`` ("plain"/"rich") but spelled out for
+# the model rather than the wire contract — see ``decide_text_format``.
+TextFormatKind = Literal["plain_text", "telegram_rich_markdown"]
+
+
+@dataclass(frozen=True)
+class OutputFormat:
+    """The reply-format contract rendered as ``<output_format>``.
+
+    ``rules`` is free text (e.g. which GFM elements are allowed, heading
+    spacing rules); empty for tasks that produce no contact-facing text
+    (orchestrator, critic, extraction, ...), where only the conservative
+    ``text_format`` default matters.
+    """
+
+    text_format: TextFormatKind = "plain_text"
+    rules: str = ""
 
 
 @dataclass(frozen=True)
@@ -38,11 +59,12 @@ class PromptSpec:
     # Trusted situational input: role description, contact profile, owner
     # identity, greeting cadence, current time.  NEVER untrusted text.
     context: tuple[str, ...] = field(default_factory=tuple)
-    # Prohibitions/rules: no fabrication, no impersonation, output-format
-    # mode, tool-usage rules (ask_questions, message-split, scheduler time).
+    # Prohibitions/rules: no fabrication, no impersonation, tool-usage rules
+    # (ask_questions, message-split, scheduler time). Output-format mode lives
+    # in ``output_format`` below, not here.
     constraints: tuple[str, ...] = field(default_factory=tuple)
-    # The reply's format contract (e.g. plain text vs Telegram Rich Markdown).
-    output_format: str = ""
+    # The reply's format contract (plain text vs Telegram Rich Markdown).
+    output_format: OutputFormat = field(default_factory=OutputFormat)
     # Few-shot examples (e.g. owner-approved/rejected past replies).
     examples: tuple[str, ...] = field(default_factory=tuple)
     # Criteria the renderer surfaces as "Verification"/"Критерии успеха".

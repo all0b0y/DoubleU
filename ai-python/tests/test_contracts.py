@@ -13,6 +13,7 @@ from ai_agent.schemas import (
     Decision,
     LLMPurpose,
     PrivacyFlag,
+    QuestionData,
     ResponsePlanData,
     RiskLevel,
     ScheduledJobData,
@@ -74,19 +75,29 @@ class ContractEnumTests(unittest.TestCase):
         """LLMPurpose("draft").value must equal "draft" (header attribute)."""
         self.assertEqual(LLMPurpose("draft").value, "draft")
 
-    def test_response_plan_serializes_with_options(self) -> None:
+    def test_response_plan_serializes_questionnaire(self) -> None:
         response = AIProcessMessageResponse(
             decision=Decision.DRAFT,
-            response_text="Выберите время",
+            response_text="Уточню детали",
             confidence=0.9,
             risk_level=RiskLevel.LOW,
             intent="choice_question",
             model_used="test",
             usage=Usage(),
-            response_plan=ResponsePlanData(shape="buttons", options=("Сегодня", "Завтра")),
+            response_plan=ResponsePlanData(
+                shape="questions",
+                questions=(
+                    QuestionData(prompt="Когда удобно?", options=("Сегодня", "Завтра")),
+                    QuestionData(prompt="Какой бюджет?"),
+                ),
+            ),
         )
         self.assertEqual(response.to_dict()["response_plan"], {
-            "shape": "buttons", "options": ["Сегодня", "Завтра"]
+            "shape": "questions",
+            "questions": [
+                {"prompt": "Когда удобно?", "options": ["Сегодня", "Завтра"]},
+                {"prompt": "Какой бюджет?", "options": []},
+            ],
         })
 
     def test_scheduled_jobs_serialize_for_go_persistence(self) -> None:

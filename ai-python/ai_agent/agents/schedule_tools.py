@@ -39,9 +39,13 @@ async def create_reminder(
 ) -> str:
     """Create one future reminder for the owner or current-chat contact.
 
-    ``fire_at_iso`` must include a timezone offset. Use the current time and
-    owner timezone from the system instruction. This tool records the job for
-    the Go backend to persist; it never sends the reminder immediately.
+    Call only when the message clearly asks for a reminder at a specific
+    future time. ``fire_at_iso`` must include a timezone offset. Use the
+    current time and owner timezone from the system instruction — if the
+    named time has already passed today and the rollover is ambiguous, ask a
+    clarifying question (``ask_questions``) instead of guessing a time. This
+    tool records the job for the Go backend to persist; it never sends the
+    reminder immediately.
     """
 
     if ctx.deps.no_memory or ctx.deps.private:
@@ -81,3 +85,45 @@ async def create_reminder(
             )
         )
     return f"scheduled reminder for {fire_at.isoformat()}"
+
+
+@schedule_toolset.tool
+async def list_reminders(ctx: RunContext[AgentDeps]) -> str:
+    """List the pending reminders already scheduled for this chat.
+
+    Call before ``cancel_reminder`` to find its numeric id, or when you need
+    to reference an existing reminder. Returns each reminder's numeric id, fire
+    time and text. The ids come from the Go-owned scheduled_jobs rows supplied
+    on the request; this tool performs no DB access.
+    """
+
+    if ctx.deps.no_memory or ctx.deps.private:
+        return "error: scheduler is unavailable for this chat privacy mode"
+    jobs = ctx.deps.existing_jobs
+    if not jobs:
+        return "Активных напоминаний нет."
+    lines = []
+    for job in jobs:
+        text = (job.text or "").strip()
+        suffix = f" — {text}" if text else ""
+        lines.append(f"#{job.id} [{job.target}] {job.fire_at}{suffix}")
+    return "\n".join(lines)
+
+
+@schedule_toolset.tool
+async def cancel_reminder(ctx: RunContext[AgentDeps], reminder_id: int) -> str:
+    """Cancel one pending reminder by its numeric id (from ``list_reminders``).
+
+    Only call with an id you actually have from ``list_reminders`` — never
+    guess a number. Records the cancellation for the Go backend to apply
+    within this chat's scope; it never touches another chat's jobs.
+    Re-cancelling the same id is a no-op so concurrent runs stay idempotent.
+    """
+
+    if ctx.deps.no_memory or ctx.deps.private:
+        return "error: scheduler is unavailable for this chat privacy mode"
+    if not any(job.id == reminder_id for job in ctx.deps.existing_jobs):
+        return f"error: no pending reminder with id {reminder_id}"
+    if reminder_id not in ctx.deps.cancelled_job_ids:
+        ctx.deps.cancelled_job_ids.append(reminder_id)
+    return f"reminder #{reminder_id} cancelled"

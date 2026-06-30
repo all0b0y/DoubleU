@@ -11,11 +11,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Awaitable, Callable, Sequence
+from typing import Any, Awaitable, Callable, Sequence
 
 import asyncpg
 
-from .results import ResponsePlan, ScheduledJob
+from ..schemas import ExistingScheduledJob
+from .results import OutboundMessage, ResponsePlan, ScheduledJob
 
 
 @dataclass
@@ -41,11 +42,26 @@ class AgentDeps:
     # Interaction tools write a deferred contact-facing form here. The tool
     # itself never performs transport IO; core sends it through approval.
     response_plan: ResponsePlan | None = None
+    # The send_message tool appends ordered prose messages here so the writer
+    # can split one turn into several Telegram messages. Go delivers them in
+    # order before the terminal reply/questionnaire; Python performs no IO.
+    outbound_messages: list[OutboundMessage] = field(default_factory=list)
     # Scheduler tools write deferred jobs here. Python does not persist them;
     # Go owns scheduled_jobs DB IO and consumes this accumulator from the response.
     scheduled_jobs: list[ScheduledJob] = field(default_factory=list)
+    # Pending jobs Go already persisted for this chat, supplied read-only so the
+    # list/cancel scheduler tools can operate without DB access (Python stays
+    # stateless). The clock/scope still come from the Go-owned scheduled_jobs row.
+    existing_jobs: tuple[ExistingScheduledJob, ...] = field(default_factory=tuple)
+    # Scheduler cancel tool records pending-job ids here; Go runs CancelJob for
+    # each within the chat scope. Never mutated for no_memory/private chats.
+    cancelled_job_ids: list[int] = field(default_factory=list)
     # One stable clock value shared by the scheduler prompt and tool validation.
     current_time: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    # Tool-call cache keyed by (tool_name, normalized_args) — see
+    # ``agents.dedup_toolset.DedupToolset``. A repeat call within this run
+    # returns the cached result instead of hitting the DB/tool again.
+    tool_call_cache: dict[tuple[str, str], Any] = field(default_factory=dict)
 
     @property
     def no_memory(self) -> bool:

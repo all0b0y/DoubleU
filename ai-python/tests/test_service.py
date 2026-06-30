@@ -41,7 +41,7 @@ from ai_agent.schemas import (
 )
 from ai_agent.service import AIService, InMemoryAuditSink
 
-from agent_helpers import make_test_runtime, structured
+from agent_helpers import make_test_runtime, prompted, structured
 
 
 class ServicePolicyTests(unittest.TestCase):
@@ -217,7 +217,7 @@ class ServicePolicyTests(unittest.TestCase):
 
     def test_agent_failure_yields_error_fallback(self) -> None:
         """A draft the agent cannot produce surfaces as the error_fallback decision."""
-        broken = AIService(make_test_runtime(draft_model=structured({"reply": ""})))
+        broken = AIService(make_test_runtime(draft_model=prompted({"reply": ""})))
         response = broken.process_message(
             _process_request(mode=ChatMode.AUTO, text="Когда будет готов отчёт?")
         )

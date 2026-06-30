@@ -10,10 +10,8 @@ the legacy ``notes`` JSON is never echoed raw.
 
 from __future__ import annotations
 
-import os
 import unittest
 from datetime import datetime, timezone
-from unittest import mock
 
 import json
 
@@ -22,6 +20,9 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from ai_agent.agents.tool_catalog import TOOL_CATALOG
 from ai_agent.pipelines import draft as draft_pipeline
+from ai_agent.prompts import library as prompt_library
+from ai_agent.prompts.families import ModelFamily
+from ai_agent.prompts.renderers import render as render_prompt
 from ai_agent.schemas import (
     AIProcessMessageRequest,
     AIRoleData,
@@ -33,7 +34,6 @@ from ai_agent.schemas import (
     UserSettingsData,
 )
 from ai_agent.schemas import _parse_ai_role, _parse_contact_profile
-from ai_agent.security import PromptBuilder
 
 from agent_helpers import make_test_runtime, structured
 
@@ -72,6 +72,64 @@ def _process_request(
         ai_role=ai_role,
         user_settings=user_settings,
     )
+
+
+def _draft_request(
+    *,
+    ai_role: AIRoleData | None = None,
+    user_settings: UserSettingsData | None = None,
+    contact_profile: ContactProfileData | None = None,
+) -> AIProcessMessageRequest:
+    """Like ``_process_request`` but also wires ``contact_profile`` for ``draft_spec``."""
+    return AIProcessMessageRequest(
+        request_id="r1",
+        event=NormalizedTelegramEvent(
+            event_id="e1",
+            tenant_id="tenant:user:77",
+            chat_id="42",
+            telegram_update_id=1,
+            business_connection_id="",
+            source_message_id="m1",
+            sender_id="s1",
+            message_text="Когда созвонимся?",
+            message_type="text",
+            created_at="2026-06-11T10:00:00Z",
+        ),
+        chat_settings=ChatSettings(
+            tenant_id="tenant:user:77", chat_id="42", mode=ChatMode.MANUAL, privacy_flags=()
+        ),
+        ai_role=ai_role,
+        user_settings=user_settings,
+        contact_profile=contact_profile,
+    )
+
+
+def _build_draft_spec(request: AIProcessMessageRequest, **overrides) -> prompt_library.PromptSpec:
+    """Build the draft ``PromptSpec`` with sane test defaults — mirrors
+    ``test_prompt_library.py``'s helper of the same shape, scoped to this
+    file's content-placement assertions."""
+    kwargs = dict(
+        clean_memory=["[CURRENT DATE: 2026-05-30]"],
+        owner_style_facts=[],
+        current_draft=None,
+        owner_instruction=None,
+        feedback_hint="",
+        two_stage=False,
+    )
+    kwargs.update(overrides)
+    return prompt_library.draft_spec(request, **kwargs)
+
+
+def _context_entry(spec: prompt_library.PromptSpec, prefix: str) -> str:
+    """Return the single ``spec.context`` entry starting with ``prefix``."""
+    for line in spec.context:
+        if line.startswith(prefix):
+            return line
+    raise AssertionError(f"no context entry starts with {prefix!r}: {spec.context!r}")
+
+
+def _spec_has(items: tuple[str, ...], sentinel: str) -> bool:
+    return any(sentinel in item for item in items)
 
 
 class ContactProfileParsingTests(unittest.TestCase):
@@ -122,86 +180,77 @@ class ContactProfileParsingTests(unittest.TestCase):
 
 
 class DraftPromptAssemblyTests(unittest.TestCase):
-    """``_compose_base_instruction`` places profile data in the right sections."""
-
-    def _compose(self, profile: ContactProfileData | None) -> str:
-        return draft_pipeline._compose_base_instruction(
-            clean_memory=["[CURRENT DATE: 2026-05-30]"],
-            owner_style_facts=[],
-            contact_profile=profile,
-            current_draft=None,
-            owner_instruction=None,
-            feedback_hint="",
-        )
+    """``library.draft_spec`` places profile data in the right context entries."""
 
     def test_me_style_is_in_owner_section_not_contact(self) -> None:
-        """me_style describes how the OWNER writes — it belongs in the РОЛЬ block."""
+        """me_style describes how the OWNER writes — it belongs in the persona entry."""
         profile = ContactProfileData(relationship_type="friendship", owner_style=OWNER_STYLE)
-        role_block, contact_block = _split_sections(self._compose(profile))
-        self.assertIn(OWNER_STYLE, role_block)
-        self.assertNotIn(OWNER_STYLE, contact_block)
+        spec = _build_draft_spec(_draft_request(contact_profile=profile))
+        persona_entry = _context_entry(spec, "КТО ТЫ В ЭТОМ ЧАТЕ:")
+        contact_entry = _context_entry(spec, "СОБЕСЕДНИК — кому пишешь:")
+        self.assertIn(OWNER_STYLE, persona_entry)
+        self.assertNotIn(OWNER_STYLE, contact_entry)
 
     def test_raw_notes_json_never_appears(self) -> None:
-        """The assembled prompt must never contain the raw {"me_style"...} JSON."""
+        """The assembled spec must never carry the raw {"me_style"...} JSON."""
         profile = ContactProfileData(owner_style=OWNER_STYLE, notes='{"me_style":"x"}')
-        prompt = self._compose(profile)
-        self.assertNotIn('{"me_style"', prompt)
-        self.assertNotIn("me_style", prompt)
+        spec = _build_draft_spec(_draft_request(contact_profile=profile))
+        joined = "\n".join(spec.context)
+        self.assertNotIn('{"me_style"', joined)
+        self.assertNotIn("me_style", joined)
 
     def test_structured_contact_fields_render_cleanly(self) -> None:
-        """Tone / address form / chat context / taboo appear in the contact block."""
+        """Tone / address form / chat context / taboo appear in the contact entry."""
         profile = ContactProfileData(
             address_form="ty",
             tone="casual",
             chat_context=CONTACT_CONTEXT,
             do_not_discuss=(TABOO_TOPIC,),
         )
-        _, contact_block = _split_sections(self._compose(profile))
-        self.assertIn("на «ты»", contact_block)
-        self.assertIn("casual", contact_block)
-        self.assertIn(CONTACT_CONTEXT, contact_block)
-        self.assertIn(TABOO_TOPIC, contact_block)
+        spec = _build_draft_spec(_draft_request(contact_profile=profile))
+        contact_entry = _context_entry(spec, "СОБЕСЕДНИК — кому пишешь:")
+        self.assertIn("на «ты»", contact_entry)
+        self.assertIn("casual", contact_entry)
+        self.assertIn(CONTACT_CONTEXT, contact_entry)
+        self.assertIn(TABOO_TOPIC, contact_entry)
 
     def test_facts_are_framed_as_optional_background(self) -> None:
-        """The prompt instructs the model to treat [ФАКТ ...] lines as soft context."""
-        prompt = self._compose(None)
-        self.assertIn("[ФАКТ", prompt)
-        self.assertIn("справочный фон", prompt)
+        """The spec instructs the model to treat [ФАКТ ...] lines as soft context."""
+        spec = _build_draft_spec(_draft_request())
+        joined = "\n".join(spec.constraints)
+        self.assertIn("[ФАКТ", joined)
+        self.assertIn("справочный фон", joined)
 
     def test_contact_extras_render_in_contact_block(self) -> None:
-        """Topics/language/timezone/preferred-address (sent by Go) reach the prompt."""
+        """Topics/language/timezone/preferred-address (sent by Go) reach the spec."""
         profile = ContactProfileData(
             topics=("topic-sentinel",),
             language="lang-sentinel",
             contact_timezone="tz-sentinel",
             preferred_address="addr-sentinel",
         )
-        _, contact_block = _split_sections(self._compose(profile))
-        self.assertIn("topic-sentinel", contact_block)
-        self.assertIn("lang-sentinel", contact_block)
-        self.assertIn("tz-sentinel", contact_block)
-        self.assertIn("addr-sentinel", contact_block)
+        spec = _build_draft_spec(_draft_request(contact_profile=profile))
+        contact_entry = _context_entry(spec, "СОБЕСЕДНИК — кому пишешь:")
+        self.assertIn("topic-sentinel", contact_entry)
+        self.assertIn("lang-sentinel", contact_entry)
+        self.assertIn("tz-sentinel", contact_entry)
+        self.assertIn("addr-sentinel", contact_entry)
 
     def test_owner_identity_renders_in_role_block(self) -> None:
-        """user_settings identity lands in the OWNER role block, not the contact block."""
-        from ai_agent.schemas import UserSettingsData
-
-        prompt = draft_pipeline._compose_base_instruction(
-            clean_memory=["[CURRENT DATE: 2026-05-30]"],
-            owner_style_facts=[],
-            contact_profile=None,
-            current_draft=None,
-            owner_instruction=None,
-            feedback_hint="",
-            user_settings=UserSettingsData(display_name="owner-name-sentinel", timezone="tz-x"),
+        """user_settings identity lands among the OWNER/role entries, not contact."""
+        spec = _build_draft_spec(
+            _draft_request(
+                user_settings=UserSettingsData(display_name="owner-name-sentinel", timezone="tz-x")
+            )
         )
-        role_block, contact_block = _split_sections(prompt)
-        self.assertIn("owner-name-sentinel", role_block)
-        self.assertNotIn("owner-name-sentinel", contact_block)
+        joined_context = "\n".join(spec.context)
+        contact_entry = _context_entry(spec, "СОБЕСЕДНИК — кому пишешь:")
+        self.assertIn("owner-name-sentinel", joined_context)
+        self.assertNotIn("owner-name-sentinel", contact_entry)
 
 
 class AIRolePromptTests(unittest.TestCase):
-    """The assigned AI role drives the persona block of the system prompt."""
+    """The assigned AI role drives the persona entry of the draft ``PromptSpec``."""
 
     ROLE = AIRoleData(
         name="role-name-sentinel",
@@ -211,21 +260,11 @@ class AIRolePromptTests(unittest.TestCase):
         constraints="role-constraints-sentinel",
     )
 
-    def _compose(self, ai_role: AIRoleData | None, **kwargs) -> str:
-        return draft_pipeline._compose_base_instruction(
-            clean_memory=["[CURRENT DATE: 2026-05-30]"],
-            owner_style_facts=kwargs.pop("owner_style_facts", []),
-            contact_profile=kwargs.pop("contact_profile", None),
-            current_draft=None,
-            owner_instruction=None,
-            feedback_hint=kwargs.pop("feedback_hint", ""),
-            ai_role=ai_role,
-            **kwargs,
-        )
-
     def test_role_fields_render_in_persona_block(self) -> None:
-        """Name, description, style, goals and constraints all reach the persona block."""
-        persona_block, contact_block = _split_sections(self._compose(self.ROLE))
+        """Name, description, style, goals and constraints all reach the persona entry."""
+        spec = _build_draft_spec(_draft_request(ai_role=self.ROLE))
+        persona_entry = _context_entry(spec, "КТО ТЫ В ЭТОМ ЧАТЕ:")
+        contact_entry = _context_entry(spec, "СОБЕСЕДНИК — кому пишешь:")
         for sentinel in (
             "role-name-sentinel",
             "role-description-sentinel",
@@ -233,73 +272,77 @@ class AIRolePromptTests(unittest.TestCase):
             "role-goals-sentinel",
             "role-constraints-sentinel",
         ):
-            self.assertIn(sentinel, persona_block)
-            self.assertNotIn(sentinel, contact_block)
+            self.assertIn(sentinel, persona_entry)
+            self.assertNotIn(sentinel, contact_entry)
 
     def test_role_style_wins_over_owner_style(self) -> None:
         """With a role speaking_style set, the owner's observed style is not injected."""
         profile = ContactProfileData(owner_style=OWNER_STYLE)
-        prompt = self._compose(self.ROLE, contact_profile=profile)
-        self.assertIn("role-style-sentinel", prompt)
-        self.assertNotIn(OWNER_STYLE, prompt)
+        spec = _build_draft_spec(_draft_request(ai_role=self.ROLE, contact_profile=profile))
+        joined = "\n".join(spec.context)
+        self.assertIn("role-style-sentinel", joined)
+        self.assertNotIn(OWNER_STYLE, joined)
 
     def test_role_without_style_falls_back_to_owner_style(self) -> None:
         """A role with no speaking_style borrows the owner's per-chat style as a hint."""
         role = AIRoleData(name="role-name-sentinel", description="d")
         profile = ContactProfileData(owner_style=OWNER_STYLE)
-        persona_block, _ = _split_sections(self._compose(role, contact_profile=profile))
-        self.assertIn(OWNER_STYLE, persona_block)
+        spec = _build_draft_spec(_draft_request(ai_role=role, contact_profile=profile))
+        persona_entry = _context_entry(spec, "КТО ТЫ В ЭТОМ ЧАТЕ:")
+        self.assertIn(OWNER_STYLE, persona_entry)
 
     def test_bot_role_uses_owner_bio_as_context_not_personality(self) -> None:
         """Bot mode may reason from owner facts without inheriting the owner's voice."""
-        from ai_agent.schemas import UserSettingsData
-
         role = AIRoleData(
             name="bot-role-sentinel",
             description="bot-description-sentinel",
             speak_as_owner=False,
         )
-        prompt = self._compose(
-            role,
-            owner_style_facts=[OWNER_STYLE],
-            contact_profile=ContactProfileData(owner_style=OWNER_STYLE),
-            user_settings=UserSettingsData(
-                display_name="owner-name-sentinel",
-                bio="owner-bio-sentinel",
+        spec = _build_draft_spec(
+            _draft_request(
+                ai_role=role,
+                user_settings=UserSettingsData(
+                    display_name="owner-name-sentinel", bio="owner-bio-sentinel"
+                ),
+                contact_profile=ContactProfileData(owner_style=OWNER_STYLE),
             ),
+            owner_style_facts=[OWNER_STYLE],
             feedback_hint="owner-feedback-sentinel",
         )
+        text = render_prompt(spec, ModelFamily.GPT)
 
-        self.assertIn("Твоя единственная персона", prompt)
-        self.assertIn("bot-role-sentinel", prompt)
-        self.assertIn("не копируй личность", prompt.lower())
-        self.assertIn("выше остальных инструкций", prompt)
-        self.assertIn("СПРАВОЧНЫЙ КОНТЕКСТ, НЕ ПЕРСОНА БОТА", prompt)
-        self.assertIn("owner-name-sentinel", prompt)
-        self.assertIn("owner-bio-sentinel", prompt)
-        self.assertIn("точный совет, объяснение или вывод", prompt)
-        self.assertNotIn(OWNER_STYLE, prompt)
-        self.assertNotIn("owner-feedback-sentinel", prompt)
+        self.assertIn("Твоя единственная персона", spec.role)
+        self.assertIn("bot-role-sentinel", text)
+        self.assertIn("не копируй личность", text.lower())
+        self.assertIn("выше остальных инструкций", text)
+        self.assertIn("ВЛАДЕЛЕЦ — справочный контекст, НЕ персона бота", text)
+        self.assertIn("owner-name-sentinel", text)
+        self.assertIn("owner-bio-sentinel", text)
+        self.assertIn("точный совет, объяснение или вывод", text)
+        self.assertNotIn(OWNER_STYLE, text)
+        self.assertNotIn("owner-feedback-sentinel", text)
 
     def test_no_role_falls_back_to_owner_assistant_persona(self) -> None:
-        """Without a role the prompt keeps the legacy copy-the-owner behaviour."""
+        """Without a role the spec keeps the legacy copy-the-owner behaviour."""
         profile = ContactProfileData(owner_style=OWNER_STYLE)
-        persona_block, _ = _split_sections(self._compose(None, contact_profile=profile))
-        self.assertIn("Роль для чата не задана", persona_block)
-        self.assertIn(OWNER_STYLE, persona_block)
+        spec = _build_draft_spec(_draft_request(contact_profile=profile))
+        persona_entry = _context_entry(spec, "КТО ТЫ В ЭТОМ ЧАТЕ:")
+        self.assertIn("Роль для чата не задана", persona_entry)
+        self.assertIn(OWNER_STYLE, persona_entry)
 
     def test_prompt_pins_memory_to_this_chat(self) -> None:
-        """The prompt forbids referencing conversations outside this chat's context."""
-        prompt = self._compose(self.ROLE)
-        self.assertIn("только из этого чата", prompt)
+        """The spec forbids referencing conversations outside this chat's context."""
+        spec = _build_draft_spec(_draft_request(ai_role=self.ROLE))
+        self.assertIn("только из этого чата", "\n".join(spec.constraints))
 
     def test_prompt_frames_markup_as_readability_tool(self) -> None:
-        """The compact prompt names the Rich Markdown dialect and useful GFM blocks."""
-        prompt = self._compose(self.ROLE)
+        """The output-format rules name the Rich Markdown dialect and useful GFM blocks."""
+        spec = _build_draft_spec(_draft_request(ai_role=self.ROLE))
+        rules = spec.output_format.rules
 
-        self.assertIn("Telegram Rich Markdown (GFM)", prompt)
-        self.assertIn("GFM-таблицы", prompt)
-        self.assertIn("Короткий ответ пиши обычным текстом", prompt)
+        self.assertIn("Telegram Rich Markdown (GFM)", rules)
+        self.assertIn("GFM-таблицы", rules)
+        self.assertIn("Короткий ответ", rules)
 
     def test_two_stage_writer_directive_is_opt_in(self) -> None:
         """Only the bimodal writer gets the context-already-gathered directive.
@@ -307,35 +350,37 @@ class AIRolePromptTests(unittest.TestCase):
         Hybrid: the writer keeps its tools as a fallback, so the directive frames
         them as a backup path rather than removing them.
         """
-        single_stage = self._compose(self.ROLE)
-        two_stage = self._compose(self.ROLE, two_stage=True)
-        self.assertNotIn("КОНТЕКСТ УЖЕ СОБРАН", single_stage)
-        self.assertIn("КОНТЕКСТ УЖЕ СОБРАН", two_stage)
-        self.assertIn("ЗАПАСНОЙ путь", two_stage)
+        single_stage = _build_draft_spec(_draft_request(ai_role=self.ROLE))
+        two_stage = _build_draft_spec(_draft_request(ai_role=self.ROLE), two_stage=True)
+        self.assertFalse(_spec_has(single_stage.constraints, "КОНТЕКСТ УЖЕ СОБРАН"))
+        self.assertTrue(_spec_has(two_stage.constraints, "КОНТЕКСТ УЖЕ СОБРАН"))
+        self.assertTrue(_spec_has(two_stage.constraints, "ЗАПАСНОЙ путь"))
 
     def test_ask_questions_instruction_present_in_both_stages(self) -> None:
         """Hybrid: the writer is told the ask_questions schema in both stages.
 
         The bimodal writer keeps the tool as a fallback, so it needs the schema
-        even when an orchestrator bundle is present.
+        even when an orchestrator bundle is present (``two_stage=True`` here
+        models the writer's *own* spec once a bundle exists — the orchestrator
+        bundle text itself is appended separately by ``AgentRuntime``).
         """
         role = AIRoleData(
             name="role-name-sentinel",
             tool_settings={"interaction.ask_questions": True},
         )
-        request = _process_request(ai_role=role)
+        request = _draft_request(ai_role=role)
 
-        single_stage, _ = draft_pipeline.build_draft_prompt(request, PromptBuilder())
-        two_stage, _ = draft_pipeline.build_draft_prompt(
-            request, PromptBuilder(), orchestrator_bundle=("context",)
-        )
+        single_stage = _build_draft_spec(request)
+        two_stage = _build_draft_spec(request, two_stage=True)
+        single_joined = "\n".join(single_stage.constraints)
+        two_joined = "\n".join(two_stage.constraints)
 
-        self.assertIn("ask_questions(questions[1..6])", single_stage)
-        self.assertIn("своими словами", single_stage)
-        self.assertIn("ask_questions(questions[1..6])", two_stage)
+        self.assertIn("ask_questions(questions[1..6])", single_joined)
+        self.assertIn("своими словами", single_joined)
+        self.assertIn("ask_questions(questions[1..6])", two_joined)
         # The question text must not be echoed into the reply (anti-duplicate rule).
-        self.assertIn("ТОЛЬКО в ask_questions", single_stage)
-        self.assertIn("НИКОГДА не повторяй этот вопрос", two_stage)
+        self.assertIn("ТОЛЬКО в ask_questions", single_joined)
+        self.assertIn("НИКОГДА не повторяй этот вопрос", two_joined)
 
     def test_single_stage_writer_ask_questions_reaches_draft_outcome(self) -> None:
         """A writer tool call in single-stage mode becomes the final response_plan."""
@@ -391,7 +436,9 @@ class AIRolePromptTests(unittest.TestCase):
 
     def test_no_role_prompt_forbids_markup(self) -> None:
         """The legacy owner-copy path remains plain to match its delivery contract."""
-        self.assertIn("Пиши обычным текстом без разметки", self._compose(None))
+        spec = _build_draft_spec(_draft_request())
+        self.assertEqual(spec.output_format.text_format, "plain_text")
+        self.assertIn("без разметки", spec.output_format.rules)
 
     def test_decide_text_format_uses_rich_for_role_structured_intents(self) -> None:
         """Assigned roles may return Rich Markdown for structured answer intents.
@@ -442,10 +489,12 @@ class AIRolePromptTests(unittest.TestCase):
                 ),
             ),
         )
-        persona_block, contact_block = _split_sections(self._compose(role))
+        spec = _build_draft_spec(_draft_request(ai_role=role))
+        persona_entry = _context_entry(spec, "КТО ТЫ В ЭТОМ ЧАТЕ:")
+        contact_entry = _context_entry(spec, "СОБЕСЕДНИК — кому пишешь:")
         for sentinel in ("cf-title-sentinel", "cf-desc-sentinel", "cf-context-sentinel"):
-            self.assertIn(sentinel, persona_block)
-            self.assertNotIn(sentinel, contact_block)
+            self.assertIn(sentinel, persona_entry)
+            self.assertNotIn(sentinel, contact_entry)
 
     def test_parse_ai_role_drops_custom_fields_without_title(self) -> None:
         """Custom fields without a title are dropped on parse."""
@@ -611,19 +660,12 @@ class NormalizeRichMarkdownTests(unittest.TestCase):
         self.assertEqual(self._norm(text), text)
 
     def test_formatting_line_enforces_heading_rules(self) -> None:
-        """The formatting prompt forbids # on the same line as text or emoji."""
+        """The output-format rules forbid # on the same line as text or emoji."""
         role = AIRoleData(name="r", description="d")
-        prompt = draft_pipeline._compose_base_instruction(
-            clean_memory=[],
-            owner_style_facts=[],
-            contact_profile=None,
-            current_draft=None,
-            owner_instruction=None,
-            feedback_hint="",
-            ai_role=role,
-        )
-        self.assertIn("никогда в одной строке", prompt)
-        self.assertIn("пустая строка до и после", prompt)
+        spec = _build_draft_spec(_draft_request(ai_role=role))
+        rules = spec.output_format.rules
+        self.assertIn("никогда в одной строке", rules)
+        self.assertIn("Пустая строка до и после", rules)
 
 
 class OrchestratorResultCoercionTests(unittest.TestCase):
@@ -701,42 +743,6 @@ class DraftRetryTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             runtime.draft_outcome(_process_request(), RiskLevel.LOW)
         self.assertEqual(calls["n"], 3)  # exactly draft_max_attempts tries
-
-
-class PromptContractFlagIsolationTests(unittest.TestCase):
-    """``draft.py``'s legacy ``build_*_prompt`` functions must stay flag-blind.
-
-    All ``PROMPT_CONTRACT_ENABLED`` branching lives in ``agents/runtime.py``
-    (see its module docstring) — these pipeline functions never read the env
-    var, so this locks in that invariant: a future edit that wires
-    flag-awareness in here without preserving the flag-off text would break
-    "flag off == old path unchanged" without any other test noticing, since
-    these functions are exercised directly, not through ``AgentRuntime``.
-    """
-
-    def test_build_draft_prompt_ignores_the_flag(self) -> None:
-        request = _process_request(ai_role=AIRoleData(name="role-name-sentinel", description="d"))
-        with mock.patch.dict(os.environ, {"PROMPT_CONTRACT_ENABLED": "false"}):
-            off_prompt = draft_pipeline.build_draft_prompt(request, PromptBuilder())
-        with mock.patch.dict(os.environ, {"PROMPT_CONTRACT_ENABLED": "true"}):
-            on_prompt = draft_pipeline.build_draft_prompt(request, PromptBuilder())
-        self.assertEqual(off_prompt, on_prompt)
-
-    def test_build_orchestrator_prompt_ignores_the_flag(self) -> None:
-        request = _process_request(ai_role=AIRoleData(name="role-name-sentinel"))
-        with mock.patch.dict(os.environ, {"PROMPT_CONTRACT_ENABLED": "false"}):
-            off_prompt = draft_pipeline.build_orchestrator_prompt(request, PromptBuilder())
-        with mock.patch.dict(os.environ, {"PROMPT_CONTRACT_ENABLED": "true"}):
-            on_prompt = draft_pipeline.build_orchestrator_prompt(request, PromptBuilder())
-        self.assertEqual(off_prompt, on_prompt)
-
-
-def _split_sections(prompt: str) -> tuple[str, str]:
-    """Return (persona_block, contact_block) substrings of the system prompt."""
-    role_start = prompt.index("КТО ТЫ В ЭТОМ ЧАТЕ:")
-    contact_start = prompt.index("СОБЕСЕДНИК — КОМУ ПИШЕШЬ:")
-    task_start = prompt.index("ЗАДАЧА:")
-    return prompt[role_start:contact_start], prompt[contact_start:task_start]
 
 
 if __name__ == "__main__":
