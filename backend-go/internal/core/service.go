@@ -587,6 +587,10 @@ func embeddingAt(embeddings [][]float64, i int) []float64 {
 // Facts are stored as chat-scoped preference facts — conservative defaults that work
 // without typed JSON output from the AI (Phase 4 extractor upgrade will add full typing).
 func (s *Service) saveExtractedFacts(event contracts.NormalizedTelegramEvent, facts []string) {
+	s.saveExtractedFactsWithRoleContext(event, facts, s.activeRoleContextIDForEvent(event))
+}
+
+func (s *Service) saveExtractedFactsWithRoleContext(event contracts.NormalizedTelegramEvent, facts []string, roleContextID int64) {
 	if len(facts) == 0 || s.repository == nil {
 		return
 	}
@@ -618,6 +622,7 @@ func (s *Service) saveExtractedFacts(event contracts.NormalizedTelegramEvent, fa
 			Confidence:      0.75,
 			Source:          "llm_extracted",
 			SourceMessageID: event.SourceMessageID,
+			RoleContextID:   roleContextID,
 		}, embeddingAt(embeddings, i))
 	}
 }
@@ -626,6 +631,7 @@ func (s *Service) saveExtractedFacts(event contracts.NormalizedTelegramEvent, fa
 // It opens/updates the active episode and fires the extractor in a goroutine so it never
 // blocks the webhook path. No response is generated and no draft is created.
 func (s *Service) processPassive(ctx context.Context, event contracts.NormalizedTelegramEvent) {
+	roleContextID := s.activeRoleContextIDForEvent(event)
 	// Maintain an active episode so episode-based context works after claim.
 	now := s.now()
 	ep := store.ActiveEpisodeRecord{
@@ -634,10 +640,14 @@ func (s *Service) processPassive(ctx context.Context, event contracts.Normalized
 		StartedAt:     now,
 		LastMessageAt: now,
 		MessageCount:  1,
+		RoleContextID: roleContextID,
 	}
 	if existing, ok := s.repository.ActiveEpisodeByChat(event.TenantID, event.ChatID); ok {
 		ep.StartedAt = existing.StartedAt
 		ep.MessageCount = existing.MessageCount + 1
+		if ep.RoleContextID == 0 {
+			ep.RoleContextID = existing.RoleContextID
+		}
 	}
 	s.repository.UpsertActiveEpisode(ep)
 
@@ -666,13 +676,14 @@ func (s *Service) processPassive(ctx context.Context, event contracts.Normalized
 					InputMessageIDs: []string{event.SourceMessageID},
 					Error:           err.Error(),
 					DurationMS:      durationMS,
+					RoleContextID:   roleContextID,
 				})
 				return
 			}
 			if resp.BlockedByPrivacy {
 				return
 			}
-			outcome := s.saveTypedFacts(event, resp.Facts)
+			outcome := s.saveTypedFacts(event, resp.Facts, roleContextID)
 			s.repository.LogExtraction(store.ExtractionLogRecord{
 				TenantID:        event.TenantID,
 				ChatID:          event.ChatID,
@@ -683,6 +694,7 @@ func (s *Service) processPassive(ctx context.Context, event contracts.Normalized
 				FactsSkipped:    outcome.Skipped,
 				FactsMerged:     resp.DeterministicFactsCount,
 				DurationMS:      durationMS,
+				RoleContextID:   roleContextID,
 			})
 		})
 	} else if extractor, ok := s.ai.(aiclient.MemoryExtractor); ok {
@@ -700,7 +712,7 @@ func (s *Service) processPassive(ctx context.Context, event contracts.Normalized
 				return
 			}
 			if !resp.BlockedByPrivacy {
-				s.saveExtractedFacts(event, resp.Memories)
+				s.saveExtractedFactsWithRoleContext(event, resp.Memories, roleContextID)
 			}
 		})
 	}
@@ -825,7 +837,7 @@ func redactHealthFacts(raw string, facts []aiclient.TypedFact, healthIDs map[str
 	return raw
 }
 
-func (s *Service) saveTypedFacts(event contracts.NormalizedTelegramEvent, facts []aiclient.TypedFact) extractionOutcome {
+func (s *Service) saveTypedFacts(event contracts.NormalizedTelegramEvent, facts []aiclient.TypedFact, roleContextID int64) extractionOutcome {
 	outcome := extractionOutcome{}
 	if len(facts) == 0 || s.repository == nil {
 		return outcome
@@ -862,6 +874,7 @@ func (s *Service) saveTypedFacts(event contracts.NormalizedTelegramEvent, facts 
 			Confidence:      f.Confidence,
 			Source:          "llm_extracted",
 			SourceMessageID: event.SourceMessageID,
+			RoleContextID:   roleContextID,
 		}, embeddingAt(embeddings, i))
 		if result.FactID != 0 {
 			outcome.CreatedIDs = append(outcome.CreatedIDs, result.FactID)
@@ -1008,6 +1021,10 @@ func (s *Service) Repository() *store.Repository {
 }
 
 func (s *Service) createDraft(event contracts.NormalizedTelegramEvent, decisionID, text string, textFormat contracts.TextFormat) store.DraftRecord {
+	return s.createDraftWithRoleContext(event, decisionID, text, textFormat, s.activeRoleContextIDForEvent(event))
+}
+
+func (s *Service) createDraftWithRoleContext(event contracts.NormalizedTelegramEvent, decisionID, text string, textFormat contracts.TextFormat, roleContextID int64) store.DraftRecord {
 	now := s.now()
 	return store.DraftRecord{
 		DraftID:              "draft:" + decisionID,
@@ -1021,6 +1038,7 @@ func (s *Service) createDraft(event contracts.NormalizedTelegramEvent, decisionI
 		TextFormat:           textFormat.Normalize(),
 		DraftType:            "reply",
 		Status:               store.DraftPending,
+		RoleContextID:        roleContextID,
 		// Persisting trace_id lets owner feedback (approve / thumb) attach a
 		// Langfuse score back to the Phase 4 generation span.
 		TraceID:   tracepkg.DeriveTraceID(event.EventID),
@@ -1191,10 +1209,14 @@ func outgoingUpdateID(decisionID string) int64 {
 // saveOutgoingMessage persists a synthetic outgoing message and a virtual sent draft so the
 // Mini App can display the AI auto-reply in chat history and label it as "DoubleU".
 func (s *Service) saveOutgoingMessage(event contracts.NormalizedTelegramEvent, ownerID, sentMsgID, text, decisionID string, textFormat contracts.TextFormat) {
+	s.saveOutgoingMessageWithRoleContext(event, ownerID, sentMsgID, text, decisionID, textFormat, s.activeRoleContextIDForEvent(event))
+}
+
+func (s *Service) saveOutgoingMessageWithRoleContext(event contracts.NormalizedTelegramEvent, ownerID, sentMsgID, text, decisionID string, textFormat contracts.TextFormat, roleContextID int64) {
 	if ownerID == "" || sentMsgID == "" {
 		return
 	}
-	s.repository.SaveMessage(contracts.NormalizedTelegramEvent{
+	s.repository.SaveMessageWithRoleContext(contracts.NormalizedTelegramEvent{
 		EventID:              "out:" + decisionID,
 		TenantID:             event.TenantID,
 		ChatID:               event.ChatID,
@@ -1205,7 +1227,7 @@ func (s *Service) saveOutgoingMessage(event contracts.NormalizedTelegramEvent, o
 		MessageType:          "text",
 		TelegramUpdateID:     outgoingUpdateID(decisionID),
 		CreatedAt:            s.now(),
-	})
+	}, roleContextID)
 	// Virtual draft lets DraftBySentMessageID recognise this as a DoubleU message.
 	s.repository.SaveDraft(store.DraftRecord{
 		DraftID:              "draft:" + decisionID,
@@ -1218,6 +1240,7 @@ func (s *Service) saveOutgoingMessage(event contracts.NormalizedTelegramEvent, o
 		TextFormat:           textFormat.Normalize(),
 		Status:               store.DraftSent,
 		SentMessageID:        sentMsgID,
+		RoleContextID:        roleContextID,
 		CreatedAt:            s.now(),
 		UpdatedAt:            s.now(),
 	})
@@ -1243,7 +1266,7 @@ func (s *Service) saveOutgoingMessageFromDraft(draft store.DraftRecord) {
 	if ownerID == "" {
 		return
 	}
-	s.repository.SaveMessage(contracts.NormalizedTelegramEvent{
+	s.repository.SaveMessageWithRoleContext(contracts.NormalizedTelegramEvent{
 		EventID:              "out:" + draft.DecisionID,
 		TenantID:             draft.TenantID,
 		ChatID:               draft.ChatID,
@@ -1254,7 +1277,7 @@ func (s *Service) saveOutgoingMessageFromDraft(draft store.DraftRecord) {
 		MessageType:          "text",
 		TelegramUpdateID:     outgoingUpdateID(draft.DecisionID),
 		CreatedAt:            s.now(),
-	})
+	}, draft.RoleContextID)
 }
 
 func valueOrDefault(value, fallback string) string {

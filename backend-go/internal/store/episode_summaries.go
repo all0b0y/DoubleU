@@ -26,20 +26,22 @@ func (r *Repository) UpsertActiveEpisode(episode ActiveEpisodeRecord) {
 	_, err := r.db.Exec(
 		`INSERT INTO active_episodes (
 		   tenant_id, chat_id, started_at, last_message_at, message_count,
-		   current_topic, open_question_message_id, pending_owner_action, updated_at
-		 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
+		   current_topic, open_question_message_id, pending_owner_action, role_context_id, updated_at
+		 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
 		 ON CONFLICT (tenant_id, chat_id) DO UPDATE SET
 		   last_message_at         = EXCLUDED.last_message_at,
 		   message_count           = active_episodes.message_count + 1,
 		   current_topic           = COALESCE(EXCLUDED.current_topic, active_episodes.current_topic),
 		   open_question_message_id = COALESCE(EXCLUDED.open_question_message_id, active_episodes.open_question_message_id),
 		   pending_owner_action    = COALESCE(EXCLUDED.pending_owner_action, active_episodes.pending_owner_action),
+		   role_context_id         = COALESCE(EXCLUDED.role_context_id, active_episodes.role_context_id),
 		   updated_at              = now()`,
 		episode.TenantID, episode.ChatID,
 		episode.StartedAt, episode.LastMessageAt, episode.MessageCount,
 		nullableString(episode.CurrentTopic),
 		nullableString(episode.OpenQuestionMsgID),
 		nullableString(episode.PendingOwnerAction),
+		nullableInt64(episode.RoleContextID),
 	)
 	r.logWriteError("upsert_active_episode", episode.TenantID, episode.ChatID, err)
 }
@@ -115,14 +117,15 @@ func (r *Repository) ActiveEpisodeByChat(tenantID, chatID string) (ActiveEpisode
 		var pendingAction sql.NullString
 		err := r.db.QueryRow(
 			`SELECT tenant_id, chat_id, started_at, last_message_at, message_count,
-			        current_topic, open_question_message_id, pending_owner_action
+			        current_topic, open_question_message_id, pending_owner_action,
+			        COALESCE(role_context_id, 0)
 			   FROM active_episodes
 			  WHERE tenant_id = $1 AND chat_id = $2`,
 			tenantID, chatID,
 		).Scan(
 			&ep.TenantID, &ep.ChatID,
 			&ep.StartedAt, &ep.LastMessageAt, &ep.MessageCount,
-			&currentTopic, &openQuestion, &pendingAction,
+			&currentTopic, &openQuestion, &pendingAction, &ep.RoleContextID,
 		)
 		if err == nil {
 			ep.CurrentTopic = currentTopic.String
@@ -175,14 +178,15 @@ func (r *Repository) SaveEpisodeSummary(summary EpisodeSummaryRecord) int64 {
 	err := r.db.QueryRow(
 		`INSERT INTO episode_summaries (
 		   tenant_id, chat_id, period_start, period_end, content,
-		   message_count, closure_reason, source_message_ids
-		 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		   message_count, closure_reason, source_message_ids, role_context_id
+		 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		 RETURNING id`,
 		summary.TenantID, summary.ChatID,
 		summary.PeriodStart, summary.PeriodEnd,
 		summary.Content, summary.MessageCount,
 		valueOrDefault(summary.ClosureReason, "manual"),
 		pq.Array(nilToEmpty(summary.SourceMessageIDs)),
+		nullableInt64(summary.RoleContextID),
 	).Scan(&id)
 	// id=0 already signals failure to callers; the log makes the cause visible
 	// (a CHECK-constraint violation here once silently dropped all summaries — MEM-10).
@@ -216,7 +220,8 @@ func (r *Repository) EpisodeSummariesWithoutEmbeddings(limit int) []EpisodeSumma
 	}
 	rows, err := r.db.Query(
 		`SELECT id, tenant_id, chat_id, period_start, period_end,
-		        content, closure_reason, message_count, created_at
+		        content, closure_reason, message_count, created_at,
+		        COALESCE(role_context_id, 0)
 		   FROM episode_summaries
 		  WHERE embedding IS NULL
 		    AND deleted_at IS NULL
@@ -234,6 +239,7 @@ func (r *Repository) EpisodeSummariesWithoutEmbeddings(limit int) []EpisodeSumma
 			&s.ID, &s.TenantID, &s.ChatID,
 			&s.PeriodStart, &s.PeriodEnd,
 			&s.Content, &s.ClosureReason, &s.MessageCount, &s.CreatedAt,
+			&s.RoleContextID,
 		) == nil {
 			result = append(result, s)
 		}
@@ -246,7 +252,8 @@ func (r *Repository) EpisodeSummaries(tenantID, chatID string, limit int) []Epis
 	if r.db != nil {
 		rows, err := r.db.Query(
 			`SELECT id, tenant_id, chat_id, period_start, period_end,
-			        content, closure_reason, message_count, created_at
+			        content, closure_reason, message_count, created_at,
+			        COALESCE(role_context_id, 0)
 			   FROM episode_summaries
 			  WHERE tenant_id = $1 AND chat_id = $2
 			    AND deleted_at IS NULL
@@ -263,6 +270,7 @@ func (r *Repository) EpisodeSummaries(tenantID, chatID string, limit int) []Epis
 					&s.ID, &s.TenantID, &s.ChatID,
 					&s.PeriodStart, &s.PeriodEnd,
 					&s.Content, &s.ClosureReason, &s.MessageCount, &s.CreatedAt,
+					&s.RoleContextID,
 				) == nil {
 					result = append(result, s)
 				}
@@ -296,7 +304,8 @@ func (r *Repository) EpisodeSummariesByVector(tenantID, chatID string, queryVect
 	vec := float64SliceToVector(queryVector)
 	rows, err := r.db.Query(fmt.Sprintf(
 		`SELECT id, tenant_id, chat_id, period_start, period_end,
-		        content, closure_reason, message_count, created_at
+		        content, closure_reason, message_count, created_at,
+		        COALESCE(role_context_id, 0)
 		   FROM episode_summaries
 		  WHERE tenant_id = $1 AND chat_id = $2
 		    AND embedding IS NOT NULL
@@ -318,6 +327,7 @@ func (r *Repository) EpisodeSummariesByVector(tenantID, chatID string, queryVect
 			&s.ID, &s.TenantID, &s.ChatID,
 			&s.PeriodStart, &s.PeriodEnd,
 			&s.Content, &s.ClosureReason, &s.MessageCount, &s.CreatedAt,
+			&s.RoleContextID,
 		) == nil {
 			result = append(result, s)
 		}

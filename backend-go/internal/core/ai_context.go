@@ -425,6 +425,34 @@ func (s *Service) botForChat(tenantID, chatID string) (store.UserBotRecord, bool
 	return s.repository.UserBotByID(tenantID, botID)
 }
 
+// activeRoleContextIDForEvent returns the reusable bot memory context currently
+// active for this event. Non-bot chats deliberately keep the legacy zero/NULL
+// context until read isolation is added in the next slice.
+func (s *Service) activeRoleContextIDForEvent(event contracts.NormalizedTelegramEvent) int64 {
+	if s == nil || s.repository == nil {
+		return 0
+	}
+	transport := event.Transport
+	if transport == "" {
+		transport = s.repository.ChatTransport(event.TenantID, event.ChatID)
+	}
+	if transport != contracts.TransportBot {
+		return 0
+	}
+	bot, ok := s.botForChat(event.TenantID, event.ChatID)
+	if !ok {
+		return 0
+	}
+	if bot.ActiveRoleContextID != 0 {
+		return bot.ActiveRoleContextID
+	}
+	ctx, ok := s.repository.ActiveBotRoleContext(event.TenantID, bot.BotID)
+	if !ok {
+		return 0
+	}
+	return ctx.ID
+}
+
 // feedbackContext returns recent draft feedback for this chat to send to the AI.
 func (s *Service) feedbackContext(tenantID, chatID string, limit int) []contracts.FeedbackItem {
 	feedbacks := s.repository.RecentFeedback(tenantID, chatID, limit)

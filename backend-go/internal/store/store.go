@@ -360,6 +360,13 @@ func nullableString(s string) any {
 	return s
 }
 
+func nullableInt64(value int64) any {
+	if value == 0 {
+		return nil
+	}
+	return value
+}
+
 func nullableTime(t *time.Time) any {
 	if t == nil {
 		return nil

@@ -26,7 +26,7 @@ const minEpisodeSpan = 2 * time.Minute
 // full provenance (source_message_ids). Idempotency is period-overlap based:
 // a second close of the same episode, or a daily fallback over an already
 // summarised window, is a no-op. Safe to call concurrently.
-func (s *Service) summarizeEpisode(ctx context.Context, tenantID, chatID string, startedAt, closedAt time.Time, closureReason string) {
+func (s *Service) summarizeEpisode(ctx context.Context, tenantID, chatID string, startedAt, closedAt time.Time, closureReason string, roleContextID int64) {
 	settings := s.repository.ChatSettings(tenantID, chatID)
 	if settings.PrivacyFlags.Contains(contracts.PrivacyNoSummary) {
 		return
@@ -88,6 +88,7 @@ func (s *Service) summarizeEpisode(ctx context.Context, tenantID, chatID string,
 		MessageCount:     len(messages),
 		SourceMessageIDs: sourceIDs,
 		ClosureReason:    closureReason,
+		RoleContextID:    roleContextID,
 	})
 	s.logger.Info("episode summary saved",
 		"tenant_id", tenantID, "chat_id", chatID,
@@ -116,7 +117,7 @@ func (s *Service) summarizeChatDay(ctx context.Context, tenantID, chatID string,
 	if !endOfDay.After(from) {
 		return // the whole day is already covered by episode summaries
 	}
-	s.summarizeEpisode(ctx, tenantID, chatID, from, endOfDay.Add(-time.Second), closureReason)
+	s.summarizeEpisode(ctx, tenantID, chatID, from, endOfDay.Add(-time.Second), closureReason, 0)
 }
 
 // maxSummaryConcurrency caps simultaneous LLM summarisation calls across all tenants.
@@ -161,7 +162,7 @@ func (s *Service) closeStaleEpisodes(ctx context.Context) {
 			if s.now().Sub(ep.LastMessageAt) < 6*time.Hour {
 				continue
 			}
-			tenantID, chatID, startedAt, lastMsg := tenantID, chat.ChatID, ep.StartedAt, ep.LastMessageAt
+			tenantID, chatID, startedAt, lastMsg, roleContextID := tenantID, chat.ChatID, ep.StartedAt, ep.LastMessageAt, ep.RoleContextID
 			// Close the active episode record before launching the goroutine so a
 			// second closeStaleEpisodes call for the same chat cannot race.
 			s.repository.CloseActiveEpisode(tenantID, chatID)
@@ -173,7 +174,7 @@ func (s *Service) closeStaleEpisodes(ctx context.Context) {
 			sem <- struct{}{}
 			go func() {
 				defer func() { <-sem }()
-				s.summarizeEpisode(ctx, tenantID, chatID, startedAt, lastMsg, "silence_gap")
+				s.summarizeEpisode(ctx, tenantID, chatID, startedAt, lastMsg, "silence_gap", roleContextID)
 			}()
 		}
 	}

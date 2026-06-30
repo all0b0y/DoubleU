@@ -213,6 +213,7 @@ func (r *Repository) SaveSemanticFact(fact SemanticFactRecord) int64 {
 	key := normalizeFactKey(fact.FactText)
 	for _, existing := range r.semanticFacts {
 		if existing.TenantID == fact.TenantID && existing.ChatID == fact.ChatID &&
+			existing.RoleContextID == fact.RoleContextID &&
 			existing.FactType == fact.FactType && existing.Subject == fact.Subject &&
 			normalizeFactKey(existing.FactText) == key {
 			return 0
@@ -243,7 +244,7 @@ func (r *Repository) UpsertSemanticFact(fact SemanticFactRecord, embedding []flo
 		var superseded *int64
 		err := r.db.QueryRow(
 			`SELECT action, fact_id, superseded_fact_id
-			   FROM upsert_semantic_fact($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+			   FROM upsert_semantic_fact($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
 			fact.TenantID,
 			fact.ScopeKind,
 			nullableString(fact.ChatID),
@@ -256,6 +257,7 @@ func (r *Repository) UpsertSemanticFact(fact SemanticFactRecord, embedding []flo
 			nullableTime(fact.ExpiresAt),
 			embeddingArg,
 			"qwen/qwen3-embedding-8b",
+			nullableInt64(fact.RoleContextID),
 		).Scan(&result.Action, &result.FactID, &superseded)
 		if err != nil {
 			r.logWriteError("upsert_semantic_fact", fact.TenantID, fact.ChatID, err)
@@ -283,7 +285,8 @@ func (r *Repository) SemanticFacts(tenantID, chatID string, limit int) []Semanti
 	if r.db != nil {
 		rows, err := r.db.Query(
 			`SELECT id, tenant_id, scope_kind, COALESCE(chat_id,''), fact_text, fact_type,
-			        subject, confidence, source, COALESCE(source_message_id,''), expires_at, created_at
+			        subject, confidence, source, COALESCE(source_message_id,''),
+			        COALESCE(role_context_id, 0), expires_at, created_at
 			   FROM semantic_facts
 			  WHERE tenant_id = $1 AND chat_id = $2
 			    AND scope_kind = 'chat'
@@ -317,7 +320,7 @@ func scanSemanticFacts(rows *sql.Rows) []SemanticFactRecord {
 		if rows.Scan(
 			&f.ID, &f.TenantID, &f.ScopeKind, &f.ChatID, &f.FactText,
 			&f.FactType, &f.Subject, &f.Confidence, &f.Source,
-			&f.SourceMessageID, &expiresAt, &f.CreatedAt,
+			&f.SourceMessageID, &f.RoleContextID, &expiresAt, &f.CreatedAt,
 		) == nil {
 			if expiresAt.Valid {
 				f.ExpiresAt = &expiresAt.Time
@@ -352,8 +355,8 @@ func (r *Repository) LogExtraction(rec ExtractionLogRecord) {
 	_, err := r.db.Exec(
 		`INSERT INTO extraction_log (
 		   tenant_id, chat_id, input_message_ids, model_used, raw_output,
-		   facts_created, facts_skipped, facts_merged, error, duration_ms
-		 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+		   facts_created, facts_skipped, facts_merged, error, duration_ms, role_context_id
+		 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
 		rec.TenantID, rec.ChatID,
 		pq.Array(nilToEmpty(rec.InputMessageIDs)),
 		rec.ModelUsed,
@@ -363,6 +366,7 @@ func (r *Repository) LogExtraction(rec ExtractionLogRecord) {
 		rec.FactsSkipped, rec.FactsMerged,
 		nullableString(rec.Error),
 		rec.DurationMS,
+		nullableInt64(rec.RoleContextID),
 	)
 	r.logWriteError("log_extraction", rec.TenantID, rec.ChatID, err)
 }
@@ -412,7 +416,8 @@ func (r *Repository) hardIncludeChatFacts(tenantID, chatID string) []SemanticFac
 	}
 	rows, err := r.db.Query(
 		`SELECT id, tenant_id, scope_kind, COALESCE(chat_id,''), fact_text, fact_type,
-		        subject, confidence, source, COALESCE(source_message_id,''), expires_at, created_at
+		        subject, confidence, source, COALESCE(source_message_id,''),
+		        COALESCE(role_context_id, 0), expires_at, created_at
 		   FROM semantic_facts
 		  WHERE tenant_id = $1 AND chat_id = $2
 		    AND scope_kind = 'chat'
@@ -453,11 +458,14 @@ func (r *Repository) SemanticFactsByVector(tenantID, chatID string, queryVector 
 	// A boost-multiplied ORDER BY on the index expression would force a seq scan.
 	rows, err := r.db.Query(fmt.Sprintf(
 		`SELECT id, tenant_id, scope_kind, chat_id, fact_text, fact_type,
-		        subject, confidence, source, source_message_id, expires_at, created_at
+		        subject, confidence, source, source_message_id,
+		        COALESCE(role_context_id, 0), expires_at, created_at
 		   FROM (
 		     SELECT sf.id, sf.tenant_id, sf.scope_kind, COALESCE(sf.chat_id,'') AS chat_id,
 		            sf.fact_text, sf.fact_type, sf.subject, sf.confidence, sf.source,
-		            COALESCE(sf.source_message_id,'') AS source_message_id, sf.expires_at, sf.created_at,
+		            COALESCE(sf.source_message_id,'') AS source_message_id,
+		            COALESCE(sf.role_context_id, 0) AS role_context_id,
+		            sf.expires_at, sf.created_at,
 		            %s AS dist
 		       FROM semantic_facts sf
 		       JOIN fact_embeddings fe ON fe.fact_id = sf.id
@@ -497,7 +505,8 @@ func (r *Repository) SemanticFactsByBM25(tenantID, chatID, query string, limit i
 	}
 	rows, err := r.db.Query(
 		`SELECT id, tenant_id, scope_kind, COALESCE(chat_id,''), fact_text, fact_type,
-		        subject, confidence, source, COALESCE(source_message_id,''), expires_at, created_at
+		        subject, confidence, source, COALESCE(source_message_id,''),
+		        COALESCE(role_context_id, 0), expires_at, created_at
 		   FROM semantic_facts
 		  WHERE tenant_id = $1 AND chat_id = $2
 		    AND scope_kind = 'chat'
@@ -530,7 +539,8 @@ func (r *Repository) SemanticFactsByIDs(tenantID string, ids []int64) []Semantic
 	}
 	query := fmt.Sprintf(
 		`SELECT id, tenant_id, scope_kind, COALESCE(chat_id,''), fact_text, fact_type,
-		        subject, confidence, source, COALESCE(source_message_id,''), expires_at, created_at
+		        subject, confidence, source, COALESCE(source_message_id,''),
+		        COALESCE(role_context_id, 0), expires_at, created_at
 		   FROM semantic_facts
 		  WHERE tenant_id = $1 AND id IN (%s)
 		    AND deleted_at IS NULL`,
@@ -574,7 +584,8 @@ func (r *Repository) RankFactsByCosine(tenantID string, ids []int64, queryVector
 	args = append(args, limit)
 	query := fmt.Sprintf(
 		`SELECT sf.id, sf.tenant_id, sf.scope_kind, COALESCE(sf.chat_id,''), sf.fact_text, sf.fact_type,
-		        sf.subject, sf.confidence, sf.source, COALESCE(sf.source_message_id,''), sf.expires_at, sf.created_at
+		        sf.subject, sf.confidence, sf.source, COALESCE(sf.source_message_id,''),
+		        COALESCE(sf.role_context_id, 0), sf.expires_at, sf.created_at
 		   FROM semantic_facts sf
 		   JOIN fact_embeddings fe ON fe.fact_id = sf.id
 		  WHERE sf.tenant_id = $1 AND sf.id IN (%s)

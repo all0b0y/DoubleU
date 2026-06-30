@@ -19,6 +19,7 @@ import (
 // can_reply permission).
 func (s *Service) processContactMessage(ctx context.Context, event contracts.NormalizedTelegramEvent, ownerID string, replyBlockNote string) (InboundResult, error) {
 	settings := s.repository.ChatSettings(event.TenantID, event.ChatID)
+	roleContextID := s.activeRoleContextIDForEvent(event)
 	s.repository.SaveChat(store.ChatRecord{
 		TenantID:             event.TenantID,
 		ChatID:               event.ChatID,
@@ -39,7 +40,7 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 	if !settings.PrivacyFlags.Contains(contracts.PrivacyNoMemory) {
 		recent := s.repository.RecentMessages(event.TenantID, event.ChatID, 5)
 		quarantined = classifyQuarantine(event.MessageText, recent)
-		s.repository.SaveMessageQuarantined(event, quarantined)
+		s.repository.SaveMessageQuarantinedWithRoleContext(event, quarantined, roleContextID)
 		if quarantined {
 			s.logger.Info("message quarantined as duplicate",
 				"tenant_id", event.TenantID,
@@ -82,10 +83,14 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 			StartedAt:     now,
 			LastMessageAt: now,
 			MessageCount:  1,
+			RoleContextID: roleContextID,
 		}
 		if existing, ok := s.repository.ActiveEpisodeByChat(event.TenantID, event.ChatID); ok {
 			ep.StartedAt = existing.StartedAt
 			ep.MessageCount = existing.MessageCount + 1
+			if ep.RoleContextID == 0 {
+				ep.RoleContextID = existing.RoleContextID
+			}
 		}
 		s.repository.UpsertActiveEpisode(ep)
 
@@ -117,8 +122,9 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 					"message_count", ep.MessageCount,
 				)
 				tenantID, chatID := event.TenantID, event.ChatID
+				capturedRoleContextID := roleContextID
 				s.runAsyncLLMTask(event.TenantID, func() {
-					s.summarizeEpisode(context.Background(), tenantID, chatID, startedAt, closedAt, "message_count")
+					s.summarizeEpisode(context.Background(), tenantID, chatID, startedAt, closedAt, "message_count", capturedRoleContextID)
 				})
 			}
 		}
@@ -165,7 +171,7 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 	// backpressure, not a block; the chat remains open for the next in-window message.
 	if !s.chatLimiterFor(event).Allow() {
 		if !settings.PrivacyFlags.Contains(contracts.PrivacyNoMemory) {
-			s.repository.SaveMessageQuarantined(event, true)
+			s.repository.SaveMessageQuarantinedWithRoleContext(event, true, roleContextID)
 		}
 		s.logger.Info("message rate_limited",
 			"tenant_id", event.TenantID,
@@ -176,7 +182,7 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 	}
 
 	if replyBlockNote != "" {
-		draft := s.createDraft(event, event.EventID, replyBlockNote, contracts.TextFormatPlain)
+		draft := s.createDraftWithRoleContext(event, event.EventID, replyBlockNote, contracts.TextFormatPlain, roleContextID)
 		s.repository.SaveDraft(draft)
 		s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateDraftSentToOwner)
 		s.repository.AppendAudit(s.auditEvent(event, contracts.DecisionAskOwner, "business_connection_cannot_reply"))
@@ -320,7 +326,7 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 	// LLM-based extraction is fired asynchronously below, after the draft is dispatched,
 	// so it never adds latency to the reply path (see backlog §7.1).
 	if !settings.PrivacyFlags.Contains(contracts.PrivacyNoMemory) && !s.pythonOwnsMemory() {
-		s.saveExtractedFacts(event, proposal.MemoryUsed)
+		s.saveExtractedFactsWithRoleContext(event, proposal.MemoryUsed, roleContextID)
 	}
 	s.logger.Info("ai analysis completed",
 		"tenant_id", event.TenantID,
@@ -375,7 +381,7 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 			}
 			s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateSentToRecipient)
 			s.logger.Info("telegram auto reply sent", "tenant_id", event.TenantID, "chat_id", event.ChatID, "source_message_id", event.SourceMessageID)
-			s.saveOutgoingMessage(event, ownerID, sentMsgID, proposal.ResponseText, event.EventID, proposal.TextFormat)
+			s.saveOutgoingMessageWithRoleContext(event, ownerID, sentMsgID, proposal.ResponseText, event.EventID, proposal.TextFormat, roleContextID)
 			// A reply went out on the owner's behalf: nothing is awaited from the owner.
 			s.repository.ClearEpisodeRuntimeState(event.TenantID, event.ChatID)
 			if s.notify != nil {
@@ -386,7 +392,7 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 			// row carries an empty ResponseText and DraftType="warning" so no approval
 			// path can ever deliver the service text to the contact.
 			if ownerNote := s.ownerNoteFor(proposal); decision == contracts.DecisionAskOwner && ownerNote != "" {
-				draft := s.createDraft(event, event.EventID, "", contracts.TextFormatPlain)
+				draft := s.createDraftWithRoleContext(event, event.EventID, "", contracts.TextFormatPlain, roleContextID)
 				draft.DraftType = "warning"
 				s.repository.SaveDraft(draft)
 				s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateDraftSentToOwner)
@@ -416,7 +422,7 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 					options = parseOptions(proposal.ResponseText)
 				}
 				if len(options) > 0 {
-					draft := s.createDraft(event, event.EventID, "", contracts.TextFormatPlain)
+					draft := s.createDraftWithRoleContext(event, event.EventID, "", contracts.TextFormatPlain, roleContextID)
 					draft.DraftType = "question"
 					draft.SuggestedOptions = options
 					s.repository.SaveDraft(draft)
@@ -438,7 +444,7 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 					break
 				}
 			}
-			draft := s.createDraft(event, event.EventID, proposal.ResponseText, proposal.TextFormat)
+			draft := s.createDraftWithRoleContext(event, event.EventID, proposal.ResponseText, proposal.TextFormat, roleContextID)
 			if proposal.Flagged {
 				draft.ActionHistory = append(draft.ActionHistory, "flagged")
 			}
@@ -513,6 +519,7 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 						InputMessageIDs: []string{event.SourceMessageID},
 						Error:           err.Error(),
 						DurationMS:      durationMS,
+						RoleContextID:   roleContextID,
 					})
 					return
 				}
@@ -523,7 +530,7 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 				// facts/suggestions through upsert_semantic_fact; Go only logs.
 				outcome := extractionOutcome{}
 				if !s.pythonOwnsMemory() {
-					outcome = s.saveTypedFacts(event, resp.Facts)
+					outcome = s.saveTypedFacts(event, resp.Facts, roleContextID)
 					s.saveProfileSuggestions(extractCtx, event, resp.ProfileSuggestions)
 				}
 				// Persist the attempt so a returned empty fact set is observable and
@@ -539,6 +546,7 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 					FactsSkipped:    outcome.Skipped,
 					FactsMerged:     resp.DeterministicFactsCount,
 					DurationMS:      durationMS,
+					RoleContextID:   roleContextID,
 				})
 			})
 		} else if extractor, ok := s.ai.(aiclient.MemoryExtractor); ok {
@@ -557,7 +565,7 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 					return
 				}
 				if !resp.BlockedByPrivacy && !s.pythonOwnsMemory() {
-					s.saveExtractedFacts(event, resp.Memories)
+					s.saveExtractedFactsWithRoleContext(event, resp.Memories, roleContextID)
 				}
 			})
 		}

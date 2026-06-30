@@ -40,15 +40,15 @@ func (r *Repository) SaveDraft(draft DraftRecord) {
 			   source_message_id, source_message_text, response_text,
 			   text_format, draft_type, suggested_options, status,
 			   owner_chat_id, owner_message_id, sent_message_id, action_history,
-			   trace_id, created_at, updated_at
-			 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$18)
+			   trace_id, role_context_id, created_at, updated_at
+			 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$19)
 			 ON CONFLICT (draft_id) DO NOTHING`,
 			draft.DraftID, draft.DecisionID, draft.TenantID, draft.ChatID,
 			draft.BusinessConnectionID, draft.SourceMessageID, draft.SourceMessageText,
 			draft.ResponseText, string(draft.TextFormat.Normalize()), valueOrDefault(draft.DraftType, "reply"),
 			pq.Array(nilToEmpty(draft.SuggestedOptions)), string(valueOrDefault(string(draft.Status), "pending")),
 			draft.OwnerChatID, draft.OwnerMessageID, draft.SentMessageID,
-			pq.Array(nilToEmpty(draft.ActionHistory)), traceArg, draft.CreatedAt,
+			pq.Array(nilToEmpty(draft.ActionHistory)), traceArg, nullableInt64(draft.RoleContextID), draft.CreatedAt,
 		)
 	}
 }
@@ -117,7 +117,7 @@ func (r *Repository) dbDraft(draftID string) (DraftRecord, bool) {
 		        COALESCE(text_format,'plain'), draft_type, suggested_options, status,
 		        COALESCE(owner_chat_id,''), COALESCE(owner_message_id,''),
 		        COALESCE(sent_message_id,''), action_history,
-		        COALESCE(trace_id,''), created_at, updated_at
+		        COALESCE(trace_id,''), COALESCE(role_context_id, 0), created_at, updated_at
 		   FROM drafts WHERE draft_id = $1`,
 		draftID,
 	).Scan(
@@ -126,7 +126,7 @@ func (r *Repository) dbDraft(draftID string) (DraftRecord, bool) {
 		&d.SourceMessageText, &d.ResponseText,
 		&textFormat, &draftType, &opts, &status,
 		&d.OwnerChatID, &d.OwnerMessageID,
-		&d.SentMessageID, &history, &d.TraceID, &d.CreatedAt, &d.UpdatedAt,
+		&d.SentMessageID, &history, &d.TraceID, &d.RoleContextID, &d.CreatedAt, &d.UpdatedAt,
 	)
 	if err != nil {
 		return DraftRecord{}, false

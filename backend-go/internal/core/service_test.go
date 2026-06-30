@@ -2343,14 +2343,14 @@ func TestEpisodeSummariesPerEpisodeIdempotency(t *testing.T) {
 	seed(morningStart, "am")
 	seed(eveningStart, "pm")
 
-	service.summarizeEpisode(ctx, "tenant-1", "42", morningStart, morningEnd, "message_count")
-	service.summarizeEpisode(ctx, "tenant-1", "42", eveningStart, eveningEnd, "silence_gap")
+	service.summarizeEpisode(ctx, "tenant-1", "42", morningStart, morningEnd, "message_count", 0)
+	service.summarizeEpisode(ctx, "tenant-1", "42", eveningStart, eveningEnd, "silence_gap", 0)
 	if got := len(repository.EpisodeSummaries("tenant-1", "42", 10)); got != 2 {
 		t.Fatalf("summaries after two episode closes = %d, want 2 (second episode of the day must not be lost)", got)
 	}
 
 	// Re-closing the same episode is idempotent (period overlap).
-	service.summarizeEpisode(ctx, "tenant-1", "42", morningStart, morningEnd, "message_count")
+	service.summarizeEpisode(ctx, "tenant-1", "42", morningStart, morningEnd, "message_count", 0)
 	if got := len(repository.EpisodeSummaries("tenant-1", "42", 10)); got != 2 {
 		t.Fatalf("duplicate episode close created a summary: %d", got)
 	}
@@ -2537,7 +2537,7 @@ func TestSaveTypedFactsAlwaysChatScoped(t *testing.T) {
 			ScopeKind: "owner_global", Confidence: 0.95},
 		{FactText: "любит краткие ответы", FactType: "preference", Subject: "contact",
 			Confidence: 0.8},
-	})
+	}, 0)
 
 	chat := repo.SemanticFacts(event.TenantID, event.ChatID, 10)
 	if len(chat) != 2 {
@@ -2566,13 +2566,58 @@ func TestSaveTypedFactsOutcomeSkipCounting(t *testing.T) {
 		{FactText: "хочу кофе по утрам", FactType: "preference", Subject: "contact", Confidence: 0.8},
 		{FactText: "tiny", FactType: "preference", Subject: "contact", Confidence: 0.8},          // too short → skip
 		{FactText: "[ФАКТ] context contamination leak", FactType: "preference", Confidence: 0.8}, // contaminated → skip
-	})
+	}, 0)
 
 	if outcome.Skipped != 2 {
 		t.Errorf("expected 2 skipped facts, got %d", outcome.Skipped)
 	}
 	if got := len(repo.SemanticFacts(event.TenantID, event.ChatID, 10)); got != 1 {
 		t.Errorf("expected 1 persisted fact, got %d", got)
+	}
+}
+
+func TestSaveTypedFactsUsesCapturedRoleContext(t *testing.T) {
+	const tenantID = "tenant:user:77"
+	const botID int64 = 555
+	chatID := contracts.BotChatID("555", "42")
+
+	repo := store.NewRepository()
+	repo.SaveUserBot(store.UserBotRecord{TenantID: tenantID, BotID: botID, BotUsername: "helper_bot", Token: "secret"})
+	ctxA, err := repo.SetUserBotRoleWithContextPolicy(tenantID, botID, 10, store.RoleContextPolicyReuse)
+	if err != nil {
+		t.Fatalf("activate role A: %v", err)
+	}
+	event := contracts.NormalizedTelegramEvent{
+		TenantID:        tenantID,
+		ChatID:          chatID,
+		SourceMessageID: "msg-a",
+		Transport:       contracts.TransportBot,
+		BotID:           "555",
+	}
+	svc := newTestService(repo, &fakeAI{}, &fakeSender{})
+	if got := svc.activeRoleContextIDForEvent(event); got != ctxA.ID {
+		t.Fatalf("active context before switch = %d, want %d", got, ctxA.ID)
+	}
+	ctxB, err := repo.SetUserBotRoleWithContextPolicy(tenantID, botID, 11, store.RoleContextPolicyReuse)
+	if err != nil {
+		t.Fatalf("activate role B: %v", err)
+	}
+	if got := svc.activeRoleContextIDForEvent(event); got != ctxB.ID {
+		t.Fatalf("active context after switch = %d, want %d", got, ctxB.ID)
+	}
+
+	outcome := svc.saveTypedFacts(event, []aiclient.TypedFact{{
+		FactText:   "пользователь любит зеленый чай",
+		FactType:   "preference",
+		Subject:    "contact",
+		Confidence: 0.8,
+	}}, ctxA.ID)
+	if len(outcome.CreatedIDs) != 1 {
+		t.Fatalf("created ids = %+v, want one fact", outcome.CreatedIDs)
+	}
+	facts := repo.SemanticFacts(tenantID, chatID, 10)
+	if len(facts) != 1 || facts[0].RoleContextID != ctxA.ID {
+		t.Fatalf("facts = %+v, want delayed write in captured context %d", facts, ctxA.ID)
 	}
 }
 

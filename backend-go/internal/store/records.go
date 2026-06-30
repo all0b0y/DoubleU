@@ -8,9 +8,10 @@ import (
 
 // MessageRecord stores operational state for a normalized message.
 type MessageRecord struct {
-	Event       contracts.NormalizedTelegramEvent
-	States      []contracts.MessageState
-	Quarantined bool // persist for audit; excluded from every memory surface when true
+	Event         contracts.NormalizedTelegramEvent
+	States        []contracts.MessageState
+	Quarantined   bool // persist for audit; excluded from every memory surface when true
+	RoleContextID int64
 }
 
 // DraftRecord stores an owner-facing draft.
@@ -38,6 +39,8 @@ type DraftRecord struct {
 	TraceID   string
 	CreatedAt time.Time
 	UpdatedAt time.Time
+
+	RoleContextID int64
 }
 
 // ScheduledJobRecord is one deferred owner/contact action created by AI or the owner.
@@ -78,6 +81,7 @@ type SemanticFactRecord struct {
 	SourceMessageID string
 	ExpiresAt       *time.Time
 	CreatedAt       time.Time
+	RoleContextID   int64
 }
 
 // ActiveEpisodeRecord stores the runtime state of an open conversation episode.
@@ -91,6 +95,7 @@ type ActiveEpisodeRecord struct {
 	CurrentTopic       string
 	OpenQuestionMsgID  string
 	PendingOwnerAction string
+	RoleContextID      int64
 }
 
 // EpisodeSummaryRecord stores a compressed summary of a closed episode.
@@ -109,6 +114,7 @@ type EpisodeSummaryRecord struct {
 	SourceMessageIDs []string
 	CreatedAt        time.Time
 	Embedding        []float64 // populated by the embedding worker; nil until then
+	RoleContextID    int64
 }
 
 // ExtractionLogRecord captures one async fact-extraction attempt for observability.
@@ -125,6 +131,7 @@ type ExtractionLogRecord struct {
 	FactsMerged     int
 	Error           string
 	DurationMS      int
+	RoleContextID   int64
 }
 
 // RoleContextPolicy is the explicit memory-context choice for a bot role swap.
