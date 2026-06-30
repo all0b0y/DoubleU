@@ -565,6 +565,24 @@ func (s *Service) memoryRoleContextForEvent(event contracts.NormalizedTelegramEv
 	return s.activeRoleContextIDForEvent(event), true
 }
 
+// recentMessagesForMemoryEvent keeps bot lifecycle reads inside the active role
+// memory context while preserving legacy broad reads for non-bot chats.
+func (s *Service) recentMessagesForMemoryEvent(event contracts.NormalizedTelegramEvent, limit int, roleContextID int64) []store.MessageRecord {
+	if _, roleScoped := s.memoryRoleContextForEvent(event); roleScoped {
+		return s.repository.RecentMessagesForRoleContext(event.TenantID, event.ChatID, limit, roleContextID)
+	}
+	return s.repository.RecentMessages(event.TenantID, event.ChatID, limit)
+}
+
+// activeEpisodeForMemoryEvent mirrors prompt-context isolation for bot lifecycle
+// reads and for the structured ActiveEpisode field sent beside MemoryContext.
+func (s *Service) activeEpisodeForMemoryEvent(event contracts.NormalizedTelegramEvent, roleContextID int64) (store.ActiveEpisodeRecord, bool) {
+	if _, roleScoped := s.memoryRoleContextForEvent(event); roleScoped {
+		return s.repository.ActiveEpisodeByChatForRoleContext(event.TenantID, event.ChatID, roleContextID)
+	}
+	return s.repository.ActiveEpisodeByChat(event.TenantID, event.ChatID)
+}
+
 // feedbackContext returns recent draft feedback for this chat to send to the AI.
 func (s *Service) feedbackContext(tenantID, chatID string, limit int) []contracts.FeedbackItem {
 	feedbacks := s.repository.RecentFeedback(tenantID, chatID, limit)

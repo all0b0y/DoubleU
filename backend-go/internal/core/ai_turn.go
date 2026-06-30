@@ -38,7 +38,7 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 	// but excluded from every memory surface (window-20, episode summaries, extraction).
 	quarantined := false
 	if !settings.PrivacyFlags.Contains(contracts.PrivacyNoMemory) {
-		recent := s.repository.RecentMessages(event.TenantID, event.ChatID, 5)
+		recent := s.recentMessagesForMemoryEvent(event, 5, roleContextID)
 		quarantined = classifyQuarantine(event.MessageText, recent)
 		s.repository.SaveMessageQuarantinedWithRoleContext(event, quarantined, roleContextID)
 		if quarantined {
@@ -85,7 +85,7 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 			MessageCount:  1,
 			RoleContextID: roleContextID,
 		}
-		if existing, ok := s.repository.ActiveEpisodeByChat(event.TenantID, event.ChatID); ok {
+		if existing, ok := s.activeEpisodeForMemoryEvent(event, roleContextID); ok {
 			ep.StartedAt = existing.StartedAt
 			ep.MessageCount = existing.MessageCount + 1
 			if ep.RoleContextID == 0 {
@@ -278,7 +278,7 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 		hotDelivery = s.deliverySettingsFromUser(event, nil)
 	}
 	// Runtime State Layer: current open episode data for AI awareness (§6.2).
-	if ep, ok := s.repository.ActiveEpisodeByChat(event.TenantID, event.ChatID); ok {
+	if ep, ok := s.activeEpisodeForMemoryEvent(event, roleContextID); ok {
 		ae := contracts.ActiveEpisode{
 			TenantID:           ep.TenantID,
 			ChatID:             ep.ChatID,

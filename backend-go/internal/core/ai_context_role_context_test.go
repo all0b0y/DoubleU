@@ -46,9 +46,20 @@ func TestConversationContextBotRoleContextIsolation(t *testing.T) {
 		t.Fatalf("activate role B: %v", err)
 	}
 	saveRoleContextMemory(t, repo, tenantID, chatID, "555", ctxB.ID, "role B", base.Add(time.Hour))
+	repo.UpsertActiveEpisode(store.ActiveEpisodeRecord{
+		TenantID:           tenantID,
+		ChatID:             chatID,
+		StartedAt:          base.Add(time.Hour),
+		LastMessageAt:      base.Add(time.Hour),
+		MessageCount:       1,
+		CurrentTopic:       "role B active topic",
+		OpenQuestionMsgID:  "role A-message",
+		PendingOwnerAction: "role B pending owner action",
+		RoleContextID:      ctxB.ID,
+	})
 
 	textB, recordsB := renderedConversationContext(t, svc, tenantID, chatID, "555", "current-b")
-	assertContainsAll(t, textB, "role B visible message", "role B visible fact", "role B pending draft")
+	assertContainsAll(t, textB, "role B visible message", "role B visible fact", "role B pending draft", "role B active topic", "role B pending owner action")
 	assertContainsNone(t, textB, "role A visible message", "role A visible fact", "role A pending draft", "role A taboo boundary")
 	if len(recordsB) != 1 || recordsB[0].RoleContextID != ctxB.ID {
 		t.Fatalf("role B records = %+v, want one record in context %d", recordsB, ctxB.ID)
@@ -79,6 +90,97 @@ func TestConversationContextBotRoleContextIsolation(t *testing.T) {
 	)
 	if len(recordsFreshA) != 0 {
 		t.Fatalf("fresh role A records = %+v, want empty context", recordsFreshA)
+	}
+}
+
+func TestMemoryEventReadsUseActiveRoleContext(t *testing.T) {
+	const tenantID = "tenant:user:77"
+	const botID int64 = 555
+	chatID := contracts.BotChatID("555", "42")
+	now := time.Date(2026, 6, 30, 12, 0, 0, 0, time.UTC)
+
+	repo := store.NewRepository()
+	repo.SaveUserBot(store.UserBotRecord{TenantID: tenantID, BotID: botID, BotUsername: "helper_bot", Token: "secret"})
+	repo.SaveChat(store.ChatRecord{TenantID: tenantID, ChatID: chatID, DisplayName: "Bot chat", Transport: contracts.TransportBot})
+	svc := newTestService(repo, &fakeAI{}, &fakeSender{})
+
+	ctxA, err := repo.SetUserBotRoleWithContextPolicy(tenantID, botID, 10, store.RoleContextPolicyReuse)
+	if err != nil {
+		t.Fatalf("activate role A: %v", err)
+	}
+	repo.SaveMessageWithRoleContext(contracts.NormalizedTelegramEvent{
+		EventID:         "role-a-message",
+		TenantID:        tenantID,
+		ChatID:          chatID,
+		SourceMessageID: "role-a-message",
+		SenderID:        "contact",
+		MessageText:     "role A lifecycle message",
+		MessageType:     "text",
+		CreatedAt:       now,
+		Transport:       contracts.TransportBot,
+		BotID:           "555",
+	}, ctxA.ID)
+	repo.UpsertActiveEpisode(store.ActiveEpisodeRecord{
+		TenantID:      tenantID,
+		ChatID:        chatID,
+		StartedAt:     now,
+		LastMessageAt: now,
+		MessageCount:  1,
+		CurrentTopic:  "role A active topic",
+		RoleContextID: ctxA.ID,
+	})
+	ctxB, err := repo.SetUserBotRoleWithContextPolicy(tenantID, botID, 11, store.RoleContextPolicyReuse)
+	if err != nil {
+		t.Fatalf("activate role B: %v", err)
+	}
+
+	event := contracts.NormalizedTelegramEvent{
+		EventID:         "current-b",
+		TenantID:        tenantID,
+		ChatID:          chatID,
+		SourceMessageID: "current-b",
+		SenderID:        "contact",
+		MessageText:     "current role B message",
+		MessageType:     "text",
+		CreatedAt:       now.Add(time.Minute),
+		Transport:       contracts.TransportBot,
+		BotID:           "555",
+	}
+	if recent := svc.recentMessagesForMemoryEvent(event, 5, ctxB.ID); len(recent) != 0 {
+		t.Fatalf("active role B lifecycle read saw stale messages from context %d: %+v", ctxA.ID, recent)
+	}
+	if ep, ok := svc.activeEpisodeForMemoryEvent(event, ctxB.ID); ok {
+		t.Fatalf("active role B AI event saw stale episode from context %d: %+v", ctxA.ID, ep)
+	}
+
+	repo.SaveMessageWithRoleContext(contracts.NormalizedTelegramEvent{
+		EventID:         "role-b-message",
+		TenantID:        tenantID,
+		ChatID:          chatID,
+		SourceMessageID: "role-b-message",
+		SenderID:        "contact",
+		MessageText:     "role B lifecycle message",
+		MessageType:     "text",
+		CreatedAt:       now.Add(2 * time.Minute),
+		Transport:       contracts.TransportBot,
+		BotID:           "555",
+	}, ctxB.ID)
+	repo.UpsertActiveEpisode(store.ActiveEpisodeRecord{
+		TenantID:      tenantID,
+		ChatID:        chatID,
+		StartedAt:     now.Add(2 * time.Minute),
+		LastMessageAt: now.Add(2 * time.Minute),
+		MessageCount:  1,
+		CurrentTopic:  "role B active topic",
+		RoleContextID: ctxB.ID,
+	})
+	recent := svc.recentMessagesForMemoryEvent(event, 5, ctxB.ID)
+	if len(recent) != 1 || recent[0].Event.MessageText != "role B lifecycle message" || recent[0].RoleContextID != ctxB.ID {
+		t.Fatalf("active role B lifecycle messages = %+v", recent)
+	}
+	ep, ok := svc.activeEpisodeForMemoryEvent(event, ctxB.ID)
+	if !ok || ep.CurrentTopic != "role B active topic" || ep.RoleContextID != ctxB.ID {
+		t.Fatalf("active role B episode = %+v, ok=%t", ep, ok)
 	}
 }
 

@@ -657,7 +657,7 @@ func (s *Service) processPassive(ctx context.Context, event contracts.Normalized
 		MessageCount:  1,
 		RoleContextID: roleContextID,
 	}
-	if existing, ok := s.repository.ActiveEpisodeByChat(event.TenantID, event.ChatID); ok {
+	if existing, ok := s.activeEpisodeForMemoryEvent(event, roleContextID); ok {
 		ep.StartedAt = existing.StartedAt
 		ep.MessageCount = existing.MessageCount + 1
 		if ep.RoleContextID == 0 {
