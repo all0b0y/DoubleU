@@ -66,6 +66,9 @@ type Repository struct {
 	// (user_bots table / tenants.ingestion_mode column in Postgres mode).
 	userBots    map[string]UserBotRecord
 	tenantModes map[string]contracts.IngestionMode
+	// roleContexts are reusable bot memory contexts keyed by bot and nullable role.
+	roleContexts   map[int64]RoleContextRecord
+	roleContextSeq int64
 	// New memory architecture fields
 	semanticFacts    []SemanticFactRecord
 	activeEpisodes   map[string]ActiveEpisodeRecord
@@ -145,6 +148,7 @@ func NewRepository() *Repository {
 		unclaimedChats:      make(map[string]UnclaimedChatRecord),
 		userBots:            make(map[string]UserBotRecord),
 		tenantModes:         make(map[string]contracts.IngestionMode),
+		roleContexts:        make(map[int64]RoleContextRecord),
 		pendingInputs:       make(map[string]contracts.PendingInput),
 		contactProfiles:     make(map[string]contracts.ContactProfile),
 		messageCounts:       make(map[string]int),

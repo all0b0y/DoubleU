@@ -28,6 +28,9 @@ type UserBotRecord struct {
 	// (migration 102); 0 means the default assistant persona. Managed via
 	// SetUserBotRole, not SaveUserBot, so re-register/offset writes preserve it.
 	AIRoleID int64
+	// ActiveRoleContextID points at the reusable memory context active for the
+	// current bot role. 0 means no role-scoped context has been activated yet.
+	ActiveRoleContextID int64
 	// Nil delivery toggles inherit role/owner defaults; non-nil values override them.
 	RichFormattingEnabled *bool
 	StreamingEnabled      *bool
@@ -55,6 +58,9 @@ func (r *Repository) SaveUserBot(record UserBotRecord) {
 	if existing, ok := r.userBots[key]; ok {
 		if record.AIRoleID == 0 {
 			record.AIRoleID = existing.AIRoleID
+		}
+		if record.ActiveRoleContextID == 0 {
+			record.ActiveRoleContextID = existing.ActiveRoleContextID
 		}
 		if record.RichFormattingEnabled == nil {
 			record.RichFormattingEnabled = cloneBoolPtr(existing.RichFormattingEnabled)
@@ -135,21 +141,23 @@ func (r *Repository) SetUserBotDeliverySettings(tenantID string, botID int64, ri
 func scanUserBot(sc rowScanner) (UserBotRecord, bool) {
 	var rec UserBotRecord
 	var roleID sql.NullInt64
+	var activeRoleContextID sql.NullInt64
 	var richFormatting sql.NullBool
 	var streaming sql.NullBool
 	if err := sc.Scan(
 		&rec.TenantID, &rec.BotID, &rec.BotUsername, &rec.Token, &rec.Status, &rec.LastUpdateOffset,
-		&roleID, &richFormatting, &streaming,
+		&roleID, &activeRoleContextID, &richFormatting, &streaming,
 	); err != nil {
 		return UserBotRecord{}, false
 	}
 	rec.AIRoleID = roleID.Int64
+	rec.ActiveRoleContextID = activeRoleContextID.Int64
 	rec.RichFormattingEnabled = boolPtrFromNull(richFormatting)
 	rec.StreamingEnabled = boolPtrFromNull(streaming)
 	return rec, true
 }
 
-const userBotColumns = `tenant_id, bot_id, bot_username, token, status, last_update_offset, COALESCE(ai_role_id, 0), rich_formatting_enabled, streaming_enabled`
+const userBotColumns = `tenant_id, bot_id, bot_username, token, status, last_update_offset, COALESCE(ai_role_id, 0), COALESCE(active_role_context_id, 0), rich_formatting_enabled, streaming_enabled`
 
 // UserBotByID returns one specific bot of the tenant.
 func (r *Repository) UserBotByID(tenantID string, botID int64) (UserBotRecord, bool) {

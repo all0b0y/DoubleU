@@ -127,6 +127,31 @@ type ExtractionLogRecord struct {
 	DurationMS      int
 }
 
+// RoleContextPolicy is the explicit memory-context choice for a bot role swap.
+type RoleContextPolicy string
+
+const (
+	RoleContextPolicyReuse RoleContextPolicy = "reuse_role_context"
+	RoleContextPolicyNew   RoleContextPolicy = "new_role_context"
+)
+
+// Valid reports whether the policy is one of the public contract values.
+func (p RoleContextPolicy) Valid() bool {
+	return p == RoleContextPolicyReuse || p == RoleContextPolicyNew
+}
+
+// RoleContextRecord identifies a reusable memory context for one bot role.
+// AIRoleID is nil for the no-role/default-assistant context.
+type RoleContextRecord struct {
+	ID              int64
+	TenantID        string
+	BotID           int64
+	AIRoleID        *int64
+	CreatedAt       time.Time
+	LastActivatedAt time.Time
+	ArchivedAt      *time.Time
+}
+
 // SendRecord stores an outbound send idempotency record.
 type SendRecord struct {
 	Key             string
