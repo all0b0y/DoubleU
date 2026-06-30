@@ -54,11 +54,7 @@ func (s *Service) HandleApprovalCallback(ctx context.Context, payload contracts.
 		}
 		s.repository.AppendState(draft.TenantID, draft.ChatID, draft.SourceMessageID, contracts.StateApprovedByOwner)
 		approvalEvent := s.resolveSourceEvent(draft)
-		markup := telegram.ReplyMarkup(nil)
-		if s.contactInteractionEnabled(approvalEvent) && len(draft.SuggestedOptions) >= 2 {
-			markup = contactOptionsKeyboard(draft.DraftID, draft.SuggestedOptions)
-		}
-		sentMsgID, err := s.sendRecipientWithMarkup(ctx, approvalEvent, draft.DecisionID, draft.ResponseText, draft.TextFormat, false, s.deliverySettingsFor(approvalEvent), markup)
+		sentMsgID, err := s.sendRecipientWithMarkup(ctx, approvalEvent, draft.DecisionID, draft.ResponseText, draft.TextFormat, false, s.deliverySettingsFor(approvalEvent), nil)
 		if err != nil {
 			s.repository.AppendState(draft.TenantID, draft.ChatID, draft.SourceMessageID, contracts.StateFailed)
 			return ApprovalResult{}, err
@@ -346,9 +342,9 @@ func (s *Service) handleCallbackQuery(ctx context.Context, cbq telegram.Callback
 		return InboundResult{Event: event, Decision: contracts.DecisionIgnore, Reason: "duplicate_callback_query", Duplicate: true}
 	}
 
-	if optionIdx, draftID, idempotencyKey, buttonOK := contracts.CallbackDataDecodeAIButton(cbq.Data); buttonOK {
+	if formID, questionIdx, optionIdx, freeText, idempotencyKey, qformOK := contracts.CallbackDataDecodeQForm(cbq.Data); qformOK {
 		_ = callbackSender.AnswerCallbackQuery(ctx, cbq.QueryID)
-		return s.handleAIButton(ctx, cbq, callbackSender, optionIdx, draftID, idempotencyKey)
+		return s.handleQFormCallback(ctx, cbq, callbackSender, formID, questionIdx, optionIdx, freeText, idempotencyKey)
 	}
 
 	// Handle question-card option selection (format "co:N:bareID") before the regular decode.
@@ -497,62 +493,4 @@ func (s *Service) handleCallbackQuery(ctx context.Context, cbq telegram.Callback
 
 	s.logger.Info("callback query handled", "action", result.Action, "draft_id", result.DraftID, "status", result.Status)
 	return InboundResult{Event: event, Decision: contracts.DecisionObserve, Reason: "callback_" + string(result.Action), DraftID: result.DraftID}
-}
-
-func (s *Service) handleAIButton(ctx context.Context, cbq telegram.CallbackQueryUpdate, callbackSender telegram.Sender, optionIdx int, draftID, idempotencyKey string) InboundResult {
-	event := contracts.NormalizedTelegramEvent{
-		EventID:          fmt.Sprintf("%d:callback_query:%s", cbq.UpdateID, cbq.QueryID),
-		TenantID:         cbq.TenantID,
-		ChatID:           contracts.BotChatID(cbq.BotID, cbq.ChatID),
-		TelegramUpdateID: cbq.UpdateID,
-		SourceMessageID:  cbq.QueryID,
-		SenderID:         cbq.SenderID,
-		MessageType:      "callback_query",
-		CreatedAt:        s.now(),
-		Transport:        contracts.TransportBot,
-		BotID:            cbq.BotID,
-	}
-	if cbq.Transport != contracts.TransportBot || cbq.TenantID == "" || cbq.BotID == "" {
-		return InboundResult{Event: event, Decision: contracts.DecisionIgnore, Reason: "aibtn_not_bot_transport"}
-	}
-	if s.repository.MarkCallback(idempotencyKey) {
-		return InboundResult{Event: event, Decision: contracts.DecisionIgnore, Reason: "duplicate_aibtn_callback", Duplicate: true}
-	}
-	draft, ok := s.repository.Draft(draftID)
-	if !ok || draft.DraftType == "question" || draft.TenantID != cbq.TenantID {
-		return InboundResult{Event: event, Decision: contracts.DecisionIgnore, Reason: "aibtn_draft_not_found"}
-	}
-	if draft.ChatID != event.ChatID || contracts.RawChatID(draft.ChatID) != cbq.ChatID {
-		return InboundResult{Event: event, Decision: contracts.DecisionIgnore, Reason: "aibtn_chat_mismatch"}
-	}
-	sourceEvent := s.resolveSourceEvent(draft)
-	if !s.contactInteractionEnabled(sourceEvent) {
-		return InboundResult{Event: event, Decision: contracts.DecisionIgnore, Reason: "aibtn_tool_disabled"}
-	}
-	if optionIdx < 0 || optionIdx >= len(draft.SuggestedOptions) {
-		return InboundResult{Event: event, Decision: contracts.DecisionIgnore, Reason: "aibtn_option_out_of_range"}
-	}
-	option := draft.SuggestedOptions[optionIdx]
-	event.MessageText = option
-	if cbq.OriginalMsgID != "" {
-		selectedText := draft.ResponseText + "\n\n✓ Выбрано: " + option
-		if err := callbackSender.EditMessageText(ctx, cbq.ChatID, cbq.OriginalMsgID, selectedText, telegram.InlineKeyboardMarkup{}); err != nil {
-			s.logger.Warn("contact interaction message edit failed",
-				"tenant_id", cbq.TenantID, "draft_id", draftID, "error", err)
-		}
-	}
-	s.logger.Info("contact interaction option selected",
-		"tenant_id", cbq.TenantID, "chat_id", event.ChatID,
-		"draft_id", draftID, "option_idx", optionIdx)
-	ownerID := strings.TrimPrefix(cbq.TenantID, "tenant:user:")
-	if ownerID == cbq.TenantID {
-		ownerID = ""
-	}
-	result, err := s.processContactMessage(ctx, event, ownerID, "")
-	if err != nil {
-		s.logger.Error("contact interaction follow-up failed",
-			"tenant_id", cbq.TenantID, "draft_id", draftID, "error", err)
-		return InboundResult{Event: event, Decision: contracts.DecisionErrorFallback, Reason: "aibtn_process_error"}
-	}
-	return result
 }

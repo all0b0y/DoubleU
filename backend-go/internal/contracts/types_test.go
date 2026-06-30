@@ -52,7 +52,7 @@ func TestAIRoleModelNameJSONRoundTrip(t *testing.T) {
 		ModelTier: "smart",
 		ModelName: "deepseek/model-b",
 		ToolSettings: map[string]bool{
-			"interaction.present_buttons": true,
+			"interaction.ask_questions": true,
 		},
 	}
 	raw, err := json.Marshal(want)
@@ -68,25 +68,32 @@ func TestAIRoleModelNameJSONRoundTrip(t *testing.T) {
 	}
 }
 
-func TestAIButtonCallbackDataRoundTrip(t *testing.T) {
-	draftID := "draft:9002:bot:555:8"
-	data := CallbackDataEncodeAIButton(draftID, 1)
-	option, decodedDraft, idem, ok := CallbackDataDecodeAIButton(data)
-	if !ok || option != 1 || decodedDraft != draftID || idem == "" {
-		t.Fatalf("decode %q = option=%d draft=%q idem=%q ok=%v", data, option, decodedDraft, idem, ok)
+func TestQFormCallbackDataRoundTrip(t *testing.T) {
+	data := CallbackDataEncodeQForm(9002, 2, 1)
+	formID, qIdx, optIdx, freeText, idem, ok := CallbackDataDecodeQForm(data)
+	if !ok || formID != 9002 || qIdx != 2 || optIdx != 1 || freeText || idem == "" {
+		t.Fatalf("decode %q = form=%d q=%d opt=%d free=%v idem=%q ok=%v", data, formID, qIdx, optIdx, freeText, idem, ok)
 	}
 	if len(data) > 64 {
 		t.Fatalf("callback_data exceeds Telegram limit: %d", len(data))
 	}
-	if _, _, _, ok := CallbackDataDecodeAIButton(data + "tampered"); ok {
-		t.Fatal("tampered callback data accepted")
+	freeData := CallbackDataEncodeQFormFreeText(9002, 2)
+	formID, qIdx, optIdx, freeText, idem, ok = CallbackDataDecodeQForm(freeData)
+	if !ok || formID != 9002 || qIdx != 2 || optIdx != -1 || !freeText || idem == "" {
+		t.Fatalf("decode free %q = form=%d q=%d opt=%d free=%v ok=%v", freeData, formID, qIdx, optIdx, freeText, ok)
+	}
+	if _, _, _, _, _, ok := CallbackDataDecodeQForm("qf:abc:1:2"); ok {
+		t.Fatal("malformed callback data accepted")
 	}
 }
 
 func TestAIProcessMessageResponsePlanJSONRoundTrip(t *testing.T) {
 	want := AIProcessMessageResponse{
-		Decision: DecisionDraft, ResponseText: "Выберите время",
-		ResponsePlan: &ResponsePlan{Shape: "buttons", Options: []string{"Сегодня", "Завтра"}},
+		Decision: DecisionDraft, ResponseText: "Уточню детали",
+		ResponsePlan: &ResponsePlan{Shape: "questions", Questions: []Question{
+			{Prompt: "Когда удобно?", Options: []string{"Сегодня", "Завтра"}},
+			{Prompt: "Какой бюджет?"},
+		}},
 	}
 	raw, err := json.Marshal(want)
 	if err != nil {
@@ -96,8 +103,11 @@ func TestAIProcessMessageResponsePlanJSONRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(raw, &got); err != nil {
 		t.Fatalf("unmarshal response plan: %v", err)
 	}
-	if got.ResponsePlan == nil || got.ResponsePlan.Shape != "buttons" || len(got.ResponsePlan.Options) != 2 {
+	if got.ResponsePlan == nil || got.ResponsePlan.Shape != "questions" || len(got.ResponsePlan.Questions) != 2 {
 		t.Fatalf("response plan round-trip = %+v", got.ResponsePlan)
+	}
+	if got.ResponsePlan.Questions[0].Prompt != "Когда удобно?" || len(got.ResponsePlan.Questions[0].Options) != 2 {
+		t.Fatalf("question 0 round-trip = %+v", got.ResponsePlan.Questions[0])
 	}
 }
 

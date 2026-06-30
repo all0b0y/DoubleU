@@ -8,7 +8,6 @@ import (
 	"doubleu/backend-go/internal/aiclient"
 	"doubleu/backend-go/internal/contracts"
 	"doubleu/backend-go/internal/store"
-	"doubleu/backend-go/internal/telegram"
 	tracepkg "doubleu/backend-go/internal/trace"
 )
 
@@ -143,6 +142,21 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 			"sender_id", event.SenderID,
 		)
 		return InboundResult{Event: event, Decision: contracts.DecisionObserve, Reason: "owner_message_observed"}, nil
+	}
+
+	if form, ok := s.repository.ActiveInteractionForm(event.TenantID, event.ChatID); ok {
+		nextEvent, formResult, err := s.handleInteractionFormTextAnswer(ctx, event, ownerID, form)
+		if err != nil {
+			s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateFailed)
+			s.repository.AppendAudit(s.auditEvent(event, contracts.DecisionErrorFallback, "form_answer_error:"+err.Error()))
+			s.logger.Error("interaction form answer failed", "tenant_id", event.TenantID, "chat_id", event.ChatID, "form_id", form.ID, "error", err)
+			return InboundResult{Event: event, Decision: contracts.DecisionErrorFallback, Reason: "form_answer_error"}, nil
+		}
+		if formResult != nil {
+			s.repository.AppendAudit(s.auditEvent(event, formResult.Decision, formResult.Reason))
+			return *formResult, nil
+		}
+		event = nextEvent
 	}
 
 	// Per chat+sender rate limit: owner messages are already handled above (returned early).
@@ -290,7 +304,7 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 		s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateFailed)
 		s.repository.AppendAudit(s.auditEvent(event, contracts.DecisionErrorFallback, "ai_process_error:"+err.Error()))
 		s.logger.Error("ai analysis failed", "tenant_id", event.TenantID, "chat_id", event.ChatID, "error", err)
-		s.notifyAIError(event)
+		s.notifyAIError(ctx, event)
 		return InboundResult{Event: event, Decision: contracts.DecisionErrorFallback, Reason: "ai_process_error"}, nil
 	}
 	s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateAIGenerated)
@@ -299,7 +313,7 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 		s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateFailed)
 		s.repository.AppendAudit(s.auditEvent(event, contracts.DecisionErrorFallback, "scheduled_job_persist_error:"+err.Error()))
 		s.logger.Error("scheduled job persistence failed", "tenant_id", event.TenantID, "chat_id", event.ChatID, "error", err)
-		s.notifyAIError(event)
+		s.notifyAIError(ctx, event)
 		return InboundResult{Event: event, Decision: contracts.DecisionErrorFallback, Reason: "scheduled_job_persist_error"}, nil
 	}
 	// Persist fast (regex) facts returned by process-message synchronously.
@@ -332,132 +346,126 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 		s.updateEpisodeRuntime(event, proposal, decision)
 	}
 	result := InboundResult{Event: event, Decision: decision, Reason: reason}
-	interactionOptions, contactInteraction := s.contactInteractionOptions(event, proposal)
-	switch decision {
-	case contracts.DecisionAutoReply:
-		decisionID := event.EventID
-		var interactionDraft store.DraftRecord
-		if contactInteraction {
-			interactionDraft = s.createDraft(event, decisionID, proposal.ResponseText, proposal.TextFormat)
-			interactionDraft.DraftID = interactionDraftID(decisionID)
-			interactionDraft.SuggestedOptions = interactionOptions
-			s.repository.SaveDraft(interactionDraft)
-			result.DraftID = interactionDraft.DraftID
-		}
-		markup := telegram.ReplyMarkup(nil)
-		if contactInteraction {
-			markup = contactOptionsKeyboard(interactionDraft.DraftID, interactionOptions)
-		}
-		allowStreaming := proposal.Intent != "choice_question"
-		sentMsgID, err := s.sendRecipientWithMarkup(ctx, event, decisionID, proposal.ResponseText, proposal.TextFormat, allowStreaming, hotDelivery, markup)
-		if err != nil {
+	interactionQuestions, contactInteraction := s.contactInteractionQuestions(event, proposal)
+	if contactInteraction {
+		if _, err := s.startInteractionForm(ctx, event, ownerID, proposal, interactionQuestions, hotDelivery); err != nil {
 			s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateFailed)
-			s.repository.AppendAudit(s.auditEvent(event, contracts.DecisionErrorFallback, "send_error:"+err.Error()))
-			s.logger.Error("telegram send failed", "tenant_id", event.TenantID, "chat_id", event.ChatID, "error", err)
-			return InboundResult{Event: event, Decision: contracts.DecisionErrorFallback, Reason: "send_error"}, nil
+			s.repository.AppendAudit(s.auditEvent(event, contracts.DecisionErrorFallback, "form_start_error:"+err.Error()))
+			s.logger.Error("interaction form start failed", "tenant_id", event.TenantID, "chat_id", event.ChatID, "error", err)
+			return InboundResult{Event: event, Decision: contracts.DecisionErrorFallback, Reason: "form_start_error"}, nil
 		}
+		result.Decision = contracts.DecisionAutoReply
+		result.Reason = "form_started"
 		s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateSentToRecipient)
-		s.logger.Info("telegram auto reply sent", "tenant_id", event.TenantID, "chat_id", event.ChatID, "source_message_id", event.SourceMessageID)
-		s.saveOutgoingMessage(event, ownerID, sentMsgID, proposal.ResponseText, event.EventID, proposal.TextFormat)
-		if contactInteraction {
-			interactionDraft.Status = store.DraftSent
-			interactionDraft.SentMessageID = sentMsgID
-			interactionDraft.UpdatedAt = s.now()
-			s.repository.UpdateDraft(interactionDraft)
-		}
-		// A reply went out on the owner's behalf: nothing is awaited from the owner.
 		s.repository.ClearEpisodeRuntimeState(event.TenantID, event.ChatID)
 		if s.notify != nil {
 			s.notify(event.TenantID, "new_message", map[string]any{"chat_id": event.ChatID})
 		}
-	case contracts.DecisionDraft, contracts.DecisionAskOwner:
-		// Critical-risk warning (ARCH-1): the note is owner-facing only. The draft
-		// row carries an empty ResponseText and DraftType="warning" so no approval
-		// path can ever deliver the service text to the contact.
-		if ownerNote := s.ownerNoteFor(proposal); decision == contracts.DecisionAskOwner && ownerNote != "" {
-			draft := s.createDraft(event, event.EventID, "", contracts.TextFormatPlain)
-			draft.DraftType = "warning"
-			s.repository.SaveDraft(draft)
-			s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateDraftSentToOwner)
-			s.logger.Info("warning card prepared", "tenant_id", event.TenantID, "chat_id", event.ChatID, "draft_id", draft.DraftID)
-			result.DraftID = draft.DraftID
+	} else {
+		switch decision {
+		case contracts.DecisionAutoReply:
+			decisionID := event.EventID
+			allowStreaming := proposal.Intent != "choice_question"
+			sentMsgID, err := s.sendRecipientWithMarkup(ctx, event, decisionID, proposal.ResponseText, proposal.TextFormat, allowStreaming, hotDelivery, nil)
+			if err != nil {
+				s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateFailed)
+				s.repository.AppendAudit(s.auditEvent(event, contracts.DecisionErrorFallback, "send_error:"+err.Error()))
+				s.logger.Error("telegram send failed", "tenant_id", event.TenantID, "chat_id", event.ChatID, "error", err)
+				return InboundResult{Event: event, Decision: contracts.DecisionErrorFallback, Reason: "send_error"}, nil
+			}
+			s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateSentToRecipient)
+			s.logger.Info("telegram auto reply sent", "tenant_id", event.TenantID, "chat_id", event.ChatID, "source_message_id", event.SourceMessageID)
+			s.saveOutgoingMessage(event, ownerID, sentMsgID, proposal.ResponseText, event.EventID, proposal.TextFormat)
+			// A reply went out on the owner's behalf: nothing is awaited from the owner.
+			s.repository.ClearEpisodeRuntimeState(event.TenantID, event.ChatID)
 			if s.notify != nil {
-				s.notify(draft.TenantID, "new_draft", map[string]any{
-					"chat_id":     draft.ChatID,
-					"draft_id":    draft.DraftID,
-					"draft_type":  draft.DraftType,
-					"owner_note":  ownerNote,
-					"source_text": draft.SourceMessageText,
-					"created_at":  draft.CreatedAt.UTC().Format("2006-01-02T15:04:05Z"),
-				})
-			} else {
-				s.sendWarningToOwner(ctx, event, draft, ownerNote)
+				s.notify(event.TenantID, "new_message", map[string]any{"chat_id": event.ChatID})
 			}
-			break
-		}
-		// When the AI flags the incoming message as a choice question, replace the normal
-		// draft flow with an interactive question card that lets the owner pick an option.
-		if proposal.Intent == "choice_question" && proposal.ResponsePlan == nil {
-			// Structured output carries options directly (ARCH-4); the line-split
-			// of ResponseText remains as a legacy fallback.
-			options := proposal.Options
-			if len(options) == 0 {
-				options = parseOptions(proposal.ResponseText)
-			}
-			if len(options) > 0 {
+		case contracts.DecisionDraft, contracts.DecisionAskOwner:
+			// Critical-risk warning (ARCH-1): the note is owner-facing only. The draft
+			// row carries an empty ResponseText and DraftType="warning" so no approval
+			// path can ever deliver the service text to the contact.
+			if ownerNote := s.ownerNoteFor(proposal); decision == contracts.DecisionAskOwner && ownerNote != "" {
 				draft := s.createDraft(event, event.EventID, "", contracts.TextFormatPlain)
-				draft.DraftType = "question"
-				draft.SuggestedOptions = options
+				draft.DraftType = "warning"
 				s.repository.SaveDraft(draft)
 				s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateDraftSentToOwner)
-				s.logger.Info("question card prepared", "tenant_id", event.TenantID, "chat_id", event.ChatID, "draft_id", draft.DraftID, "options_count", len(options))
+				s.logger.Info("warning card prepared", "tenant_id", event.TenantID, "chat_id", event.ChatID, "draft_id", draft.DraftID)
 				result.DraftID = draft.DraftID
 				if s.notify != nil {
 					s.notify(draft.TenantID, "new_draft", map[string]any{
 						"chat_id":     draft.ChatID,
 						"draft_id":    draft.DraftID,
 						"draft_type":  draft.DraftType,
-						"options":     draft.SuggestedOptions,
+						"owner_note":  ownerNote,
 						"source_text": draft.SourceMessageText,
 						"created_at":  draft.CreatedAt.UTC().Format("2006-01-02T15:04:05Z"),
 					})
 				} else {
-					s.sendQuestionToOwner(ctx, event, draft, ownerID)
+					s.sendWarningToOwner(ctx, event, draft, ownerNote)
 				}
 				break
 			}
+			// When the AI flags the incoming message as a choice question, replace the normal
+			// draft flow with an interactive question card that lets the owner pick an option.
+			if proposal.Intent == "choice_question" && proposal.ResponsePlan == nil {
+				// Structured output carries options directly (ARCH-4); the line-split
+				// of ResponseText remains as a legacy fallback.
+				options := proposal.Options
+				if len(options) == 0 {
+					options = parseOptions(proposal.ResponseText)
+				}
+				if len(options) > 0 {
+					draft := s.createDraft(event, event.EventID, "", contracts.TextFormatPlain)
+					draft.DraftType = "question"
+					draft.SuggestedOptions = options
+					s.repository.SaveDraft(draft)
+					s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateDraftSentToOwner)
+					s.logger.Info("question card prepared", "tenant_id", event.TenantID, "chat_id", event.ChatID, "draft_id", draft.DraftID, "options_count", len(options))
+					result.DraftID = draft.DraftID
+					if s.notify != nil {
+						s.notify(draft.TenantID, "new_draft", map[string]any{
+							"chat_id":     draft.ChatID,
+							"draft_id":    draft.DraftID,
+							"draft_type":  draft.DraftType,
+							"options":     draft.SuggestedOptions,
+							"source_text": draft.SourceMessageText,
+							"created_at":  draft.CreatedAt.UTC().Format("2006-01-02T15:04:05Z"),
+						})
+					} else {
+						s.sendQuestionToOwner(ctx, event, draft, ownerID)
+					}
+					break
+				}
+			}
+			draft := s.createDraft(event, event.EventID, proposal.ResponseText, proposal.TextFormat)
+			if proposal.Flagged {
+				draft.ActionHistory = append(draft.ActionHistory, "flagged")
+			}
+			s.repository.SaveDraft(draft)
+			s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateDraftSentToOwner)
+			s.logger.Info("owner draft prepared", "tenant_id", event.TenantID, "chat_id", event.ChatID, "draft_id", draft.DraftID, "decision", decision, "flagged", proposal.Flagged)
+			result.DraftID = draft.DraftID
+			if s.notify != nil {
+				s.notify(draft.TenantID, "new_draft", map[string]any{
+					"chat_id":       draft.ChatID,
+					"draft_id":      draft.DraftID,
+					"response_text": draft.ResponseText,
+					"source_text":   draft.SourceMessageText,
+					"created_at":    draft.CreatedAt.UTC().Format("2006-01-02T15:04:05Z"),
+				})
+			} else {
+				s.sendDraftToOwner(ctx, event, draft, ownerID)
+			}
+		case contracts.DecisionIgnore:
+			s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateIgnored)
+		case contracts.DecisionErrorFallback:
+			s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateFailed)
+			// The AI produced no usable reply (transient model failure). Tell the
+			// owner so the thinking indicator resolves into a retry notice instead of
+			// silently vanishing, which reads as the bot being dead.
+			s.notifyAIError(ctx, event)
 		}
-		draft := s.createDraft(event, event.EventID, proposal.ResponseText, proposal.TextFormat)
-		if contactInteraction {
-			draft.DraftID = interactionDraftID(event.EventID)
-			draft.SuggestedOptions = interactionOptions
-		}
-		if proposal.Flagged {
-			draft.ActionHistory = append(draft.ActionHistory, "flagged")
-		}
-		s.repository.SaveDraft(draft)
-		s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateDraftSentToOwner)
-		s.logger.Info("owner draft prepared", "tenant_id", event.TenantID, "chat_id", event.ChatID, "draft_id", draft.DraftID, "decision", decision, "flagged", proposal.Flagged)
-		result.DraftID = draft.DraftID
-		if s.notify != nil {
-			s.notify(draft.TenantID, "new_draft", map[string]any{
-				"chat_id":       draft.ChatID,
-				"draft_id":      draft.DraftID,
-				"response_text": draft.ResponseText,
-				"source_text":   draft.SourceMessageText,
-				"created_at":    draft.CreatedAt.UTC().Format("2006-01-02T15:04:05Z"),
-			})
-		} else {
-			s.sendDraftToOwner(ctx, event, draft, ownerID)
-		}
-	case contracts.DecisionIgnore:
-		s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateIgnored)
-	case contracts.DecisionErrorFallback:
-		s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateFailed)
-		// The AI produced no usable reply (transient model failure). Tell the
-		// owner so the thinking indicator resolves into a retry notice instead of
-		// silently vanishing, which reads as the bot being dead.
-		s.notifyAIError(event)
 	}
 	s.repository.AppendAudit(s.auditEvent(event, decision, reason))
 

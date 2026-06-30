@@ -8,7 +8,7 @@
 | [`architecture/`](architecture/) | Архитектура системы (memory, AI/backend) + под-беклоги ARCH-*/MEM-* (реализованы, хранятся как контекст решений). [`diagrams/`](architecture/diagrams/) — UML component/sequence + data-flow диаграммы (Mermaid), сверены с кодом. |
 | [`plans/`](plans/) | Планы реализации фич — частью выполнены, частью открыты; каждый план — самодостаточный промпт-набор для агента-исполнителя. |
 | [`runbooks/`](runbooks/) | Операционные процедуры (LiteLLM cutover, настройка Telegram-бота). |
-| [`reference/`](reference/) | Вендоренная внешняя документация (Telegram Bot API rich messages). |
+| [`reference/`](reference/) | Справочники: [`tools.md`](reference/tools.md) — все встроенные AI-инструменты (назначение, контракт Go↔Python, privacy/идемпотентность); вендоренный Telegram Bot API rich messages. |
 | [`product/`](product/) | Продуктовые UX-флоу. |
 | [`process/`](process/) | Правила взаимодействия нескольких агентов в репозитории. |
 | [`reports/`](reports/) | Точечные отчёты (QA/security аудит). |

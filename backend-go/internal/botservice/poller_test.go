@@ -202,7 +202,7 @@ func TestPollerDeliversUpdatesAndAdvancesOffset(t *testing.T) {
 }
 
 func TestPollerDeliversCallbackWithBotScope(t *testing.T) {
-	data := contracts.CallbackDataEncodeAIButton("draft:9600:bot:555:21", 1)
+	data := contracts.CallbackDataEncodeQForm(9600, 0, 1)
 	api := &fakeTelegram{updateBatches: [][]json.RawMessage{{
 		rawCallbackUpdate(t, 150, 42, 100, "query-1", data),
 	}}}

@@ -196,13 +196,15 @@ func TestInteractionButtonsNeverSendOnBusinessTransport(t *testing.T) {
 	})
 	role := repository.SaveAIRole(store.AIRoleRecord{
 		TenantID: "tenant-1", Name: "Interactive",
-		ToolSettings: map[string]bool{"interaction.present_buttons": true},
+		ToolSettings: map[string]bool{"interaction.ask_questions": true},
 	})
 	repository.AssignAIRoleToChat("tenant-1", "42", role.ID)
 	ai := &fakeAI{response: contracts.AIProcessMessageResponse{
 		Decision: contracts.DecisionAutoReply, ResponseText: "Выберите вариант",
 		Confidence: 0.99, RiskLevel: contracts.RiskLow, Intent: "choice_question",
-		ResponsePlan: &contracts.ResponsePlan{Shape: "buttons", Options: []string{"Один", "Два"}},
+		ResponsePlan: &contracts.ResponsePlan{Shape: "questions", Questions: []contracts.Question{
+			{Prompt: "Выберите вариант", Options: []string{"Один", "Два"}},
+		}},
 	}}
 	sender := &fakeSender{}
 	service := newTestService(repository, ai, sender)
@@ -379,6 +381,8 @@ func TestHandleBotMessageRichStreamingSendsDraftsThenFinal(t *testing.T) {
 	if result.Decision != contracts.DecisionAutoReply {
 		t.Fatalf("decision = %s", result.Decision)
 	}
+	// 3 drafts: the early "Thinking…" placeholder (shown before the AI call), then
+	// the streaming preview's thinking + final frames. All share one draft id.
 	last := len(botSender.richDrafts) - 1
 	if botSender.richCalls != 1 || len(botSender.richDrafts) != 3 || botSender.calls != 0 {
 		t.Fatalf("rich calls=%d rich drafts=%d plain calls=%d", botSender.richCalls, len(botSender.richDrafts), botSender.calls)
@@ -415,6 +419,306 @@ func TestHandleBotMessageRichStreamingSendsDraftsThenFinal(t *testing.T) {
 	}
 }
 
+func TestHandleBotMessageChoiceQuestionRendersRichWithoutStreaming(t *testing.T) {
+	repository := store.NewRepository()
+	repository.SaveChatSettings(contracts.ChatSettings{TenantID: "tenant:user:77", ChatID: contracts.BotChatID("555", "42"), Mode: contracts.ChatModeAuto})
+	repository.SaveUserSettings(contracts.UserSettings{
+		TenantID:               "tenant:user:77",
+		RichFormattingEnabled:  true,
+		StreamingEnabled:       true,
+		DefaultModeForNewChats: "manual",
+		LearningEnabled:        true,
+		LanguageForDrafts:      "auto",
+	})
+	// A quiz question: rich markdown, choice_question intent, streaming enabled.
+	ai := &fakeAI{response: contracts.AIProcessMessageResponse{
+		Decision:     contracts.DecisionAutoReply,
+		ResponseText: "**Вопрос №1:**\n\n1. A\n2. B",
+		TextFormat:   contracts.TextFormatRich,
+		Intent:       "choice_question",
+		Confidence:   0.99,
+		RiskLevel:    contracts.RiskLow,
+	}}
+	controlSender := &fakeSender{}
+	botSender := &fakeSender{}
+	service := NewService(repository, ai, controlSender,
+		WithClock(func() time.Time { return time.Unix(1700000000, 0).UTC() }),
+		WithDefaultIngestionMode(contracts.IngestionModeFull),
+		WithBotSenderProvider(&fakeBotSenders{sender: botSender}),
+	)
+
+	result, err := service.HandleBotMessage(context.Background(), botEvent(t, 1014, 42, 7, "quiz"))
+	if err != nil {
+		t.Fatalf("bot message: %v", err)
+	}
+	if result.Decision != contracts.DecisionAutoReply {
+		t.Fatalf("decision = %s", result.Decision)
+	}
+	// Renders rich as ONE complete message — no token-by-token streaming preview
+	// of the answer. The single draft is the early "Thinking…" placeholder shown
+	// during the AI wait, not a streamed answer frame.
+	if botSender.richCalls != 1 || len(botSender.richDrafts) != 1 {
+		t.Fatalf("choice_question must render rich without answer streaming: rich calls=%d drafts=%d", botSender.richCalls, len(botSender.richDrafts))
+	}
+	if botSender.richDrafts[0].markdown != richStreamingThinkingMarkdown {
+		t.Fatalf("the only draft must be the thinking placeholder, got %q", botSender.richDrafts[0].markdown)
+	}
+}
+
+func TestQuestionnaireDeliversResponseTextBeforeForm(t *testing.T) {
+	repository := store.NewRepository()
+	role := repository.SaveAIRole(store.AIRoleRecord{
+		TenantID:     "tenant:user:77",
+		Name:         "Tutor",
+		ToolSettings: map[string]bool{"interaction.ask_questions": true},
+	})
+	repository.SaveUserBot(store.UserBotRecord{
+		TenantID: "tenant:user:77", BotID: 555, Status: "active", AIRoleID: role.ID,
+	})
+	// The writer puts the lecture in response_text and the quiz in ask_questions:
+	// the lecture must be delivered before the question, not dropped.
+	ai := &fakeAI{response: contracts.AIProcessMessageResponse{
+		Decision:     contracts.DecisionAutoReply,
+		ResponseText: "Краткая лекция про X.",
+		Confidence:   0.9,
+		RiskLevel:    contracts.RiskLow,
+		Intent:       "choice_question",
+		ResponsePlan: &contracts.ResponsePlan{Shape: "questions", Questions: []contracts.Question{
+			{Prompt: "Первый вопрос?", Options: []string{"A", "B"}},
+		}},
+	}}
+	controlSender := &fakeSender{}
+	botSender := &fakeSender{}
+	service := NewService(repository, ai, controlSender,
+		WithClock(func() time.Time { return time.Unix(1700000000, 0).UTC() }),
+		WithDefaultIngestionMode(contracts.IngestionModeFull),
+		WithBotSenderProvider(&fakeBotSenders{sender: botSender}),
+	)
+
+	if _, err := service.HandleBotMessage(context.Background(), botEvent(t, 9810, 42, 41, "лекция и вопрос")); err != nil {
+		t.Fatalf("bot message: %v", err)
+	}
+	if len(botSender.sent) != 2 {
+		t.Fatalf("want lecture then question, got %d: %+v", len(botSender.sent), botSender.sent)
+	}
+	if botSender.sent[0].Text != "Краткая лекция про X." || botSender.sent[0].ReplyMarkup != nil {
+		t.Fatalf("first message must be the lecture without buttons: %+v", botSender.sent[0])
+	}
+	if botSender.sent[1].Text != "Первый вопрос?" || botSender.sent[1].ReplyMarkup == nil {
+		t.Fatalf("second message must be the question with buttons: %+v", botSender.sent[1])
+	}
+}
+
+// TestQuestionnaireTurnIsNotStreamed proves live mode and questions never coexist:
+// even with streaming enabled and a rich lecture, a turn that asks a question emits
+// NO answer-reveal draft frames. The lecture is sent as one complete rich message
+// and the question as its own discrete message — nothing streams token-by-token.
+func TestQuestionnaireTurnIsNotStreamed(t *testing.T) {
+	repository := store.NewRepository()
+	role := repository.SaveAIRole(store.AIRoleRecord{
+		TenantID:     "tenant:user:77",
+		Name:         "Tutor",
+		ToolSettings: map[string]bool{"interaction.ask_questions": true},
+	})
+	repository.SaveUserBot(store.UserBotRecord{
+		TenantID: "tenant:user:77", BotID: 555, Status: "active", AIRoleID: role.ID,
+	})
+	repository.SaveUserSettings(contracts.UserSettings{
+		TenantID:              "tenant:user:77",
+		RichFormattingEnabled: true,
+		StreamingEnabled:      true,
+	})
+	const lecture = "Краткая **лекция** про X."
+	ai := &fakeAI{response: contracts.AIProcessMessageResponse{
+		Decision:     contracts.DecisionAutoReply,
+		ResponseText: lecture,
+		TextFormat:   contracts.TextFormatRich,
+		Confidence:   0.9,
+		RiskLevel:    contracts.RiskLow,
+		Intent:       "choice_question",
+		ResponsePlan: &contracts.ResponsePlan{Shape: "questions", Questions: []contracts.Question{
+			{Prompt: "Первый вопрос?", Options: []string{"A", "B"}},
+		}},
+	}}
+	botSender := &fakeSender{}
+	service := NewService(repository, ai, &fakeSender{},
+		WithClock(func() time.Time { return time.Unix(1700000000, 0).UTC() }),
+		WithDefaultIngestionMode(contracts.IngestionModeFull),
+		WithBotSenderProvider(&fakeBotSenders{sender: botSender}),
+	)
+
+	event := botEvent(t, 9811, 42, 43, "лекция и вопрос")
+	if _, err := service.HandleBotMessage(context.Background(), event); err != nil {
+		t.Fatalf("bot message: %v", err)
+	}
+
+	// No draft frame may carry reply content: the only acceptable draft is the
+	// speculative "Thinking…" placeholder shown before the AI call. Any lecture
+	// frame means the answer streamed inside a question turn.
+	for _, d := range botSender.richDrafts {
+		if d.markdown != richStreamingThinkingMarkdown {
+			t.Fatalf("question turn must not stream; saw draft frame %q", d.markdown)
+		}
+	}
+	// The lecture is one complete rich message; the question is its own message.
+	if len(botSender.richSent) != 1 || botSender.richSent[0].Text != lecture {
+		t.Fatalf("lecture must be one complete rich message, got %+v", botSender.richSent)
+	}
+	if len(botSender.sent) != 1 || botSender.sent[0].Text != "Первый вопрос?" || botSender.sent[0].ReplyMarkup == nil {
+		t.Fatalf("form question must be delivered as its own message with buttons, got %+v", botSender.sent)
+	}
+}
+
+// TestQuestionnaireDropsDuplicateQuestionEcho is the reminder-clarification bug:
+// the writer puts the clarifying question in BOTH response_text and ask_questions.
+// The echo in response_text must be dropped so the contact sees the question once.
+func TestQuestionnaireDropsDuplicateQuestionEcho(t *testing.T) {
+	repository := store.NewRepository()
+	role := repository.SaveAIRole(store.AIRoleRecord{
+		TenantID:     "tenant:user:77",
+		Name:         "Tutor",
+		ToolSettings: map[string]bool{"interaction.ask_questions": true},
+	})
+	repository.SaveUserBot(store.UserBotRecord{
+		TenantID: "tenant:user:77", BotID: 555, Status: "active", AIRoleID: role.ID,
+	})
+	const question = "О чём напомнить завтра в 14:00?"
+	ai := &fakeAI{response: contracts.AIProcessMessageResponse{
+		Decision: contracts.DecisionAutoReply,
+		// response_text restates the question (with cosmetic whitespace drift).
+		ResponseText: "  О чём напомнить завтра в 14:00?  ",
+		Confidence:   0.9,
+		RiskLevel:    contracts.RiskLow,
+		Intent:       "choice_question",
+		ResponsePlan: &contracts.ResponsePlan{Shape: "questions", Questions: []contracts.Question{
+			{Prompt: question},
+		}},
+	}}
+	botSender := &fakeSender{}
+	service := NewService(repository, ai, &fakeSender{},
+		WithClock(func() time.Time { return time.Unix(1700000000, 0).UTC() }),
+		WithDefaultIngestionMode(contracts.IngestionModeFull),
+		WithBotSenderProvider(&fakeBotSenders{sender: botSender}),
+	)
+
+	if _, err := service.HandleBotMessage(context.Background(), botEvent(t, 9812, 42, 44, "Поставь напоминание на завтра в 14")); err != nil {
+		t.Fatalf("bot message: %v", err)
+	}
+
+	// Exactly one contact-facing message: the form question with its button. The
+	// echoed prose must not appear as a second message.
+	if len(botSender.sent) != 1 {
+		t.Fatalf("want only the form question, got %d messages: %+v", len(botSender.sent), botSender.sent)
+	}
+	if botSender.sent[0].Text != question || botSender.sent[0].ReplyMarkup == nil {
+		t.Fatalf("the single message must be the question with a button: %+v", botSender.sent[0])
+	}
+}
+
+// TestContactFallbackDeliveredOnErrorFallback proves the contact is never left in
+// silence: when the AI turn ends in error_fallback (e.g. provider failure after
+// all retries), the "Thinking…" placeholder resolves into a real notice instead
+// of vanishing. The owner is still notified separately.
+func TestContactFallbackDeliveredOnErrorFallback(t *testing.T) {
+	repository := store.NewRepository()
+	role := repository.SaveAIRole(store.AIRoleRecord{
+		TenantID: "tenant:user:77", Name: "Tutor",
+	})
+	repository.SaveUserBot(store.UserBotRecord{
+		TenantID: "tenant:user:77", BotID: 555, Status: "active", AIRoleID: role.ID,
+	})
+	// error_fallback after the AI exhausted its retries.
+	ai := &fakeAI{response: contracts.AIProcessMessageResponse{
+		Decision: contracts.DecisionErrorFallback, RiskLevel: contracts.RiskLow,
+	}}
+	botSender := &fakeSender{}
+	service := NewService(repository, ai, &fakeSender{},
+		WithClock(func() time.Time { return time.Unix(1700000000, 0).UTC() }),
+		WithDefaultIngestionMode(contracts.IngestionModeFull),
+		WithBotSenderProvider(&fakeBotSenders{sender: botSender}),
+	)
+	service.thinkingRefreshInterval = 0 // keep-alive irrelevant to this assertion
+
+	res, err := service.HandleBotMessage(context.Background(), botEvent(t, 9820, 42, 60, "ответь мне"))
+	if err != nil {
+		t.Fatalf("bot message: %v", err)
+	}
+	if res.Decision != contracts.DecisionErrorFallback {
+		t.Fatalf("decision = %s, want error_fallback", res.Decision)
+	}
+	// The contact must receive exactly the fallback notice (sent rich since rich
+	// formatting defaults on), not silence.
+	all := append(append([]telegram.OutboundMessage{}, botSender.sent...), botSender.richSent...)
+	var got int
+	for _, m := range all {
+		if m.Text == contactProviderProblemText {
+			got++
+		}
+	}
+	if got != 1 {
+		t.Fatalf("want exactly one fallback notice to the contact, got %d (sent=%+v richSent=%+v)", got, botSender.sent, botSender.richSent)
+	}
+}
+
+func TestSendMessageDeliversLeadingMessagesBeforeQuestionnaire(t *testing.T) {
+	repository := store.NewRepository()
+	role := repository.SaveAIRole(store.AIRoleRecord{
+		TenantID:     "tenant:user:77",
+		Name:         "Tutor",
+		SpeakAsOwner: false,
+		ToolSettings: map[string]bool{"interaction.ask_questions": true},
+	})
+	repository.SaveUserBot(store.UserBotRecord{
+		TenantID: "tenant:user:77",
+		BotID:    555,
+		Status:   "active",
+		AIRoleID: role.ID,
+	})
+	// One send_message prose chunk (the lecture) plus a questionnaire (the question).
+	ai := &fakeAI{response: contracts.AIProcessMessageResponse{
+		Decision:   contracts.DecisionAutoReply,
+		Confidence: 0.9,
+		RiskLevel:  contracts.RiskLow,
+		Intent:     "choice_question",
+		Messages: []contracts.OutboundMessage{
+			{Text: "Краткая лекция про X.", TextFormat: contracts.TextFormatPlain},
+		},
+		ResponsePlan: &contracts.ResponsePlan{Shape: "questions", Questions: []contracts.Question{
+			{Prompt: "Готов к вопросу?", Options: []string{"Да", "Нет"}},
+		}},
+	}}
+	controlSender := &fakeSender{}
+	botSender := &fakeSender{}
+	service := NewService(repository, ai, controlSender,
+		WithClock(func() time.Time { return time.Unix(1700000000, 0).UTC() }),
+		WithDefaultIngestionMode(contracts.IngestionModeFull),
+		WithBotSenderProvider(&fakeBotSenders{sender: botSender}),
+	)
+
+	if _, err := service.HandleBotMessage(context.Background(), botEvent(t, 9800, 42, 40, "дай лекцию и вопрос")); err != nil {
+		t.Fatalf("bot message: %v", err)
+	}
+
+	// Lecture first (no buttons), then the questionnaire's first question (buttons).
+	if len(botSender.sent) != 2 {
+		t.Fatalf("want 2 messages (lecture then question), got %d: %+v", len(botSender.sent), botSender.sent)
+	}
+	if botSender.sent[0].Text != "Краткая лекция про X." || botSender.sent[0].ReplyMarkup != nil {
+		t.Fatalf("first message must be the lecture without buttons: %+v", botSender.sent[0])
+	}
+	if botSender.sent[1].Text != "Готов к вопросу?" || botSender.sent[1].ReplyMarkup == nil {
+		t.Fatalf("second message must be the question with buttons: %+v", botSender.sent[1])
+	}
+
+	// Duplicate inbound resends nothing (per-message send idempotency).
+	if _, err := service.HandleBotMessage(context.Background(), botEvent(t, 9800, 42, 40, "дай лекцию и вопрос")); err != nil {
+		t.Fatalf("duplicate bot message: %v", err)
+	}
+	if len(botSender.sent) != 2 {
+		t.Fatalf("duplicate must not resend: got %d messages", len(botSender.sent))
+	}
+}
+
 func TestHandleBotMessageRichStreamingDraftFailureStillSendsFinalText(t *testing.T) {
 	repository := store.NewRepository()
 	repository.SaveChatSettings(contracts.ChatSettings{TenantID: "tenant:user:77", ChatID: contracts.BotChatID("555", "42"), Mode: contracts.ChatModeAuto})
@@ -448,6 +752,9 @@ func TestHandleBotMessageRichStreamingDraftFailureStillSendsFinalText(t *testing
 	if result.Decision != contracts.DecisionAutoReply {
 		t.Fatalf("decision = %s", result.Decision)
 	}
+	// 2 attempted drafts (both fail via richDraftErr): the early "Thinking…"
+	// placeholder, then the streaming preview's first (thinking) frame. The final
+	// rich message must still be sent despite the draft failures.
 	if botSender.richCalls != 1 || len(botSender.richDrafts) != 2 || botSender.calls != 0 {
 		t.Fatalf("rich calls=%d rich drafts=%d plain calls=%d", botSender.richCalls, len(botSender.richDrafts), botSender.calls)
 	}
@@ -571,6 +878,38 @@ func TestHandleTelegramWebhookRichFormattingToggleOffForcesPlainSend(t *testing.
 	}
 }
 
+// TestThinkingPlaceholderSkippedWhenRichOff verifies the "Thinking…" placeholder is
+// gated on rich formatting: with rich off, the reply degrades to HTML and no rich
+// draft is ever sent.
+func TestThinkingPlaceholderSkippedWhenRichOff(t *testing.T) {
+	repository := store.NewRepository()
+	repository.SaveChatSettings(contracts.ChatSettings{TenantID: "tenant:user:77", ChatID: contracts.BotChatID("555", "42"), Mode: contracts.ChatModeAuto})
+	repository.SaveUserSettings(contracts.UserSettings{
+		TenantID:              "tenant:user:77",
+		RichFormattingEnabled: false, // OFF → no thinking placeholder
+		StreamingEnabled:      false,
+		LearningEnabled:       true,
+		LanguageForDrafts:     "auto",
+	})
+	ai := &fakeAI{response: contracts.AIProcessMessageResponse{
+		Decision: contracts.DecisionAutoReply, ResponseText: "## Ответ",
+		TextFormat: contracts.TextFormatRich, Confidence: 0.99, RiskLevel: contracts.RiskLow,
+	}}
+	botSender := &fakeSender{}
+	service := NewService(repository, ai, &fakeSender{},
+		WithClock(func() time.Time { return time.Unix(1700000000, 0).UTC() }),
+		WithDefaultIngestionMode(contracts.IngestionModeFull),
+		WithBotSenderProvider(&fakeBotSenders{sender: botSender}),
+	)
+
+	if _, err := service.HandleBotMessage(context.Background(), botEvent(t, 1101, 42, 7, "hi")); err != nil {
+		t.Fatalf("bot message: %v", err)
+	}
+	if len(botSender.richDrafts) != 0 {
+		t.Fatalf("rich off: expected no thinking placeholder, got %+v", botSender.richDrafts)
+	}
+}
+
 // TestHandleBotMessageStreamingTypingActionNotSentWhenOff verifies that sendChatAction
 // is never called when streaming is disabled — the Phase A plain rich path must stay clean.
 func TestHandleBotMessageStreamingTypingActionNotSentWhenOff(t *testing.T) {
@@ -604,6 +943,8 @@ func TestHandleBotMessageStreamingTypingActionNotSentWhenOff(t *testing.T) {
 	if len(botSender.chatActions) != 0 {
 		t.Fatalf("streaming off: expected no chat action, got %v", botSender.chatActions)
 	}
+	// Streaming off → no answer-streaming frames, but the early "Thinking…"
+	// placeholder still shows (it is gated on rich formatting, not streaming).
 	if len(botSender.richDrafts) != 1 || botSender.richDrafts[0].markdown != richStreamingThinkingMarkdown {
 		t.Fatalf("streaming off: expected only the thinking placeholder draft, got %+v", botSender.richDrafts)
 	}

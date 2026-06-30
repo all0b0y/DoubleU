@@ -638,3 +638,21 @@ func TestMarkdownToHTMLIdempotentNormalization(t *testing.T) {
 		t.Errorf("first pass must remove **, got %q", first)
 	}
 }
+
+func TestInlineKeyboardMarkupEmptyMarshalsAsArrayNotNull(t *testing.T) {
+	// Telegram rejects {"inline_keyboard": null} with a 400; an empty markup is
+	// how we strip option buttons off an answered question, so it must serialise
+	// inline_keyboard as [].
+	raw, err := json.Marshal(InlineKeyboardMarkup{})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if string(raw) != `{"inline_keyboard":[]}` {
+		t.Fatalf("empty markup = %s, want empty array", raw)
+	}
+	// A populated keyboard still round-trips.
+	populated, _ := json.Marshal(InlineKeyboardMarkup{InlineKeyboard: [][]InlineKeyboardButton{{{Text: "A", CallbackData: "a"}}}})
+	if !strings.Contains(string(populated), `"text":"A"`) {
+		t.Fatalf("populated markup lost its button: %s", populated)
+	}
+}

@@ -18,8 +18,10 @@ func ToolCatalog() []ToolCatalogEntry {
 		{Key: "memory.get_contact_profile", Label: "Профиль собеседника", Description: "Читает сохранённые имя, отношения, тон и обращение к собеседнику.", Category: ToolCategoryRead, DefaultEnabled: true},
 		{Key: "memory.save_fact", Label: "Сохранение фактов", Description: "Сохраняет устойчивые факты и договорённости в память чата.", Category: ToolCategoryRead, DefaultEnabled: true},
 		{Key: "memory.suggest_profile_update", Label: "Предложения к профилю", Description: "Предлагает владельцу обновить профиль собеседника.", Category: ToolCategoryRead, DefaultEnabled: true},
-		{Key: "interaction.present_buttons", Label: "Кнопки для собеседника", Description: "Задаёт собеседнику вопрос с вариантами ответа или подтверждением.", Category: ToolCategoryInteraction, DefaultEnabled: false},
-		{Key: "scheduler.create_reminder", Label: "Напоминания", Description: "Создаёт видимые владельцу напоминания для него или собеседника.", Category: ToolCategorySchedule, DefaultEnabled: false},
+		{Key: "interaction.ask_questions", Label: "Вопросы собеседнику", Description: "Задаёт собеседнику пул вопросов по одному с кнопками-подсказками и ответом своими словами.", Category: ToolCategoryInteraction, DefaultEnabled: false},
+		{Key: "scheduler.create_reminder", Label: "Создание напоминаний", Description: "Создаёт видимые владельцу напоминания для него или собеседника.", Category: ToolCategorySchedule, DefaultEnabled: false},
+		{Key: "scheduler.list_reminders", Label: "Список напоминаний", Description: "Показывает активные напоминания этого чата, чтобы на них ссылаться.", Category: ToolCategorySchedule, DefaultEnabled: false},
+		{Key: "scheduler.cancel_reminder", Label: "Отмена напоминаний", Description: "Отменяет ранее поставленное напоминание этого чата по его номеру.", Category: ToolCategorySchedule, DefaultEnabled: false},
 	}
 }
 

@@ -47,10 +47,10 @@ print(json.dumps(entries))`,
 }
 
 func TestInteractionToolDefaultsDisabled(t *testing.T) {
-	if ToolEnabled(nil, "interaction.present_buttons") {
+	if ToolEnabled(nil, "interaction.ask_questions") {
 		t.Fatal("interaction tool must require explicit role enablement")
 	}
-	if !ToolEnabled(map[string]bool{"interaction.present_buttons": true}, "interaction.present_buttons") {
+	if !ToolEnabled(map[string]bool{"interaction.ask_questions": true}, "interaction.ask_questions") {
 		t.Fatal("explicit interaction enablement ignored")
 	}
 }

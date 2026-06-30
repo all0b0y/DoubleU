@@ -5,6 +5,16 @@ This file defines the mandatory rules for all AI agents (Claude Code and similar
 
 ---
 
+## Code Exploration
+
+- For **understanding code and finding relationships** (call chains, callers, data flow, cross-service
+  links, architecture, impact analysis), use the **Codebase Memory MCP** (`codebase-memory-mcp` tools:
+  `search_graph`, `trace_path`, `get_code_snippet`, `query_graph`, `get_architecture`, `search_code`)
+  **first**. Fall back to `Grep`/`Glob`/`Read` for plain text, configs, and non-code files. If the
+  project is not indexed yet, run `index_repository` first.
+
+---
+
 ## Code Quality
 
 - Write **clean, readable code**. Prefer clarity over cleverness.
@@ -34,6 +44,28 @@ This file defines the mandatory rules for all AI agents (Claude Code and similar
 - **Privacy flags** (`no_memory`, `no_training`, `no_summary`, `private`) must be respected at every layer.
 - **Idempotency** must be maintained for all webhook processing, send operations, and approval callbacks.
 - Risk classification and policy decisions belong to the backend, not the AI service.
+
+## Native Tools (карта связей)
+
+Полный справочник — [`docs/reference/tools.md`](docs/reference/tools.md). Инструменты AI-агента
+только **записывают намерение** в `AgentDeps`; всё видимое/персистентное исполняет Go-бэкенд.
+Источник правды каталога — Python `TOOL_CATALOG`; Go зеркалит его (синк-тест
+`TestToolCatalogMatchesCanonicalPythonCatalog`). Меняя контракт инструмента, правь **обе** стороны
+и бампай `contracts/contracts.json` (затем `python3 scripts/generate_contracts.py`).
+
+| Инструмент (ключ) | Python | Контракт-поле | Go-потребитель → стор |
+|---|---|---|---|
+| `memory.*` (6 шт.) | `agents/memory_tools.py` | прямой ответ / `memory_used` | `service.go` → `semantic_facts`, `contact_profiles*` |
+| `interaction.ask_questions` | `agents/interaction_tools.py` | `response_plan{shape,questions}` | `service.go` (анкета+callback) → `interaction_forms` |
+| `scheduler.create_reminder` | `agents/schedule_tools.py` | `scheduled_jobs[]` | `saveAIScheduledJobs` → `scheduled_jobs` |
+| `scheduler.list_reminders` | `agents/schedule_tools.py` | req `existing_scheduled_jobs[]` | `existingScheduledJobsFor` (read) |
+| `scheduler.cancel_reminder` | `agents/schedule_tools.py` | `cancelled_job_ids[]` | `cancelAIScheduledJobs` → `CancelJob` |
+
+- **Анкета (`ask_questions`):** агент готовит пул из 1–6 вопросов; бот задаёт их **по одному**
+  (кнопка-подсказка или ответ своими словами). Ответы копятся в `interaction_forms` (один активный
+  на чат, TTL 24ч); после ВСЕХ вопросов Q&A уходит в ИИ как один ход. Callback — `qf:{form}:{q}:{slot}`.
+- **Планировщик:** create/list/cancel; `existing_scheduled_jobs` шлётся в запрос только когда роль
+  включает list/cancel. Категория `schedule` гейтится `no_memory`/`private`.
 
 ## Refactoring & Backlog
 

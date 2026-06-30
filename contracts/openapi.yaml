@@ -192,6 +192,18 @@ components:
           items: { type: string }
         ai_role:
           $ref: "#/components/schemas/AIRole"
+        existing_scheduled_jobs:
+          type: array
+          description: Pending scheduler jobs Go already persisted, so the scheduler tools can list/cancel them.
+          items:
+            type: object
+            required: [id, kind, target, fire_at]
+            properties:
+              id: { type: integer }
+              kind: { type: string }
+              target: { type: string, enum: [owner, contact] }
+              fire_at: { type: string, format: date-time }
+              text: { type: string }
     AIProcessMessageResponse:
       type: object
       required: [decision, response_text, confidence, risk_level, intent, model_used, usage, memory_used]
@@ -239,20 +251,48 @@ components:
           description: AI-suggested short replies; non-empty only for intent=choice_question.
         response_plan:
           type: object
-          required: [shape, options]
-          description: Deferred contact-facing form produced by an interaction tool.
+          required: [shape, questions]
+          description: >
+            Deferred contact-facing questionnaire produced by an interaction tool.
+            The Go backend collects it one question at a time (tap an option or
+            reply in free text); only after every answer is a reply drafted.
           properties:
             shape:
               type: string
-              enum: [buttons]
-            options:
+              enum: [questions]
+            questions:
               type: array
-              minItems: 2
-              maxItems: 4
-              items: { type: string }
+              minItems: 1
+              maxItems: 6
+              items:
+                type: object
+                required: [prompt]
+                properties:
+                  prompt: { type: string }
+                  options:
+                    type: array
+                    maxItems: 8
+                    items: { type: string }
+        cancelled_job_ids:
+          type: array
+          items: { type: integer }
+          description: Pending scheduler-job ids the AI asked to cancel; Go applies CancelJob within the chat scope.
         topic:
           type: string
           description: 3-7 word conversation topic from the same draft call (replaces per-message /ai/tag-topic).
+        messages:
+          type: array
+          description: >
+            Ordered prose messages queued by the send_message tool. Go delivers
+            them in order BEFORE response_text/response_plan so one AI turn can
+            become several Telegram messages (e.g. an explanation, then a
+            question). Empty for the common single-message turn.
+          items:
+            type: object
+            required: [text]
+            properties:
+              text: { type: string }
+              text_format: { type: string, enum: [plain, rich] }
     AuditEvent:
       type: object
       required: [audit_id, tenant_id, chat_id, source_message_id, decision, reason, created_at]

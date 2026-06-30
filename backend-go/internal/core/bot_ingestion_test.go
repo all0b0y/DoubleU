@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -386,75 +387,14 @@ func TestApprovalApproveSendsThroughBotTransport(t *testing.T) {
 	}
 }
 
-func TestInteractionDraftWaitsForApprovalThenSendsButtons(t *testing.T) {
-	repository := store.NewRepository()
-	role := repository.SaveAIRole(store.AIRoleRecord{
-		TenantID:     "tenant:user:77",
-		Name:         "Interactive",
-		SpeakAsOwner: true,
-		ToolSettings: map[string]bool{"interaction.present_buttons": true},
-	})
-	repository.SaveUserBot(store.UserBotRecord{
-		TenantID: "tenant:user:77", BotID: 555, Status: "active", AIRoleID: role.ID,
-	})
-	chatID := contracts.BotChatID("555", "42")
-	repository.SaveChatSettings(contracts.ChatSettings{
-		TenantID: "tenant:user:77", ChatID: chatID, Mode: contracts.ChatModeManual,
-	})
-	ai := &fakeAI{response: contracts.AIProcessMessageResponse{
-		Decision:     contracts.DecisionDraft,
-		ResponseText: "Когда вам удобно?",
-		Confidence:   0.9,
-		RiskLevel:    contracts.RiskLow,
-		Intent:       "choice_question",
-		Options:      []string{"Сегодня", "Завтра"},
-		ResponsePlan: &contracts.ResponsePlan{Shape: "buttons", Options: []string{"Сегодня", "Завтра"}},
-	}}
-	controlSender := &fakeSender{}
-	botSender := &fakeSender{}
-	service := NewService(repository, ai, controlSender,
-		WithClock(func() time.Time { return time.Unix(1700000000, 0).UTC() }),
-		WithDefaultIngestionMode(contracts.IngestionModeFull),
-		WithBotSenderProvider(&fakeBotSenders{sender: botSender}),
-	)
-
-	inbound, err := service.HandleBotMessage(context.Background(), botEvent(t, 9500, 42, 20, "Назначим звонок"))
-	if err != nil || inbound.DraftID == "" {
-		t.Fatalf("interaction draft: %+v err=%v", inbound, err)
-	}
-	if len(botSender.sent) != 0 {
-		t.Fatalf("tool must not send before approval: %+v", botSender.sent)
-	}
-	draft, ok := repository.Draft(inbound.DraftID)
-	if !ok || draft.DraftType != "reply" || len(draft.SuggestedOptions) != 2 {
-		t.Fatalf("deferred interaction draft = %+v ok=%v", draft, ok)
-	}
-
-	_, err = service.HandleApprovalCallback(context.Background(), contracts.ApprovalCallbackPayload{
-		Action: contracts.ApprovalApprove, TenantID: "tenant:user:77", ChatID: chatID,
-		SourceMessageID: "20", DraftID: inbound.DraftID, DecisionID: inbound.Event.EventID,
-		IdempotencyKey: "approve:interaction:9500",
-	})
-	if err != nil {
-		t.Fatalf("approve interaction: %v", err)
-	}
-	if len(botSender.sent) != 1 {
-		t.Fatalf("approved interaction sends once, got %+v", botSender.sent)
-	}
-	markup, ok := botSender.sent[0].ReplyMarkup.(telegram.InlineKeyboardMarkup)
-	if !ok || len(markup.InlineKeyboard) != 2 {
-		t.Fatalf("interaction markup = %#v", botSender.sent[0].ReplyMarkup)
-	}
-	if _, _, _, ok := contracts.CallbackDataDecodeAIButton(markup.InlineKeyboard[0][0].CallbackData); !ok {
-		t.Fatalf("invalid aibtn callback: %q", markup.InlineKeyboard[0][0].CallbackData)
-	}
-}
-
-func TestInteractionButtonStartsNewTurnAndIsIdempotent(t *testing.T) {
+// newQuestionnaireService wires a bot-transport service whose role enables the
+// ask_questions tool and whose AI replies with a two-question questionnaire.
+func newQuestionnaireService(t *testing.T) (*Service, *store.Repository, *fakeAI, *fakeSender) {
+	t.Helper()
 	repository := store.NewRepository()
 	role := repository.SaveAIRole(store.AIRoleRecord{
 		TenantID: "tenant:user:77", Name: "Interactive",
-		ToolSettings: map[string]bool{"interaction.present_buttons": true},
+		ToolSettings: map[string]bool{"interaction.ask_questions": true},
 	})
 	repository.SaveUserBot(store.UserBotRecord{
 		TenantID: "tenant:user:77", BotID: 555, Status: "active", AIRoleID: role.ID,
@@ -463,10 +403,16 @@ func TestInteractionButtonStartsNewTurnAndIsIdempotent(t *testing.T) {
 	repository.SaveChatSettings(contracts.ChatSettings{
 		TenantID: "tenant:user:77", ChatID: chatID, Mode: contracts.ChatModeAuto,
 	})
+	// Empty ResponseText: these tests exercise questionnaire mechanics only, so the
+	// first sent message must be the question. Prose-before-the-form is covered by
+	// TestQuestionnaireDeliversResponseTextBeforeForm.
 	ai := &fakeAI{response: contracts.AIProcessMessageResponse{
-		Decision: contracts.DecisionAutoReply, ResponseText: "Выберите день",
-		Confidence: 0.99, RiskLevel: contracts.RiskLow, Intent: "choice_question",
-		ResponsePlan: &contracts.ResponsePlan{Shape: "buttons", Options: []string{"Сегодня", "Завтра"}},
+		Decision: contracts.DecisionDraft, ResponseText: "",
+		Confidence: 0.9, RiskLevel: contracts.RiskLow, Intent: "choice_question",
+		ResponsePlan: &contracts.ResponsePlan{Shape: "questions", Questions: []contracts.Question{
+			{Prompt: "Когда удобно?", Options: []string{"Сегодня", "Завтра"}},
+			{Prompt: "Какой бюджет?"},
+		}},
 	}}
 	botSender := &fakeSender{}
 	service := NewService(repository, ai, &fakeSender{},
@@ -474,40 +420,106 @@ func TestInteractionButtonStartsNewTurnAndIsIdempotent(t *testing.T) {
 		WithDefaultIngestionMode(contracts.IngestionModeFull),
 		WithBotSenderProvider(&fakeBotSenders{sender: botSender}),
 	)
+	return service, repository, ai, botSender
+}
 
-	inbound, err := service.HandleBotMessage(context.Background(), botEvent(t, 9600, 42, 21, "Когда?"))
-	if err != nil || inbound.DraftID == "" || len(botSender.sent) != 1 {
-		t.Fatalf("auto interaction: %+v sends=%+v err=%v", inbound, botSender.sent, err)
+// TestQuestionnaireCollectsAnswersThenRunsAITurn covers the full step-by-step
+// flow: the first question is sent directly to the contact, a button answer
+// advances to the next question, a free-text answer completes the form, and only
+// then does a single AI turn run with both answers in its message.
+func TestQuestionnaireCollectsAnswersThenRunsAITurn(t *testing.T) {
+	service, repository, ai, botSender := newQuestionnaireService(t)
+	chatID := contracts.BotChatID("555", "42")
+
+	inbound, err := service.HandleBotMessage(context.Background(), botEvent(t, 9600, 42, 21, "Назначим звонок"))
+	if err != nil || inbound.Reason != "form_started" {
+		t.Fatalf("questionnaire start: %+v err=%v", inbound, err)
 	}
-	markup := botSender.sent[0].ReplyMarkup.(telegram.InlineKeyboardMarkup)
-	callbackData := markup.InlineKeyboard[1][0].CallbackData
+	if ai.calls != 1 || len(botSender.sent) != 1 {
+		t.Fatalf("first question: ai.calls=%d sends=%+v", ai.calls, botSender.sent)
+	}
+	form, ok := repository.ActiveInteractionForm("tenant:user:77", chatID)
+	if !ok || form.CurrentIndex != 0 || len(form.Questions) != 2 {
+		t.Fatalf("active form = %+v ok=%v", form, ok)
+	}
+	markup, ok := botSender.sent[0].ReplyMarkup.(telegram.InlineKeyboardMarkup)
+	if !ok || len(markup.InlineKeyboard) != 3 { // 2 options + free-text button
+		t.Fatalf("question 1 markup = %#v", botSender.sent[0].ReplyMarkup)
+	}
+
+	// Answer question 1 by tapping the second option ("Завтра").
+	callback := telegram.CallbackQueryUpdate{
+		UpdateID: 9601, QueryID: "query-1", Data: markup.InlineKeyboard[1][0].CallbackData,
+		SenderID: "42", ChatID: "42", OriginalMsgID: "100",
+		ReceiveIdempotencyKey: "9601:callback_query:query-1",
+	}
+	res, err := service.HandleBotCallbackQuery(context.Background(), callback, "tenant:user:77", "555")
+	if err != nil || res.Reason != "form_question_sent" {
+		t.Fatalf("answer q1: %+v err=%v", res, err)
+	}
+	if ai.calls != 1 || len(botSender.sent) != 2 {
+		t.Fatalf("q1 answered should send q2 without an AI turn: ai.calls=%d sends=%d", ai.calls, len(botSender.sent))
+	}
+
+	// Answer question 2 by free text — this completes the form and runs the turn.
 	ai.response = contracts.AIProcessMessageResponse{
-		Decision: contracts.DecisionAutoReply, ResponseText: "Завтра подходит.",
+		Decision: contracts.DecisionAutoReply, ResponseText: "Принято, до завтра.",
 		Confidence: 0.99, RiskLevel: contracts.RiskLow, Intent: "acknowledgement",
 	}
+	done, err := service.HandleBotMessage(context.Background(), botEvent(t, 9602, 42, 22, "До 100 тысяч"))
+	if err != nil {
+		t.Fatalf("free-text answer: %v", err)
+	}
+	if ai.calls != 2 {
+		t.Fatalf("completion must run exactly one AI turn, ai.calls=%d", ai.calls)
+	}
+	if !strings.Contains(ai.lastRequest.Event.MessageText, "Завтра") ||
+		!strings.Contains(ai.lastRequest.Event.MessageText, "До 100 тысяч") {
+		t.Fatalf("final turn message missing answers: %q", ai.lastRequest.Event.MessageText)
+	}
+	if _, stillActive := repository.ActiveInteractionForm("tenant:user:77", chatID); stillActive {
+		t.Fatalf("form should be completed after the last answer")
+	}
+	if done.Decision != contracts.DecisionAutoReply {
+		t.Fatalf("completion turn decision = %+v", done)
+	}
+}
+
+// TestQuestionnaireButtonIsIdempotent verifies a double-tap on the same option
+// neither double-advances the form nor triggers a second collection step.
+func TestQuestionnaireButtonIsIdempotent(t *testing.T) {
+	service, repository, ai, botSender := newQuestionnaireService(t)
+	chatID := contracts.BotChatID("555", "42")
+
+	if _, err := service.HandleBotMessage(context.Background(), botEvent(t, 9600, 42, 21, "Когда?")); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	markup := botSender.sent[0].ReplyMarkup.(telegram.InlineKeyboardMarkup)
 	callback := telegram.CallbackQueryUpdate{
-		UpdateID: 9601, QueryID: "query-1", Data: callbackData, SenderID: "42",
-		ChatID: "42", OriginalMsgID: "100", ReceiveIdempotencyKey: "9601:callback_query:query-1",
+		UpdateID: 9601, QueryID: "query-1", Data: markup.InlineKeyboard[0][0].CallbackData,
+		SenderID: "42", ChatID: "42", OriginalMsgID: "100",
+		ReceiveIdempotencyKey: "9601:callback_query:query-1",
 	}
-	result, err := service.HandleBotCallbackQuery(context.Background(), callback, "tenant:user:77", "555")
-	if err != nil || result.Decision != contracts.DecisionAutoReply {
-		t.Fatalf("button result: %+v err=%v", result, err)
+	if _, err := service.HandleBotCallbackQuery(context.Background(), callback, "tenant:user:77", "555"); err != nil {
+		t.Fatalf("first tap: %v", err)
 	}
-	if ai.calls != 2 || ai.lastRequest.Event.MessageText != "Завтра" {
-		t.Fatalf("button did not become new AI turn: calls=%d request=%+v", ai.calls, ai.lastRequest.Event)
-	}
-	if len(botSender.answered) != 1 || len(botSender.edits) != 1 {
-		t.Fatalf("callback ack/edit = answered:%+v edits:%+v", botSender.answered, botSender.edits)
+	form, _ := repository.ActiveInteractionForm("tenant:user:77", chatID)
+	if form.CurrentIndex != 1 {
+		t.Fatalf("after one answer CurrentIndex = %d, want 1", form.CurrentIndex)
 	}
 
 	callback.UpdateID = 9602
 	callback.QueryID = "query-2"
 	callback.ReceiveIdempotencyKey = "9602:callback_query:query-2"
-	duplicate, err := service.HandleBotCallbackQuery(context.Background(), callback, "tenant:user:77", "555")
-	if err != nil || !duplicate.Duplicate || duplicate.Reason != "duplicate_aibtn_callback" {
-		t.Fatalf("double press = %+v err=%v", duplicate, err)
+	dup, err := service.HandleBotCallbackQuery(context.Background(), callback, "tenant:user:77", "555")
+	if err != nil || dup.Reason != "duplicate_qform_callback" {
+		t.Fatalf("double tap = %+v err=%v", dup, err)
 	}
-	if ai.calls != 2 {
-		t.Fatalf("double press triggered AI again: %d", ai.calls)
+	form, _ = repository.ActiveInteractionForm("tenant:user:77", chatID)
+	if form.CurrentIndex != 1 {
+		t.Fatalf("double tap advanced the form to %d", form.CurrentIndex)
+	}
+	if ai.calls != 1 {
+		t.Fatalf("double tap triggered an AI turn: %d", ai.calls)
 	}
 }

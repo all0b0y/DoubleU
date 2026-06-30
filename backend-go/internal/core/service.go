@@ -139,6 +139,9 @@ type Service struct {
 	chatLimiters sync.Map
 	chatRate     rate.Limit // sustained messages/sec per chat+sender
 	chatBurst    int        // initial burst allowance
+	// thinkingRefreshInterval is reserved for bot "thinking" keep-alives; tests
+	// can set it to zero while the current implementation sends one indicator.
+	thinkingRefreshInterval time.Duration
 	// webhookOverflow is a bounded spill queue: updates that cannot enter their
 	// ordered shard land here instead of spawning unbounded goroutines. When it
 	// too is full the enqueue is shed (HTTP 429) and Telegram retries.
@@ -217,6 +220,8 @@ const (
 	defaultChatRate  = rate.Limit(0.5)
 	defaultChatBurst = 8
 )
+
+const contactProviderProblemText = "ИИ не смог сформировать ответ. Попробуйте отправить сообщение ещё раз."
 
 // OwnerFeedbackSender is implemented by observability.ScoreSender; the
 // interface keeps the core package decoupled from the OTel/Langfuse SDK.
@@ -888,14 +893,22 @@ func (s *Service) saveTypedFacts(event contracts.NormalizedTelegramEvent, facts 
 // notifyAIError pushes a real-time error notice to connected Mini App clients so
 // a failed AI turn surfaces as a retryable message rather than the thinking
 // indicator disappearing with nothing in its place.
-func (s *Service) notifyAIError(event contracts.NormalizedTelegramEvent) {
-	if s.notify == nil {
-		return
+func (s *Service) notifyAIError(ctx context.Context, event contracts.NormalizedTelegramEvent) {
+	if event.Transport == contracts.TransportBot {
+		if _, err := s.sendRecipient(ctx, event, event.EventID+":ai_error", contactProviderProblemText, contracts.TextFormatPlain, false, s.deliverySettingsFor(event)); err != nil {
+			s.logger.Warn("telegram contact ai-error fallback failed",
+				"tenant_id", event.TenantID,
+				"chat_id", event.ChatID,
+				"error", err,
+			)
+		}
 	}
-	s.notify(event.TenantID, "ai_error", map[string]any{
-		"chat_id": event.ChatID,
-		"message": "ИИ не смог сформировать ответ. Попробуйте отправить сообщение ещё раз.",
-	})
+	if s.notify != nil {
+		s.notify(event.TenantID, "ai_error", map[string]any{
+			"chat_id": event.ChatID,
+			"message": contactProviderProblemText,
+		})
+	}
 }
 
 func anonymousChatName(chatID string) string {

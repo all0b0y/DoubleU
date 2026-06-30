@@ -301,49 +301,53 @@ func CallbackDataDecodeChoice(data string) (optionIdx int, draftID string, idemp
 	return n, draftID, idempotencyKey, true
 }
 
-// CallbackDataEncodeAIButton encodes a contact-facing interaction option.
-// The idempotency suffix is stable for the draft, so concurrent presses on
-// different options still resolve to one logical answer.
-func CallbackDataEncodeAIButton(draftID string, optionIdx int) string {
-	bare := strings.TrimPrefix(draftID, "draft:")
-	return fmt.Sprintf("aibtn:%s:%d:%s", bare, optionIdx, aiButtonIdem(bare))
+// qformFreeTextMarker is the option slot encoding the "answer in your own words"
+// button: the contact is prompted to type instead of picking a suggestion.
+const qformFreeTextMarker = "t"
+
+// CallbackDataEncodeQForm encodes a tap on a questionnaire option button as
+// "qf:{formID}:{questionIdx}:{optionIdx}". Form ids are numeric, so unlike the
+// aibtn codec no right-to-left separator handling is needed.
+func CallbackDataEncodeQForm(formID int64, questionIdx, optionIdx int) string {
+	return fmt.Sprintf("qf:%d:%d:%d", formID, questionIdx, optionIdx)
 }
 
-// CallbackDataDecodeAIButton parses "aibtn:{draftId}:{optionIdx}:{idem}".
-// Draft ids may contain colons, so separators are consumed from the right.
-func CallbackDataDecodeAIButton(data string) (optionIdx int, draftID string, idempotencyKey string, ok bool) {
-	if !strings.HasPrefix(data, "aibtn:") {
-		return 0, "", "", false
-	}
-	rest := strings.TrimPrefix(data, "aibtn:")
-	idemSep := strings.LastIndex(rest, ":")
-	if idemSep <= 0 {
-		return 0, "", "", false
-	}
-	idem := rest[idemSep+1:]
-	rest = rest[:idemSep]
-	indexSep := strings.LastIndex(rest, ":")
-	if indexSep <= 0 {
-		return 0, "", "", false
-	}
-	bare := rest[:indexSep]
-	n, err := strconv.Atoi(rest[indexSep+1:])
-	if err != nil || n < 0 || n > 3 || idem != aiButtonIdem(bare) {
-		return 0, "", "", false
-	}
-	draftID = "draft:" + bare
-	return n, draftID, draftID + ":aibtn:" + idem, true
+// CallbackDataEncodeQFormFreeText encodes the "answer in your own words" button
+// for a questionnaire question as "qf:{formID}:{questionIdx}:t".
+func CallbackDataEncodeQFormFreeText(formID int64, questionIdx int) string {
+	return fmt.Sprintf("qf:%d:%d:%s", formID, questionIdx, qformFreeTextMarker)
 }
 
-func aiButtonIdem(value string) string {
-	// Small deterministic FNV-1a suffix: compact enough for Telegram's 64-byte
-	// callback_data cap and sufficient to reject malformed/stale payloads.
-	var hash uint32 = 2166136261
-	for index := 0; index < len(value); index++ {
-		hash ^= uint32(value[index])
-		hash *= 16777619
+// CallbackDataDecodeQForm parses "qf:{formID}:{questionIdx}:{optionIdx|t}".
+// freeText is true for the own-words button (optionIdx is then -1). The
+// idempotency key is stable per (form, question, slot) so duplicate taps and
+// late retries resolve to one logical answer.
+func CallbackDataDecodeQForm(data string) (formID int64, questionIdx, optionIdx int, freeText bool, idempotencyKey string, ok bool) {
+	if !strings.HasPrefix(data, "qf:") {
+		return 0, 0, 0, false, "", false
 	}
-	return strconv.FormatUint(uint64(hash), 36)
+	parts := strings.Split(data[3:], ":")
+	if len(parts) != 3 {
+		return 0, 0, 0, false, "", false
+	}
+	form, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil || form <= 0 {
+		return 0, 0, 0, false, "", false
+	}
+	qIdx, err := strconv.Atoi(parts[1])
+	if err != nil || qIdx < 0 {
+		return 0, 0, 0, false, "", false
+	}
+	slot := parts[2]
+	idempotencyKey = fmt.Sprintf("qform:%d:%d:%s", form, qIdx, slot)
+	if slot == qformFreeTextMarker {
+		return form, qIdx, -1, true, idempotencyKey, true
+	}
+	optIdx, err := strconv.Atoi(slot)
+	if err != nil || optIdx < 0 {
+		return 0, 0, 0, false, "", false
+	}
+	return form, qIdx, optIdx, false, idempotencyKey, true
 }
 
 // ContactProfile is the owner-supplied description of a contact in a specific chat.
@@ -761,8 +765,15 @@ type TokenUsage struct {
 
 // ResponsePlan marks Options as a deferred contact-facing response form.
 type ResponsePlan struct {
-	Shape   string   `json:"shape"`
-	Options []string `json:"options"`
+	Shape     string     `json:"shape"`
+	Questions []Question `json:"questions"`
+}
+
+// Question is one step of a questionnaire ResponsePlan: a prompt plus optional
+// quick-reply options. Empty Options means a pure free-text question.
+type Question struct {
+	Prompt  string   `json:"prompt"`
+	Options []string `json:"options,omitempty"`
 }
 
 // ScheduledJob is a deferred job produced by the Python scheduler tool.
@@ -809,6 +820,18 @@ type AIProcessMessageResponse struct {
 	// Topic is a 3-7 word label of the current conversation produced by the
 	// same draft call (replaces the per-message /ai/tag-topic call — ARCH-4).
 	Topic string `json:"topic,omitempty"`
+	// Messages are ordered prose messages the send_message tool queued. The
+	// backend delivers them in order BEFORE ResponseText/ResponsePlan so one AI
+	// turn can become several Telegram messages (e.g. an explanation, then a
+	// question). Empty for the common single-message turn.
+	Messages []OutboundMessage `json:"messages,omitempty"`
+}
+
+// OutboundMessage is one contact-facing message in a split turn, delivered in
+// order before the terminal reply/questionnaire.
+type OutboundMessage struct {
+	Text       string     `json:"text"`
+	TextFormat TextFormat `json:"text_format,omitempty"`
 }
 
 // AuditEvent records the policy outcome for an inbound message.

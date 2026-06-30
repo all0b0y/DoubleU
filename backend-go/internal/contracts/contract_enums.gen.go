@@ -10,7 +10,7 @@
 package contracts
 
 // ContractVersion is the version of contracts/contracts.json this code was generated from.
-const ContractVersion = "0.4.0"
+const ContractVersion = "0.6.0"
 
 // ToolCategory values from the frozen contract.
 const (

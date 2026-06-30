@@ -12,6 +12,30 @@ import (
 	"doubleu/backend-go/internal/contracts"
 )
 
+// FormAnswer pairs one questionnaire question with the contact's answer to it.
+type FormAnswer struct {
+	Prompt string `json:"prompt"`
+	Answer string `json:"answer"`
+}
+
+// InteractionFormRecord is the persisted state of a step-by-step questionnaire
+// (interaction.ask_questions). Questions are asked one at a time; Answers grows
+// as the contact replies (by button tap or free text) and len(Answers) equals
+// CurrentIndex. Exactly one form per chat may be active at a time.
+type InteractionFormRecord struct {
+	ID              int64                `json:"id"`
+	TenantID        string               `json:"tenant_id"`
+	ChatID          string               `json:"chat_id"`
+	BotID           string               `json:"bot_id,omitempty"`
+	Questions       []contracts.Question `json:"questions"`
+	CurrentIndex    int                  `json:"current_index"`
+	Answers         []FormAnswer         `json:"answers"`
+	Status          string               `json:"status"`
+	SourceMessageID string               `json:"source_message_id,omitempty"`
+	CreatedAt       time.Time            `json:"created_at"`
+	ExpiresAt       time.Time            `json:"expires_at"`
+}
+
 // Repository stores state — in memory when no DB is configured, in Postgres otherwise.
 type Repository struct {
 	mu           sync.Mutex
@@ -54,6 +78,9 @@ type Repository struct {
 	// scheduledJobs is the in-memory fallback for migration 114.
 	scheduledJobs   map[int64]ScheduledJobRecord
 	scheduledJobSeq int64
+	// interactionForms is the in-memory fallback for migration 116.
+	interactionForms   map[int64]InteractionFormRecord
+	interactionFormSeq int64
 	// ctxScoreCache memoises ContextScoreForChat with a short TTL (ARCH-8):
 	// the score gates mode selection and was recomputed (3 queries) per check.
 	// Writes that affect the score delete the entry so reads stay fresh.
@@ -126,6 +153,7 @@ func NewRepository() *Repository {
 		aiRoles:             make(map[int64]AIRoleRecord),
 		chatAIRoleIDs:       make(map[string]int64),
 		scheduledJobs:       make(map[int64]ScheduledJobRecord),
+		interactionForms:    make(map[int64]InteractionFormRecord),
 	}
 }
 

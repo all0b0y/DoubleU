@@ -79,6 +79,20 @@ type InlineKeyboardMarkup struct {
 // isReplyMarkup marks InlineKeyboardMarkup as a sendMessage reply markup.
 func (InlineKeyboardMarkup) isReplyMarkup() {}
 
+// MarshalJSON guarantees inline_keyboard is always a JSON array, never null:
+// Telegram rejects {"inline_keyboard": null} with a 400, and an empty markup
+// ({}) is exactly how we strip the option buttons off a question once it's
+// answered. A nil row slice would otherwise serialise to null.
+func (m InlineKeyboardMarkup) MarshalJSON() ([]byte, error) {
+	rows := m.InlineKeyboard
+	if rows == nil {
+		rows = [][]InlineKeyboardButton{}
+	}
+	return json.Marshal(struct {
+		InlineKeyboard [][]InlineKeyboardButton `json:"inline_keyboard"`
+	}{InlineKeyboard: rows})
+}
+
 // NoopSender accepts sends without external side effects.
 type NoopSender struct{}
 
