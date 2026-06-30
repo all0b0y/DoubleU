@@ -48,16 +48,24 @@ func (r *Repository) InsertScheduledJob(job ScheduledJobRecord) (ScheduledJobRec
 			}
 			botID = parsed
 		}
+		var localTime, tzName any
+		if job.LocalTime != "" {
+			localTime = job.LocalTime
+		}
+		if job.TZName != "" {
+			tzName = job.TZName
+		}
 		err = r.db.QueryRow(
 			`INSERT INTO scheduled_jobs
 			   (tenant_id, chat_id, bot_id, kind, target, fire_at, payload,
-			    status, created_by, idempotency_key, created_at)
-			 VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10,$11)
+			    status, created_by, idempotency_key, created_at, local_time, tz_name)
+			 VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10,$11,$12,$13)
 			 ON CONFLICT (idempotency_key) DO UPDATE
 			 SET idempotency_key = EXCLUDED.idempotency_key
 			 RETURNING id, created_at`,
 			job.TenantID, job.ChatID, botID, job.Kind, job.Target, job.FireAt,
 			string(payload), job.Status, job.CreatedBy, job.IdempotencyKey, job.CreatedAt,
+			localTime, tzName,
 		).Scan(&job.ID, &job.CreatedAt)
 		return cloneScheduledJob(job), err
 	}
@@ -89,7 +97,8 @@ func (r *Repository) DueJobs(now time.Time, limit int) ([]ScheduledJobRecord, er
 		defer func() { _ = tx.Rollback() }()
 		rows, err := tx.Query(
 			`SELECT id, tenant_id, chat_id, bot_id, kind, target, fire_at, payload,
-			        status, created_by, idempotency_key, created_at, sent_at
+			        status, created_by, idempotency_key, created_at, sent_at,
+			        local_time, tz_name
 			   FROM scheduled_jobs
 			  WHERE status = 'pending' AND fire_at <= $1
 			  ORDER BY fire_at, id
@@ -107,7 +116,7 @@ func (r *Repository) DueJobs(now time.Time, limit int) ([]ScheduledJobRecord, er
 		if err := tx.Commit(); err != nil {
 			return nil, err
 		}
-		return jobs, nil
+		return recomputeDueJobs(jobs, now), nil
 	}
 
 	r.mu.Lock()
@@ -118,6 +127,7 @@ func (r *Repository) DueJobs(now time.Time, limit int) ([]ScheduledJobRecord, er
 			jobs = append(jobs, cloneScheduledJob(job))
 		}
 	}
+	jobs = recomputeDueJobs(jobs, now)
 	sort.Slice(jobs, func(i, j int) bool {
 		if jobs[i].FireAt.Equal(jobs[j].FireAt) {
 			return jobs[i].ID < jobs[j].ID
@@ -128,6 +138,44 @@ func (r *Repository) DueJobs(now time.Time, limit int) ([]ScheduledJobRecord, er
 		jobs = jobs[:limit]
 	}
 	return jobs, nil
+}
+
+// recomputeFireAt derives the authoritative fire instant for a wall-clock-anchored
+// job (D) fresh from LocalTime+TZName using the current IANA tzdata, instead of
+// trusting the FireAt baked in when the job was created. This corrects drift from
+// DST/tzdata changes between creation and firing (and any offset arithmetic error
+// upstream). Jobs without both fields are untouched: FireAt (UTC) stays authoritative.
+// An unresolvable TZName is treated the same as "no wall-clock identity" (fail safe,
+// never panics) — the originally stored FireAt is kept.
+func recomputeFireAt(job ScheduledJobRecord) ScheduledJobRecord {
+	if job.LocalTime == "" || job.TZName == "" {
+		return job
+	}
+	loc, err := time.LoadLocation(job.TZName)
+	if err != nil {
+		return job
+	}
+	parsed, err := time.ParseInLocation("2006-01-02T15:04:05", job.LocalTime, loc)
+	if err != nil {
+		return job
+	}
+	job.FireAt = parsed.UTC()
+	return job
+}
+
+// recomputeDueJobs applies recomputeFireAt to each candidate row and drops any
+// job that recomputation pushed back into the future — deterministic and
+// idempotent: repeated calls before the real due moment yield the same result,
+// so a job's actual fire instant never depends on which poll cycle observed it.
+func recomputeDueJobs(jobs []ScheduledJobRecord, now time.Time) []ScheduledJobRecord {
+	due := make([]ScheduledJobRecord, 0, len(jobs))
+	for _, job := range jobs {
+		job = recomputeFireAt(job)
+		if !job.FireAt.After(now) {
+			due = append(due, job)
+		}
+	}
+	return due
 }
 
 // ClaimScheduledJob atomically reserves a pending job by moving it to sent.
@@ -238,7 +286,8 @@ func (r *Repository) ListJobs(tenantID, chatID string) []ScheduledJobRecord {
 	if r.db != nil {
 		rows, err := r.db.Query(
 			`SELECT id, tenant_id, chat_id, bot_id, kind, target, fire_at, payload,
-			        status, created_by, idempotency_key, created_at, sent_at
+			        status, created_by, idempotency_key, created_at, sent_at,
+			        local_time, tz_name
 			   FROM scheduled_jobs
 			  WHERE tenant_id = $1 AND chat_id = $2
 			  ORDER BY fire_at DESC, id DESC`, tenantID, chatID,
@@ -277,10 +326,12 @@ func scanScheduledJobs(rows *sql.Rows) ([]ScheduledJobRecord, error) {
 		var botID sql.NullInt64
 		var payload []byte
 		var sentAt sql.NullTime
+		var localTime, tzName sql.NullString
 		if err := rows.Scan(
 			&job.ID, &job.TenantID, &job.ChatID, &botID, &job.Kind, &job.Target,
 			&job.FireAt, &payload, &job.Status, &job.CreatedBy,
 			&job.IdempotencyKey, &job.CreatedAt, &sentAt,
+			&localTime, &tzName,
 		); err != nil {
 			return nil, err
 		}
@@ -293,6 +344,12 @@ func scanScheduledJobs(rows *sql.Rows) ([]ScheduledJobRecord, error) {
 		if sentAt.Valid {
 			value := sentAt.Time
 			job.SentAt = &value
+		}
+		if localTime.Valid {
+			job.LocalTime = localTime.String
+		}
+		if tzName.Valid {
+			job.TZName = tzName.String
 		}
 		jobs = append(jobs, job)
 	}

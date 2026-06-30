@@ -489,6 +489,19 @@ func (s *Service) saveAIScheduledJobs(event contracts.NormalizedTelegramEvent, s
 				botID = parsed
 			}
 		}
+		// D: validate the optional wall-clock pair the same way as owner timezones
+		// (ownerTimeLocation / time.LoadLocation, A1 fail-safe convention) — an
+		// unresolvable zone or malformed local_time degrades to "no wall-clock
+		// identity" (FireAt stays authoritative) rather than failing the job.
+		localTime := strings.TrimSpace(job.LocalTime)
+		tzName := strings.TrimSpace(job.TZName)
+		if localTime == "" || tzName == "" {
+			localTime, tzName = "", ""
+		} else if loc, ok := ownerTimeLocation(tzName); !ok {
+			localTime, tzName = "", ""
+		} else if _, err := time.ParseInLocation("2006-01-02T15:04:05", localTime, loc); err != nil {
+			localTime, tzName = "", ""
+		}
 		if _, err := s.repository.InsertScheduledJob(store.ScheduledJobRecord{
 			TenantID:       event.TenantID,
 			ChatID:         event.ChatID,
@@ -499,6 +512,8 @@ func (s *Service) saveAIScheduledJobs(event contracts.NormalizedTelegramEvent, s
 			Payload:        payload,
 			CreatedBy:      createdBy,
 			IdempotencyKey: strings.TrimSpace(job.IdempotencyKey),
+			LocalTime:      localTime,
+			TZName:         tzName,
 		}); err != nil {
 			return err
 		}

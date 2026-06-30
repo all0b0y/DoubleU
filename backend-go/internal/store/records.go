@@ -58,6 +58,13 @@ type ScheduledJobRecord struct {
 	IdempotencyKey string         `json:"idempotency_key"`
 	CreatedAt      time.Time      `json:"created_at"`
 	SentAt         *time.Time     `json:"sent_at,omitempty"`
+	// LocalTime is the naive wall-clock fire time ("YYYY-MM-DDTHH:MM:SS") in
+	// TZName, preserved so DST transitions between creation and firing recompute
+	// the same local moment instead of drifting with the frozen UTC instant.
+	// "" together with TZName=="" means FireAt (UTC) is authoritative (D).
+	LocalTime string `json:"local_time,omitempty"`
+	// TZName is the IANA zone LocalTime is expressed in.
+	TZName string `json:"tz_name,omitempty"`
 }
 
 // SemanticFactRecord stores a typed, atomic fact in the Semantic Layer.

@@ -75,6 +75,21 @@
 
 ### DEBT — осознанные отложенные решения
 
+- **`list_reminders` показывает не пересчитанный `fire_at`.** Scheduler/DST-fix (2026-06-30,
+  `docs/plans/scheduler_timezone_and_time_context_plan_2026-06-30.md`, задача D) научил `DueJobs`
+  пересчитывать авторитетное время срабатывания из `local_time`+`tz_name` (свежий tzdata на момент
+  выборки), но `ListJobs` ([scheduled_jobs.go](../backend-go/internal/store/scheduled_jobs.go)) и
+  `existingScheduledJobs` ([service.go](../backend-go/internal/core/service.go)) по-прежнему отдают
+  «запечённый» `fire_at` как есть. Для дальних напоминаний, пересекающих смену tzdata/DST-политики,
+  `scheduler.list_reminders` может показать владельцу чуть неточное время. Низкий риск (само
+  срабатывание — `DueJobs` — уже корректно), но стоит применить тот же пересчёт при листинге.
+- **`conversationContextAndMessages` делает отдельный `UserSettings`-лукап.** Task B (2026-06-30, тот же
+  план) добавил параллельный `s.repository.UserSettings(event.TenantID)` внутри
+  [ai_context.go](../backend-go/internal/core/ai_context.go) для локализации `[CURRENT DATE]`/таймстемпов
+  транскрипта. `processContactMessage` ([ai_turn.go](../backend-go/internal/core/ai_turn.go)) уже делает
+  свой собственный `UserSettings`-лукап чуть позже для `request.UserSettings` — два индексных чтения одной
+  строки за оборот. Не на горячем пути блокировки (читается параллельно с остальным контекстом), но можно
+  свести к одному чтению, прокинув `UserSettings` параметром.
 - **Voice role drafting: base64 JSON upload.** Mini App пока буферизует запись `MediaRecorder`
   целиком в памяти и отправляет base64 в JSON (лимит записи 60 секунд, серверный cap 14 MiB).
   При росте лимитов заменить на streaming/multipart upload и добавить codec fallback для WebView
