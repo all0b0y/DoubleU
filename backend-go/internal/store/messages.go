@@ -267,6 +267,80 @@ func (r *Repository) RecentMessages(tenantID, chatID string, limit int) []Messag
 	return messages
 }
 
+// RecentMessagesForRoleContext returns recent stored messages for one bot role
+// memory context. A zero roleContextID represents a missing active bot context
+// and intentionally returns no messages instead of falling back to broad chat
+// history.
+func (r *Repository) RecentMessagesForRoleContext(tenantID, chatID string, limit int, roleContextID int64) []MessageRecord {
+	if limit <= 0 || roleContextID == 0 {
+		return nil
+	}
+	if r.db != nil {
+		rows, err := r.db.Query(
+			`SELECT event_id, tenant_id, chat_id, telegram_update_id, business_connection_id,
+			        source_message_id, sender_id, message_text, message_type, received_at,
+			        COALESCE(role_context_id, 0)
+			   FROM (
+			     SELECT event_id, tenant_id, chat_id, telegram_update_id, business_connection_id,
+			            source_message_id, sender_id, message_text, message_type, received_at,
+			            role_context_id
+			       FROM messages
+			      WHERE tenant_id = $1 AND chat_id = $2 AND role_context_id = $3 AND quarantined = false
+			      ORDER BY received_at DESC
+			      LIMIT $4
+			   ) recent
+			  ORDER BY received_at ASC`,
+			tenantID,
+			chatID,
+			roleContextID,
+			limit,
+		)
+		if err == nil {
+			defer rows.Close()
+			messages := make([]MessageRecord, 0)
+			for rows.Next() {
+				var event contracts.NormalizedTelegramEvent
+				var scannedRoleContextID int64
+				if rows.Scan(
+					&event.EventID,
+					&event.TenantID,
+					&event.ChatID,
+					&event.TelegramUpdateID,
+					&event.BusinessConnectionID,
+					&event.SourceMessageID,
+					&event.SenderID,
+					&event.MessageText,
+					&event.MessageType,
+					&event.CreatedAt,
+					&scannedRoleContextID,
+				) == nil {
+					messages = append(messages, MessageRecord{Event: event, RoleContextID: scannedRoleContextID})
+				}
+			}
+			return messages
+		}
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	keys := r.chatMessageKeys[chatKey(tenantID, chatID)]
+	messages := make([]MessageRecord, 0, len(keys))
+	for _, key := range keys {
+		if record, ok := r.messages[key]; ok &&
+			record.Event.EventID != "" &&
+			!record.Quarantined &&
+			record.RoleContextID == roleContextID {
+			messages = append(messages, record)
+		}
+	}
+	sort.Slice(messages, func(i, j int) bool {
+		return messages[i].Event.CreatedAt.Before(messages[j].Event.CreatedAt)
+	})
+	if len(messages) > limit {
+		messages = messages[len(messages)-limit:]
+	}
+	return messages
+}
+
 func (r *Repository) insertState(tenantID, chatID, sourceMessageID string, state contracts.MessageState, traceID string) {
 	var traceArg any = nil
 	if traceID != "" {

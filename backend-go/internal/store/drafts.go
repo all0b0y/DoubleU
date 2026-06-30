@@ -179,6 +179,26 @@ func (r *Repository) DraftsForChat(tenantID, chatID string) []DraftRecord {
 	return result
 }
 
+// DraftsForChatForRoleContext returns drafts scoped to one bot role memory
+// context. A zero roleContextID intentionally returns an empty set.
+func (r *Repository) DraftsForChatForRoleContext(tenantID, chatID string, roleContextID int64) []DraftRecord {
+	if roleContextID == 0 {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var result []DraftRecord
+	for _, draft := range r.drafts {
+		if draft.TenantID == tenantID && draft.ChatID == chatID && draft.RoleContextID == roleContextID {
+			result = append(result, draft)
+		}
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].CreatedAt.After(result[j].CreatedAt)
+	})
+	return result
+}
+
 // DraftBySentMessageID returns the draft whose reply was sent as the given Telegram message_id.
 func (r *Repository) DraftBySentMessageID(tenantID, chatID, sentMessageID string) (DraftRecord, bool) {
 	if sentMessageID == "" {

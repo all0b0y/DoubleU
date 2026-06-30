@@ -140,6 +140,42 @@ func (r *Repository) ActiveEpisodeByChat(tenantID, chatID string) (ActiveEpisode
 	return ep, ok
 }
 
+// ActiveEpisodeByChatForRoleContext returns the active episode only when it
+// belongs to the requested bot role memory context.
+func (r *Repository) ActiveEpisodeByChatForRoleContext(tenantID, chatID string, roleContextID int64) (ActiveEpisodeRecord, bool) {
+	if roleContextID == 0 {
+		return ActiveEpisodeRecord{}, false
+	}
+	if r.db != nil {
+		var ep ActiveEpisodeRecord
+		var currentTopic sql.NullString
+		var openQuestion sql.NullString
+		var pendingAction sql.NullString
+		err := r.db.QueryRow(
+			`SELECT tenant_id, chat_id, started_at, last_message_at, message_count,
+			        current_topic, open_question_message_id, pending_owner_action,
+			        COALESCE(role_context_id, 0)
+			   FROM active_episodes
+			  WHERE tenant_id = $1 AND chat_id = $2 AND role_context_id = $3`,
+			tenantID, chatID, roleContextID,
+		).Scan(
+			&ep.TenantID, &ep.ChatID,
+			&ep.StartedAt, &ep.LastMessageAt, &ep.MessageCount,
+			&currentTopic, &openQuestion, &pendingAction, &ep.RoleContextID,
+		)
+		if err == nil {
+			ep.CurrentTopic = currentTopic.String
+			ep.OpenQuestionMsgID = openQuestion.String
+			ep.PendingOwnerAction = pendingAction.String
+			return ep, true
+		}
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	ep, ok := r.activeEpisodes[chatKey(tenantID, chatID)]
+	return ep, ok && ep.RoleContextID == roleContextID
+}
+
 // CloseActiveEpisode deletes the active episode record, signalling that it has been
 // materialised into episode_summaries.
 func (r *Repository) CloseActiveEpisode(tenantID, chatID string) {
@@ -290,6 +326,53 @@ func (r *Repository) EpisodeSummaries(tenantID, chatID string, limit int) []Epis
 	return result
 }
 
+// EpisodeSummariesForRoleContext returns recent episode summaries for one bot
+// role memory context, newest first.
+func (r *Repository) EpisodeSummariesForRoleContext(tenantID, chatID string, limit int, roleContextID int64) []EpisodeSummaryRecord {
+	if limit <= 0 || roleContextID == 0 {
+		return nil
+	}
+	if r.db != nil {
+		rows, err := r.db.Query(
+			`SELECT id, tenant_id, chat_id, period_start, period_end,
+			        content, closure_reason, message_count, created_at,
+			        COALESCE(role_context_id, 0)
+			   FROM episode_summaries
+			  WHERE tenant_id = $1 AND chat_id = $2 AND role_context_id = $3
+			    AND deleted_at IS NULL
+			  ORDER BY period_end DESC
+			  LIMIT $4`,
+			tenantID, chatID, roleContextID, limit,
+		)
+		if err == nil {
+			defer rows.Close()
+			result := make([]EpisodeSummaryRecord, 0)
+			for rows.Next() {
+				var s EpisodeSummaryRecord
+				if rows.Scan(
+					&s.ID, &s.TenantID, &s.ChatID,
+					&s.PeriodStart, &s.PeriodEnd,
+					&s.Content, &s.ClosureReason, &s.MessageCount, &s.CreatedAt,
+					&s.RoleContextID,
+				) == nil {
+					result = append(result, s)
+				}
+			}
+			return result
+		}
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	result := make([]EpisodeSummaryRecord, 0)
+	for i := len(r.episodeSummaries) - 1; i >= 0 && len(result) < limit; i-- {
+		s := r.episodeSummaries[i]
+		if s.TenantID == tenantID && s.ChatID == chatID && s.RoleContextID == roleContextID {
+			result = append(result, s)
+		}
+	}
+	return result
+}
+
 // float64SliceToVector converts a Go float64 slice to a pgvector literal string.
 // Format: "[0.1, 0.2, ...]" — distinct from the PostgreSQL array literal "{0.1, ...}".
 // Used to pass query vectors to ORDER BY embedding <=> $n::vector clauses.
@@ -335,6 +418,52 @@ func (r *Repository) EpisodeSummariesByVector(tenantID, chatID string, queryVect
 	// If no embedded summaries found, fall back to recency.
 	if len(result) == 0 {
 		return r.EpisodeSummaries(tenantID, chatID, limit)
+	}
+	return result
+}
+
+// EpisodeSummariesByVectorForRoleContext returns episode summaries ranked by
+// vector similarity inside one bot role memory context.
+func (r *Repository) EpisodeSummariesByVectorForRoleContext(tenantID, chatID string, queryVector []float64, limit int, roleContextID int64) []EpisodeSummaryRecord {
+	if roleContextID == 0 {
+		return nil
+	}
+	if r.db == nil || len(queryVector) == 0 {
+		return r.EpisodeSummariesForRoleContext(tenantID, chatID, limit, roleContextID)
+	}
+	vec := float64SliceToVector(queryVector)
+	rows, err := r.db.Query(fmt.Sprintf(
+		`SELECT id, tenant_id, chat_id, period_start, period_end,
+		        content, closure_reason, message_count, created_at,
+		        COALESCE(role_context_id, 0)
+		   FROM episode_summaries
+		  WHERE tenant_id = $1 AND chat_id = $2 AND role_context_id = $3
+		    AND embedding IS NOT NULL
+		    AND deleted_at IS NULL
+		  ORDER BY %s ASC
+		  LIMIT $5`,
+		r.vectorOrderExpr("embedding", "$4"),
+	),
+		tenantID, chatID, roleContextID, vec, limit,
+	)
+	if err != nil {
+		return r.EpisodeSummariesForRoleContext(tenantID, chatID, limit, roleContextID)
+	}
+	defer rows.Close()
+	result := make([]EpisodeSummaryRecord, 0, limit)
+	for rows.Next() {
+		var s EpisodeSummaryRecord
+		if rows.Scan(
+			&s.ID, &s.TenantID, &s.ChatID,
+			&s.PeriodStart, &s.PeriodEnd,
+			&s.Content, &s.ClosureReason, &s.MessageCount, &s.CreatedAt,
+			&s.RoleContextID,
+		) == nil {
+			result = append(result, s)
+		}
+	}
+	if len(result) == 0 {
+		return r.EpisodeSummariesForRoleContext(tenantID, chatID, limit, roleContextID)
 	}
 	return result
 }

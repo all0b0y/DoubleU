@@ -312,6 +312,42 @@ func (r *Repository) SemanticFacts(tenantID, chatID string, limit int) []Semanti
 	return result
 }
 
+// SemanticFactsForRoleContext returns active chat-scoped semantic facts inside
+// one bot role memory context.
+func (r *Repository) SemanticFactsForRoleContext(tenantID, chatID string, limit int, roleContextID int64) []SemanticFactRecord {
+	if limit <= 0 || roleContextID == 0 {
+		return nil
+	}
+	if r.db != nil {
+		rows, err := r.db.Query(
+			`SELECT id, tenant_id, scope_kind, COALESCE(chat_id,''), fact_text, fact_type,
+			        subject, confidence, source, COALESCE(source_message_id,''),
+			        COALESCE(role_context_id, 0), expires_at, created_at
+			   FROM semantic_facts
+			  WHERE tenant_id = $1 AND chat_id = $2 AND role_context_id = $3
+			    AND scope_kind = 'chat'
+			    AND deleted_at IS NULL AND superseded_by_id IS NULL
+			  ORDER BY created_at DESC
+			  LIMIT $4`,
+			tenantID, chatID, roleContextID, limit,
+		)
+		if err == nil {
+			defer rows.Close()
+			return scanSemanticFacts(rows)
+		}
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	result := make([]SemanticFactRecord, 0)
+	for i := len(r.semanticFacts) - 1; i >= 0 && len(result) < limit; i-- {
+		f := r.semanticFacts[i]
+		if f.TenantID == tenantID && f.ChatID == chatID && f.ScopeKind == "chat" && f.RoleContextID == roleContextID {
+			result = append(result, f)
+		}
+	}
+	return result
+}
+
 func scanSemanticFacts(rows *sql.Rows) []SemanticFactRecord {
 	result := make([]SemanticFactRecord, 0)
 	for rows.Next() {
@@ -433,6 +469,38 @@ func (r *Repository) hardIncludeChatFacts(tenantID, chatID string) []SemanticFac
 	return scanSemanticFacts(rows)
 }
 
+func (r *Repository) hardIncludeChatFactsForRoleContext(tenantID, chatID string, roleContextID int64) []SemanticFactRecord {
+	if roleContextID == 0 {
+		return nil
+	}
+	if r.db == nil {
+		result := make([]SemanticFactRecord, 0, 2)
+		for _, fact := range r.SemanticFactsForRoleContext(tenantID, chatID, 200, roleContextID) {
+			if fact.FactType == "taboo" || fact.FactType == "health" {
+				result = append(result, fact)
+			}
+		}
+		return result
+	}
+	rows, err := r.db.Query(
+		`SELECT id, tenant_id, scope_kind, COALESCE(chat_id,''), fact_text, fact_type,
+		        subject, confidence, source, COALESCE(source_message_id,''),
+		        COALESCE(role_context_id, 0), expires_at, created_at
+		   FROM semantic_facts
+		  WHERE tenant_id = $1 AND chat_id = $2 AND role_context_id = $3
+		    AND scope_kind = 'chat'
+		    AND fact_type IN ('taboo', 'health')
+		    AND deleted_at IS NULL AND superseded_by_id IS NULL
+		  ORDER BY created_at DESC`,
+		tenantID, chatID, roleContextID,
+	)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	return scanSemanticFacts(rows)
+}
+
 // SemanticFactsByVector returns chat-scoped facts ranked by cosine similarity to queryVector.
 // Taboo and health facts are always included regardless of similarity (design §8.2).
 // The remaining slots are filled by top-K similarity-ranked facts with commitment (÷1.5) and
@@ -496,6 +564,61 @@ func (r *Repository) SemanticFactsByVector(tenantID, chatID string, queryVector 
 	return append(hardFacts, simFacts...)
 }
 
+// SemanticFactsByVectorForRoleContext returns chat-scoped facts ranked by
+// cosine similarity inside one bot role memory context.
+func (r *Repository) SemanticFactsByVectorForRoleContext(tenantID, chatID string, queryVector []float64, limit int, roleContextID int64) []SemanticFactRecord {
+	if roleContextID == 0 {
+		return nil
+	}
+	if r.db == nil || len(queryVector) == 0 {
+		return r.SemanticFactsForRoleContext(tenantID, chatID, limit, roleContextID)
+	}
+
+	hardFacts := r.hardIncludeChatFactsForRoleContext(tenantID, chatID, roleContextID)
+	remaining := limit - len(hardFacts)
+	if remaining < 1 {
+		remaining = 1
+	}
+	vec := float64SliceToVector(queryVector)
+	rows, err := r.db.Query(fmt.Sprintf(
+		`SELECT id, tenant_id, scope_kind, chat_id, fact_text, fact_type,
+		        subject, confidence, source, source_message_id,
+		        COALESCE(role_context_id, 0), expires_at, created_at
+		   FROM (
+		     SELECT sf.id, sf.tenant_id, sf.scope_kind, COALESCE(sf.chat_id,'') AS chat_id,
+		            sf.fact_text, sf.fact_type, sf.subject, sf.confidence, sf.source,
+		            COALESCE(sf.source_message_id,'') AS source_message_id,
+		            COALESCE(sf.role_context_id, 0) AS role_context_id,
+		            sf.expires_at, sf.created_at,
+		            %s AS dist
+		       FROM semantic_facts sf
+		       JOIN fact_embeddings fe ON fe.fact_id = sf.id
+		      WHERE sf.tenant_id = $1 AND sf.chat_id = $2 AND sf.role_context_id = $5
+		        AND sf.scope_kind = 'chat'
+		        AND sf.fact_type NOT IN ('taboo', 'health')
+		        AND sf.deleted_at IS NULL AND sf.superseded_by_id IS NULL
+		        AND fe.embedding IS NOT NULL
+		      ORDER BY %s ASC
+		      LIMIT $4 * 3
+		   ) candidates
+		  ORDER BY dist * CASE fact_type
+		             WHEN 'commitment' THEN 0.667
+		             WHEN 'preference' THEN 0.833
+		             ELSE 1.0 END ASC
+		  LIMIT $4`,
+		r.vectorOrderExpr("fe.embedding", "$3"),
+		r.vectorOrderExpr("fe.embedding", "$3"),
+	),
+		tenantID, chatID, vec, remaining, roleContextID,
+	)
+	if err != nil {
+		return r.SemanticFactsForRoleContext(tenantID, chatID, limit, roleContextID)
+	}
+	defer rows.Close()
+	simFacts := scanSemanticFacts(rows)
+	return append(hardFacts, simFacts...)
+}
+
 // SemanticFactsByBM25 returns chat-scoped facts ranked by full-text (BM25) relevance to query.
 // Uses the 'simple' text-search configuration so it handles Russian and English without
 // a language-specific dictionary. Returns nil when the fact_tsv column is absent (pre-migration).
@@ -518,6 +641,32 @@ func (r *Repository) SemanticFactsByBM25(tenantID, chatID, query string, limit i
 	)
 	if err != nil {
 		return nil // column absent or query error — caller falls back to vector-only
+	}
+	defer rows.Close()
+	return scanSemanticFacts(rows)
+}
+
+// SemanticFactsByBM25ForRoleContext returns BM25-ranked chat-scoped facts
+// inside one bot role memory context.
+func (r *Repository) SemanticFactsByBM25ForRoleContext(tenantID, chatID, query string, limit int, roleContextID int64) []SemanticFactRecord {
+	if roleContextID == 0 || r.db == nil || strings.TrimSpace(query) == "" {
+		return nil
+	}
+	rows, err := r.db.Query(
+		`SELECT id, tenant_id, scope_kind, COALESCE(chat_id,''), fact_text, fact_type,
+		        subject, confidence, source, COALESCE(source_message_id,''),
+		        COALESCE(role_context_id, 0), expires_at, created_at
+		   FROM semantic_facts
+		  WHERE tenant_id = $1 AND chat_id = $2 AND role_context_id = $5
+		    AND scope_kind = 'chat'
+		    AND fact_tsv @@ plainto_tsquery('simple', $3)
+		    AND deleted_at IS NULL AND superseded_by_id IS NULL
+		  ORDER BY ts_rank_cd(fact_tsv, plainto_tsquery('simple', $3)) DESC
+		  LIMIT $4`,
+		tenantID, chatID, query, limit, roleContextID,
+	)
+	if err != nil {
+		return nil
 	}
 	defer rows.Close()
 	return scanSemanticFacts(rows)
@@ -565,6 +714,75 @@ func (r *Repository) SemanticFactsByIDs(tenantID string, ids []int64) []Semantic
 	return result
 }
 
+// SemanticFactsByIDsForRoleContext returns facts with the given IDs, restricted
+// to one bot role memory context.
+func (r *Repository) SemanticFactsByIDsForRoleContext(tenantID string, ids []int64, roleContextID int64) []SemanticFactRecord {
+	if roleContextID == 0 {
+		return nil
+	}
+	if r.db == nil {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		allowed := make(map[int64]struct{}, len(ids))
+		for _, id := range ids {
+			allowed[id] = struct{}{}
+		}
+		byID := make(map[int64]SemanticFactRecord, len(ids))
+		for _, f := range r.semanticFacts {
+			if f.TenantID == tenantID && f.RoleContextID == roleContextID {
+				if _, ok := allowed[f.ID]; ok {
+					byID[f.ID] = f
+				}
+			}
+		}
+		result := make([]SemanticFactRecord, 0, len(ids))
+		for _, id := range ids {
+			if f, ok := byID[id]; ok {
+				result = append(result, f)
+			}
+		}
+		return result
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	placeholders := make([]string, len(ids))
+	args := make([]any, 0, len(ids)+2)
+	args = append(args, tenantID)
+	for i, id := range ids {
+		placeholders[i] = fmt.Sprintf("$%d", i+2)
+		args = append(args, id)
+	}
+	roleContextPlaceholder := len(ids) + 2
+	args = append(args, roleContextID)
+	query := fmt.Sprintf(
+		`SELECT id, tenant_id, scope_kind, COALESCE(chat_id,''), fact_text, fact_type,
+		        subject, confidence, source, COALESCE(source_message_id,''),
+		        COALESCE(role_context_id, 0), expires_at, created_at
+		   FROM semantic_facts
+		  WHERE tenant_id = $1 AND id IN (%s)
+		    AND role_context_id = $%d
+		    AND deleted_at IS NULL`,
+		strings.Join(placeholders, ","), roleContextPlaceholder,
+	)
+	rows, err := r.db.Query(query, args...)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	byID := make(map[int64]SemanticFactRecord)
+	for _, f := range scanSemanticFacts(rows) {
+		byID[f.ID] = f
+	}
+	result := make([]SemanticFactRecord, 0, len(ids))
+	for _, id := range ids {
+		if f, ok := byID[id]; ok {
+			result = append(result, f)
+		}
+	}
+	return result
+}
+
 // RankFactsByCosine reorders the given fact IDs by cosine distance to queryVector
 // (closest first), truncated to limit. Facts without an embedding row are absent
 // from the result — callers backfill them from their pre-ranked order. Replaces
@@ -593,6 +811,44 @@ func (r *Repository) RankFactsByCosine(tenantID string, ids []int64, queryVector
 		  ORDER BY %s ASC
 		  LIMIT $%d`,
 		strings.Join(placeholders, ","), r.vectorOrderExpr("fe.embedding", "$2"), len(ids)+3,
+	)
+	rows, err := r.db.Query(query, args...)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	return scanSemanticFacts(rows)
+}
+
+// RankFactsByCosineForRoleContext ranks fact IDs within one bot role memory
+// context. It is used after role-scoped recall so a stale ID cannot re-enter
+// the prompt through the ranking step.
+func (r *Repository) RankFactsByCosineForRoleContext(tenantID string, ids []int64, queryVector []float64, limit int, roleContextID int64) []SemanticFactRecord {
+	if roleContextID == 0 {
+		return nil
+	}
+	if r.db == nil || len(ids) == 0 || len(queryVector) == 0 {
+		return nil
+	}
+	placeholders := make([]string, len(ids))
+	args := make([]any, 0, len(ids)+4)
+	args = append(args, tenantID, float64SliceToVector(queryVector), roleContextID)
+	for i, id := range ids {
+		placeholders[i] = fmt.Sprintf("$%d", i+4)
+		args = append(args, id)
+	}
+	args = append(args, limit)
+	query := fmt.Sprintf(
+		`SELECT sf.id, sf.tenant_id, sf.scope_kind, COALESCE(sf.chat_id,''), sf.fact_text, sf.fact_type,
+		        sf.subject, sf.confidence, sf.source, COALESCE(sf.source_message_id,''),
+		        COALESCE(sf.role_context_id, 0), sf.expires_at, sf.created_at
+		   FROM semantic_facts sf
+		   JOIN fact_embeddings fe ON fe.fact_id = sf.id
+		  WHERE sf.tenant_id = $1 AND sf.role_context_id = $3 AND sf.id IN (%s)
+		    AND sf.deleted_at IS NULL
+		  ORDER BY %s ASC
+		  LIMIT $%d`,
+		strings.Join(placeholders, ","), r.vectorOrderExpr("fe.embedding", "$2"), len(ids)+4,
 	)
 	rows, err := r.db.Query(query, args...)
 	if err != nil {
@@ -1070,6 +1326,47 @@ func (r *Repository) OpenCommitments(tenantID, chatID string) []SemanticFactReco
 	result := make([]SemanticFactRecord, 0)
 	for _, f := range r.semanticFacts {
 		if f.TenantID != tenantID || f.ChatID != chatID || f.FactType != "commitment" {
+			continue
+		}
+		if f.ExpiresAt != nil && f.ExpiresAt.Before(now) {
+			continue
+		}
+		result = append(result, f)
+	}
+	return result
+}
+
+// OpenCommitmentsForRoleContext returns active commitment facts inside one bot
+// role memory context.
+func (r *Repository) OpenCommitmentsForRoleContext(tenantID, chatID string, roleContextID int64) []SemanticFactRecord {
+	if roleContextID == 0 {
+		return nil
+	}
+	if r.db != nil {
+		rows, err := r.db.Query(
+			`SELECT id, tenant_id, scope_kind, COALESCE(chat_id,''), fact_text, fact_type,
+			        subject, confidence, source, COALESCE(source_message_id,''),
+			        COALESCE(role_context_id, 0), expires_at, created_at
+			   FROM semantic_facts
+			  WHERE tenant_id = $1 AND chat_id = $2 AND role_context_id = $3
+			    AND scope_kind = 'chat'
+			    AND fact_type = 'commitment'
+			    AND deleted_at IS NULL AND superseded_by_id IS NULL
+			    AND (expires_at IS NULL OR expires_at > now())
+			  ORDER BY expires_at NULLS LAST, created_at DESC`,
+			tenantID, chatID, roleContextID,
+		)
+		if err == nil {
+			defer rows.Close()
+			return scanSemanticFacts(rows)
+		}
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := time.Now()
+	result := make([]SemanticFactRecord, 0)
+	for _, f := range r.semanticFacts {
+		if f.TenantID != tenantID || f.ChatID != chatID || f.RoleContextID != roleContextID || f.FactType != "commitment" {
 			continue
 		}
 		if f.ExpiresAt != nil && f.ExpiresAt.Before(now) {

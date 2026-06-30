@@ -45,6 +45,7 @@ func (s *Service) conversationContext(ctx context.Context, event contracts.Norma
 // lines, commitments, and hard-include facts (taboo/health) are never trimmed.
 func (s *Service) conversationContextAndMessages(ctx context.Context, event contracts.NormalizedTelegramEvent, ownerID string, limit int) ([]string, []store.MessageRecord) {
 	now := s.now().UTC()
+	roleContextID, roleScoped := s.memoryRoleContextForEvent(event)
 
 	// Phase 1 — independent reads in parallel (ARCH-8). The embedding API call
 	// dominates (~2-5 s); everything else is a DB roundtrip that overlaps it.
@@ -81,14 +82,42 @@ func (s *Service) conversationContextAndMessages(ctx context.Context, event cont
 			}
 		}
 	})
-	run(func() { records = s.repository.RecentMessages(event.TenantID, event.ChatID, limit) })
+	run(func() {
+		if roleScoped {
+			records = s.repository.RecentMessagesForRoleContext(event.TenantID, event.ChatID, limit, roleContextID)
+			return
+		}
+		records = s.repository.RecentMessages(event.TenantID, event.ChatID, limit)
+	})
 	run(func() { greeted = s.repository.GreetedToday(event.TenantID, event.ChatID, ownerID) })
 	run(func() { pausedHours = s.repository.ChatPausedHours(event.TenantID, event.ChatID) })
-	run(func() { commitments = s.repository.OpenCommitments(event.TenantID, event.ChatID) })
-	run(func() { episode, hasEpisode = s.repository.ActiveEpisodeByChat(event.TenantID, event.ChatID) })
-	run(func() { drafts = s.repository.DraftsForChat(event.TenantID, event.ChatID) })
+	run(func() {
+		if roleScoped {
+			commitments = s.repository.OpenCommitmentsForRoleContext(event.TenantID, event.ChatID, roleContextID)
+			return
+		}
+		commitments = s.repository.OpenCommitments(event.TenantID, event.ChatID)
+	})
+	run(func() {
+		if roleScoped {
+			episode, hasEpisode = s.repository.ActiveEpisodeByChatForRoleContext(event.TenantID, event.ChatID, roleContextID)
+			return
+		}
+		episode, hasEpisode = s.repository.ActiveEpisodeByChat(event.TenantID, event.ChatID)
+	})
+	run(func() {
+		if roleScoped {
+			drafts = s.repository.DraftsForChatForRoleContext(event.TenantID, event.ChatID, roleContextID)
+			return
+		}
+		drafts = s.repository.DraftsForChat(event.TenantID, event.ChatID)
+	})
 	run(func() {
 		if event.MessageText != "" {
+			if roleScoped {
+				bm25 = s.repository.SemanticFactsByBM25ForRoleContext(event.TenantID, event.ChatID, event.MessageText, 20, roleContextID)
+				return
+			}
 			bm25 = s.repository.SemanticFactsByBM25(event.TenantID, event.ChatID, event.MessageText, 20)
 		}
 	})
@@ -102,18 +131,36 @@ func (s *Service) conversationContextAndMessages(ctx context.Context, event cont
 
 	// Phase 2 — vector-dependent retrieval.
 	// Memory is strictly per-chat: only facts observed in THIS chat are recalled.
-	chatVector := s.repository.SemanticFactsByVector(event.TenantID, event.ChatID, queryVector, 20)
+	var chatVector []store.SemanticFactRecord
+	if roleScoped {
+		chatVector = s.repository.SemanticFactsByVectorForRoleContext(event.TenantID, event.ChatID, queryVector, 20, roleContextID)
+	} else {
+		chatVector = s.repository.SemanticFactsByVector(event.TenantID, event.ChatID, queryVector, 20)
+	}
 	chatFacts := chatVector
 	if len(bm25) > 0 {
 		// RRF fusion: merge vector + BM25 ranked lists into a single ordered set,
 		// then resolve fused IDs back to records (preserves RRF order).
 		fusedChatIDs := rrfFuse(factIDs(chatVector), factIDs(bm25), 60)
-		chatFacts = s.repository.SemanticFactsByIDs(event.TenantID, fusedChatIDs)
+		if roleScoped {
+			chatFacts = s.repository.SemanticFactsByIDsForRoleContext(event.TenantID, fusedChatIDs, roleContextID)
+		} else {
+			chatFacts = s.repository.SemanticFactsByIDs(event.TenantID, fusedChatIDs)
+		}
 	}
 	// Final ordering (ARCH-5): deterministic cosine reranking in SQL replaces the
 	// listwise LLM reranker; hard-include facts (taboo/health, §8.2) always survive.
-	chatFacts = s.finalizeFactOrder(event.TenantID, chatFacts, queryVector, 8)
-	episodeSummaries := s.repository.EpisodeSummariesByVector(event.TenantID, event.ChatID, queryVector, 3)
+	if roleScoped {
+		chatFacts = s.finalizeFactOrderForRoleContext(event.TenantID, chatFacts, queryVector, 8, roleContextID)
+	} else {
+		chatFacts = s.finalizeFactOrder(event.TenantID, chatFacts, queryVector, 8)
+	}
+	var episodeSummaries []store.EpisodeSummaryRecord
+	if roleScoped {
+		episodeSummaries = s.repository.EpisodeSummariesByVectorForRoleContext(event.TenantID, event.ChatID, queryVector, 3, roleContextID)
+	} else {
+		episodeSummaries = s.repository.EpisodeSummariesByVector(event.TenantID, event.ChatID, queryVector, 3)
+	}
 
 	// --- Section assembly (then budget trimming per §8.1) ---
 
@@ -148,8 +195,10 @@ func (s *Service) conversationContextAndMessages(ctx context.Context, event cont
 		// draft can address it instead of only the newest message.
 		if episode.OpenQuestionMsgID != "" && episode.OpenQuestionMsgID != event.SourceMessageID {
 			if msg, ok := s.repository.Message(event.TenantID, event.ChatID, episode.OpenQuestionMsgID); ok {
-				if text := strings.TrimSpace(msg.Event.MessageText); text != "" {
-					header = append(header, fmt.Sprintf("[RUNTIME: незакрытый вопрос] %s", text))
+				if !roleScoped || msg.RoleContextID == roleContextID {
+					if text := strings.TrimSpace(msg.Event.MessageText); text != "" {
+						header = append(header, fmt.Sprintf("[RUNTIME: незакрытый вопрос] %s", text))
+					}
 				}
 			}
 		}
@@ -338,6 +387,14 @@ func factIDs(facts []store.SemanticFactRecord) []int64 {
 // facts that have no embedding yet (the async worker fills those later).
 // When the candidate set already fits the limit no ranking work is done at all.
 func (s *Service) finalizeFactOrder(tenantID string, chatFacts []store.SemanticFactRecord, queryVector []float64, limit int) []store.SemanticFactRecord {
+	return s.finalizeFactOrderScoped(tenantID, chatFacts, queryVector, limit, 0, false)
+}
+
+func (s *Service) finalizeFactOrderForRoleContext(tenantID string, chatFacts []store.SemanticFactRecord, queryVector []float64, limit int, roleContextID int64) []store.SemanticFactRecord {
+	return s.finalizeFactOrderScoped(tenantID, chatFacts, queryVector, limit, roleContextID, true)
+}
+
+func (s *Service) finalizeFactOrderScoped(tenantID string, chatFacts []store.SemanticFactRecord, queryVector []float64, limit int, roleContextID int64, roleScoped bool) []store.SemanticFactRecord {
 	hard := make([]store.SemanticFactRecord, 0, 2)
 	rest := make([]store.SemanticFactRecord, 0, len(chatFacts))
 	for _, f := range chatFacts {
@@ -353,7 +410,12 @@ func (s *Service) finalizeFactOrder(tenantID string, chatFacts []store.SemanticF
 	}
 	if len(rest) > slots {
 		if len(queryVector) > 0 {
-			ranked := s.repository.RankFactsByCosine(tenantID, factIDs(rest), queryVector, slots)
+			var ranked []store.SemanticFactRecord
+			if roleScoped {
+				ranked = s.repository.RankFactsByCosineForRoleContext(tenantID, factIDs(rest), queryVector, slots, roleContextID)
+			} else {
+				ranked = s.repository.RankFactsByCosine(tenantID, factIDs(rest), queryVector, slots)
+			}
 			// Backfill facts without embeddings in their RRF order.
 			if len(ranked) < slots {
 				seen := make(map[int64]bool, len(ranked))
@@ -463,7 +525,7 @@ func (s *Service) botForChat(tenantID, chatID string) (store.UserBotRecord, bool
 
 // activeRoleContextIDForEvent returns the reusable bot memory context currently
 // active for this event. Non-bot chats deliberately keep the legacy zero/NULL
-// context until read isolation is added in the next slice.
+// context.
 func (s *Service) activeRoleContextIDForEvent(event contracts.NormalizedTelegramEvent) int64 {
 	if s == nil || s.repository == nil {
 		return 0
@@ -487,6 +549,20 @@ func (s *Service) activeRoleContextIDForEvent(event contracts.NormalizedTelegram
 		return 0
 	}
 	return ctx.ID
+}
+
+func (s *Service) memoryRoleContextForEvent(event contracts.NormalizedTelegramEvent) (int64, bool) {
+	if s == nil || s.repository == nil {
+		return 0, false
+	}
+	transport := event.Transport
+	if transport == "" {
+		transport = s.repository.ChatTransport(event.TenantID, event.ChatID)
+	}
+	if transport != contracts.TransportBot {
+		return 0, false
+	}
+	return s.activeRoleContextIDForEvent(event), true
 }
 
 // feedbackContext returns recent draft feedback for this chat to send to the AI.
