@@ -26,6 +26,7 @@ coroutines so the scanners read/write the same context object the handler sees.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import threading
@@ -45,7 +46,6 @@ from ..pipelines import draft as draft_pipeline
 from ..pipelines.embedding import embed_texts
 from ..prompts import library as prompt_library
 from ..prompts.families import resolve_family
-from ..prompts.profiles import profile_for
 from ..prompts.renderers import render as render_prompt
 from ..safety.input import InputSafetyScanner
 from ..safety.output import OutputSafetyScanner
@@ -78,10 +78,12 @@ from ..schemas import (
     Usage,
 )
 from ..security import PromptBuilder
+from .dedup_toolset import DedupToolset
 from .deps import AgentDeps
 from .delivery_tools import delivery_toolset
 from .interaction_tools import interaction_toolset
 from .memory_tools import memory_toolset
+from .model_capabilities import CAPABILITY_PROFILE_VERSION, capabilities_for, provider_for
 from .models import (
     AgentTask,
     ModelTier,
@@ -92,8 +94,9 @@ from .models import (
     model_name_for_tier,
     resolve_model_slug,
 )
+from .preflight import TaskPreflightDecision, decide_preflight, model_settings_for
 from .schedule_tools import schedule_toolset
-from .tool_catalog import TOOL_CATALOG, TOOL_NAME_TO_KEY
+from .tool_catalog import TOOL_CATALOG, enabled_tool_names
 from .results import (
     CriticVerdict,
     DraftResult,
@@ -118,25 +121,31 @@ EmbedderCallable = Callable[[str], Awaitable[Sequence[float] | None]]
 def resolve_builtin_toolset(
     ai_role: AIRoleData | None,
     privacy_flags: tuple[PrivacyFlag, ...] = (),
-) -> FilteredToolset[AgentDeps]:
-    """Scope native tools to role overrides while preserving catalog defaults."""
-    settings = ai_role.tool_settings if ai_role is not None else {}
-    scheduler_blocked = any(
-        flag in (PrivacyFlag.NO_MEMORY, PrivacyFlag.PRIVATE) for flag in privacy_flags
-    )
-    enabled_keys = {
-        entry.key
-        for entry in TOOL_CATALOG
-        if settings.get(entry.key, entry.default_enabled)
-        and not (scheduler_blocked and entry.category.value == "schedule")
-    }
-    enabled_names = frozenset(
-        name for name, key in TOOL_NAME_TO_KEY.items() if key in enabled_keys
-    )
-    return FilteredToolset(
+    *,
+    allowed_names: frozenset[str] | None = None,
+) -> DedupToolset:
+    """Scope native tools to role overrides while preserving catalog defaults.
+
+    ``allowed_names``, when given, further restricts the role-enabled set —
+    used by the orchestrator stage to apply ``TaskPreflightDecision.
+    allowed_tool_names`` (2.7) on top of the role/privacy gate, so a role
+    that enables six memory tools still only exposes the ones this turn's
+    preflight decided are actually relevant. ``None`` (the writer's
+    single-stage fallback path) keeps the full role-enabled set.
+
+    Wrapped in :class:`DedupToolset` so a repeat call with the same
+    ``(tool_name, args)`` within one run (orchestrator or single-stage writer)
+    returns the cached result instead of hitting the DB again — see its
+    module docstring for why this is safe unconditionally.
+    """
+    names = enabled_tool_names(ai_role, privacy_flags)
+    if allowed_names is not None:
+        names = names & allowed_names
+    filtered = FilteredToolset(
         CombinedToolset([memory_toolset, interaction_toolset, schedule_toolset]),
-        lambda ctx, tool_def, enabled_names=enabled_names: tool_def.name in enabled_names,
+        lambda ctx, tool_def, enabled_names=names: tool_def.name in enabled_names,
     )
+    return DedupToolset(wrapped=filtered)
 
 
 def role_has_enabled_tools(
@@ -187,6 +196,32 @@ _CRITIC_RISKS = (RiskLevel.MEDIUM, RiskLevel.HIGH)
 # to still kill a runaway loop (which runs into the dozens). Env-tunable.
 _DRAFT_TOOL_CALLS_LIMIT = int(os.getenv("DRAFT_TOOL_CALLS_LIMIT", "12").strip() or "12")
 
+# Tighter ceiling for the orchestrator specifically (2.5 call budget): its job
+# is bounded by design — gather only what the writer is missing — so a
+# runaway loop should be killed well before the writer's 12-call backstop. The
+# source plan's target is request-shape-dependent (<=3 for a simple role/
+# capability question, <=5 for a memory/history-heavy one); without a
+# deterministic way to tell those apart yet (that classification is
+# TaskPreflightDecision, phase 2.7, not implemented), 5 is used as a single
+# safe ceiling — the upper end of the plan's range, not a forced minimum: a
+# simple turn that finishes in 1-2 calls is never artificially padded out.
+_ORCHESTRATOR_TOOL_CALLS_LIMIT = int(
+    os.getenv("ORCHESTRATOR_TOOL_CALLS_LIMIT", "5").strip() or "5"
+)
+
+# Two-stage default: the orchestrator owns memory/schedule/interaction tools
+# (see _orchestrate_async); the writer gets only its always-on delivery
+# capability, not a fallback copy of the same toolset. A Langfuse audit
+# (.claude/analyze.md) showed the fallback path masking orchestration bugs —
+# the writer would quietly re-fetch context the orchestrator already gathered
+# instead of the bug surfacing as a missing-context failure. Set this to
+# enable the old "writer keeps the role's tools as a backup path" behaviour
+# for a deployment that needs it; single-stage drafting (no orchestrator run)
+# is never affected — the writer is the only tool-caller there regardless.
+_WRITER_FALLBACK_TOOLS_ENABLED = os.getenv("WRITER_FALLBACK_TOOLS_ENABLED", "").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+
 # How many times draft_outcome re-runs the agent before giving up. A draft can
 # fail transiently — provider 5xx/rate-limit, a malformed structured output, or
 # the tool-call cap — and a fresh attempt usually succeeds. After this many
@@ -227,55 +262,6 @@ def _build_query_embedder() -> EmbedderCallable:
 # Number of recent messages topic tagging includes as context.
 _TOPIC_MAX_HISTORY = 5
 
-_EXTRACTION_INSTRUCTIONS = (
-    "Extract ONLY durable, long-lived facts from the CURRENT MESSAGE — stable traits"
-    " that will still be true weeks from now (profession, place of residence/study,"
-    " family, long-standing preferences, commitments with a clear deadline)."
-    " Use the CONVERSATION HISTORY only to resolve ambiguous references in the current"
-    " message. Do NOT extract transient or in-the-moment statements (what someone is"
-    " doing right now, current mood, one-off small talk): 'sitting in class right now'"
-    " is transient — skip it; 'studies medicine at university X' is durable — keep it."
-    " profile_suggestions describe identity attributes of the CONTACT the message"
-    " reveals explicitly. Use empty lists when there is nothing to report."
-)
-
-_SUMMARY_INSTRUCTIONS = (
-    "Суммаризируй переписку Telegram-чата на русском. summary — краткая связная сводка;"
-    " action_items — конкретные обязательства и задачи с дедлайнами, если упомянуты;"
-    " recommendations — проактивные советы владельцу чата (пусто, если нечего советовать)."
-)
-
-_TOPIC_INSTRUCTIONS = (
-    "Label the main topic of the conversation in 3 to 7 words as a short noun phrase"
-    " (e.g. 'обсуждение договора', 'планирование встречи', 'вопрос по заказу')."
-    " Reply in the conversation's language; no punctuation, no explanation, no quotes."
-)
-
-_RERANK_INSTRUCTIONS = (
-    "You are a relevance ranker. Given the user query and a numbered list of candidate"
-    " facts, return the IDs (the numbers after 'ID=') of the most relevant facts in"
-    " ranked_ids, ordered from most to least relevant. Include only genuinely relevant"
-    " facts — it is fine to return fewer than the candidates."
-)
-
-_PATTERN_INSTRUCTIONS = (
-    "Тебе дан кластер связанных фактов об одном собеседнике. Сформулируй ОДИН"
-    " устойчивый поведенческий паттерн контакта — обобщение, которое останется"
-    " верным и через недели (например «регулярно перегружен работой, часто в"
-    " стрессе»). Пиши кратко, по-русски, одной фразой, без префиксов и кавычек."
-    " Если факты НЕ образуют устойчивого паттерна (разовые, противоречивые или"
-    " слишком разнородные) — верни pattern='' (пустую строку). Не выдумывай и не"
-    " повторяй один факт как «паттерн»."
-)
-
-_ROLE_DRAFT_INSTRUCTIONS = (
-    "Из свободного описания собери цельную, готовую к использованию AI-роль. "
-    "Заполни короткое имя, полное описание, стиль речи, цели и ограничения. "
-    "Добавляй custom_fields только для важных деталей, которые не помещаются в основные поля; "
-    "у каждого такого поля должны быть title и description. Не выдумывай факты о бизнесе, "
-    "ценах или людях. Пиши весь черновик на языке исходного описания."
-)
-
 
 class AgentRuntime:
     """Owns the agents, the event-loop thread, safety/observability and the pool."""
@@ -291,7 +277,6 @@ class AgentRuntime:
         output_safety: OutputSafetyScanner | None = None,
         sink: LangfuseSink | None = None,
         two_stage_draft: bool = False,
-        prompt_contract_enabled: bool = False,
         orchestrator_model: object | None = None,
         draft_model: object | None = None,
         critic_model: object | None = None,
@@ -319,7 +304,6 @@ class AgentRuntime:
         self._output_safety = output_safety
         self._sink = sink
         self._two_stage_draft = two_stage_draft
-        self._prompt_contract_enabled = prompt_contract_enabled
         self._pool: asyncpg.Pool | None = None
         # Builds a fresh per-request embedder; None keeps memory tools on the
         # lexical fallback (preserved behaviour for direct callers and tests).
@@ -331,24 +315,28 @@ class AgentRuntime:
         )
         self._thread.start()
 
+        # retries=2 (not the default 1): a 2.5 Langfuse audit (.claude/analyze.md)
+        # caught a model emitting malformed tool-call JSON ("{}\"\"") for a
+        # no-arg tool TWICE in a row before a valid call — exactly 3 attempts,
+        # which exceeds a 1-retry (2-attempt) budget and fails the whole
+        # orchestrator run, forcing draft_outcome's outer retry to redo BOTH
+        # stages from scratch. Same rationale already applied to the draft
+        # agent below for the same "malformed JSON answer" failure mode.
         self._orchestrator_agent: Agent[AgentDeps, OrchestratorResult] = Agent(
             orchestrator_model or build_model(AgentTask.ORCHESTRATE),
             deps_type=AgentDeps,
             output_type=OrchestratorResult,
-            retries=1,
+            retries=2,
         )
 
-        # Legacy instructions were a static Agent-level string; the
-        # Prompt-Contract path renders per-request (model family can only be
-        # known once the request's slug is resolved), so both paths now live
-        # in one dynamic hook instead of a static `instructions=` + this hook.
-        # Flag off reproduces the exact old concatenation (legacy text + the
-        # per-request prompt) so the rendered text is unchanged byte-for-byte.
+        # Every agent's instructions are rendered per-request (model family can
+        # only be known once the request's slug is resolved), so each agent
+        # gets a dynamic hook instead of a static `instructions=` string — see
+        # the per-task `_x_async` methods below, which render the matching
+        # `prompts.library` spec into `deps.system_instruction` before `run()`.
         @self._orchestrator_agent.instructions
         def _orchestrator_context(ctx: RunContext[AgentDeps]) -> str:
-            if self._prompt_contract_enabled:
-                return ctx.deps.system_instruction
-            return prompt_library.LEGACY_ORCHESTRATOR_INSTRUCTIONS + "\n\n" + ctx.deps.system_instruction
+            return ctx.deps.system_instruction
 
         # PromptedOutput (not the default ToolOutput) is required because per-role
         # tier models can be reasoning/"thinking" models (qwen3, minimax), which
@@ -371,58 +359,82 @@ class AgentRuntime:
             critic_model or build_model(AgentTask.CRITIC),
             deps_type=AgentDeps,
             output_type=CriticVerdict,
-            # Flag off: identical static instructions as before. Flag on: no
-            # static text — _review_draft renders critic_spec per-request into
-            # deps.system_instruction and the dynamic hook below returns it.
-            instructions=(
-                None if self._prompt_contract_enabled else prompt_library.LEGACY_CRITIC_INSTRUCTIONS
-            ),
             retries=1,
         )
-        if self._prompt_contract_enabled:
 
-            @self._critic_agent.instructions
-            def _critic_context(ctx: RunContext[AgentDeps]) -> str:
-                return ctx.deps.system_instruction
+        @self._critic_agent.instructions
+        def _critic_context(ctx: RunContext[AgentDeps]) -> str:
+            return ctx.deps.system_instruction
 
-            self._warn_if_tool_output_unsupported("orchestrator", model_name_for(AgentTask.ORCHESTRATE))
-            self._warn_if_tool_output_unsupported("critic", model_name_for(AgentTask.CRITIC))
+        self._warn_if_tool_output_unsupported("orchestrator", model_name_for(AgentTask.ORCHESTRATE))
+        self._warn_if_tool_output_unsupported("critic", model_name_for(AgentTask.CRITIC))
+        orchestrator_slug = model_name_for(AgentTask.ORCHESTRATE)
+        self._orchestrator_tool_calling_supported = self._orchestrator_supports_tool_calling(
+            orchestrator_slug
+        )
+        if not self._orchestrator_tool_calling_supported:
+            logger.warning(
+                "orchestrator model %r cannot run the tool-heavy path (incompatible family or "
+                "MODEL_CAPABILITY_JSON_TOOL_RELIABILITY_OVERRIDES) — two-stage drafting falls "
+                "back to single-stage for every request until this is reconfigured",
+                orchestrator_slug,
+            )
 
         self._extraction_agent: Agent[AgentDeps, ExtractionResult] = Agent(
             extract_model or build_model(AgentTask.EXTRACT),
             deps_type=AgentDeps,
             output_type=ExtractionResult,
-            instructions=_EXTRACTION_INSTRUCTIONS,
             retries=1,
         )
+
+        @self._extraction_agent.instructions
+        def _extraction_instructions(ctx: RunContext[AgentDeps]) -> str:
+            return ctx.deps.system_instruction
+
         self._summary_agent: Agent[AgentDeps, SummaryResult] = Agent(
             summary_model or build_model(AgentTask.SUMMARIZE),
             deps_type=AgentDeps,
             output_type=SummaryResult,
-            instructions=_SUMMARY_INSTRUCTIONS,
             retries=1,
         )
+
+        @self._summary_agent.instructions
+        def _summary_instructions(ctx: RunContext[AgentDeps]) -> str:
+            return ctx.deps.system_instruction
+
         self._topic_agent: Agent[AgentDeps, TopicResult] = Agent(
             topic_model or build_model(AgentTask.TOPIC),
             deps_type=AgentDeps,
             output_type=TopicResult,
-            instructions=_TOPIC_INSTRUCTIONS,
             retries=1,
         )
+
+        @self._topic_agent.instructions
+        def _topic_instructions(ctx: RunContext[AgentDeps]) -> str:
+            return ctx.deps.system_instruction
+
         self._rerank_agent: Agent[AgentDeps, RerankResult] = Agent(
             rerank_model or build_model(AgentTask.RERANK),
             deps_type=AgentDeps,
             output_type=RerankResult,
-            instructions=_RERANK_INSTRUCTIONS,
             retries=1,
         )
+
+        @self._rerank_agent.instructions
+        def _rerank_instructions(ctx: RunContext[AgentDeps]) -> str:
+            return ctx.deps.system_instruction
+
         self._pattern_agent: Agent[AgentDeps, PatternResult] = Agent(
             pattern_model or build_model(AgentTask.REFLECT),
             deps_type=AgentDeps,
             output_type=PatternResult,
-            instructions=_PATTERN_INSTRUCTIONS,
             retries=1,
         )
+
+        @self._pattern_agent.instructions
+        def _pattern_instructions(ctx: RunContext[AgentDeps]) -> str:
+            return ctx.deps.system_instruction
+
         self._role_draft_agent: Agent[AgentDeps, RoleDraft] = Agent(
             role_draft_model or build_model(AgentTask.ROLE_DRAFT),
             deps_type=AgentDeps,
@@ -506,12 +518,29 @@ class AgentRuntime:
         privacy_flags: tuple[PrivacyFlag, ...],
         *,
         model_name_override: str = "",
+        preflight: TaskPreflightDecision | None = None,
+        request_model_settings: dict[str, object] | None = None,
+        tool_call_count: int | None = None,
     ) -> None:
         """Push one generation (and trace/safety spans) to the Langfuse sink.
 
         Mirrors the recording that used to live in ``ModelRouter._record_to_sink``
         so the agent path produces the same observability as the legacy path did.
         ``record_generation`` hashes the prompt when ``no_training`` is set.
+
+        2.6: also attaches capability/routing metadata (model slug, provider,
+        prompt-shape family, capability profile version, a hash — never the
+        raw text — of the rendered system prompt) so a trace can answer "what
+        family/capabilities did the model that actually ran resolve to" and
+        "did the rendered prompt change between two runs" without re-reading
+        the full (possibly truncated) prompt field.
+
+        2.7: ``preflight``, when given, attaches the ``TaskPreflightDecision``
+        that gated this call (reasoning on/off + effort, orchestrator
+        on/off, tool groups, the short non-CoT ``reason`` string) plus the
+        actual ``request_model_settings`` sent to the model and a
+        ``tool_call_count`` — so a trace can answer "why did this turn route
+        the way it did" without re-deriving it from the prompt text.
         """
         if self._sink is None or not ctx.trace_id:
             return
@@ -525,13 +554,42 @@ class AgentRuntime:
         )
         if self._output_safety is not None:
             self._sink.record_span(ctx.trace_id, "output_safety", {"flagged": ctx.output_flagged})
+        model_slug = model_name_override or model_name_for(task) or "test-model"
+        metadata: dict[str, object] = {
+            "task": task.value,
+            "model_slug": model_slug,
+            "provider": provider_for(model_slug),
+            "prompt_shape_family": capabilities_for(model_slug).prompt_shape_family.value,
+            "capability_profile_version": CAPABILITY_PROFILE_VERSION,
+            "rendered_system_prompt_hash": hashlib.sha256(
+                system_prompt.encode("utf-8")
+            ).hexdigest(),
+        }
+        if preflight is not None:
+            metadata.update(
+                {
+                    "preflight_needs_reasoning": preflight.needs_reasoning,
+                    "preflight_reasoning_effort": preflight.reasoning_effort,
+                    "preflight_needs_orchestrator": preflight.needs_orchestrator,
+                    "preflight_tool_groups": sorted(preflight.tool_groups),
+                    "preflight_allowed_tool_names": sorted(preflight.allowed_tool_names),
+                    "preflight_selected_model_slug": preflight.selected_model_slug,
+                    "preflight_prompt_shape_family": preflight.prompt_shape_family.value,
+                    "preflight_reason": preflight.reason,
+                }
+            )
+        if request_model_settings is not None:
+            metadata["request_model_settings"] = dict(request_model_settings)
+        if tool_call_count is not None:
+            metadata["tool_call_count"] = tool_call_count
         self._sink.record_generation(
             trace_id=ctx.trace_id,
-            model=model_name_override or model_name_for(task) or "test-model",
+            model=model_slug,
             prompt=f"[system]\n{system_prompt[:400]}\n[user]\n{user_payload[:400]}",
             completion=completion,
             privacy_flags=privacy_flags,
             usage={"input_tokens": usage.input_tokens, "output_tokens": usage.output_tokens},
+            metadata=metadata,
         )
 
     def record_decision(self, decision: str, intent: str, confidence: float) -> None:
@@ -573,21 +631,41 @@ class AgentRuntime:
     def _warn_if_tool_output_unsupported(agent_name: str, model_slug: str) -> None:
         """Guardrail for the orchestrator/critic ToolOutput agents (Prompt Contract phase 1).
 
-        Both stay on ``ToolOutput`` in this phase regardless of model family —
-        unlike the draft agent, which already moved to ``PromptedOutput`` (see
+        Both stay on ``ToolOutput`` regardless of model family — unlike the
+        draft agent, which already moved to ``PromptedOutput`` (see
         ``doubleu-thinking-models-promptedoutput``). A reasoning-family model
         assigned to either would 400 on the forced ``tool_choice`` ToolOutput
-        sends for the ``final_result`` call; this only logs the misconfiguration
-        instead of switching output modes or raising, since that switch is out
-        of scope for this phase.
+        sends for the ``final_result`` call. For the orchestrator this is no
+        longer just logged — see ``_orchestrator_supports_tool_calling``,
+        which gates two-stage routing on the same check (2.5/2.6). The critic
+        has no equivalent fallback path (it always runs when risk/confidence
+        call for it), so a misconfigured critic model still only logs here.
         """
-        profile = profile_for(model_slug)
-        if not profile.supports_forced_tool_choice:
+        capabilities = capabilities_for(model_slug)
+        if not capabilities.supports_tool_choice:
             logger.warning(
                 "%s model %r resolves to family=%s (output_mode=%s); ToolOutput sends a forced "
                 "tool_choice this family is known to reject — see doubleu-thinking-models-promptedoutput",
-                agent_name, model_slug, profile.family.value, profile.output_mode,
+                agent_name, model_slug, capabilities.prompt_shape_family.value, capabilities.output_mode,
             )
+
+    @staticmethod
+    def _orchestrator_supports_tool_calling(model_slug: str) -> bool:
+        """Whether the orchestrator's resolved model can safely run the tool-heavy path.
+
+        Two independent capability gates feed ``two_stage`` routing (2.5/2.6
+        provider compatibility guard): (1) ``supports_tool_choice`` — the same
+        check ``_warn_if_tool_output_unsupported`` logs, here it actually
+        disables the orchestrator instead of just warning. (2)
+        ``json_tool_reliability != "blocked"`` — for providers a Langfuse
+        audit caught misbehaving (400/malformed tool JSON) under a slug that
+        family-pattern resolution alone doesn't flag as reasoning (see
+        ``.claude/analyze.md``), set via the env-driven
+        ``MODEL_CAPABILITY_JSON_TOOL_RELIABILITY_OVERRIDES`` — no model names
+        hardcoded in either gate.
+        """
+        capabilities = capabilities_for(model_slug)
+        return capabilities.supports_tool_choice and capabilities.json_tool_reliability != "blocked"
 
     # ------------------------------------------------------------------ draft
 
@@ -685,21 +763,26 @@ class AgentRuntime:
         request: AIProcessMessageRequest,
         ctx: LLMCallContext,
         pool: asyncpg.Pool | None,
+        decision: TaskPreflightDecision,
     ) -> tuple[OrchestratorResult, Usage, tuple[ScheduledJobData, ...], tuple[int, ...]]:
-        """Run the tool-owning context stage without producing a contact reply."""
+        """Run the tool-owning context stage without producing a contact reply.
+
+        2.7: ``decision`` (already gated ``needs_orchestrator=True`` by the
+        caller) narrows this stage's toolset to
+        ``decision.allowed_tool_names`` and skips MCP entirely unless
+        ``"mcp"`` is in ``decision.tool_groups`` — the orchestrator only ever
+        sees the tools the preflight decided this turn actually needs, not
+        every tool the role enables.
+        """
+        orchestrator_slug = model_name_for(AgentTask.ORCHESTRATE)
         current_time = datetime.now(timezone.utc)
-        if self._prompt_contract_enabled:
-            family = resolve_family(model_name_for(AgentTask.ORCHESTRATE))
-            rendered = render_prompt(
-                prompt_library.orchestrator_spec(request, current_time=current_time), family
-            )
-            system_prompt, user_payload = self._prompt_builder.build(
-                rendered, request.event.message_text
-            )
-        else:
-            system_prompt, user_payload = draft_pipeline.build_orchestrator_prompt(
-                request, self._prompt_builder, current_time=current_time
-            )
+        family = resolve_family(orchestrator_slug)
+        rendered = render_prompt(
+            prompt_library.orchestrator_spec(request, current_time=current_time), family
+        )
+        system_prompt, user_payload = self._prompt_builder.build(
+            rendered, request.event.message_text
+        )
         system_prompt, user_payload = self._scan_input(
             system_prompt, user_payload, ModelTask.DRAFT_REPLY, ctx
         )
@@ -715,15 +798,24 @@ class AgentRuntime:
             existing_jobs=request.existing_scheduled_jobs,
         )
         toolsets = [
-            resolve_builtin_toolset(request.ai_role, privacy_flags),
-            *self._resolve_mcp_toolsets(request.ai_role, privacy_flags),
+            resolve_builtin_toolset(
+                request.ai_role, privacy_flags, allowed_names=decision.allowed_tool_names
+            ),
+            *(
+                self._resolve_mcp_toolsets(request.ai_role, privacy_flags)
+                if "mcp" in decision.tool_groups
+                else []
+            ),
         ]
-        result = await self._orchestrator_agent.run(
-            user_payload,
+        run_kwargs: dict = dict(
             deps=deps,
-            usage_limits=UsageLimits(tool_calls_limit=_DRAFT_TOOL_CALLS_LIMIT),
+            usage_limits=UsageLimits(tool_calls_limit=_ORCHESTRATOR_TOOL_CALLS_LIMIT),
             toolsets=toolsets,
         )
+        orchestrator_model_settings = model_settings_for(decision, capabilities_for(orchestrator_slug))
+        if orchestrator_model_settings:
+            run_kwargs["model_settings"] = orchestrator_model_settings
+        result = await self._orchestrator_agent.run(user_payload, **run_kwargs)
         # A response form is authoritative only when a tool actually wrote it
         # into deps. Structured model output alone cannot fabricate buttons.
         orchestrated: OrchestratorResult = result.output.model_copy(
@@ -750,6 +842,9 @@ class AgentRuntime:
             completion,
             usage,
             privacy_flags,
+            preflight=decision,
+            request_model_settings=orchestrator_model_settings,
+            tool_call_count=len(deps.tool_call_cache),
         )
         return orchestrated, usage, scheduled_jobs, cancelled_job_ids
 
@@ -764,6 +859,23 @@ class AgentRuntime:
             bundle.append("Форма ответа уже задана interaction-инструментом.")
         return tuple(bundle)
 
+    @staticmethod
+    def _writer_model_slug(request: AIProcessMessageRequest) -> str:
+        """Resolve the concrete model slug that will actually serve the writer call.
+
+        Shared by ``_build_draft_prompt_contract`` (prompt family resolution)
+        and ``_draft_async`` (2.7 ``TaskPreflightDecision``) so both derive
+        the family/capability profile from the exact same role tier/
+        model_name precedence — never two slightly different resolutions of
+        "which model is this".
+        """
+        role = request.ai_role
+        return resolve_model_slug(
+            AgentTask.DRAFT,
+            tier=role.model_tier if role is not None else "",
+            model_name=role.model_name if role is not None else "",
+        )
+
     def _build_draft_prompt_contract(
         self,
         request: AIProcessMessageRequest,
@@ -771,16 +883,15 @@ class AgentRuntime:
         orchestrator_bundle: tuple[str, ...] | None,
         current_time: datetime | None,
     ) -> tuple[str, str]:
-        """Prompt-Contract equivalent of ``draft_pipeline.build_draft_prompt``.
+        """Build the writer's (system_prompt, user_payload) pair via the Prompt Contract.
 
-        Only reached when ``PROMPT_CONTRACT_ENABLED``. Mirrors the same privacy
-        gate and memory split as the legacy function so both paths see
-        identical *data* — they differ only in how the trusted pieces are
-        rendered into the system prompt. The model family is resolved from the
-        concrete slug that will actually serve the writer call (the per-role
-        tier override when the role declares one, else the flat DRAFT model),
-        mirroring the precedence already applied when building the model
-        object further down in ``_draft_async``.
+        Honours the same privacy gate and memory split ``_split_memory_context``
+        always applied, rendered into the system prompt instead of one
+        concatenated blob. The model family is resolved from the concrete slug
+        that will actually serve the writer call (the per-role tier override
+        when the role declares one, else the flat DRAFT model), mirroring the
+        precedence already applied when building the model object further
+        down in ``_draft_async``.
         """
         raw_memory = (
             ()
@@ -791,12 +902,7 @@ class AgentRuntime:
         owner_instruction, current_draft, owner_style_facts, clean_memory = (
             draft_pipeline._split_memory_context(raw_memory)
         )
-        role = request.ai_role
-        writer_slug = resolve_model_slug(
-            AgentTask.DRAFT,
-            tier=role.model_tier if role is not None else "",
-            model_name=role.model_name if role is not None else "",
-        )
+        writer_slug = self._writer_model_slug(request)
         family = resolve_family(writer_slug)
         spec = prompt_library.draft_spec(
             request,
@@ -818,8 +924,20 @@ class AgentRuntime:
     async def _draft_async(
         self, request: AIProcessMessageRequest, risk_level: RiskLevel, ctx: LLMCallContext
     ) -> draft_pipeline.DraftOutcome:
-        two_stage = self._two_stage_draft and role_has_enabled_tools(
-            request.ai_role, request.chat_settings.privacy_flags
+        # 2.7: deterministic, no-LLM preflight — decides whether the
+        # orchestrator pre-stage runs at all, which tool groups it may use,
+        # and the reasoning effort/request params for both stages. Only ever
+        # NARROWS the other two-stage gates below, never widens them.
+        writer_slug = self._writer_model_slug(request)
+        orchestrator_slug = model_name_for(AgentTask.ORCHESTRATE)
+        decision = decide_preflight(
+            request, orchestrator_slug=orchestrator_slug, writer_slug=writer_slug
+        )
+        two_stage = (
+            self._two_stage_draft
+            and self._orchestrator_tool_calling_supported
+            and role_has_enabled_tools(request.ai_role, request.chat_settings.privacy_flags)
+            and decision.needs_orchestrator
         )
         pool = await self._get_pool()
         orchestrator_usage = Usage()
@@ -837,20 +955,13 @@ class AgentRuntime:
                 request,
                 ctx,
                 pool,
+                decision,
             )
             orchestrator_bundle = self._orchestrator_bundle(orchestrated)
         current_time = datetime.now(timezone.utc)
-        if self._prompt_contract_enabled:
-            system_prompt, user_payload = self._build_draft_prompt_contract(
-                request, orchestrator_bundle=orchestrator_bundle, current_time=current_time
-            )
-        else:
-            system_prompt, user_payload = draft_pipeline.build_draft_prompt(
-                request,
-                self._prompt_builder,
-                orchestrator_bundle=orchestrator_bundle,
-                current_time=current_time,
-            )
+        system_prompt, user_payload = self._build_draft_prompt_contract(
+            request, orchestrator_bundle=orchestrator_bundle, current_time=current_time
+        )
         # Phase 1: may rewrite (anonymize) or raise SafetyBlocked → canned reply.
         system_prompt, user_payload = self._scan_input(
             system_prompt, user_payload, ModelTask.DRAFT_REPLY, ctx
@@ -866,18 +977,20 @@ class AgentRuntime:
             current_time=current_time,
             existing_jobs=request.existing_scheduled_jobs,
         )
-        # Hybrid: the writer always keeps the role's tools. In two-stage the cheap
-        # orchestrator is the primary tool user; the writer's toolset is a fallback
-        # for anything the orchestrator missed (the writer directive tells it not to
-        # duplicate already-gathered context). Reasoning writers can still call these
-        # because native tool calls use tool_choice=auto, which thinking mode allows.
-        writer_toolsets: list = [
-            resolve_builtin_toolset(request.ai_role, privacy_flags),
-            *self._resolve_mcp_toolsets(request.ai_role, privacy_flags),
-            # Always-on, agent-only: lets the writer split a turn into several
-            # ordered messages. Not in TOOL_CATALOG → never shown in the role UI.
-            delivery_toolset,
-        ]
+        # Strict split (default, see _WRITER_FALLBACK_TOOLS_ENABLED above): in
+        # two-stage mode the orchestrator is the ONLY memory/schedule/interaction
+        # tool-caller, so the writer gets just its always-on delivery capability
+        # (lets it split a turn into several ordered messages — not in
+        # TOOL_CATALOG, never shown in the role UI). Single-stage drafting has no
+        # orchestrator run, so the writer must keep the full toolset regardless.
+        if two_stage and not _WRITER_FALLBACK_TOOLS_ENABLED:
+            writer_toolsets: list = [delivery_toolset]
+        else:
+            writer_toolsets = [
+                resolve_builtin_toolset(request.ai_role, privacy_flags),
+                *self._resolve_mcp_toolsets(request.ai_role, privacy_flags),
+                delivery_toolset,
+            ]
         # Per-role tier override: build a tier-specific model when the role
         # declares one and the env list is configured; otherwise fall back to
         # the DRAFT task model.  The agent is not recreated — only the
@@ -893,13 +1006,21 @@ class AgentRuntime:
                     request.ai_role.model_tier,
                     role_model_name,
                 )
-                if tier_model is not None:
-                    tier_model_label = model_name_for_tier(
-                        request.ai_role.model_tier,
-                        role_model_name,
-                    )
             else:
                 tier_model = build_tier_model(request.ai_role.model_tier)
+            if tier_model is not None:
+                # model_name_for_tier already resolves the concrete slug for
+                # BOTH cases (an explicit role_model_name, or — when empty —
+                # the tier's first configured slug), so this must run
+                # unconditionally. It used to live only inside the
+                # `if role_model_name:` branch above, so a role declaring
+                # just model_tier (no model_name) left tier_model_label empty
+                # and model_used fell back to the bare tier string ("smart")
+                # instead of the concrete slug actually serving the call.
+                tier_model_label = model_name_for_tier(
+                    request.ai_role.model_tier,
+                    role_model_name,
+                )
         run_kwargs: dict = dict(
             deps=deps,
             usage_limits=UsageLimits(tool_calls_limit=_DRAFT_TOOL_CALLS_LIMIT),
@@ -907,6 +1028,9 @@ class AgentRuntime:
         )
         if tier_model is not None:
             run_kwargs["model"] = tier_model
+        writer_model_settings = model_settings_for(decision, capabilities_for(decision.selected_model_slug))
+        if writer_model_settings:
+            run_kwargs["model_settings"] = writer_model_settings
         result = await self._draft_agent.run(user_payload, **run_kwargs)
         drafted: DraftResult = result.output
         # Hybrid: both stages may schedule jobs; dedupe by the content-based
@@ -984,6 +1108,9 @@ class AgentRuntime:
                 if two_stage and request.ai_role
                 else ""
             ),
+            preflight=decision,
+            request_model_settings=writer_model_settings,
+            tool_call_count=len(deps.tool_call_cache),
         )
         total = Usage(
             input_tokens=orchestrator_usage.input_tokens + draft_usage.input_tokens,
@@ -1052,36 +1179,32 @@ class AgentRuntime:
 
         ``feedback_hint`` carries the same owner-feedback anti-examples the draft
         agent saw, so the critic can flag a reply written in a style the owner
-        has already rejected (self-correction grounded in past outcomes).
+        has already rejected (self-correction grounded in past outcomes); it is
+        sanitized owner-curated style guidance (thumbs up/down on past AI text),
+        not raw contact text, so it travels in ``critic_spec.examples`` —
+        trusted, like the draft agent's own feedback hint. ``message_text`` (the
+        contact's message) and ``drafted.reply`` (model-generated) are the only
+        genuinely untrusted pieces here and go through ``PromptBuilder.build``
+        below, never into ``PromptSpec.context``.
         """
-        persona_rule = (
-            "Режим персоны: ответ от лица владельца; не раскрывай участие ИИ."
-            if speak_as_owner
-            else "Режим персоны: открытый чат-бот в назначенной роли; не имитируй владельца."
+        family = resolve_family(model_name_for(AgentTask.CRITIC))
+        rendered = render_prompt(
+            prompt_library.critic_spec(speak_as_owner=speak_as_owner, feedback_hint=feedback_hint),
+            family,
         )
-        review_payload = (
-            f"{persona_rule}\n\n"
+        review_user_content = (
             "Сообщение собеседника:\n"
             f"{message_text}\n\n"
             "Черновик ответа:\n"
             f"{drafted.reply}"
         )
-        if feedback_hint:
-            review_payload += "\n\n" + feedback_hint
-        critic_instructions = prompt_library.LEGACY_CRITIC_INSTRUCTIONS
-        if self._prompt_contract_enabled:
-            family = resolve_family(model_name_for(AgentTask.CRITIC))
-            critic_instructions = render_prompt(
-                prompt_library.critic_spec(speak_as_owner=speak_as_owner, feedback_hint=feedback_hint),
-                family,
-            )
-            # The critic reuses the draft's deps object (see _draft_async); its
-            # system_instruction currently holds the WRITER's rendered prompt.
-            # Overwriting it here is safe — nothing reads the old value after
-            # this point in _draft_async — and lets the critic agent's dynamic
-            # instructions hook (registered only when this flag is on) pick up
-            # the critic's own rendered text instead of the writer's.
-            deps.system_instruction = critic_instructions
+        critic_instructions, review_payload = self._prompt_builder.build(rendered, review_user_content)
+        # The critic reuses the draft's deps object (see _draft_async); its
+        # system_instruction currently holds the WRITER's rendered prompt.
+        # Overwriting it here is safe — nothing reads the old value after this
+        # point in _draft_async — and lets the critic agent's dynamic
+        # instructions hook pick up the critic's own rendered text.
+        deps.system_instruction = critic_instructions
         try:
             review = await self._critic_agent.run(review_payload, deps=deps)
         except Exception as exc:  # noqa: BLE001 — critic is advisory, never fatal
@@ -1114,9 +1237,9 @@ class AgentRuntime:
     async def _draft_role_async(
         self, request: DraftRoleRequest, ctx: LLMCallContext
     ) -> DraftRoleResponse:
-        system_prompt, user_payload = self._prompt_builder.build(
-            _ROLE_DRAFT_INSTRUCTIONS, request.text
-        )
+        family = resolve_family(model_name_for(AgentTask.ROLE_DRAFT))
+        rendered = render_prompt(prompt_library.role_draft_spec(), family)
+        system_prompt, user_payload = self._prompt_builder.build(rendered, request.text)
         system_prompt, user_payload = self._scan_input(
             system_prompt, user_payload, ModelTask.DRAFT_REPLY, ctx
         )
@@ -1231,16 +1354,19 @@ class AgentRuntime:
             user_content = request.message_text
         # The extraction input is untrusted contact text: wrap it the same way
         # the draft path does so instruction injection stays inert.
-        _, user_payload = self._prompt_builder.build("", user_content, ())
-        _, user_payload = self._scan_input(
-            "", user_payload, ModelTask.EXTRACT_FACTS, ctx
+        family = resolve_family(model_name_for(AgentTask.EXTRACT))
+        rendered = render_prompt(prompt_library.extract_spec(), family)
+        system_prompt, user_payload = self._prompt_builder.build(rendered, user_content, ())
+        system_prompt, user_payload = self._scan_input(
+            system_prompt, user_payload, ModelTask.EXTRACT_FACTS, ctx
         )
         deps = self._deps_for(
-            request.tenant_id, request.chat_id, request.privacy_flags, pool=None
+            request.tenant_id, request.chat_id, request.privacy_flags,
+            system_instruction=system_prompt, pool=None,
         )
         result = await self._extraction_agent.run(user_payload, deps=deps)
         self._record_run(
-            ctx, AgentTask.EXTRACT, "", user_payload,
+            ctx, AgentTask.EXTRACT, system_prompt, user_payload,
             result.output.model_dump_json(), self._usage_of(result), request.privacy_flags,
         )
         return result.output, result.output.model_dump_json()
@@ -1310,16 +1436,20 @@ class AgentRuntime:
     async def _summarize_async(
         self, request: ChatSummaryRequest, ctx: LLMCallContext
     ) -> tuple[SummaryResult, Usage]:
-        _, user_payload = self._prompt_builder.build("", "\n".join(request.messages), ())
-        _, user_payload = self._scan_input(
-            "", user_payload, ModelTask.SUMMARIZE_CHAT, ctx
+        family = resolve_family(model_name_for(AgentTask.SUMMARIZE))
+        rendered = render_prompt(prompt_library.summary_spec(), family)
+        system_prompt, user_payload = self._prompt_builder.build(
+            rendered, "\n".join(request.messages), ()
         )
-        deps = AgentDeps(tenant_id="", chat_id="")
+        system_prompt, user_payload = self._scan_input(
+            system_prompt, user_payload, ModelTask.SUMMARIZE_CHAT, ctx
+        )
+        deps = AgentDeps(tenant_id="", chat_id="", system_instruction=system_prompt)
         result = await self._summary_agent.run(user_payload, deps=deps)
         text, _ = self._scan_output(result.output.summary, ModelTask.SUMMARIZE_CHAT, ctx)
         usage = self._usage_of(result)
         self._record_run(
-            ctx, AgentTask.SUMMARIZE, "", user_payload, text, usage, request.privacy_flags
+            ctx, AgentTask.SUMMARIZE, system_prompt, user_payload, text, usage, request.privacy_flags
         )
         return result.output, usage
 
@@ -1350,12 +1480,20 @@ class AgentRuntime:
             content = f"[RECENT MESSAGES]\n{context_block}\n\n[LATEST MESSAGE]\n{request.message_text}"
         else:
             content = request.message_text
-        _, user_payload = self._prompt_builder.build("", content, ())
-        _, user_payload = self._scan_input("", user_payload, ModelTask.EXTRACT_FACTS, ctx)
-        deps = AgentDeps(tenant_id=request.tenant_id, chat_id=request.chat_id)
+        family = resolve_family(model_name_for(AgentTask.TOPIC))
+        rendered = render_prompt(prompt_library.topic_spec(), family)
+        system_prompt, user_payload = self._prompt_builder.build(rendered, content, ())
+        system_prompt, user_payload = self._scan_input(
+            system_prompt, user_payload, ModelTask.EXTRACT_FACTS, ctx
+        )
+        deps = AgentDeps(
+            tenant_id=request.tenant_id, chat_id=request.chat_id, system_instruction=system_prompt
+        )
         result = await self._topic_agent.run(user_payload, deps=deps)
         topic = result.output.topic.strip()
-        self._record_run(ctx, AgentTask.TOPIC, "", user_payload, topic, self._usage_of(result), ())
+        self._record_run(
+            ctx, AgentTask.TOPIC, system_prompt, user_payload, topic, self._usage_of(result), ()
+        )
         return topic
 
     # ---------------------------------------------------------------- rerank
@@ -1387,12 +1525,16 @@ class AgentRuntime:
             f"{i + 1}. [ID={f['id']}] {f['text']}" for i, f in enumerate(request.facts)
         )
         content = f"QUERY: {request.query}\n\nFACTS:\n{fact_lines}"
-        _, user_payload = self._prompt_builder.build("", content, ())
-        _, user_payload = self._scan_input("", user_payload, ModelTask.EXTRACT_FACTS, ctx)
-        deps = AgentDeps(tenant_id="", chat_id="")
+        family = resolve_family(model_name_for(AgentTask.RERANK))
+        rendered = render_prompt(prompt_library.rerank_spec(), family)
+        system_prompt, user_payload = self._prompt_builder.build(rendered, content, ())
+        system_prompt, user_payload = self._scan_input(
+            system_prompt, user_payload, ModelTask.EXTRACT_FACTS, ctx
+        )
+        deps = AgentDeps(tenant_id="", chat_id="", system_instruction=system_prompt)
         result = await self._rerank_agent.run(user_payload, deps=deps)
         self._record_run(
-            ctx, AgentTask.RERANK, "", user_payload,
+            ctx, AgentTask.RERANK, system_prompt, user_payload,
             str(result.output.ranked_ids), self._usage_of(result), (),
         )
         valid_ids = {int(f["id"]) for f in request.facts}
@@ -1446,13 +1588,19 @@ class AgentRuntime:
         content = f"[КЛАСТЕР ФАКТОВ О СОБЕСЕДНИКЕ]\n{facts_block}"
         # Fact texts derive from untrusted contact messages: wrap them like the
         # extraction path so any embedded instruction stays inert.
-        _, user_payload = self._prompt_builder.build("", content, ())
-        _, user_payload = self._scan_input("", user_payload, ModelTask.EXTRACT_FACTS, ctx)
-        deps = AgentDeps(tenant_id=request.tenant_id, chat_id=request.chat_id)
+        family = resolve_family(model_name_for(AgentTask.REFLECT))
+        rendered = render_prompt(prompt_library.pattern_spec(), family)
+        system_prompt, user_payload = self._prompt_builder.build(rendered, content, ())
+        system_prompt, user_payload = self._scan_input(
+            system_prompt, user_payload, ModelTask.EXTRACT_FACTS, ctx
+        )
+        deps = AgentDeps(
+            tenant_id=request.tenant_id, chat_id=request.chat_id, system_instruction=system_prompt
+        )
         result = await self._pattern_agent.run(user_payload, deps=deps)
         usage = self._usage_of(result)
         self._record_run(
-            ctx, AgentTask.REFLECT, "", user_payload,
+            ctx, AgentTask.REFLECT, system_prompt, user_payload,
             result.output.pattern, usage, request.privacy_flags,
         )
         return result.output, usage
@@ -1464,7 +1612,6 @@ def build_runtime(
     output_safety: OutputSafetyScanner | None = None,
     sink: LangfuseSink | None = None,
     two_stage_draft: bool = False,
-    prompt_contract_enabled: bool = False,
 ) -> AgentRuntime:
     """Build the agent runtime — the single LLM execution path for the service.
 
@@ -1499,7 +1646,6 @@ def build_runtime(
         output_safety=output_safety,
         sink=sink,
         two_stage_draft=two_stage_draft,
-        prompt_contract_enabled=prompt_contract_enabled,
         query_embedder_factory=embedder_factory,
         run_timeout_seconds=run_timeout,
         draft_max_attempts=_DRAFT_MAX_ATTEMPTS,
