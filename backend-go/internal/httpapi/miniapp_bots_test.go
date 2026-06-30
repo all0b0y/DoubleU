@@ -10,7 +10,7 @@ import (
 )
 
 // TestBotsListAndPerBotRole covers the multi-bot HTTP surface: GET /bots lists
-// every bot, and PUT /bots/{bot_id}/role binds a role to one bot without
+// every bot, and PATCH /bots/{bot_id}/role binds a role to one bot without
 // touching the tenant's other bots.
 func TestBotsListAndPerBotRole(t *testing.T) {
 	repo := store.NewRepository()
@@ -41,21 +41,53 @@ func TestBotsListAndPerBotRole(t *testing.T) {
 		t.Fatalf("bot delivery settings must inherit by default: %+v", list.Bots[0])
 	}
 
-	// Bind the role to bot 111 only.
-	res = miniappRequest(t, server, http.MethodPut, "/api/v1/bots/111/role",
+	// Role changes require an explicit memory-context policy.
+	res = miniappRequest(t, server, http.MethodPatch, "/api/v1/bots/111/role",
 		fmt.Sprintf(`{"role_id":%d}`, role.ID))
+	if res.Code != http.StatusBadRequest {
+		t.Fatalf("set role without policy status = %d body=%s", res.Code, res.Body.String())
+	}
+	res = miniappRequest(t, server, http.MethodPatch, "/api/v1/bots/111/role",
+		fmt.Sprintf(`{"role_id":%d,"role_context_policy":"reuse"}`, role.ID))
+	if res.Code != http.StatusBadRequest {
+		t.Fatalf("set role with invalid policy status = %d body=%s", res.Code, res.Body.String())
+	}
+
+	// Bind the role to bot 111 only, reusing the role's prior memory context.
+	res = miniappRequest(t, server, http.MethodPatch, "/api/v1/bots/111/role",
+		fmt.Sprintf(`{"role_id":%d,"role_context_policy":"reuse_role_context"}`, role.ID))
 	if res.Code != http.StatusOK {
 		t.Fatalf("set role status = %d body=%s", res.Code, res.Body.String())
 	}
-	if b, _ := repo.UserBotByID(testTenant, 111); b.AIRoleID != role.ID {
-		t.Fatalf("bot 111 role = %d, want %d", b.AIRoleID, role.ID)
+	bot111, _ := repo.UserBotByID(testTenant, 111)
+	if bot111.AIRoleID != role.ID {
+		t.Fatalf("bot 111 role = %d, want %d", bot111.AIRoleID, role.ID)
+	}
+	reusedContextID := bot111.ActiveRoleContextID
+	if reusedContextID == 0 {
+		t.Fatalf("bot 111 active role context was not set: %+v", bot111)
 	}
 	if b, _ := repo.UserBotByID(testTenant, 222); b.AIRoleID != 0 {
 		t.Fatalf("bot 222 role = %d, want 0 (untouched)", b.AIRoleID)
 	}
 
+	// A new role context starts clean even for the same role.
+	res = miniappRequest(t, server, http.MethodPatch, "/api/v1/bots/111/role",
+		fmt.Sprintf(`{"role_id":%d,"role_context_policy":"new_role_context"}`, role.ID))
+	if res.Code != http.StatusOK {
+		t.Fatalf("set role with new context status = %d body=%s", res.Code, res.Body.String())
+	}
+	bot111, _ = repo.UserBotByID(testTenant, 111)
+	if bot111.AIRoleID != role.ID {
+		t.Fatalf("bot 111 role after new context = %d, want %d", bot111.AIRoleID, role.ID)
+	}
+	newContextID := bot111.ActiveRoleContextID
+	if newContextID == 0 || newContextID == reusedContextID {
+		t.Fatalf("bot 111 new context = %d, want non-zero distinct from %d", newContextID, reusedContextID)
+	}
+
 	// Delivery settings patch must not disturb the bound role.
-	res = miniappRequest(t, server, http.MethodPut, "/api/v1/bots/111/role",
+	res = miniappRequest(t, server, http.MethodPatch, "/api/v1/bots/111/role",
 		`{"rich_formatting_enabled":false,"streaming_enabled":true}`)
 	if res.Code != http.StatusOK {
 		t.Fatalf("set delivery status = %d body=%s", res.Code, res.Body.String())
@@ -74,7 +106,7 @@ func TestBotsListAndPerBotRole(t *testing.T) {
 	if updated.RichFormattingEnabled == nil || *updated.RichFormattingEnabled || updated.StreamingEnabled == nil || !*updated.StreamingEnabled {
 		t.Fatalf("bot delivery settings response = %+v", updated)
 	}
-	if b, _ := repo.UserBotByID(testTenant, 111); b.AIRoleID != role.ID || b.RichFormattingEnabled == nil || *b.RichFormattingEnabled || b.StreamingEnabled == nil || !*b.StreamingEnabled {
+	if b, _ := repo.UserBotByID(testTenant, 111); b.AIRoleID != role.ID || b.ActiveRoleContextID != newContextID || b.RichFormattingEnabled == nil || *b.RichFormattingEnabled || b.StreamingEnabled == nil || !*b.StreamingEnabled {
 		t.Fatalf("bot 111 after delivery patch = %+v", b)
 	}
 }

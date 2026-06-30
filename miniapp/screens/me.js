@@ -56,6 +56,32 @@ function esc(str) {
   return String(str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
+function chooseBotRoleContextPolicy(roleName) {
+  return new Promise((resolve) => {
+    const message = `Выбери память для "${roleName}".`;
+    if (twa?.showPopup) {
+      twa.showPopup({
+        title: 'Память роли',
+        message,
+        buttons: [
+          { id: 'reuse_role_context', type: 'default', text: 'Использовать память' },
+          { id: 'new_role_context', type: 'destructive', text: 'Начать чистую' },
+          { id: 'cancel', type: 'cancel', text: 'Отмена' },
+        ],
+      }, (btnId) => {
+        resolve(btnId === 'reuse_role_context' || btnId === 'new_role_context' ? btnId : null);
+      });
+      return;
+    }
+
+    const choice = window.prompt(
+      `${message}\n\nВведите reuse_role_context или new_role_context.`,
+      '',
+    )?.trim();
+    resolve(choice === 'reuse_role_context' || choice === 'new_role_context' ? choice : null);
+  });
+}
+
 // Renders <option>s for the timezone <select>, injecting the current value
 // when it falls outside the curated list so the dropdown is never wrong.
 function timezoneOptionsHTML(current) {
@@ -294,10 +320,22 @@ export function renderMe(navigate) {
     // Bot role: applies to every chat of the bot (saved instantly on change).
     el.querySelector('#f-bot-role')?.addEventListener('change', async (e) => {
       twa?.HapticFeedback?.selectionChanged();
+      const select = e.target;
+      const roleId = Number(select.value);
+      const previousRoleId = currentBot.ai_role?.id || 0;
+      const roleName = roleId
+        ? roles.find(r => Number(r.id) === roleId)?.name || 'выбранная роль'
+        : 'обычный ассистент';
+      const roleContextPolicy = await chooseBotRoleContextPolicy(roleName);
+      if (!roleContextPolicy) {
+        select.value = String(previousRoleId);
+        return;
+      }
       try {
-        await api.setBotRole(currentBot.bot_id, Number(e.target.value));
+        currentBot = await api.setBotRole(currentBot.bot_id, roleId, roleContextPolicy);
         twa?.HapticFeedback?.notificationOccurred('success');
       } catch (err) {
+        select.value = String(previousRoleId);
         twa?.HapticFeedback?.notificationOccurred('error');
         twa?.showAlert(`Ошибка: ${err.message}`);
         load();

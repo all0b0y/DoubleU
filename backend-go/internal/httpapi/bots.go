@@ -82,7 +82,9 @@ func (s *Server) apiListBots(w http.ResponseWriter, r *http.Request) {
 }
 
 // apiSetBotRole updates one bot's governing role and nullable delivery settings.
-// role_id 0 clears the role; omitted delivery settings keep their current value.
+// role_id 0 clears the role. When role_id is present, the caller must also
+// choose which role-scoped memory context to activate; delivery-only patches
+// keep their current role and do not need a memory policy.
 func (s *Server) apiSetBotRole(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 	tenantID := tenantFromContext(r.Context())
@@ -93,6 +95,7 @@ func (s *Server) apiSetBotRole(w http.ResponseWriter, r *http.Request) {
 	}
 	var payload struct {
 		RoleID                optionalInt64Patch `json:"role_id"`
+		RoleContextPolicy     string             `json:"role_context_policy"`
 		RichFormattingEnabled optionalBoolPatch  `json:"rich_formatting_enabled"`
 		StreamingEnabled      optionalBoolPatch  `json:"streaming_enabled"`
 	}
@@ -105,6 +108,19 @@ func (s *Server) apiSetBotRole(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "no such bot"})
 		return
 	}
+	var roleContextPolicy store.RoleContextPolicy
+	if payload.RoleID.Present {
+		rawPolicy := strings.TrimSpace(payload.RoleContextPolicy)
+		if rawPolicy == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "role_context_policy is required when role_id is present"})
+			return
+		}
+		roleContextPolicy = store.RoleContextPolicy(rawPolicy)
+		if !roleContextPolicy.Valid() {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "role_context_policy must be one of: reuse_role_context, new_role_context"})
+			return
+		}
+	}
 	if payload.RoleID.Present && payload.RoleID.Value != 0 {
 		if _, ok := s.service.Repository().AIRoleByID(tenantID, payload.RoleID.Value); !ok {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "role not found"})
@@ -112,8 +128,13 @@ func (s *Server) apiSetBotRole(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if payload.RoleID.Present {
-		s.service.Repository().SetUserBotRole(tenantID, botID, payload.RoleID.Value)
+		roleContext, err := s.service.Repository().SetUserBotRoleWithContextPolicy(tenantID, botID, payload.RoleID.Value, roleContextPolicy)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
 		record.AIRoleID = payload.RoleID.Value
+		record.ActiveRoleContextID = roleContext.ID
 	}
 	if payload.RichFormattingEnabled.Present || payload.StreamingEnabled.Present {
 		record.RichFormattingEnabled = payload.RichFormattingEnabled.Apply(record.RichFormattingEnabled)

@@ -2,6 +2,8 @@
 
 const twa = window.Telegram?.WebApp;
 
+const BOT_ROLE_CONTEXT_POLICIES = new Set(['reuse_role_context', 'new_role_context']);
+
 /** Raw TMA initData string used for auth. In development, falls back to a dummy value. */
 export function getInitData() {
   if (twa?.initData) return twa.initData;
@@ -78,8 +80,16 @@ export const api = {
   // Bot ingestion (user-supplied bots — a tenant may connect several)
   bots:          ()              => request('GET',    '/api/v1/bots'),
   registerBot:   (token)         => request('POST',   '/api/v1/bots', { token }),
-  setBotRole:    (botId, roleId) => request('PUT',    `/api/v1/bots/${botId}/role`, { role_id: roleId }),
-  updateBotSettings: (botId, data) => request('PUT',  `/api/v1/bots/${botId}/role`, data),
+  setBotRole:    (botId, roleId, roleContextPolicy) => {
+    if (!BOT_ROLE_CONTEXT_POLICIES.has(roleContextPolicy)) {
+      throw new Error('role_context_policy must be selected');
+    }
+    return request('PATCH', `/api/v1/bots/${botId}/role`, {
+      role_id: roleId,
+      role_context_policy: roleContextPolicy,
+    });
+  },
+  updateBotSettings: (botId, data) => request('PATCH', `/api/v1/bots/${botId}/role`, data),
   disconnectBot: (botId)         => request('DELETE', `/api/v1/bots/${botId}`),
 };
 
