@@ -91,26 +91,6 @@
   — отложен до управления пользователями БД в `infra/`.
 - **MEM-2 `export`.** JSONL-дамп tenant'а (`/forget`, `/forget_all` уже реализованы) — отдельная
   невыполненная подзадача deletion-контракта.
-- **Critic-агент получает untrusted-текст без `PromptBuilder`-обёртки.** `AgentRuntime._review_draft`
-  ([runtime.py](../ai-python/ai_agent/agents/runtime.py)) собирает `review_payload` прямой
-  f-строкой из `message_text` (сырое сообщение собеседника) и `drafted.reply`, минуя
-  `PromptBuilder.build` — единственное место в hot path, где untrusted-вход не попадает в
-  `<untrusted_user_message>`. На практике риск ниже, чем у draft/orchestrator (критик не имеет
-  тулов и не может действовать на инъекцию), но потенциально проинструктированный текст в
-  `message_text` может склонить вердикт к `approve`. Обёрнуть `message_text`/`drafted.reply` через
-  `prompt_builder.build(...)` так же, как уже делает draft-путь.
-  _Найдено 2026-06-29 при разработке Prompt Contract (фаза 1); сознательно не исправлено — вне
-  объёма задачи._
-- **`model_used`-лейбл для two-stage writer показывает голый `model_tier`, а не конкретный slug.**
-  В `AgentRuntime._draft_async` ([runtime.py](../ai-python/ai_agent/agents/runtime.py)) `tier_model_label`
-  заполняется только внутри ветки `if role_model_name:` (явный `ai_role.model_name`); когда роль
-  задаёт только `model_tier` (например `"smart"`) без конкретной модели, two-stage лейбл деградирует
-  до `f"orchestrate({router})+draft(smart)"` вместо реального первого slug из `MODEL_TIER_SMART`. Не
-  влияет на то, какая модель реально вызывается (resolution корректен), только на читаемость
-  Langfuse/логов. Чинить через `model_name_for_tier(tier, model_name)` и для случая без
-  `model_name`.
-  _Найдено 2026-06-29 при разработке Prompt Contract (фаза 1); сознательно не исправлено — вне
-  объёма задачи._
 
 ### TOOLS — integration-инструмент не реализован
 
@@ -181,6 +161,23 @@
 ## ✅ Закрыто с прошлого аудита (сверено с кодом, 2026-06-22)
 
 > Удалено из активного беклога. Каждый пункт задокументирован в коде или плановом документе.
+
+### Prompt Contract Phase 2 — cutover + critic trust boundary (2026-06-29)
+
+- **Prompt Contract стал единственным runtime-путём.** `PROMPT_CONTRACT_ENABLED` убран из
+  `config/flags.py`/`agents/runtime.py`/`http_server.py`/`docker-compose.yml`; legacy
+  `_compose_base_instruction`/`build_draft_prompt`/`build_orchestrator_prompt`
+  ([draft.py](../ai-python/ai_agent/pipelines/draft.py)) и `LEGACY_ORCHESTRATOR_INSTRUCTIONS`/
+  `LEGACY_CRITIC_INSTRUCTIONS` удалены. Все 9 agent-задач (draft/orchestrator/critic +
+  extract/summary/topic/rerank/pattern/role_draft) рендерят `PromptSpec` через единый XML
+  `<prompt_contract>` envelope ([renderers.py](../ai-python/ai_agent/prompts/renderers.py)),
+  включая ранее «голые» auxiliary-задачи, которые писали пустой `system_prompt` в Langfuse.
+- **Critic-агент больше не получает untrusted-текст без `PromptBuilder`-обёртки.**
+  `AgentRuntime._review_draft` ([runtime.py](../ai-python/ai_agent/agents/runtime.py)) теперь
+  оборачивает `message_text`/`drafted.reply` через `prompt_builder.build(...)`, как и draft-путь;
+  `feedback_hint` (sanitized owner-curated style guidance) остаётся в `critic_spec.examples`
+  (trusted system side). _(было: DEBT «Critic-агент получает untrusted-текст без PromptBuilder-
+  обёртки», найдено 2026-06-29 в фазе 1)_
 
 ### DATA — устранена коллизия миграций 111
 

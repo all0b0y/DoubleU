@@ -39,6 +39,25 @@ def test_litellm_config_is_rendered_from_model_env() -> None:
         assert f'      model: "{model}"' in rendered
 
 
+def test_litellm_renderer_gives_every_env_model_a_fallback() -> None:
+    """Each raw env model must get a router fallback so a single provider's
+    429/400 routes to a stable backup instead of failing the turn."""
+    import yaml
+
+    base = (ROOT_DIR / "infra/litellm/config.yaml").read_text(encoding="utf-8")
+    environ = {
+        "MODEL_ROUTER": "deepseek/deepseek-v4-flash",
+        "MODEL_TIER_BALANCED": "deepseek/deepseek-v4-flash,deepseek/deepseek-v3.2",
+    }
+    rendered = renderer.render_config(base, environ)
+    fallbacks = yaml.safe_load(rendered)["router_settings"]["fallbacks"]
+    mapped = {k: v for entry in fallbacks for k, v in entry.items()}
+    for model in renderer.models_from_env(environ):
+        assert mapped.get(model) == [renderer._DEFAULT_FALLBACK], f"no fallback for {model}"
+    # The static alias fallbacks must survive the injection.
+    assert mapped.get("draft-primary") == ["draft-fallback"]
+
+
 def test_litellm_renderer_deduplicates_and_preserves_aliases() -> None:
     environ = {
         "MODEL_DRAFT": "draft-primary",

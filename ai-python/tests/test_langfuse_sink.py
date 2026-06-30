@@ -93,6 +93,41 @@ class PrivacyHashingTests(unittest.TestCase):
             sink.stop()
 
 
+class GenerationMetadataTests(unittest.TestCase):
+    def test_metadata_is_enqueued_with_the_generation_event(self) -> None:
+        uploader = _CollectingUploader()
+        sink = LangfuseSink(uploader=uploader)
+        try:
+            sink.record_generation(
+                "trace-1", "draft-primary", "hi", "hello",
+                metadata={"provider": "openai", "capability_profile_version": "1"},
+            )
+            for _ in range(50):
+                if uploader.events:
+                    break
+                time.sleep(0.01)
+            self.assertTrue(uploader.events)
+            self.assertEqual(
+                uploader.events[0].payload["metadata"],
+                {"provider": "openai", "capability_profile_version": "1"},
+            )
+        finally:
+            sink.stop()
+
+    def test_metadata_defaults_to_empty_dict_when_omitted(self) -> None:
+        uploader = _CollectingUploader()
+        sink = LangfuseSink(uploader=uploader)
+        try:
+            sink.record_generation("trace-1", "draft-primary", "hi", "hello")
+            for _ in range(50):
+                if uploader.events:
+                    break
+                time.sleep(0.01)
+            self.assertEqual(uploader.events[0].payload["metadata"], {})
+        finally:
+            sink.stop()
+
+
 class ConfiguredFlagTests(unittest.TestCase):
     def test_configured_returns_false_when_no_uploader(self) -> None:
         sink = LangfuseSink(uploader=None)
@@ -128,6 +163,21 @@ class BatchItemTests(unittest.TestCase):
         # field whose absence silently dropped every app generation.
         self.assertEqual(body["id"], item["id"])
         self.assertTrue(body["id"])
+        # No metadata supplied -> empty dict, never missing/None (2.6).
+        self.assertEqual(body["metadata"], {})
+
+    def test_generation_metadata_passes_through_to_batch_item(self) -> None:
+        """2.6: capability/routing metadata (model slug, provider, prompt-shape
+        family, ...) must reach the Langfuse generation body unmodified."""
+        event = _SinkEvent(kind="generation", payload={
+            "trace_id": "t1", "model": "deepseek/deepseek-v4-flash",
+            "prompt": "hello", "completion": "hi", "usage": {},
+            "metadata": {"provider": "deepseek", "prompt_shape_family": "gpt"},
+        })
+        item = _to_batch_item(event)
+        self.assertEqual(
+            item["body"]["metadata"], {"provider": "deepseek", "prompt_shape_family": "gpt"}
+        )
 
     def test_span_maps_to_span_create(self) -> None:
         event = _SinkEvent(kind="span", payload={"trace_id": "t2", "name": "input_safety", "passed": True})

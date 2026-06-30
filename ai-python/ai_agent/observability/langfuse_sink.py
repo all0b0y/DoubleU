@@ -103,12 +103,16 @@ class LangfuseSink:
         privacy_flags: tuple[PrivacyFlag, ...] = (),
         usage: dict[str, int] | None = None,
         cost_usd: float = 0.0,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         """Enqueue a generation (LLM call) event with privacy guards.
 
         When ``no_training`` is in ``privacy_flags`` the prompt/completion are
         replaced with their SHA-256 hashes so the Langfuse instance never sees
-        raw user content.
+        raw user content. ``metadata`` (2.6: model slug/provider/prompt-shape-
+        family/capability-profile-version/rendered-system-prompt-hash — see
+        ``agents/runtime.py::_record_run``) is never redacted: every value in
+        it is already a non-sensitive identifier, never raw chat content.
         """
         prompt_payload = prompt
         completion_payload = completion
@@ -122,6 +126,7 @@ class LangfuseSink:
             "completion": completion_payload,
             "usage": usage or {},
             "cost_usd": cost_usd,
+            "metadata": metadata or {},
         })
 
     def record_score(self, trace_id: str, name: str, value: float, comment: str = "") -> None:
@@ -243,6 +248,7 @@ def _to_batch_item(event: _SinkEvent) -> dict[str, Any] | None:
                 "calculatedTotalCost": p.get("cost_usd") or 0,
                 "startTime": now,
                 "endTime": now,
+                "metadata": p.get("metadata") or {},
             },
         }
     if event.kind == "span":

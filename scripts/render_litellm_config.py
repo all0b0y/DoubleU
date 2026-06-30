@@ -30,6 +30,13 @@ MODEL_ENV_NAMES = (
 
 _MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$")
 _MODEL_LIST_MARKER = "model_list:\n"
+_FALLBACKS_MARKER = "  fallbacks:\n"
+# Stable, non-thinking, tool-capable backup every env model falls back to when its
+# OpenRouter sub-providers rate-limit (429) or reject (400) the request — already a
+# model_name in the static base config. Without this the orchestrator/writer raw
+# slugs (e.g. openrouter/deepseek/deepseek-v4-flash) get "No fallback model group
+# found" and one bad provider fails the whole turn.
+_DEFAULT_FALLBACK = "draft-fallback"
 
 
 def models_from_env(environ: Mapping[str, str]) -> tuple[str, ...]:
@@ -50,11 +57,20 @@ def models_from_env(environ: Mapping[str, str]) -> tuple[str, ...]:
 
 
 def render_config(base_config: str, environ: Mapping[str, str]) -> str:
-    """Inject concrete env-derived models immediately after ``model_list``."""
+    """Inject env-derived models and their fallbacks into the base config.
+
+    Each concrete model is added to ``model_list`` and given a router fallback to
+    ``_DEFAULT_FALLBACK`` so a 429/400 from one OpenRouter sub-provider routes to a
+    stable backup instead of failing the turn.
+    """
     if base_config.count(_MODEL_LIST_MARKER) != 1:
         raise ValueError("base LiteLLM config must contain exactly one model_list section")
+    if base_config.count(_FALLBACKS_MARKER) != 1:
+        raise ValueError("base LiteLLM config must contain exactly one router fallbacks section")
+    env_models = models_from_env(environ)
     entries = []
-    for name in models_from_env(environ):
+    fallbacks = []
+    for name in env_models:
         quoted = json.dumps(name)
         entries.append(
             "  - model_name: " + quoted + "\n"
@@ -62,7 +78,11 @@ def render_config(base_config: str, environ: Mapping[str, str]) -> str:
             "      model: " + quoted + "\n"
             "      api_key: os.environ/OPENROUTER_API_KEY\n"
         )
-    return base_config.replace(_MODEL_LIST_MARKER, _MODEL_LIST_MARKER + "".join(entries), 1)
+        # The backup must differ from the model itself (no self-loop). _DEFAULT_FALLBACK
+        # is an alias, never an env slug, so this always holds here.
+        fallbacks.append("    - " + quoted + ': ["' + _DEFAULT_FALLBACK + '"]\n')
+    rendered = base_config.replace(_MODEL_LIST_MARKER, _MODEL_LIST_MARKER + "".join(entries), 1)
+    return rendered.replace(_FALLBACKS_MARKER, _FALLBACKS_MARKER + "".join(fallbacks), 1)
 
 
 def main() -> None:
