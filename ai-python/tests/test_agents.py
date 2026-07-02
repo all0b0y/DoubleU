@@ -1282,6 +1282,73 @@ def test_parse_ai_role_skills() -> None:
     assert role.skills[0].description == "how to phrase reminders"
 
 
+def _skill_role(**extra) -> AIRoleData:
+    from ai_agent.schemas import SkillSpecData
+
+    return AIRoleData(
+        name="Support",
+        skills=(SkillSpecData(name="reminders", description="how to phrase reminders"),),
+        **extra,
+    )
+
+
+def test_writer_gets_load_skill_two_stage_and_orchestrator_never_does() -> None:
+    """Г4: a role's skills expose load_skill to the WRITER in two-stage mode,
+    never to the orchestrator."""
+    captured: dict[str, object] = {}
+
+    def orchestrator(messages, info: AgentInfo) -> ModelResponse:
+        captured["orchestrator_tools"] = [t.name for t in info.function_tools]
+        return ModelResponse(parts=[ToolCallPart(tool_name="final_result", args={
+            "gathered_context": [], "suggested_intent": "general_message", "notes": "",
+        })])
+
+    def writer(messages, info: AgentInfo) -> ModelResponse:
+        captured["writer_tools"] = [t.name for t in info.function_tools]
+        return draft_output({
+            "reply": "ok", "intent": "general_message", "options": [], "confidence": 0.9, "topic": "",
+        })
+
+    # scheduler enabled so the orchestrator actually runs this turn; load_skill
+    # kept enabled (the "disable all" map would otherwise turn it off).
+    role = _skill_role(tool_settings={
+        **{entry.key: False for entry in TOOL_CATALOG},
+        "scheduler.create_reminder": True,
+        "skills.load_skill": True,
+    })
+    request = replace(process_request("Поставь напоминание, когда созвонимся?"), ai_role=role)
+    runtime = make_runtime(
+        two_stage_draft=True,
+        orchestrator_model=FunctionModel(orchestrator),
+        draft_model=FunctionModel(writer),
+    )
+    runtime.draft_outcome(request, RiskLevel.LOW)
+
+    assert "load_skill" in set(captured["writer_tools"])
+    assert "load_skill" not in set(captured.get("orchestrator_tools", []))
+
+
+def test_writer_load_skill_single_stage_and_absent_without_skills() -> None:
+    """Г4: single-stage writer gets load_skill only when the role has skills."""
+    captured: dict[str, object] = {}
+
+    def writer(messages, info: AgentInfo) -> ModelResponse:
+        captured["writer_tools"] = [t.name for t in info.function_tools]
+        return draft_output({
+            "reply": "ok", "intent": "general_message", "options": [], "confidence": 0.9, "topic": "",
+        })
+
+    with_skills = replace(process_request("привет"), ai_role=_skill_role())
+    runtime = make_runtime(two_stage_draft=False, draft_model=FunctionModel(writer))
+    runtime.draft_outcome(with_skills, RiskLevel.LOW)
+    assert "load_skill" in set(captured["writer_tools"])
+
+    captured.clear()
+    without = replace(process_request("привет"), ai_role=AIRoleData(name="Support"))
+    runtime.draft_outcome(without, RiskLevel.LOW)
+    assert "load_skill" not in set(captured["writer_tools"])
+
+
 def test_record_decision_relabels_trace_with_outcome() -> None:
     """The request trace must be re-labelled with the final decision so an
     auto-sent reply is distinguishable from an owner draft (it is opened under

@@ -88,6 +88,7 @@ from .deps import AgentDeps
 from .delivery_tools import delivery_toolset
 from .interaction_tools import interaction_toolset
 from .memory_tools import memory_toolset
+from .skill_tools import skill_toolset
 from .model_capabilities import CAPABILITY_PROFILE_VERSION, capabilities_for, provider_for
 from .models import (
     AgentTask,
@@ -249,11 +250,32 @@ def resolve_builtin_toolset(
     return DedupToolset(wrapped=filtered)
 
 
+def resolve_skill_toolset(
+    ai_role: AIRoleData | None,
+    privacy_flags: tuple[PrivacyFlag, ...] = (),
+) -> DedupToolset | None:
+    """Writer-only skills toolset (Г4). None when the role declares no skills or
+    the owner disabled load_skill.
+
+    Deliberately NOT gated by no_memory/private: a skill is the role owner's own
+    content — like ``role.context``, which is injected under any privacy flag —
+    and load_skill reads only first-party skill bodies, never chat memory and
+    never the network. It is also NOT added to the orchestrator's toolset
+    (resolve_builtin_toolset): skills are material for WRITING the reply, an
+    always-on writer capability like delivery_toolset, not a context tool.
+    """
+    if ai_role is None or not ai_role.skills:
+        return None
+    if "load_skill" not in enabled_tool_names(ai_role, privacy_flags):
+        return None
+    return DedupToolset(wrapped=skill_toolset)
+
+
 def role_has_enabled_tools(
     ai_role: AIRoleData | None,
     privacy_flags: tuple[PrivacyFlag, ...] = (),
 ) -> bool:
-    """Return whether a role enables any catalog or MCP tool."""
+    """Return whether a role enables any catalog, MCP, or skill tool."""
     if ai_role is None:
         return False
     settings = ai_role.tool_settings
@@ -265,7 +287,7 @@ def role_has_enabled_tools(
         and not (scheduler_blocked and entry.category.value == "schedule")
         for entry in TOOL_CATALOG
     )
-    return builtin_enabled or bool(ai_role.mcp_servers)
+    return builtin_enabled or bool(ai_role.mcp_servers) or bool(ai_role.skills)
 
 
 def _scheduled_job_data(jobs: list[ScheduledJob]) -> tuple[ScheduledJobData, ...]:
@@ -1152,12 +1174,21 @@ class AgentRuntime:
             owner_timezone=(
                 request.user_settings.timezone.strip() if request.user_settings is not None else ""
             ),
+            # load_skill may only reach the role's own enabled skills (Г4).
+            enabled_skill_names=(
+                frozenset(s.name for s in request.ai_role.skills)
+                if request.ai_role is not None
+                else frozenset()
+            ),
         )
         # Strict split (default, see _WRITER_FALLBACK_TOOLS_ENABLED above): in
         # two-stage mode the orchestrator is the ONLY memory/schedule tool-caller,
         # so the writer gets only the interaction question tool plus its always-on
         # delivery capability. Single-stage drafting has no orchestrator run, so
         # the writer must keep the full toolset regardless.
+        # Skills are always-on writer material (like delivery_toolset), present in
+        # both the strict two-stage split and the single-stage/fallback path (Г4).
+        skill_ts = resolve_skill_toolset(request.ai_role, privacy_flags)
         if two_stage and not _WRITER_FALLBACK_TOOLS_ENABLED:
             writer_toolsets: list = [
                 resolve_builtin_toolset(
@@ -1166,12 +1197,14 @@ class AgentRuntime:
                     allowed_names=_WRITER_INTERACTION_FALLBACK_TOOL_NAMES,
                 ),
                 delivery_toolset,
+                *([skill_ts] if skill_ts is not None else []),
             ]
         else:
             writer_toolsets = [
                 resolve_builtin_toolset(request.ai_role, privacy_flags),
                 *self._resolve_mcp_toolsets(request.ai_role, privacy_flags),
                 delivery_toolset,
+                *([skill_ts] if skill_ts is not None else []),
             ]
         # Per-role tier override: build a tier-specific model when the role
         # declares one and the env list is configured; otherwise fall back to
