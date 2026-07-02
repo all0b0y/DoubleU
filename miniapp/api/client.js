@@ -1,8 +1,8 @@
 // API client — wraps all backend calls with TMA auth header.
 
-const twa = window.Telegram?.WebApp;
+import { isBotRoleContextPolicy } from '/miniapp/domain/bot-role-context-policy.js';
 
-const BOT_ROLE_CONTEXT_POLICIES = new Set(['reuse_role_context', 'new_role_context']);
+const twa = window.Telegram?.WebApp;
 
 /** Raw TMA initData string used for auth. In development, falls back to a dummy value. */
 export function getInitData() {
@@ -81,7 +81,7 @@ export const api = {
   bots:          ()              => request('GET',    '/api/v1/bots'),
   registerBot:   (token)         => request('POST',   '/api/v1/bots', { token }),
   setBotRole:    (botId, roleId, roleContextPolicy) => {
-    if (!BOT_ROLE_CONTEXT_POLICIES.has(roleContextPolicy)) {
+    if (!isBotRoleContextPolicy(roleContextPolicy)) {
       throw new Error('role_context_policy must be selected');
     }
     return request('PATCH', `/api/v1/bots/${botId}/role`, {

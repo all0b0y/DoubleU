@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"net/http"
+	"strconv"
 
 	"doubleu/backend-go/internal/contracts"
 	"doubleu/backend-go/internal/core"
@@ -148,8 +149,7 @@ func (s *Server) routes() {
 
 	// Mini App static files
 	if s.miniappDir != "" {
-		fs := http.FileServer(http.Dir(s.miniappDir))
-		s.mux.Handle("GET /miniapp/", http.StripPrefix("/miniapp", fs))
+		s.mux.Handle("GET /miniapp/", miniAppStaticHandler(s.miniappDir))
 		s.mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path == "/" {
 				http.Redirect(w, r, "/miniapp/", http.StatusMovedPermanently)
@@ -158,6 +158,48 @@ func (s *Server) routes() {
 			http.NotFound(w, r)
 		})
 	}
+}
+
+// miniAppStaticHandler serves the Mini App with two layers of cache defence so
+// a deploy always reaches the Telegram WebView. First, no-cache headers force
+// revalidation of anything not already pinned in the WebView cache. Second —
+// because Telegram pins stable ES module URLs across launches and ignores those
+// headers for already-cached entries — every same-origin asset URL in the HTML
+// and JS is stamped with a content version (see miniapp_assets.go); a source
+// change yields a new URL the cache has never seen, busting the whole import
+// graph transitively. The version is computed once at construction; the process
+// restarts on deploy, so this reflects the shipped assets.
+func miniAppStaticHandler(dir string) http.Handler {
+	fileServer := http.FileServer(http.Dir(dir))
+	version := miniAppAssetVersion(dir)
+	return http.StripPrefix("/miniapp", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-cache, max-age=0, must-revalidate")
+		w.Header().Set("Pragma", "no-cache")
+		w.Header().Set("Expires", "0")
+
+		if version == "" || !shouldStampMiniApp(r.URL.Path) {
+			fileServer.ServeHTTP(w, r)
+			return
+		}
+
+		// Stampable assets are tiny and rewritten whole, so a Range request can't
+		// be honoured byte-accurately — force a full body instead of a 206.
+		r.Header.Del("Range")
+		capture := newCaptureWriter()
+		fileServer.ServeHTTP(capture, r)
+
+		for key, values := range capture.Header() {
+			w.Header()[key] = values
+		}
+		body := capture.body.Bytes()
+		// Only a 200 carries a transformable body; 304/redirect/error pass through.
+		if capture.status == http.StatusOK {
+			body = stampMiniAppModuleRefs(body, version)
+			w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		}
+		w.WriteHeader(capture.status)
+		_, _ = w.Write(body)
+	}))
 }
 
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {

@@ -1,5 +1,6 @@
 import { api } from '/miniapp/api/client.js';
 import { renderBottomNav } from '/miniapp/components/nav.js';
+import { chooseBotRoleContextPolicy } from '/miniapp/domain/bot-role-context-policy.js';
 
 const twa = window.Telegram?.WebApp;
 
@@ -54,32 +55,6 @@ const TIMEZONE_OPTIONS = [
 
 function esc(str) {
   return String(str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-}
-
-function chooseBotRoleContextPolicy(roleName) {
-  return new Promise((resolve) => {
-    const message = `Выбери память для "${roleName}".`;
-    if (twa?.showPopup) {
-      twa.showPopup({
-        title: 'Память роли',
-        message,
-        buttons: [
-          { id: 'reuse_role_context', type: 'default', text: 'Использовать память' },
-          { id: 'new_role_context', type: 'destructive', text: 'Начать чистую' },
-          { id: 'cancel', type: 'cancel', text: 'Отмена' },
-        ],
-      }, (btnId) => {
-        resolve(btnId === 'reuse_role_context' || btnId === 'new_role_context' ? btnId : null);
-      });
-      return;
-    }
-
-    const choice = window.prompt(
-      `${message}\n\nВведите reuse_role_context или new_role_context.`,
-      '',
-    )?.trim();
-    resolve(choice === 'reuse_role_context' || choice === 'new_role_context' ? choice : null);
-  });
 }
 
 // Renders <option>s for the timezone <select>, injecting the current value
@@ -326,7 +301,7 @@ export function renderMe(navigate) {
       const roleName = roleId
         ? roles.find(r => Number(r.id) === roleId)?.name || 'выбранная роль'
         : 'обычный ассистент';
-      const roleContextPolicy = await chooseBotRoleContextPolicy(roleName);
+      const roleContextPolicy = await chooseBotRoleContextPolicy(twa, roleName);
       if (!roleContextPolicy) {
         select.value = String(previousRoleId);
         return;
