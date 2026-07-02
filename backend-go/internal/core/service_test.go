@@ -666,6 +666,60 @@ func TestQuestionnaireStripsTrailingQuestionFromIntro(t *testing.T) {
 	}
 }
 
+func TestQuestionnaireStripsQuestionBlockWithOptionsFromIntro(t *testing.T) {
+	repository := store.NewRepository()
+	role := repository.SaveAIRole(store.AIRoleRecord{
+		TenantID:     "tenant:user:77",
+		Name:         "Tutor",
+		ToolSettings: map[string]bool{"interaction.ask_questions": true},
+	})
+	repository.SaveUserBot(store.UserBotRecord{
+		TenantID: "tenant:user:77", BotID: 555, Status: "active", AIRoleID: role.ID,
+	})
+	const question = "Готов к первому вопросу?"
+	ai := &fakeAI{response: contracts.AIProcessMessageResponse{
+		Decision: contracts.DecisionAutoReply,
+		ResponseText: strings.Join([]string{
+			"Краткая лекция про X.",
+			"",
+			question,
+			"- Да",
+			"- Нет",
+		}, "\n"),
+		Confidence: 0.9,
+		RiskLevel:  contracts.RiskLow,
+		Intent:     "choice_question",
+		ResponsePlan: &contracts.ResponsePlan{Shape: "questions", Questions: []contracts.Question{
+			{Prompt: question, Options: []string{"Да", "Нет"}},
+		}},
+	}}
+	botSender := &fakeSender{}
+	service := NewService(repository, ai, &fakeSender{},
+		WithClock(func() time.Time { return time.Unix(1700000000, 0).UTC() }),
+		WithDefaultIngestionMode(contracts.IngestionModeFull),
+		WithBotSenderProvider(&fakeBotSenders{sender: botSender}),
+	)
+
+	if _, err := service.HandleBotMessage(context.Background(), botEvent(t, 9814, 42, 46, "лекция и вопрос")); err != nil {
+		t.Fatalf("bot message: %v", err)
+	}
+
+	if len(botSender.sent) != 2 {
+		t.Fatalf("want intro then form question, got %d messages: %+v", len(botSender.sent), botSender.sent)
+	}
+	if botSender.sent[0].Text != "Краткая лекция про X." || botSender.sent[0].ReplyMarkup != nil {
+		t.Fatalf("first message must be prose only: %+v", botSender.sent[0])
+	}
+	if strings.Contains(botSender.sent[0].Text, question) ||
+		strings.Contains(botSender.sent[0].Text, "- Да") ||
+		strings.Contains(botSender.sent[0].Text, "- Нет") {
+		t.Fatalf("intro must not include the question block: %q", botSender.sent[0].Text)
+	}
+	if botSender.sent[1].Text != question || botSender.sent[1].ReplyMarkup == nil {
+		t.Fatalf("second message must be the form question: %+v", botSender.sent[1])
+	}
+}
+
 // TestContactFallbackDeliveredOnErrorFallback proves the contact is never left in
 // silence: when the AI turn ends in error_fallback (e.g. provider failure after
 // all retries), the "Thinking…" placeholder resolves into a real notice instead

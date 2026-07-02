@@ -272,9 +272,9 @@ def test_bimodal_orchestrator_tools_writer_bundle_tier_and_critic(monkeypatch) -
     assert "финальный ответ ты НЕ пишешь" in str(captured["orchestrator_prompt"])
     assert "Support" in str(captured["orchestrator_prompt"])
     assert "Telegram Rich Markdown" not in str(captured["orchestrator_prompt"])
-    # 2.5 strict split (default): the orchestrator is the sole memory/schedule/
-    # interaction tool-caller in two-stage mode; the writer keeps only its
-    # always-on delivery capability — see test_two_stage_writer_has_no_interaction_fallback_by_default
+    # 2.5 strict split (default): the orchestrator is the sole memory/schedule
+    # tool-caller in two-stage mode; this role has no interaction tool enabled,
+    # so the writer keeps only its always-on delivery capability.
     # and test_two_stage_writer_fallback_tool_call_reaches_outcome for the opt-in fallback.
     assert captured["writer_tools"] == ["send_message"]
     assert "bundle-sentinel" in str(captured["writer_prompt"])
@@ -512,13 +512,10 @@ def test_two_stage_writer_fallback_tool_call_reaches_outcome(monkeypatch) -> Non
     assert outcome.response_plan.questions[0].prompt == "Какой день удобнее?"
 
 
-def test_two_stage_writer_has_no_interaction_fallback_by_default() -> None:
-    """2.5 default (WRITER_FALLBACK_TOOLS_ENABLED unset): the orchestrator is
-    the sole owner of memory/schedule/interaction tools in two-stage mode —
-    the writer only ever sees its always-on delivery tool. If the orchestrator
-    sets no plan, the writer just writes its own plain reply; there is no
-    interaction safety net to fall back on."""
+def test_two_stage_writer_has_question_fallback_but_no_memory_or_scheduler_by_default() -> None:
+    """The writer may ask contact-facing questions, but cannot re-run context tools."""
     captured: dict[str, object] = {}
+    calls = {"writer": 0}
 
     def orchestrator(messages, info: AgentInfo) -> ModelResponse:
         return ModelResponse(parts=[ToolCallPart(tool_name="final_result", args={
@@ -526,9 +523,17 @@ def test_two_stage_writer_has_no_interaction_fallback_by_default() -> None:
         })])
 
     def writer(messages, info: AgentInfo) -> ModelResponse:
+        calls["writer"] += 1
         captured["writer_tools"] = [tool.name for tool in info.function_tools]
+        if calls["writer"] == 1:
+            return ModelResponse(parts=[ToolCallPart(
+                tool_name="ask_questions",
+                args={"questions": [
+                    {"prompt": "Какой день удобнее?", "options": ["Сегодня", "Завтра"]},
+                ]},
+            )])
         return draft_output({
-            "reply": "Отвечу без уточнений.",
+            "reply": "Сначала зафиксирую контекст.",
             "intent": "general_message",
             "options": [],
             "confidence": 0.9,
@@ -554,10 +559,14 @@ def test_two_stage_writer_has_no_interaction_fallback_by_default() -> None:
 
     outcome = runtime.draft_outcome(request, RiskLevel.LOW)
 
-    assert captured["writer_tools"] == ["send_message"]
-    assert outcome.intent == "general_message"
-    assert outcome.response_plan is None
-    assert outcome.text == "Отвечу без уточнений."
+    writer_tools = set(captured["writer_tools"])
+    assert {"ask_questions", "request_confirmation", "send_message"} <= writer_tools
+    assert "create_reminder" not in writer_tools
+    assert "search_facts" not in writer_tools
+    assert outcome.intent == "choice_question"
+    assert outcome.text == "Сначала зафиксирую контекст."
+    assert outcome.response_plan is not None
+    assert outcome.response_plan.questions[0].prompt == "Какой день удобнее?"
 
 
 def test_orchestrator_result_coerces_null_string_response_plan() -> None:

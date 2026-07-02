@@ -188,7 +188,7 @@ func (s *Service) startInteractionForm(ctx context.Context, event contracts.Norm
 	if err != nil {
 		return store.InteractionFormRecord{}, err
 	}
-	if err := s.sendInteractionProse(ctx, event, ownerID, proposal, questions[0], delivery); err != nil {
+	if err := s.sendInteractionProse(ctx, event, ownerID, proposal, questions, delivery); err != nil {
 		s.repository.CancelForm(form.ID)
 		return store.InteractionFormRecord{}, err
 	}
@@ -202,9 +202,9 @@ func (s *Service) startInteractionForm(ctx context.Context, event contracts.Norm
 	return form, nil
 }
 
-func (s *Service) sendInteractionProse(ctx context.Context, event contracts.NormalizedTelegramEvent, ownerID string, proposal contracts.AIProcessMessageResponse, firstQuestion contracts.Question, delivery deliverySettings) error {
+func (s *Service) sendInteractionProse(ctx context.Context, event contracts.NormalizedTelegramEvent, ownerID string, proposal contracts.AIProcessMessageResponse, questions []contracts.Question, delivery deliverySettings) error {
 	for index, message := range proposal.Messages {
-		text := interactionIntroText(message.Text, firstQuestion.Prompt)
+		text := interactionIntroText(message.Text, questions)
 		if text == "" {
 			continue
 		}
@@ -215,7 +215,7 @@ func (s *Service) sendInteractionProse(ctx context.Context, event contracts.Norm
 		}
 		s.saveOutgoingMessage(event, ownerID, sentMsgID, text, decisionID, message.TextFormat)
 	}
-	text := interactionIntroText(proposal.ResponseText, firstQuestion.Prompt)
+	text := interactionIntroText(proposal.ResponseText, questions)
 	if text == "" {
 		return nil
 	}
@@ -277,16 +277,54 @@ func canonicalInteractionText(text string) string {
 	return strings.Join(fields, " ")
 }
 
-func interactionIntroText(text, firstQuestion string) string {
+func interactionIntroText(text string, questions []contracts.Question) string {
 	text = strings.TrimSpace(text)
-	if text == "" || sameInteractionText(text, firstQuestion) {
+	if text == "" || sameAnyInteractionQuestion(text, questions) {
 		return ""
 	}
-	stripped := stripTrailingQuestionSentences(text)
-	if stripped == "" || sameInteractionText(stripped, firstQuestion) {
+	stripped := stripInteractionQuestionBlocks(text, questions)
+	stripped = stripTrailingQuestionSentences(stripped)
+	if stripped == "" || sameAnyInteractionQuestion(stripped, questions) {
 		return ""
 	}
 	return stripped
+}
+
+func sameAnyInteractionQuestion(text string, questions []contracts.Question) bool {
+	for _, question := range questions {
+		if sameInteractionText(text, question.Prompt) {
+			return true
+		}
+	}
+	return false
+}
+
+func stripInteractionQuestionBlocks(text string, questions []contracts.Question) string {
+	current := strings.TrimSpace(text)
+	if current == "" || len(questions) == 0 {
+		return current
+	}
+	lines := strings.Split(current, "\n")
+	for index, line := range lines {
+		if lineContainsInteractionQuestion(line, questions) {
+			return strings.TrimSpace(strings.Join(lines[:index], "\n"))
+		}
+	}
+	return current
+}
+
+func lineContainsInteractionQuestion(line string, questions []contracts.Question) bool {
+	canonicalLine := canonicalInteractionText(line)
+	if canonicalLine == "" {
+		return false
+	}
+	for _, question := range questions {
+		canonicalPrompt := canonicalInteractionText(question.Prompt)
+		if canonicalPrompt != "" && strings.Contains(canonicalLine, canonicalPrompt) {
+			return true
+		}
+	}
+	return false
 }
 
 func stripTrailingQuestionSentences(text string) string {

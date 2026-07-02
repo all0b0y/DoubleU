@@ -241,17 +241,22 @@ _EMPTY_DRAFT_REPAIR_HINT = (
 class EmptyDraftReplyError(RuntimeError):
     """The writer produced no contact-facing output at all."""
 
-# Two-stage default: the orchestrator owns memory/schedule/interaction tools
+# Two-stage default: the orchestrator owns memory/schedule tools
 # (see _orchestrate_async); the writer gets only its always-on delivery
-# capability, not a fallback copy of the same toolset. A Langfuse audit
+# capability plus the interaction question tool, not a fallback copy of the
+# whole role toolset. A Langfuse audit
 # (.claude/analyze.md) showed the fallback path masking orchestration bugs —
 # the writer would quietly re-fetch context the orchestrator already gathered
 # instead of the bug surfacing as a missing-context failure. Set this to
 # enable the old "writer keeps the role's tools as a backup path" behaviour
 # for a deployment that needs it; single-stage drafting (no orchestrator run)
 # is never affected — the writer is the only tool-caller there regardless.
-_WRITER_FALLBACK_TOOLS_ENABLED = os.getenv("WRITER_FALLBACK_TOOLS_ENABLED", "").strip().lower() in (
-    "1", "true", "yes", "on",
+_WRITER_FALLBACK_TOOLS_ENABLED = (
+    os.getenv("WRITER_FALLBACK_TOOLS_ENABLED", "").strip().lower()
+    in ("1", "true", "yes", "on")
+)
+_WRITER_INTERACTION_FALLBACK_TOOL_NAMES = frozenset(
+    {"ask_questions", "request_confirmation"}
 )
 
 # How many times draft_outcome re-runs the agent before giving up. A draft can
@@ -1034,13 +1039,19 @@ class AgentRuntime:
             ),
         )
         # Strict split (default, see _WRITER_FALLBACK_TOOLS_ENABLED above): in
-        # two-stage mode the orchestrator is the ONLY memory/schedule/interaction
-        # tool-caller, so the writer gets just its always-on delivery capability
-        # (lets it split a turn into several ordered messages — not in
-        # TOOL_CATALOG, never shown in the role UI). Single-stage drafting has no
-        # orchestrator run, so the writer must keep the full toolset regardless.
+        # two-stage mode the orchestrator is the ONLY memory/schedule tool-caller,
+        # so the writer gets only the interaction question tool plus its always-on
+        # delivery capability. Single-stage drafting has no orchestrator run, so
+        # the writer must keep the full toolset regardless.
         if two_stage and not _WRITER_FALLBACK_TOOLS_ENABLED:
-            writer_toolsets: list = [delivery_toolset]
+            writer_toolsets: list = [
+                resolve_builtin_toolset(
+                    request.ai_role,
+                    privacy_flags,
+                    allowed_names=_WRITER_INTERACTION_FALLBACK_TOOL_NAMES,
+                ),
+                delivery_toolset,
+            ]
         else:
             writer_toolsets = [
                 resolve_builtin_toolset(request.ai_role, privacy_flags),
