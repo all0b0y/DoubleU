@@ -1358,7 +1358,8 @@ def test_resolve_mcp_toolsets_skips_unsafe_urls() -> None:
     toolsets = runtime._resolve_mcp_toolsets(role, ())
     # Only the public https server survives; the four unsafe ones are dropped.
     assert len(toolsets) == 1
-    assert isinstance(toolsets[0], MCPServerStreamableHTTP)
+    # Each server is wrapped as untrusted-result (Э0.2); unwrap to check the type.
+    assert isinstance(toolsets[0].wrapped, MCPServerStreamableHTTP)
 
 
 def test_resolve_mcp_toolsets_builds_and_filters() -> None:
@@ -1366,6 +1367,8 @@ def test_resolve_mcp_toolsets_builds_and_filters() -> None:
     FilteredToolset that exposes only the permitted tools (deny-by-default)."""
     from pydantic_ai.mcp import MCPServerStreamableHTTP
     from pydantic_ai.toolsets import FilteredToolset
+
+    from ai_agent.agents.sanitize_toolset import UntrustedResultToolset
 
     runtime = make_runtime()
     role = AIRoleData(
@@ -1378,10 +1381,12 @@ def test_resolve_mcp_toolsets_builds_and_filters() -> None:
     )
     toolsets = runtime._resolve_mcp_toolsets(role, ())
     assert len(toolsets) == 2
-    # No allow-list → raw MCP server toolset.
-    assert isinstance(toolsets[0], MCPServerStreamableHTTP)
+    # Every MCP server is wrapped as untrusted-result (Э0.2).
+    assert all(isinstance(t, UntrustedResultToolset) for t in toolsets)
+    # No allow-list → raw MCP server toolset under the wrapper.
+    assert isinstance(toolsets[0].wrapped, MCPServerStreamableHTTP)
     # Allow-list → FilteredToolset that permits only "search".
-    scoped = toolsets[1]
+    scoped = toolsets[1].wrapped
     assert isinstance(scoped, FilteredToolset)
     assert scoped.filter_func(None, SimpleNamespace(name="search")) is True
     assert scoped.filter_func(None, SimpleNamespace(name="delete")) is False

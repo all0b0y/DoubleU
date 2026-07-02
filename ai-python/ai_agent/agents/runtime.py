@@ -82,6 +82,7 @@ from ..schemas import (
 )
 from ..security import PromptBuilder
 from .dedup_toolset import DedupToolset
+from .sanitize_toolset import UntrustedResultToolset
 from .deps import AgentDeps
 from .delivery_tools import delivery_toolset
 from .interaction_tools import interaction_toolset
@@ -851,7 +852,9 @@ class AgentRuntime:
                 server = FilteredToolset(
                     server, lambda ctx, td, allowed=allowed: td.name in allowed
                 )
-            toolsets.append(server)
+            # Wrap the (possibly allow-list-filtered) server so every result from
+            # this external endpoint arrives as escaped untrusted text (Э0.2).
+            toolsets.append(UntrustedResultToolset(wrapped=server))
         return toolsets
 
     async def _orchestrate_async(
