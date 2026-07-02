@@ -75,6 +75,29 @@
 
 ### DEBT — осознанные отложенные решения
 
+- **Legacy-боты с ролью, но без role-context, теряют изоляцию (только broad-память).**
+  Фикс 2026-07-01 (`memoryRoleContextForEvent` → `roleScoped=false` при `active_role_context_id=0`)
+  вернул память таким ботам через broad-читалки (симметрично записи в `role_context_id=0`), но
+  изоляция по ролям для них НЕ включается, пока владелец не переназначит роль через Mini App
+  (policy-aware `SetUserBotRoleWithContextPolicy`, который создаёт `bot_role_contexts` и проставляет
+  `active_role_context_id`). У бота `8696722677` был `ai_role_id=2`, `active_role_context_id=0`,
+  таблица `bot_role_contexts` пустая — роль назначена до появления фичи role-scoped памяти
+  (2026-06-30). Долгосрочно: либо ленивый self-heal (создавать контекст при первом обороте
+  role-bound бота без контекста), либо одноразовая миграция-бэкфилл для уже назначенных ролей.
+  _Найдено и пофикшено 2026-07-01._
+- **Двухстадийный draft изредка падает в `error_fallback` по таймауту.** В логах ai-service
+  (chat `bot:8696722677:770055005`, 2026-07-01) один оборот висел `latency_ms≈150021` →
+  `agent draft timed out` → `decision: error_fallback` («ИИ не смог сформировать ответ»). Это
+  потолок `AGENT_RUN_TIMEOUT_SECONDS` (по умолчанию 150с, [docker-compose.yml](../docker-compose.yml)):
+  orchestrate(deepseek-v4-flash)+draft(+critic) на длинном ответе с ~20k входных токенов иногда
+  не укладывается. Сокращение лишних вызовов `ask_questions` (правка промта 2026-07-01) часть
+  нагрузки снимает, но корневой риск — отсутствие per-stage дедлайна и стриминга/ранней отмены
+  зависшего вызова провайдера. Рассмотреть: отдельные таймауты на orchestrator и writer, отмену
+  по первому пришедшему дельта-таймауту, и троттлинг входного контекста.
+- **`embed_texts failed` на горячем пути.** В тех же логах повторяется `embed_texts failed` —
+  эмбеддер недоступен, поиск фактов молча деградирует на лексический (ILIKE) fallback (by design,
+  best-effort). Но это значит, что семантическая память по факту выключена в этом окружении —
+  проверить конфиг эмбеддера (ключ/endpoint), иначе `memory.search_facts` работает вслепую.
 - **`list_reminders` показывает не пересчитанный `fire_at`.** Scheduler/DST-fix (2026-06-30,
   `docs/plans/scheduler_timezone_and_time_context_plan_2026-06-30.md`, задача D) научил `DueJobs`
   пересчитывать авторитетное время срабатывания из `local_time`+`tz_name` (свежий tzdata на момент
@@ -106,6 +129,12 @@
   — отложен до управления пользователями БД в `infra/`.
 - **MEM-2 `export`.** JSONL-дамп tenant'а (`/forget`, `/forget_all` уже реализованы) — отдельная
   невыполненная подзадача deletion-контракта.
+- **Мёртвый код: per-chat `assignRole`.** [`miniapp/api/client.js`](../miniapp/api/client.js)
+  всё ещё определяет `assignRole(chatId, roleId)` → `PUT /api/v1/chats/{chat_id}/role`
+  (`apiAssignChatRole` в [`miniapp_roles_handlers.go`](../backend-go/internal/httpapi/miniapp_roles_handlers.go)),
+  но ни один экран Mini App его не вызывает — роль теперь назначается только на уровне бота
+  (`setBotRole`). Найдено при разборе бага role_context_policy (2026-06-30). Удалить клиентский
+  метод и оценить, нужен ли ещё сам HTTP-роут, или он тоже сирота.
 
 ### TOOLS — integration-инструмент не реализован
 
