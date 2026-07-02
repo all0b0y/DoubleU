@@ -1233,6 +1233,34 @@ def test_generation_metadata_carries_capability_and_routing_fields(monkeypatch) 
     assert len(meta["rendered_system_prompt_hash"]) == 64  # sha256 hex digest
 
 
+def test_record_run_attaches_mcp_server_names_only() -> None:
+    """Э1.5: a run trace carries the connected MCP server NAMES only — never a
+    url or auth header."""
+    import json
+
+    from ai_agent.agents.models import AgentTask
+    from ai_agent.schemas import Usage
+
+    sink = _FakeSink()
+    runtime = make_runtime(sink=sink)
+    ctx = LLMCallContext(trace_id="trace-mcp")
+    runtime._record_run(
+        ctx,
+        AgentTask.ORCHESTRATE,
+        "system prompt",
+        "user payload",
+        "completion",
+        Usage(input_tokens=1, output_tokens=1),
+        (),
+        mcp_server_names=("weather", "search"),
+    )
+    gen = sink.generations[-1]
+    assert gen["metadata"]["mcp_servers"] == ["weather", "search"]
+    # Names only: nothing that could carry a url or credential leaks into the trace.
+    blob = json.dumps(gen).lower()
+    assert "authorization" not in blob and "bearer" not in blob and "https://" not in blob
+
+
 def test_record_decision_relabels_trace_with_outcome() -> None:
     """The request trace must be re-labelled with the final decision so an
     auto-sent reply is distinguishable from an owner draft (it is opened under

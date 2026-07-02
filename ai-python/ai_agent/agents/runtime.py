@@ -659,6 +659,7 @@ class AgentRuntime:
         preflight: TaskPreflightDecision | None = None,
         request_model_settings: dict[str, object] | None = None,
         tool_call_count: int | None = None,
+        mcp_server_names: tuple[str, ...] = (),
     ) -> None:
         """Push one generation (and trace/safety spans) to the Langfuse sink.
 
@@ -720,6 +721,9 @@ class AgentRuntime:
             metadata["request_model_settings"] = dict(request_model_settings)
         if tool_call_count is not None:
             metadata["tool_call_count"] = tool_call_count
+        if mcp_server_names:
+            # Only the server NAMES — never url or auth header (Э1.5).
+            metadata["mcp_servers"] = list(mcp_server_names)
         self._sink.record_generation(
             trace_id=ctx.trace_id,
             model=model_slug,
@@ -944,16 +948,28 @@ class AgentRuntime:
                 request.user_settings.timezone.strip() if request.user_settings is not None else ""
             ),
         )
+        mcp_attached = request.ai_role is not None and "mcp" in decision.tool_groups
         toolsets = [
             resolve_builtin_toolset(
                 request.ai_role, privacy_flags, allowed_names=decision.allowed_tool_names
             ),
             *(
                 self._resolve_mcp_toolsets(request.ai_role, privacy_flags)
-                if "mcp" in decision.tool_groups
+                if mcp_attached
                 else []
             ),
         ]
+        # Names of the MCP servers connected to this turn, for the run trace
+        # (Э1.5). Same egress filter as _resolve_mcp_toolsets; names only.
+        mcp_server_names: tuple[str, ...] = (
+            tuple(
+                spec.name
+                for spec in request.ai_role.mcp_servers
+                if spec.url and _mcp_url_is_safe(spec.url)
+            )
+            if mcp_attached
+            else ()
+        )
         run_kwargs: dict = dict(
             deps=deps,
             usage_limits=UsageLimits(tool_calls_limit=_ORCHESTRATOR_TOOL_CALLS_LIMIT),
@@ -992,6 +1008,7 @@ class AgentRuntime:
             preflight=decision,
             request_model_settings=orchestrator_model_settings,
             tool_call_count=len(deps.tool_call_cache),
+            mcp_server_names=mcp_server_names,
         )
         return orchestrated, usage, scheduled_jobs, cancelled_job_ids
 
