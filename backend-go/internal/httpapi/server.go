@@ -117,6 +117,14 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("DELETE /api/v1/roles/{role_id}", s.tmaAuth(s.apiDeleteRole))
 	s.mux.HandleFunc("PUT /api/v1/chats/{chat_id}/role", s.tmaAuth(s.apiAssignChatRole))
 
+	// MCP servers (external tools) — owner CRUD plus per-role access grants.
+	s.mux.HandleFunc("GET /api/v1/mcp-servers", s.tmaAuth(s.apiListMCPServers))
+	s.mux.HandleFunc("POST /api/v1/mcp-servers", s.tmaAuth(s.apiCreateMCPServer))
+	s.mux.HandleFunc("PUT /api/v1/mcp-servers/{server_id}", s.tmaAuth(s.apiUpdateMCPServer))
+	s.mux.HandleFunc("DELETE /api/v1/mcp-servers/{server_id}", s.tmaAuth(s.apiDeleteMCPServer))
+	s.mux.HandleFunc("GET /api/v1/roles/{role_id}/mcp", s.tmaAuth(s.apiGetRoleMCP))
+	s.mux.HandleFunc("PUT /api/v1/roles/{role_id}/mcp", s.tmaAuth(s.apiSetRoleMCP))
+
 	// AI profile suggestions: tenant-wide inbox and per-chat list.
 	s.mux.HandleFunc("GET /api/v1/suggestions", s.tmaAuth(s.apiSuggestions))
 	s.mux.HandleFunc("GET /api/v1/chats/{chat_id}/suggestions", s.tmaAuth(s.apiSuggestions))

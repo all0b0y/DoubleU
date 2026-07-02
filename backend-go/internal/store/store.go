@@ -18,10 +18,14 @@ import (
 	"doubleu/backend-go/internal/contracts"
 )
 
-// errMissingSecretsKey is returned when a caller tries to persist a non-empty
+// ErrMissingSecretsKey is returned when a caller tries to persist a non-empty
 // secret but no encryption key was injected — encryption is mandatory, so we
 // fail closed rather than fall back to plaintext.
-var errMissingSecretsKey = errors.New("cannot store secret: MCP_SECRETS_KEY is not configured")
+var ErrMissingSecretsKey = errors.New("cannot store secret: MCP_SECRETS_KEY is not configured")
+
+// ErrMCPServerNotFound signals that an update/delete matched no row for the
+// caller's tenant (missing id or cross-tenant attempt).
+var ErrMCPServerNotFound = errors.New("mcp server not found")
 
 // encryptSecret seals plaintext with AES-256-GCM and returns nonce||ciphertext.
 // A fresh random nonce is prepended to every value (crypto/rand), so the same
@@ -375,7 +379,7 @@ func (r *Repository) SaveMCPServer(tenantID, name, transport, url, authHeader st
 	var enc []byte
 	if authHeader != "" {
 		if len(r.secretsKey) == 0 {
-			return 0, errMissingSecretsKey
+			return 0, ErrMissingSecretsKey
 		}
 		var err error
 		if enc, err = encryptSecret(r.secretsKey, authHeader); err != nil {
@@ -481,7 +485,7 @@ func (r *Repository) UpdateMCPServer(tenantID string, id int64, name, transport,
 		)
 	} else {
 		if len(r.secretsKey) == 0 {
-			return errMissingSecretsKey
+			return ErrMissingSecretsKey
 		}
 		enc, encErr := encryptSecret(r.secretsKey, authHeader)
 		if encErr != nil {
@@ -499,7 +503,7 @@ func (r *Repository) UpdateMCPServer(tenantID string, id int64, name, transport,
 		return err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
-		return fmt.Errorf("mcp server not found")
+		return ErrMCPServerNotFound
 	}
 	return nil
 }
@@ -516,7 +520,7 @@ func (r *Repository) DeleteMCPServer(tenantID string, id int64) error {
 		return err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
-		return fmt.Errorf("mcp server not found")
+		return ErrMCPServerNotFound
 	}
 	return nil
 }
@@ -552,6 +556,38 @@ func (r *Repository) RoleMCPAccessByRole(roleID int64) []RoleMCPAccessRecord {
 		}
 	}
 	return out
+}
+
+// SetRoleMCPServers replaces a role's entire MCP grant set in one transaction
+// (Э1.2): the toggle UI sends the full desired set, so de-selected servers must
+// lose their grant. DELETE-then-INSERT keeps the read side (RoleMCPServers) in
+// sync with exactly what the owner chose. A nil/empty AllowedTools means all
+// tools. Caller is responsible for validating server ownership.
+func (r *Repository) SetRoleMCPServers(roleID int64, grants []RoleMCPAccessRecord) error {
+	if r.db == nil {
+		return nil
+	}
+	tx, err := r.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }() // no-op after Commit
+	if _, err := tx.Exec(`DELETE FROM role_mcp_access WHERE role_id = $1`, roleID); err != nil {
+		return err
+	}
+	for _, g := range grants {
+		var allowed any
+		if len(g.AllowedTools) > 0 {
+			allowed = pq.Array(g.AllowedTools)
+		}
+		if _, err := tx.Exec(
+			`INSERT INTO role_mcp_access (role_id, mcp_server_id, allowed_tools) VALUES ($1,$2,$3)`,
+			roleID, g.ServerID, allowed,
+		); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // ============================================================
