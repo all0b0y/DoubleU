@@ -150,7 +150,7 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 		return InboundResult{Event: event, Decision: contracts.DecisionObserve, Reason: "owner_message_observed"}, nil
 	}
 
-	if form, ok := s.repository.ActiveInteractionForm(event.TenantID, event.ChatID); ok {
+	if form, ok := s.repository.ActiveInteractionFormAt(event.TenantID, event.ChatID, s.now()); ok {
 		nextEvent, formResult, err := s.handleInteractionFormTextAnswer(ctx, event, ownerID, form)
 		if err != nil {
 			s.repository.AppendState(event.TenantID, event.ChatID, event.SourceMessageID, contracts.StateFailed)

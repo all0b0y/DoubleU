@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -30,7 +31,7 @@ func (s *Service) handleQFormCallback(ctx context.Context, cbq telegram.Callback
 	if s.repository.MarkCallback(idempotencyKey) {
 		return InboundResult{Event: event, Decision: contracts.DecisionIgnore, Reason: "duplicate_qform_callback", Duplicate: true}
 	}
-	form, ok := s.repository.ActiveInteractionForm(cbq.TenantID, event.ChatID)
+	form, ok := s.repository.ActiveInteractionFormAt(cbq.TenantID, event.ChatID, s.now())
 	if !ok || form.ID != formID {
 		return InboundResult{Event: event, Decision: contracts.DecisionIgnore, Reason: "qform_not_found"}
 	}
@@ -48,7 +49,7 @@ func (s *Service) handleQFormCallback(ctx context.Context, cbq telegram.Callback
 		_ = callbackSender.SendMessage(ctx, telegram.OutboundMessage{
 			TenantID: cbq.TenantID,
 			ChatID:   cbq.ChatID,
-			Text:     "Напишите ответ текстом в этот чат.",
+			Text:     "✏️\n" + question.Prompt,
 		})
 		return InboundResult{Event: event, Decision: contracts.DecisionObserve, Reason: "form_free_text_requested"}
 	}
@@ -57,7 +58,7 @@ func (s *Service) handleQFormCallback(ctx context.Context, cbq telegram.Callback
 	}
 	answer := question.Options[optionIdx]
 	if cbq.OriginalMsgID != "" {
-		selectedText := question.Prompt + "\n\n✓ Выбрано: " + answer
+		selectedText := question.Prompt + "\n\n✓ " + answer
 		if err := callbackSender.EditMessageText(ctx, cbq.ChatID, cbq.OriginalMsgID, selectedText, telegram.InlineKeyboardMarkup{}); err != nil {
 			s.logger.Warn("interaction form message edit failed",
 				"tenant_id", cbq.TenantID, "form_id", formID, "error", err)
@@ -157,7 +158,7 @@ func qformQuestionKeyboard(formID int64, questionIdx int, question contracts.Que
 		}})
 	}
 	rows = append(rows, []telegram.InlineKeyboardButton{{
-		Text:         "✏️ Ответить текстом",
+		Text:         "✏️",
 		CallbackData: contracts.CallbackDataEncodeQFormFreeText(formID, questionIdx),
 	}})
 	return telegram.InlineKeyboardMarkup{InlineKeyboard: rows}
@@ -182,7 +183,7 @@ func (s *Service) startInteractionForm(ctx context.Context, event contracts.Norm
 		Questions:       questions,
 		SourceMessageID: event.SourceMessageID,
 		CreatedAt:       s.now(),
-		ExpiresAt:       time.Now().UTC().Add(24 * time.Hour),
+		ExpiresAt:       s.now().UTC().Add(24 * time.Hour),
 	})
 	if err != nil {
 		return store.InteractionFormRecord{}, err
@@ -203,7 +204,7 @@ func (s *Service) startInteractionForm(ctx context.Context, event contracts.Norm
 
 func (s *Service) sendInteractionProse(ctx context.Context, event contracts.NormalizedTelegramEvent, ownerID string, proposal contracts.AIProcessMessageResponse, firstQuestion contracts.Question, delivery deliverySettings) error {
 	for index, message := range proposal.Messages {
-		text := strings.TrimSpace(message.Text)
+		text := interactionIntroText(message.Text, firstQuestion.Prompt)
 		if text == "" {
 			continue
 		}
@@ -214,8 +215,8 @@ func (s *Service) sendInteractionProse(ctx context.Context, event contracts.Norm
 		}
 		s.saveOutgoingMessage(event, ownerID, sentMsgID, text, decisionID, message.TextFormat)
 	}
-	text := strings.TrimSpace(proposal.ResponseText)
-	if text == "" || sameInteractionText(text, firstQuestion.Prompt) {
+	text := interactionIntroText(proposal.ResponseText, firstQuestion.Prompt)
+	if text == "" {
 		return nil
 	}
 	decisionID := event.EventID + ":intro"
@@ -262,16 +263,86 @@ func (s *Service) handleInteractionFormTextAnswer(ctx context.Context, event con
 }
 
 func sameInteractionText(left, right string) bool {
-	return strings.Join(strings.Fields(left), " ") == strings.Join(strings.Fields(right), " ")
+	return canonicalInteractionText(left) == canonicalInteractionText(right)
+}
+
+func canonicalInteractionText(text string) string {
+	fields := strings.Fields(strings.ToLower(text))
+	for i, field := range fields {
+		fields[i] = strings.TrimFunc(field, func(r rune) bool {
+			return r == '?' || r == '!' || r == '.' || r == ',' || r == ':' || r == ';' ||
+				r == '؟' || r == '？' || r == '！' || r == '。'
+		})
+	}
+	return strings.Join(fields, " ")
+}
+
+func interactionIntroText(text, firstQuestion string) string {
+	text = strings.TrimSpace(text)
+	if text == "" || sameInteractionText(text, firstQuestion) {
+		return ""
+	}
+	stripped := stripTrailingQuestionSentences(text)
+	if stripped == "" || sameInteractionText(stripped, firstQuestion) {
+		return ""
+	}
+	return stripped
+}
+
+func stripTrailingQuestionSentences(text string) string {
+	current := strings.TrimSpace(text)
+	for endsWithQuestionMark(current) {
+		start := lastSentenceStart(current)
+		if start <= 0 {
+			return ""
+		}
+		current = strings.TrimSpace(current[:start])
+	}
+	return current
+}
+
+func endsWithQuestionMark(text string) bool {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return false
+	}
+	runes := []rune(trimmed)
+	switch runes[len(runes)-1] {
+	case '?', '؟', '？':
+		return true
+	default:
+		return false
+	}
+}
+
+func lastSentenceStart(text string) int {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return 0
+	}
+	finalQuestion := strings.LastIndexAny(trimmed, "?؟？")
+	if finalQuestion < 0 {
+		return len(trimmed)
+	}
+	start := 0
+	for idx, r := range trimmed[:finalQuestion] {
+		switch r {
+		case '.', '!', '?', '؟', '？', '！', '。', '\n', '\r':
+			start = idx + len(string(r))
+		}
+	}
+	return start
 }
 
 func interactionAnswersText(form store.InteractionFormRecord) string {
-	lines := make([]string, 0, len(form.Answers)+1)
-	lines = append(lines, "Ответы на уточняющие вопросы:")
-	for _, answer := range form.Answers {
-		lines = append(lines, fmt.Sprintf("- %s: %s", answer.Prompt, answer.Answer))
+	payload := struct {
+		InteractionAnswers []store.FormAnswer `json:"interaction_answers"`
+	}{InteractionAnswers: form.Answers}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return "{}"
 	}
-	return strings.Join(lines, "\n")
+	return string(data)
 }
 
 // handleChoiceOption processes an ApprovalChooseOption callback: the owner has selected one of the

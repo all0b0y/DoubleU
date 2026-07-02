@@ -615,6 +615,57 @@ func TestQuestionnaireDropsDuplicateQuestionEcho(t *testing.T) {
 	}
 }
 
+func TestQuestionnaireStripsTrailingQuestionFromIntro(t *testing.T) {
+	repository := store.NewRepository()
+	role := repository.SaveAIRole(store.AIRoleRecord{
+		TenantID:     "tenant:user:77",
+		Name:         "Planner",
+		ToolSettings: map[string]bool{"interaction.ask_questions": true},
+	})
+	repository.SaveUserBot(store.UserBotRecord{
+		TenantID: "tenant:user:77", BotID: 555, Status: "active", AIRoleID: role.ID,
+	})
+	ai := &fakeAI{response: contracts.AIProcessMessageResponse{
+		Decision: contracts.DecisionAutoReply,
+		ResponseText: strings.Join([]string{
+			"Отлично, теперь у меня есть актуальный список задач на завтра:",
+			"1. Почитать",
+			"2. Позаниматься спортом",
+			"",
+			"Во сколько планируешь проснуться?",
+		}, "\n"),
+		Confidence: 0.9,
+		RiskLevel:  contracts.RiskLow,
+		Intent:     "choice_question",
+		ResponsePlan: &contracts.ResponsePlan{Shape: "questions", Questions: []contracts.Question{
+			{Prompt: "Во сколько планируешь проснуться?"},
+		}},
+	}}
+	botSender := &fakeSender{}
+	service := NewService(repository, ai, &fakeSender{},
+		WithClock(func() time.Time { return time.Unix(1700000000, 0).UTC() }),
+		WithDefaultIngestionMode(contracts.IngestionModeFull),
+		WithBotSenderProvider(&fakeBotSenders{sender: botSender}),
+	)
+
+	if _, err := service.HandleBotMessage(context.Background(), botEvent(t, 9813, 42, 45, "спланируй день")); err != nil {
+		t.Fatalf("bot message: %v", err)
+	}
+
+	if len(botSender.sent) != 2 {
+		t.Fatalf("want intro then form question, got %d messages: %+v", len(botSender.sent), botSender.sent)
+	}
+	if strings.Contains(botSender.sent[0].Text, "Во сколько") {
+		t.Fatalf("intro must not include the question tail: %q", botSender.sent[0].Text)
+	}
+	if !strings.Contains(botSender.sent[0].Text, "Позаниматься спортом") || botSender.sent[0].ReplyMarkup != nil {
+		t.Fatalf("first message must be prose only: %+v", botSender.sent[0])
+	}
+	if botSender.sent[1].Text != "Во сколько планируешь проснуться?" || botSender.sent[1].ReplyMarkup == nil {
+		t.Fatalf("second message must be the form question: %+v", botSender.sent[1])
+	}
+}
+
 // TestContactFallbackDeliveredOnErrorFallback proves the contact is never left in
 // silence: when the AI turn ends in error_fallback (e.g. provider failure after
 // all retries), the "Thinking…" placeholder resolves into a real notice instead

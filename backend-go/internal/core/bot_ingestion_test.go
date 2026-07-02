@@ -401,13 +401,10 @@ func newQuestionnaireService(t *testing.T) (*Service, *store.Repository, *fakeAI
 	})
 	chatID := contracts.BotChatID("555", "42")
 	repository.SaveChatSettings(contracts.ChatSettings{
-		TenantID: "tenant:user:77", ChatID: chatID, Mode: contracts.ChatModeAuto,
+		TenantID: "tenant:user:77", ChatID: chatID, Mode: contracts.ChatModeManual,
 	})
-	// Empty ResponseText: these tests exercise questionnaire mechanics only, so the
-	// first sent message must be the question. Prose-before-the-form is covered by
-	// TestQuestionnaireDeliversResponseTextBeforeForm.
 	ai := &fakeAI{response: contracts.AIProcessMessageResponse{
-		Decision: contracts.DecisionDraft, ResponseText: "",
+		Decision: contracts.DecisionAutoReply, ResponseText: "Когда удобно?",
 		Confidence: 0.9, RiskLevel: contracts.RiskLow, Intent: "choice_question",
 		ResponsePlan: &contracts.ResponsePlan{Shape: "questions", Questions: []contracts.Question{
 			{Prompt: "Когда удобно?", Options: []string{"Сегодня", "Завтра"}},
@@ -438,13 +435,16 @@ func TestQuestionnaireCollectsAnswersThenRunsAITurn(t *testing.T) {
 	if ai.calls != 1 || len(botSender.sent) != 1 {
 		t.Fatalf("first question: ai.calls=%d sends=%+v", ai.calls, botSender.sent)
 	}
-	form, ok := repository.ActiveInteractionForm("tenant:user:77", chatID)
+	form, ok := repository.ActiveInteractionFormAt("tenant:user:77", chatID, service.now())
 	if !ok || form.CurrentIndex != 0 || len(form.Questions) != 2 {
 		t.Fatalf("active form = %+v ok=%v", form, ok)
 	}
 	markup, ok := botSender.sent[0].ReplyMarkup.(telegram.InlineKeyboardMarkup)
 	if !ok || len(markup.InlineKeyboard) != 3 { // 2 options + free-text button
 		t.Fatalf("question 1 markup = %#v", botSender.sent[0].ReplyMarkup)
+	}
+	if markup.InlineKeyboard[2][0].Text != "✏️" {
+		t.Fatalf("free-text button must be language-neutral, got %q", markup.InlineKeyboard[2][0].Text)
 	}
 
 	// Answer question 1 by tapping the second option ("Завтра").
@@ -456,6 +456,9 @@ func TestQuestionnaireCollectsAnswersThenRunsAITurn(t *testing.T) {
 	res, err := service.HandleBotCallbackQuery(context.Background(), callback, "tenant:user:77", "555")
 	if err != nil || res.Reason != "form_question_sent" {
 		t.Fatalf("answer q1: %+v err=%v", res, err)
+	}
+	if len(botSender.edits) != 1 || strings.Contains(botSender.edits[0].text, "Выбрано") {
+		t.Fatalf("selected option edit must avoid hardcoded language, edits=%+v", botSender.edits)
 	}
 	if ai.calls != 1 || len(botSender.sent) != 2 {
 		t.Fatalf("q1 answered should send q2 without an AI turn: ai.calls=%d sends=%d", ai.calls, len(botSender.sent))
@@ -477,11 +480,32 @@ func TestQuestionnaireCollectsAnswersThenRunsAITurn(t *testing.T) {
 		!strings.Contains(ai.lastRequest.Event.MessageText, "До 100 тысяч") {
 		t.Fatalf("final turn message missing answers: %q", ai.lastRequest.Event.MessageText)
 	}
-	if _, stillActive := repository.ActiveInteractionForm("tenant:user:77", chatID); stillActive {
+	if _, stillActive := repository.ActiveInteractionFormAt("tenant:user:77", chatID, service.now()); stillActive {
 		t.Fatalf("form should be completed after the last answer")
 	}
 	if done.Decision != contracts.DecisionAutoReply {
 		t.Fatalf("completion turn decision = %+v", done)
+	}
+}
+
+func TestQuestionnaireFreeTextPromptUsesQuestionText(t *testing.T) {
+	service, _, _, botSender := newQuestionnaireService(t)
+
+	if _, err := service.HandleBotMessage(context.Background(), botEvent(t, 9610, 42, 31, "Назначим звонок")); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	markup := botSender.sent[0].ReplyMarkup.(telegram.InlineKeyboardMarkup)
+	callback := telegram.CallbackQueryUpdate{
+		UpdateID: 9611, QueryID: "query-free-text", Data: markup.InlineKeyboard[2][0].CallbackData,
+		SenderID: "42", ChatID: "42", OriginalMsgID: "100",
+		ReceiveIdempotencyKey: "9611:callback_query:query-free-text",
+	}
+	res, err := service.HandleBotCallbackQuery(context.Background(), callback, "tenant:user:77", "555")
+	if err != nil || res.Reason != "form_free_text_requested" {
+		t.Fatalf("free text tap = %+v err=%v", res, err)
+	}
+	if len(botSender.sent) != 2 || botSender.sent[1].Text != "✏️\nКогда удобно?" {
+		t.Fatalf("free text prompt must reuse the question text, sent=%+v", botSender.sent)
 	}
 }
 
@@ -503,7 +527,7 @@ func TestQuestionnaireButtonIsIdempotent(t *testing.T) {
 	if _, err := service.HandleBotCallbackQuery(context.Background(), callback, "tenant:user:77", "555"); err != nil {
 		t.Fatalf("first tap: %v", err)
 	}
-	form, _ := repository.ActiveInteractionForm("tenant:user:77", chatID)
+	form, _ := repository.ActiveInteractionFormAt("tenant:user:77", chatID, service.now())
 	if form.CurrentIndex != 1 {
 		t.Fatalf("after one answer CurrentIndex = %d, want 1", form.CurrentIndex)
 	}
@@ -515,7 +539,7 @@ func TestQuestionnaireButtonIsIdempotent(t *testing.T) {
 	if err != nil || dup.Reason != "duplicate_qform_callback" {
 		t.Fatalf("double tap = %+v err=%v", dup, err)
 	}
-	form, _ = repository.ActiveInteractionForm("tenant:user:77", chatID)
+	form, _ = repository.ActiveInteractionFormAt("tenant:user:77", chatID, service.now())
 	if form.CurrentIndex != 1 {
 		t.Fatalf("double tap advanced the form to %d", form.CurrentIndex)
 	}

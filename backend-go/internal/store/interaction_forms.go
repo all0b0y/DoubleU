@@ -89,7 +89,17 @@ func (r *Repository) CreateInteractionForm(form InteractionFormRecord) (Interact
 // ActiveInteractionForm returns the chat's in-progress questionnaire, if one is
 // active and not expired.
 func (r *Repository) ActiveInteractionForm(tenantID, chatID string) (InteractionFormRecord, bool) {
-	now := time.Now().UTC()
+	return r.ActiveInteractionFormAt(tenantID, chatID, time.Now().UTC())
+}
+
+// ActiveInteractionFormAt is the clock-injected variant used by service flows
+// that create and consume forms under a testable service clock.
+func (r *Repository) ActiveInteractionFormAt(tenantID, chatID string, now time.Time) (InteractionFormRecord, bool) {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
 	if r.db != nil {
 		row := r.db.QueryRow(
 			`SELECT id, tenant_id, chat_id, bot_id, questions, current_index, answers,
