@@ -135,6 +135,20 @@ def draft_spec(
     }
     tool_policy = "\n".join(applicable_policy_text(enabled_names))
 
+    # Level-1 disclosure (Г4): list the role's enabled skills (name + description)
+    # so the writer knows which exist and can pull the body via load_skill. This
+    # is owner-authored, first-party metadata, so it lives on the trusted system
+    # side (same basis as role.context; invariant prompts/spec.py). True only
+    # while skills are owner/first-party — imported skills (backlog) must pass
+    # owner confirmation before they are enabled.
+    if ai_role is not None and ai_role.skills:
+        skill_lines = "\n".join(f"- {s.name}: {s.description}" for s in ai_role.skills)
+        tool_policy = (
+            tool_policy
+            + "\n\nДоступные навыки роли (перед ответом по теме навыка сначала вызови load_skill):\n"
+            + skill_lines
+        )
+
     return PromptSpec(
         role=role,
         task=task,

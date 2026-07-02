@@ -323,3 +323,20 @@ class TestRoleDraftSpec:
     def test_does_not_invent_business_facts(self) -> None:
         spec = role_draft_spec()
         assert any("не выдумывай факты" in c.lower() for c in spec.constraints)
+
+
+def test_draft_spec_lists_enabled_skills() -> None:
+    """Г4: the writer spec's tool_policy lists the role's skills (level 1); a role
+    without skills has no such section."""
+    from ai_agent.schemas import SkillSpecData
+
+    role = AIRoleData(
+        name="R",
+        skills=(SkillSpecData(name="reminders", description="как оформить напоминание"),),
+    )
+    spec = _draft_spec(_request(ai_role=role))
+    assert "Доступные навыки роли" in spec.tool_policy
+    assert "reminders: как оформить напоминание" in spec.tool_policy
+
+    no_skills = _draft_spec(_request(ai_role=AIRoleData(name="R")))
+    assert "Доступные навыки роли" not in no_skills.tool_policy
