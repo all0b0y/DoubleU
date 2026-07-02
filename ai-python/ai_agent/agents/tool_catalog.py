@@ -92,6 +92,13 @@ TOOL_CATALOG: tuple[ToolCatalogEntry, ...] = (
         category=ToolCategory.SCHEDULE,
         default_enabled=False,
     ),
+    ToolCatalogEntry(
+        key="skills.load_skill",
+        label="Навыки роли",
+        description="Загружает полный текст включённого навыка роли по имени.",
+        category=ToolCategory.SKILLS,
+        default_enabled=True,
+    ),
 )
 
 
@@ -108,6 +115,7 @@ TOOL_NAME_TO_KEY: Mapping[str, str] = MappingProxyType(
         "create_reminder": "scheduler.create_reminder",
         "list_reminders": "scheduler.list_reminders",
         "cancel_reminder": "scheduler.cancel_reminder",
+        "load_skill": "skills.load_skill",
     }
 )
 

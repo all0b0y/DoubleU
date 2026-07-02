@@ -278,6 +278,22 @@ TOOL_PROMPT_POLICIES: Mapping[str, ToolPromptPolicy] = MappingProxyType(
                 " reply; ModelRetry при превышении лимита или пустом тексте, не тихий провал."
             ),
         ),
+        "load_skill": ToolPromptPolicy(
+            tool_name="load_skill",
+            purpose="Загрузить полный текст включённого навыка роли по имени (level-2 progressive disclosure).",
+            use_when=(
+                "в промпте перечислен навык, релевантный текущему ходу, и нужна его процедура/детали.",
+            ),
+            do_not_use_when=("ни один навык из списка не относится к вопросу — не выдумывай навык.",),
+            parameters=("name — имя навыка ровно как в списке навыков роли.",),
+            side_effect="none",
+            privacy="Не гейтится privacy-флагами — это owner-контент (как role.context), а не память чата.",
+            idempotency="Чистое чтение; повтор с тем же name безопасен, но избыточен — тело уже у тебя.",
+            result_semantics=(
+                "'<skill>…</skill>' с телом навыка; 'навык не найден' означает, что навыка нет в"
+                " списке роли — это не системная ошибка, не выдумывай содержимое."
+            ),
+        ),
     }
 )
 

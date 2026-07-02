@@ -66,6 +66,11 @@ class AgentDeps:
     # ``agents.dedup_toolset.DedupToolset``. A repeat call within this run
     # returns the cached result instead of hitting the DB/tool again.
     tool_call_cache: dict[tuple[str, str], Any] = field(default_factory=dict)
+    # Names of the skills enabled for this role (Г4). load_skill may only load a
+    # skill whose name is in this set — it can never reach an unenabled or
+    # another tenant's skill. Sourced from request.ai_role.skills, so the SQL is
+    # filtered without threading a role_id through the wire schema.
+    enabled_skill_names: frozenset[str] = frozenset()
 
     @property
     def no_memory(self) -> bool:

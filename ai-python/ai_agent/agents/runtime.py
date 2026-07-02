@@ -611,6 +611,7 @@ class AgentRuntime:
         current_time: datetime | None = None,
         existing_jobs: tuple = (),
         owner_timezone: str = "",
+        enabled_skill_names: frozenset[str] = frozenset(),
     ) -> AgentDeps:
         return AgentDeps(
             tenant_id=tenant_id,
@@ -623,6 +624,7 @@ class AgentRuntime:
             current_time=current_time or datetime.now(timezone.utc),
             existing_jobs=existing_jobs,
             owner_timezone=owner_timezone,
+            enabled_skill_names=enabled_skill_names,
         )
 
     # ----------------------------------------------------------- safety/sink

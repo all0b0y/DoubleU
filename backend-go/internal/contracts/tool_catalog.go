@@ -22,6 +22,7 @@ func ToolCatalog() []ToolCatalogEntry {
 		{Key: "scheduler.create_reminder", Label: "Создание напоминаний", Description: "Создаёт видимые владельцу напоминания для него или собеседника.", Category: ToolCategorySchedule, DefaultEnabled: false},
 		{Key: "scheduler.list_reminders", Label: "Список напоминаний", Description: "Показывает активные напоминания этого чата, чтобы на них ссылаться.", Category: ToolCategorySchedule, DefaultEnabled: false},
 		{Key: "scheduler.cancel_reminder", Label: "Отмена напоминаний", Description: "Отменяет ранее поставленное напоминание этого чата по его номеру.", Category: ToolCategorySchedule, DefaultEnabled: false},
+		{Key: "skills.load_skill", Label: "Навыки роли", Description: "Загружает полный текст включённого навыка роли по имени.", Category: ToolCategorySkills, DefaultEnabled: true},
 	}
 }
 
