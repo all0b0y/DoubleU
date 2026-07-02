@@ -27,12 +27,14 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import ipaddress
 import logging
 import os
 import threading
 import warnings
 from datetime import datetime, timezone
 from typing import Awaitable, Callable, Sequence, TypeVar
+from urllib.parse import urlsplit
 
 import asyncpg
 from pydantic_ai import Agent, PromptedOutput, RunContext, UsageLimits
@@ -118,6 +120,45 @@ T = TypeVar("T")
 
 # Async query-embedding callable shape expected by AgentDeps.embedder.
 EmbedderCallable = Callable[[str], Awaitable[Sequence[float] | None]]
+
+# Docker-compose service hostnames the agent must never reach through an MCP
+# server URL. Mirrors backend-go/internal/httpapi/mcp_url_guard.go — the Go CRUD
+# API is the authoritative SSRF boundary; this is defense in depth so a row that
+# somehow bypassed it (legacy manual SQL, a future write path) still can't point
+# egress at our own infrastructure.
+_MCP_HOST_DENY_LIST: frozenset[str] = frozenset(
+    {"postgres", "redis", "backend", "ai-service", "litellm", "langfuse"}
+)
+
+
+def _mcp_url_is_safe(raw_url: str) -> bool:
+    """Cheap, network-free egress check for an MCP server URL.
+
+    Rejects non-http(s) schemes, the docker-network service names above, and any
+    URL whose host is a *literal* private/loopback/link-local IP. Full DNS-based
+    validation lives in the Go guard; here we deliberately avoid a lookup so the
+    hot path stays cheap and the check has no side effects (DNS rebinding between
+    resolution and connect is a known residual risk, see docs/backlog.md).
+    """
+    parts = urlsplit(raw_url)
+    if parts.scheme not in ("https", "http"):
+        return False
+    host = (parts.hostname or "").lower()
+    if not host or host in _MCP_HOST_DENY_LIST:
+        return False
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        # Not a literal IP — a hostname. Leave DNS-based rejection to the Go
+        # boundary; treat hostnames as acceptable at this defensive layer.
+        return True
+    return not (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_unspecified
+    )
 
 
 def resolve_builtin_toolset(
@@ -786,6 +827,13 @@ class AgentRuntime:
         toolsets: list = []
         for spec in ai_role.mcp_servers:
             if not spec.url:
+                continue
+            if not _mcp_url_is_safe(spec.url):
+                # Degrade-safe: a server that fails the egress check is skipped
+                # and the turn proceeds. Never log the URL's auth header.
+                logger.warning(
+                    "skipping MCP server %r: url failed egress safety check", spec.name
+                )
                 continue
             headers = {"Authorization": spec.auth_header} if spec.auth_header else None
             # MCPServerSSE/StreamableHTTP take url+headers directly with only the

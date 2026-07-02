@@ -1338,6 +1338,29 @@ def test_resolve_mcp_toolsets_empty_cases() -> None:
     assert runtime._resolve_mcp_toolsets(role, (PrivacyFlag.NO_MEMORY,)) == []
 
 
+def test_resolve_mcp_toolsets_skips_unsafe_urls() -> None:
+    """Э0.1 defense-in-depth: a server whose URL targets internal infra (private
+    IP, loopback, or a docker service name) or uses a bad scheme is silently
+    skipped, and the turn proceeds with the remaining safe servers."""
+    from pydantic_ai.mcp import MCPServerStreamableHTTP
+
+    runtime = make_runtime()
+    role = AIRoleData(
+        name="r",
+        mcp_servers=(
+            MCPServerSpecData(name="private", transport="http", url="https://10.0.0.5/mcp"),
+            MCPServerSpecData(name="loopback", transport="http", url="https://127.0.0.1/mcp"),
+            MCPServerSpecData(name="internal", transport="http", url="https://postgres:5432/mcp"),
+            MCPServerSpecData(name="badscheme", transport="http", url="ftp://x/mcp"),
+            MCPServerSpecData(name="ok", transport="http", url="https://api.example.com/mcp"),
+        ),
+    )
+    toolsets = runtime._resolve_mcp_toolsets(role, ())
+    # Only the public https server survives; the four unsafe ones are dropped.
+    assert len(toolsets) == 1
+    assert isinstance(toolsets[0], MCPServerStreamableHTTP)
+
+
 def test_resolve_mcp_toolsets_builds_and_filters() -> None:
     """#7: a declared server becomes a toolset; an allow-list wraps it in a
     FilteredToolset that exposes only the permitted tools (deny-by-default)."""

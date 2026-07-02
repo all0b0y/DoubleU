@@ -146,6 +146,13 @@
   диапазонов и internal-хостов docker-сети (postgres, redis, ai-service), allow-list схем (https),
   плюс обёртка результатов MCP-инструментов как untrusted input (XML-теги) против prompt-injection
   через tool results. Найдено при анализе MCP/Skills архитектуры 2026-07-02.
+  - **Остаточный риск — DNS rebinding (не закрыт в этой итерации).** `ValidateMCPServerURL`
+    ([`mcp_url_guard.go`](../backend-go/internal/httpapi/mcp_url_guard.go)) резолвит хост в
+    момент валидации, но pydantic-ai MCP-клиент ре-резолвит его при подключении — злонамеренный
+    DNS может отдать публичный IP на проверке и приватный на коннекте. Полное закрытие требует
+    pin'а резолвленного IP + проверки на уровне dial (custom `DialContext`/resolver), либо
+    egress-прокси с allow-list. Дешёвая литеральная проверка в `_resolve_mcp_toolsets`
+    (Python) DNS не делает и rebinding не ловит. _Записано 2026-07-02 (Э0.1)._
 
 ### TOOLS — integration-инструмент не реализован
 
