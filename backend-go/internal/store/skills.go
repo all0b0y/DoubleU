@@ -85,6 +85,28 @@ func (r *Repository) SkillsForTenant(tenantID string) []SkillRecord {
 	return out
 }
 
+// UpdateSkill edits a tenant-owned skill in place by id (Э4.7). Scoped by
+// tenant_id, so globals (tenant_id NULL) and other tenants' rows never match;
+// an unmatched id/tenant is ErrSkillNotFound.
+func (r *Repository) UpdateSkill(tenantID string, id int64, name, description, body string, enabled bool) error {
+	if r.db == nil {
+		return nil
+	}
+	res, err := r.db.Exec(
+		`UPDATE skills SET name=$1, description=$2, body=$3, enabled=$4
+		  WHERE id=$5 AND tenant_id=$6`,
+		name, description, body, enabled, id, tenantID,
+	)
+	if err != nil {
+		r.logWriteError("update_skill", tenantID, "", err)
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrSkillNotFound
+	}
+	return nil
+}
+
 // DeleteSkill removes a tenant-owned skill. The tenant_id predicate is non-null,
 // so global (tenant_id NULL) skills never match and cannot be deleted by a
 // tenant; an unmatched id/tenant is an error.

@@ -126,6 +126,13 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/v1/roles/{role_id}/mcp", s.tmaAuth(s.apiGetRoleMCP))
 	s.mux.HandleFunc("PUT /api/v1/roles/{role_id}/mcp", s.tmaAuth(s.apiSetRoleMCP))
 
+	// Skills (owner-authored content layer) — CRUD plus per-role selection.
+	s.mux.HandleFunc("GET /api/v1/skills", s.tmaAuth(s.apiListSkills))
+	s.mux.HandleFunc("POST /api/v1/skills", s.tmaAuth(s.apiCreateSkill))
+	s.mux.HandleFunc("PUT /api/v1/skills/{skill_id}", s.tmaAuth(s.apiUpdateSkill))
+	s.mux.HandleFunc("DELETE /api/v1/skills/{skill_id}", s.tmaAuth(s.apiDeleteSkill))
+	s.mux.HandleFunc("PUT /api/v1/roles/{role_id}/skills", s.tmaAuth(s.apiSetRoleSkills))
+
 	// AI profile suggestions: tenant-wide inbox and per-chat list.
 	s.mux.HandleFunc("GET /api/v1/suggestions", s.tmaAuth(s.apiSuggestions))
 	s.mux.HandleFunc("GET /api/v1/chats/{chat_id}/suggestions", s.tmaAuth(s.apiSuggestions))
