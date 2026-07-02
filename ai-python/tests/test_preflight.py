@@ -165,6 +165,18 @@ class TestDecidePreflightToolMinimisation:
         assert "create_reminder" not in decision.allowed_tool_names
         assert "search_facts" in decision.allowed_tool_names
 
+    def test_interaction_enabled_alone_stays_with_writer(self) -> None:
+        role = AIRoleData(
+            name="Assistant",
+            tool_settings={"interaction.ask_questions": True},
+        )
+        request = process_request("Спланируй мой день как лучше", ai_role=role)
+        decision = decide_preflight(request, orchestrator_slug="router", writer_slug="writer")
+        assert decision.needs_orchestrator is False
+        assert decision.tool_groups - {"delivery"} == frozenset()
+        assert decision.allowed_tool_names == frozenset()
+        assert "interaction available to writer" in decision.reason
+
     def test_mcp_only_rides_along_with_an_already_triggered_turn(self) -> None:
         role = AIRoleData(
             name="Assistant",

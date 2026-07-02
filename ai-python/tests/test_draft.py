@@ -397,7 +397,7 @@ class AIRolePromptTests(unittest.TestCase):
                 )])
             # Draft uses PromptedOutput → final result is plain-text JSON.
             return ModelResponse(parts=[TextPart(json.dumps({
-                "reply": "writer placeholder",
+                "reply": "",
                 "intent": "general_message",
                 "options": [],
                 "confidence": 0.9,

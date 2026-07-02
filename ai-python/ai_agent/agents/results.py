@@ -148,11 +148,14 @@ class OrchestratorResult(BaseModel):
 class DraftResult(BaseModel):
     """Structured draft: reply + intent + options + confidence + topic (ARCH-4)."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     reply: str = Field(
-        min_length=1,
-        description="Текст ответа собеседнику от лица назначенной персоны — без пояснений.",
+        default="",
+        description=(
+            "Текст ответа собеседнику от лица назначенной персоны — без пояснений. Может быть"
+            " пустым только когда вопрос уже задан через ask_questions."
+        ),
     )
     intent: Intent = Field(
         default="general_message",
@@ -167,6 +170,16 @@ class DraftResult(BaseModel):
         description=(
             "Для intent=choice_question — 2-4 коротких готовых ответа от лица назначенной персоны."
             " Для остальных интентов — пустой список."
+        ),
+    )
+    questions: tuple[Question, ...] = Field(
+        default=(),
+        max_length=6,
+        description=(
+            "Fallback для interaction.ask_questions: заполняй только когда нужно задать"
+            " блокирующий вопрос собеседнику, но tool call ask_questions не был выполнен."
+            " Это тот же пул вопросов, который иначе должен уйти в ask_questions; сам вопрос"
+            " не дублируй в reply."
         ),
     )
     confidence: float = Field(

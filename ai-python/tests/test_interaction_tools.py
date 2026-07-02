@@ -19,7 +19,7 @@ def test_ask_questions_records_normalised_pool() -> None:
         {"prompt": "  Когда удобно?  ", "options": [" Сегодня ", "Завтра"]},
         {"prompt": "Какой бюджет?"},  # pure free-text question, no options
     ]))
-    assert "2 вопрос" in result
+    assert "questions=2" in result
     plan = ctx.deps.response_plan
     assert plan is not None and plan.shape == "questions"
     assert len(plan.questions) == 2
@@ -41,12 +41,27 @@ def test_ask_questions_rejects_empty_and_oversized_pools() -> None:
             raise AssertionError(f"expected rejection for {bad!r}")
 
 
+def test_ask_questions_rejects_wordless_prompt() -> None:
+    # A "question" with no letters or digits ("…", "—", "?") is a degenerate
+    # placeholder the contact cannot answer; the backend would send it verbatim
+    # as the question text. It must be rejected so the model retries with a real
+    # worded question — covers the "…" confirmation regression.
+    for bad in ("…", "...", "—", "?", "  -- "):
+        ctx = _ctx()
+        try:
+            asyncio.run(ask_questions(ctx, [{"prompt": bad, "options": ["Да", "Нет"]}]))
+        except ModelRetry:
+            assert ctx.deps.response_plan is None
+        else:  # pragma: no cover - guard against silent acceptance
+            raise AssertionError(f"expected rejection for wordless prompt {bad!r}")
+
+
 def test_ask_questions_accepts_bare_string_questions() -> None:
     # Reasoning models often pass questions as plain strings; treat each as a
     # prompt with no options instead of failing.
     ctx = _ctx()
     result = asyncio.run(ask_questions(ctx, ["Когда удобно?", "Какой бюджет?"]))
-    assert "2 вопрос" in result
+    assert "questions=2" in result
     plan = ctx.deps.response_plan
     assert plan is not None and len(plan.questions) == 2
     assert plan.questions[0].prompt == "Когда удобно?"
@@ -65,8 +80,23 @@ def test_ask_questions_rejects_duplicate_options() -> None:
 
 def test_request_confirmation_is_single_yes_no_question() -> None:
     ctx = _ctx()
-    asyncio.run(request_confirmation(ctx, "Отправить сейчас?"))
+    asyncio.run(request_confirmation(
+        ctx,
+        "Отправить сейчас?",
+        confirm_label="Да, отправить",
+        cancel_label="Не отправлять",
+    ))
     plan = ctx.deps.response_plan
     assert plan is not None and len(plan.questions) == 1
     assert plan.questions[0].prompt == "Отправить сейчас?"
-    assert plan.questions[0].options == ("Подтвердить", "Отменить")
+    assert plan.questions[0].options == ("Да, отправить", "Не отправлять")
+
+
+def test_request_confirmation_requires_language_specific_labels() -> None:
+    ctx = _ctx()
+    try:
+        asyncio.run(request_confirmation(ctx, "Отправить сейчас?"))
+    except ModelRetry:
+        assert ctx.deps.response_plan is None
+    else:  # pragma: no cover
+        raise AssertionError("request_confirmation must not invent hardcoded labels")

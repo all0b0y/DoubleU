@@ -188,16 +188,17 @@ def decide_preflight(
         if memory_signal and "memory" in available:
             groups.add("memory")
             reasons.append("memory-recall keyword")
-        if "interaction" in available:
-            # interaction.ask_questions is opt-in (default_enabled=False): an
-            # owner who turned it on for this role already signalled the role
-            # may need to clarify before answering. WHETHER this specific
-            # turn needs a question is the orchestrator/writer's own
-            # judgment call — unlike memory/schedule, that need has no
-            # reliable lexical marker in the contact's message, so it is not
-            # keyword-gated the way schedule/memory are.
+        if groups and "interaction" in available:
+            # interaction.ask_questions is a companion capability for a tool turn
+            # that is already awake (e.g. scheduler may need a clarification).
+            # It must not wake the orchestrator by itself: for ordinary turns the
+            # writer can still use ask_questions in single-stage mode, which
+            # keeps the decision about "answer now vs ask" in the same call that
+            # writes the reply and avoids duplicate text+form turns.
             groups.add("interaction")
-            reasons.append("role opts into interaction.ask_questions")
+            reasons.append("interaction available for signalled tool turn")
+        elif "interaction" in available:
+            reasons.append("interaction available to writer; no orchestrator signal")
 
     mcp_allowed = (
         role is not None

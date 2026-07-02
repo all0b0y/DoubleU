@@ -105,6 +105,7 @@ from .results import (
     OrchestratorResult,
     PatternResult,
     RerankResult,
+    ResponsePlan,
     RoleDraft,
     ScheduledJob,
     SummaryResult,
@@ -185,6 +186,19 @@ def _scheduled_job_data(jobs: list[ScheduledJob]) -> tuple[ScheduledJobData, ...
     )
 
 
+def _draft_questions_response_plan(
+    drafted: DraftResult,
+    ai_role: AIRoleData | None,
+    privacy_flags: tuple[PrivacyFlag, ...],
+) -> ResponsePlan | None:
+    """Convert DraftResult.questions into a response plan when interaction is enabled."""
+    if not drafted.questions:
+        return None
+    if "ask_questions" not in enabled_tool_names(ai_role, privacy_flags):
+        return None
+    return ResponsePlan(shape="questions", questions=drafted.questions)
+
+
 # A draft is reviewed by the critic when risk is elevated or the draft's own
 # confidence is below this bar; low-risk confident drafts skip the extra call.
 _CRITIC_CONFIDENCE_BAR = 0.6
@@ -211,6 +225,21 @@ _DRAFT_TOOL_CALLS_LIMIT = int(os.getenv("DRAFT_TOOL_CALLS_LIMIT", "12").strip() 
 _ORCHESTRATOR_TOOL_CALLS_LIMIT = int(
     os.getenv("ORCHESTRATOR_TOOL_CALLS_LIMIT", "5").strip() or "5"
 )
+
+_EMPTY_DRAFT_REPAIR_HINT = (
+    "REPAIR: предыдущая попытка вернула пустой reply без ask_questions и без send_message. "
+    "Такой ход нельзя доставить собеседнику. В этой попытке выбери ровно один корректный "
+    "контактный выход: непустой reply; или send_message для самостоятельной прозы; или "
+    "ask_questions, если следующий ответ реально должен быть вопросом/проверкой. Если "
+    "модельный gateway не выполнил tool call ask_questions, заполни поле questions тем же "
+    "пулом вопросов, который должен был уйти в ask_questions. Если "
+    "собеседник согласился продолжить после обещанной проверки, сразу задай первый "
+    "конкретный вопрос через ask_questions или questions вместо пустого ответа."
+)
+
+
+class EmptyDraftReplyError(RuntimeError):
+    """The writer produced no contact-facing output at all."""
 
 # Two-stage default: the orchestrator owns memory/schedule/interaction tools
 # (see _orchestrate_async); the writer gets only its always-on delivery
@@ -697,9 +726,12 @@ class AgentRuntime:
             return preflight
         ctx = current_context()
         last_exc: Exception | None = None
+        repair_hint = ""
         for attempt in range(1, self._draft_max_attempts + 1):
             try:
-                return self._run(self._draft_async(request, risk_level, ctx))
+                return self._run(
+                    self._draft_async(request, risk_level, ctx, repair_hint=repair_hint)
+                )
             except SafetyBlocked as exc:
                 return draft_pipeline.DraftOutcome(
                     text=exc.canned_reply, model_used="blocked", usage=Usage()
@@ -708,6 +740,12 @@ class AgentRuntime:
                 # The run exceeded its wall-clock budget; the HTTP caller has
                 # almost certainly given up, so retrying wastes a slow LLM call.
                 raise RuntimeError(f"agent draft timed out: {exc}") from exc
+            except EmptyDraftReplyError as exc:
+                last_exc = exc
+                repair_hint = _EMPTY_DRAFT_REPAIR_HINT
+                logger.warning(
+                    "draft attempt %d/%d failed: %s", attempt, self._draft_max_attempts, exc
+                )
             except Exception as exc:  # noqa: BLE001 — single conversion point to the contract error
                 last_exc = exc
                 logger.warning(
@@ -930,7 +968,12 @@ class AgentRuntime:
         return self._prompt_builder.build(rendered, request.event.message_text, tuple(prompt_context))
 
     async def _draft_async(
-        self, request: AIProcessMessageRequest, risk_level: RiskLevel, ctx: LLMCallContext
+        self,
+        request: AIProcessMessageRequest,
+        risk_level: RiskLevel,
+        ctx: LLMCallContext,
+        *,
+        repair_hint: str = "",
     ) -> draft_pipeline.DraftOutcome:
         # 2.7: deterministic, no-LLM preflight — decides whether the
         # orchestrator pre-stage runs at all, which tool groups it may use,
@@ -970,6 +1013,8 @@ class AgentRuntime:
         system_prompt, user_payload = self._build_draft_prompt_contract(
             request, orchestrator_bundle=orchestrator_bundle, current_time=current_time
         )
+        if repair_hint:
+            system_prompt = f"{system_prompt}\n\n{repair_hint}"
         # Phase 1: may rewrite (anonymize) or raise SafetyBlocked → canned reply.
         system_prompt, user_payload = self._scan_input(
             system_prompt, user_payload, ModelTask.DRAFT_REPLY, ctx
@@ -1060,7 +1105,10 @@ class AgentRuntime:
         response_plan = (
             orchestrated.response_plan
             if (orchestrated is not None and orchestrated.response_plan is not None)
-            else deps.response_plan
+            else (
+                deps.response_plan
+                or _draft_questions_response_plan(drafted, request.ai_role, privacy_flags)
+            )
         )
         if response_plan is not None:
             # The questionnaire is collected by the Go backend one question at a
@@ -1068,6 +1116,10 @@ class AgentRuntime:
             # Keep the writer's reply as a short intro; mark the intent so the
             # decision engine treats this as an interactive turn.
             drafted = drafted.model_copy(update={"intent": "choice_question", "options": ()})
+        elif not drafted.reply.strip() and not deps.outbound_messages:
+            raise EmptyDraftReplyError(
+                "draft reply is empty without response_plan or queued messages"
+            )
         draft_usage = self._usage_of(result)
         if two_stage and request.ai_role is not None:
             router_name = model_name_for(AgentTask.ORCHESTRATE) or "test-model"
@@ -1088,7 +1140,7 @@ class AgentRuntime:
 
         text = drafted.reply
         confidence = drafted.confidence
-        if risk_level in _CRITIC_RISKS or confidence < _CRITIC_CONFIDENCE_BAR:
+        if response_plan is None and (risk_level in _CRITIC_RISKS or confidence < _CRITIC_CONFIDENCE_BAR):
             speak_as_owner = request.ai_role is None or request.ai_role.speak_as_owner
             feedback_hint = (
                 draft_pipeline.build_feedback_hint(request.feedback_context)

@@ -10,6 +10,7 @@ saved and a reply drafted.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from pydantic_ai import ModelRetry, RunContext
@@ -47,6 +48,14 @@ def _build_question(raw: Any) -> Question:
     clean_prompt = prompt.strip()
     if not clean_prompt:
         raise ModelRetry("question prompt must not be empty")
+    # A "question" with no letters or digits (e.g. "…", "—", "?") is a
+    # degenerate placeholder the contact cannot answer; the Go side would send
+    # it verbatim as the question text. Reject at the contract boundary so the
+    # model retries with a real worded question instead.
+    if not re.search(r"\w", clean_prompt, flags=re.UNICODE):
+        raise ModelRetry(
+            "question prompt must be a real worded question, not punctuation or an ellipsis"
+        )
     clean_options = tuple(str(option).strip() for option in options if str(option).strip())
     if len(clean_options) > _MAX_OPTIONS:
         raise ModelRetry(f"a question allows at most {_MAX_OPTIONS} options")
@@ -59,19 +68,15 @@ def _build_question(raw: Any) -> Question:
 async def ask_questions(
     ctx: RunContext[AgentDeps], questions: list[Any]
 ) -> str:
-    """Ask the contact one or more questions with tappable option buttons.
+    """Ask the contact one or more blocking questions as a deferred form.
 
     Pass an ordered pool of 1–6 questions; each question is a ``prompt`` plus an
-    optional list of short ``options`` rendered as quick-reply buttons (the
-    contact may also answer in their own words). Use this for ANY question that
-    offers a choice — a clarification, a poll, or a quiz / multiple-choice
-    question — so the contact taps a button and the answer binds to the question
-    instead of arriving as ambiguous free text like "2". For a quiz, ask one
-    question per turn and fold any reaction to the previous answer into the next
-    prompt. Do NOT call this for a plain open question with no choices (write it
-    into your final reply instead), and do not call it twice in the same turn —
-    it replaces, not accumulates, the pending form. This records a deferred
-    form; it does not send anything.
+    optional list of short ``options`` rendered as quick-reply buttons. Empty
+    options mean the contact answers in free text. Use this only when the next
+    useful reply depends on the answer, or when a choice must be captured
+    unambiguously. Do NOT call it for a casual follow-up after a complete answer,
+    and do not call it twice in the same turn — it replaces, not accumulates, the
+    pending form. This records a deferred form; it does not send anything.
     """
 
     if not questions:
@@ -80,18 +85,31 @@ async def ask_questions(
         raise ModelRetry(f"ask_questions allows at most {_MAX_QUESTIONS} questions")
     built = tuple(_build_question(item) for item in questions)
     ctx.deps.response_plan = ResponsePlan(shape="questions", questions=built)
-    return f"Подготовлена анкета из {len(built)} вопрос(ов) для обычного approval-пути."
+    return f"response_plan_recorded questions={len(built)}"
 
 
 @interaction_toolset.tool
-async def request_confirmation(ctx: RunContext[AgentDeps], prompt: str) -> str:
+async def request_confirmation(
+    ctx: RunContext[AgentDeps],
+    prompt: str,
+    confirm_label: str = "",
+    cancel_label: str = "",
+) -> str:
     """Prepare a single yes/no confirmation question without sending it.
 
-    Use when one explicit yes/no confirmation is enough before acting. If you
-    need more than one question or non-yes/no options, call ``ask_questions``
-    directly instead.
+    Use when one explicit yes/no confirmation is enough before acting. Provide
+    both button labels in the same language as ``prompt``. If you need more than
+    one question or non-yes/no options, call ``ask_questions`` directly instead.
     """
 
+    confirm = confirm_label.strip()
+    cancel = cancel_label.strip()
+    if not confirm or not cancel:
+        raise ModelRetry(
+            "request_confirmation requires confirm_label and cancel_label in the prompt language"
+        )
+    if confirm == cancel:
+        raise ModelRetry("request_confirmation labels must be different")
     return await ask_questions(
-        ctx, [{"prompt": prompt, "options": ["Подтвердить", "Отменить"]}]
+        ctx, [{"prompt": prompt, "options": [confirm, cancel]}]
     )

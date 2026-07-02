@@ -414,11 +414,12 @@ def test_interaction_tool_forms_questionnaire_without_sending() -> None:
         })])
 
     request = replace(
-        process_request("Когда созвонимся?"),
+        process_request("Поставь напоминание, когда созвонимся?"),
         ai_role=AIRoleData(
             name="Support",
             tool_settings={
                 **{entry.key: False for entry in TOOL_CATALOG},
+                "scheduler.create_reminder": True,
                 "interaction.ask_questions": True,
             },
         ),
@@ -487,11 +488,12 @@ def test_two_stage_writer_fallback_tool_call_reaches_outcome(monkeypatch) -> Non
         })
 
     request = replace(
-        process_request("Когда созвонимся?"),
+        process_request("Поставь напоминание, когда созвонимся?"),
         ai_role=AIRoleData(
             name="Support",
             tool_settings={
                 **{entry.key: False for entry in TOOL_CATALOG},
+                "scheduler.create_reminder": True,
                 "interaction.ask_questions": True,
             },
         ),
@@ -534,11 +536,12 @@ def test_two_stage_writer_has_no_interaction_fallback_by_default() -> None:
         })
 
     request = replace(
-        process_request("Когда созвонимся?"),
+        process_request("Поставь напоминание, когда созвонимся?"),
         ai_role=AIRoleData(
             name="Support",
             tool_settings={
                 **{entry.key: False for entry in TOOL_CATALOG},
+                "scheduler.create_reminder": True,
                 "interaction.ask_questions": True,
             },
         ),
@@ -730,11 +733,12 @@ def test_draft_outcome_contract_is_stable_across_model_families(monkeypatch, fam
         })])
 
     request = replace(
-        process_request("Когда созвонимся?"),
+        process_request("Поставь напоминание, когда созвонимся?"),
         ai_role=AIRoleData(
             name="Support",
             tool_settings={
                 **{entry.key: False for entry in TOOL_CATALOG},
+                "scheduler.create_reminder": True,
                 "interaction.ask_questions": True,
             },
         ),
@@ -1032,6 +1036,110 @@ def test_invalid_structured_output_falls_back_to_error_contract() -> None:
     runtime = make_runtime(draft_model=FunctionModel(broken))
     with pytest.raises(RuntimeError):
         runtime.draft_outcome(process_request(), RiskLevel.LOW)
+
+
+def test_empty_draft_retry_can_recover_with_questionnaire() -> None:
+    calls = {"writer": 0}
+
+    def writer(messages, info: AgentInfo) -> ModelResponse:
+        calls["writer"] += 1
+        if calls["writer"] == 1:
+            return draft_output({"reply": ""})
+        if calls["writer"] > 2:
+            return draft_output({
+                "reply": "",
+                "intent": "general_message",
+                "options": [],
+                "confidence": 0.9,
+                "topic": "проверка знаний",
+            })
+        return ModelResponse(parts=[ToolCallPart(
+            tool_name="ask_questions",
+            args={"questions": [{"prompt": "Что делает декоратор?", "options": ["Оборачивает функцию", "Удаляет функцию"]}]},
+        )])
+
+    request = replace(
+        process_request("Давай"),
+        ai_role=AIRoleData(
+            name="Tutor",
+            tool_settings={
+                **{entry.key: False for entry in TOOL_CATALOG},
+                "interaction.ask_questions": True,
+            },
+        ),
+    )
+    runtime = make_runtime(draft_model=FunctionModel(writer), draft_max_attempts=2)
+
+    outcome = runtime.draft_outcome(request, RiskLevel.LOW)
+
+    assert calls["writer"] == 3
+    assert outcome.response_plan is not None
+    assert outcome.response_plan.questions[0].prompt == "Что делает декоратор?"
+
+
+def test_prompted_questions_field_recovers_when_model_skips_tool_call() -> None:
+    request = replace(
+        process_request("Давай"),
+        ai_role=AIRoleData(
+            name="Tutor",
+            tool_settings={
+                **{entry.key: False for entry in TOOL_CATALOG},
+                "interaction.ask_questions": True,
+            },
+        ),
+    )
+    runtime = make_runtime(
+        draft_model=prompted({
+            "reply": "",
+            "intent": "acknowledgement",
+            "options": [],
+            "questions": [
+                {
+                    "prompt": "Что делает запись @decorator перед функцией?",
+                    "options": [
+                        "Применяет декоратор к функции",
+                        "Запускает функцию в цикле",
+                    ],
+                }
+            ],
+            "confidence": 0.9,
+            "topic": "проверка декораторов",
+        })
+    )
+
+    outcome = runtime.draft_outcome(request, RiskLevel.LOW)
+
+    assert outcome.intent == "choice_question"
+    assert outcome.response_plan is not None
+    assert outcome.response_plan.questions[0].prompt == "Что делает запись @decorator перед функцией?"
+    assert outcome.response_plan.questions[0].options == (
+        "Применяет декоратор к функции",
+        "Запускает функцию в цикле",
+    )
+
+
+def test_prompted_questions_field_requires_interaction_tool_enabled() -> None:
+    request = replace(
+        process_request("Давай"),
+        ai_role=AIRoleData(
+            name="Tutor",
+            tool_settings={entry.key: False for entry in TOOL_CATALOG},
+        ),
+    )
+    runtime = make_runtime(
+        draft_model=prompted({
+            "reply": "",
+            "intent": "acknowledgement",
+            "options": [],
+            "questions": [{"prompt": "Что делает декоратор?", "options": []}],
+            "confidence": 0.9,
+            "topic": "проверка декораторов",
+        }),
+        draft_max_attempts=1,
+    )
+
+    with pytest.raises(RuntimeError):
+        runtime.draft_outcome(request, RiskLevel.LOW)
 
 
 def test_tag_topic_returns_structured_label() -> None:
