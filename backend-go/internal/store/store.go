@@ -423,6 +423,137 @@ func (r *Repository) SetRoleMCPAccess(roleID, serverID int64, allowedTools []str
 	}
 }
 
+// MCPServerRecord is the owner-facing view of one configured MCP server. The
+// auth header value NEVER leaves the store in this shape — only HasAuth, the
+// fact of its presence, so the UI can show "заголовок задан" without exposure.
+type MCPServerRecord struct {
+	ID        int64
+	Name      string
+	Transport string
+	URL       string
+	HasAuth   bool
+	Enabled   bool
+}
+
+// MCPServersForTenant lists a tenant's MCP servers for the owner UI (Э1.1). One
+// query; the auth header value is never selected, only its presence (HasAuth).
+func (r *Repository) MCPServersForTenant(tenantID string) []MCPServerRecord {
+	if r.db == nil {
+		return nil
+	}
+	rows, err := r.db.Query(
+		`SELECT id, name, transport, url,
+		        (auth_header IS NOT NULL OR auth_header_enc IS NOT NULL) AS has_auth, enabled
+		   FROM mcp_servers WHERE tenant_id = $1 ORDER BY name`,
+		tenantID,
+	)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var out []MCPServerRecord
+	for rows.Next() {
+		var rec MCPServerRecord
+		if rows.Scan(&rec.ID, &rec.Name, &rec.Transport, &rec.URL, &rec.HasAuth, &rec.Enabled) == nil {
+			out = append(out, rec)
+		}
+	}
+	return out
+}
+
+// UpdateMCPServer updates a tenant's server in place (Э1.1). An empty authHeader
+// leaves the stored secret untouched; a non-empty one is re-encrypted (fail
+// closed without a key), clearing any legacy plaintext. Scoped by tenant_id;
+// returns an error when no row matches (not found or wrong tenant).
+func (r *Repository) UpdateMCPServer(tenantID string, id int64, name, transport, url, authHeader string, enabled bool) error {
+	if r.db == nil {
+		return nil
+	}
+	var (
+		res sql.Result
+		err error
+	)
+	if authHeader == "" {
+		res, err = r.db.Exec(
+			`UPDATE mcp_servers SET name=$1, transport=$2, url=$3, enabled=$4
+			  WHERE id=$5 AND tenant_id=$6`,
+			name, transport, url, enabled, id, tenantID,
+		)
+	} else {
+		if len(r.secretsKey) == 0 {
+			return errMissingSecretsKey
+		}
+		enc, encErr := encryptSecret(r.secretsKey, authHeader)
+		if encErr != nil {
+			return encErr
+		}
+		res, err = r.db.Exec(
+			`UPDATE mcp_servers SET name=$1, transport=$2, url=$3, enabled=$4,
+			        auth_header=NULL, auth_header_enc=$5
+			  WHERE id=$6 AND tenant_id=$7`,
+			name, transport, url, enabled, enc, id, tenantID,
+		)
+	}
+	if err != nil {
+		r.logWriteError("update_mcp_server", tenantID, "", err)
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("mcp server not found")
+	}
+	return nil
+}
+
+// DeleteMCPServer removes a tenant's server (Э1.1). Scoped by tenant_id so one
+// tenant cannot delete another's row; an unmatched id/tenant is an error.
+func (r *Repository) DeleteMCPServer(tenantID string, id int64) error {
+	if r.db == nil {
+		return nil
+	}
+	res, err := r.db.Exec(`DELETE FROM mcp_servers WHERE id=$1 AND tenant_id=$2`, id, tenantID)
+	if err != nil {
+		r.logWriteError("delete_mcp_server", tenantID, "", err)
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("mcp server not found")
+	}
+	return nil
+}
+
+// RoleMCPAccessRecord is one role→server grant with its tool allow-list
+// (nil = all tools), for rendering the per-role MCP toggles (Э1.1).
+type RoleMCPAccessRecord struct {
+	ServerID     int64
+	AllowedTools []string
+}
+
+// RoleMCPAccessByRole returns every server a role is granted, with its allow-list
+// (Э1.1). One query; nil AllowedTools means all tools are permitted.
+func (r *Repository) RoleMCPAccessByRole(roleID int64) []RoleMCPAccessRecord {
+	if r.db == nil {
+		return nil
+	}
+	rows, err := r.db.Query(
+		`SELECT mcp_server_id, allowed_tools FROM role_mcp_access WHERE role_id = $1`,
+		roleID,
+	)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var out []RoleMCPAccessRecord
+	for rows.Next() {
+		var rec RoleMCPAccessRecord
+		var allowed pq.StringArray
+		if rows.Scan(&rec.ServerID, &allowed) == nil {
+			rec.AllowedTools = []string(allowed)
+			out = append(out, rec)
+		}
+	}
+	return out
+}
+
 // ============================================================
 // Helpers
 // ============================================================
