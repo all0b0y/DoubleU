@@ -590,6 +590,35 @@ func (r *Repository) SetRoleMCPServers(roleID int64, grants []RoleMCPAccessRecor
 	return tx.Commit()
 }
 
+// MCPServerForCheck returns one server's transport/url and DECRYPTED auth header
+// for the internal Go→Python /ai/mcp-check probe (Э1.3). The header travels only
+// over that internal channel — exactly like the per-request MCPServerSpec today —
+// and is never returned to the owner UI. ok is false when no row matches the
+// tenant (missing id or cross-tenant attempt).
+func (r *Repository) MCPServerForCheck(tenantID string, id int64) (transport, url, authHeader string, ok bool) {
+	if r.db == nil {
+		return "", "", "", false
+	}
+	var plaintext string
+	var enc []byte
+	if err := r.db.QueryRow(
+		`SELECT transport, url, COALESCE(auth_header,''), auth_header_enc
+		   FROM mcp_servers WHERE id = $1 AND tenant_id = $2`,
+		id, tenantID,
+	).Scan(&transport, &url, &plaintext, &enc); err != nil {
+		return "", "", "", false
+	}
+	authHeader = plaintext
+	if len(enc) > 0 && len(r.secretsKey) > 0 {
+		if h, derr := decryptSecret(r.secretsKey, enc); derr == nil {
+			authHeader = h
+		} else {
+			r.logWriteError("decrypt_mcp_auth", tenantID, "", derr)
+		}
+	}
+	return transport, url, authHeader, true
+}
+
 // ============================================================
 // Helpers
 // ============================================================

@@ -60,6 +60,7 @@ from ..schemas import (
     DraftRoleRequest,
     DraftRoleResponse,
     EmbedTextsRequest,
+    MCPServerSpecData,
     ModelTask,
     OutboundMessageData,
     PrivacyFlag,
@@ -160,6 +161,62 @@ def _mcp_url_is_safe(raw_url: str) -> bool:
         or ip.is_reserved
         or ip.is_unspecified
     )
+
+
+def _mcp_client_for(spec: MCPServerSpecData):
+    """Create the pydantic-ai MCP client for one server spec.
+
+    Shared by the per-request toolset builder (`_resolve_mcp_toolsets`) and the
+    stateless `/ai/mcp-check` probe so both dial a server identically. Returns
+    the bare client — no allow-list filter, no untrusted-result wrapping. Raises
+    ImportError if the optional `mcp` extra is not installed.
+    """
+    from pydantic_ai.mcp import MCPServerSSE, MCPServerStreamableHTTP
+
+    headers = {"Authorization": spec.auth_header} if spec.auth_header else None
+    # MCPServerSSE/StreamableHTTP take url+headers directly with only the `mcp`
+    # package. The non-deprecated MCPToolset needs an extra `fastmcp` dependency,
+    # not worth pulling for this seam (backlog). Silence the v2 deprecation here.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        if spec.transport == "sse":
+            return MCPServerSSE(url=spec.url, headers=headers)
+        return MCPServerStreamableHTTP(url=spec.url, headers=headers)
+
+
+async def _list_mcp_tools(spec: MCPServerSpecData) -> list[dict[str, str]]:
+    """Open a session to the server and return its advertised tools."""
+    client = _mcp_client_for(spec)
+    async with client:
+        tools = await client.list_tools()
+    return [{"name": t.name, "description": (t.description or "")} for t in tools]
+
+
+def check_mcp_server(url: str, transport: str, auth_header: str = "") -> dict[str, Any]:
+    """Probe an MCP server and list its tools (Э1.3). Stateless, no DB writes.
+
+    Returns ``{"ok": True, "tools": [{"name", "description"}]}`` on success or
+    ``{"ok": False, "error": "<class>"}`` on failure — only the error *class*
+    name is surfaced, never a stack trace or the auth header. The listing is
+    bounded to 10s so an unresponsive server cannot hang the request.
+    """
+    if not url or not _mcp_url_is_safe(url):
+        return {"ok": False, "error": "url_not_allowed"}
+    spec = MCPServerSpecData(
+        name="check", transport=(transport or "http"), url=url, auth_header=auth_header or ""
+    )
+
+    async def _run() -> list[dict[str, str]]:
+        return await asyncio.wait_for(_list_mcp_tools(spec), timeout=10.0)
+
+    try:
+        return {"ok": True, "tools": asyncio.run(_run())}
+    except ImportError:
+        return {"ok": False, "error": "mcp_extra_missing"}
+    except asyncio.TimeoutError:
+        return {"ok": False, "error": "timeout"}
+    except Exception as exc:  # noqa: BLE001 — external probe: surface only the class, no secrets
+        return {"ok": False, "error": type(exc).__name__}
 
 
 def resolve_builtin_toolset(
@@ -818,13 +875,6 @@ class AgentRuntime:
             return []
         if PrivacyFlag.NO_MEMORY in privacy_flags or PrivacyFlag.PRIVATE in privacy_flags:
             return []
-        try:
-            from pydantic_ai.mcp import MCPServerSSE, MCPServerStreamableHTTP
-        except ImportError:
-            logger.warning("ai_role declares MCP servers but the `mcp` package is not installed")
-            return []
-        from pydantic_ai.toolsets import FilteredToolset
-
         toolsets: list = []
         for spec in ai_role.mcp_servers:
             if not spec.url:
@@ -836,17 +886,12 @@ class AgentRuntime:
                     "skipping MCP server %r: url failed egress safety check", spec.name
                 )
                 continue
-            headers = {"Authorization": spec.auth_header} if spec.auth_header else None
-            # MCPServerSSE/StreamableHTTP take url+headers directly with only the
-            # `mcp` package. The non-deprecated MCPToolset needs an extra
-            # `fastmcp` dependency, not worth pulling for this seam — migrate when
-            # real servers onboard (backlog). Silence the v2 deprecation locally.
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", DeprecationWarning)
-                if spec.transport == "sse":
-                    server = MCPServerSSE(url=spec.url, headers=headers)
-                else:
-                    server = MCPServerStreamableHTTP(url=spec.url, headers=headers)
+            try:
+                server = _mcp_client_for(spec)
+            except ImportError:
+                # The optional `mcp` extra is absent — degrade safe, no external tools.
+                logger.warning("ai_role declares MCP servers but the `mcp` package is not installed")
+                return []
             if spec.allowed_tools:
                 allowed = frozenset(spec.allowed_tools)
                 server = FilteredToolset(

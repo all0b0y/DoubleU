@@ -26,6 +26,44 @@ class HTTPServerTests(unittest.TestCase):
 
         self.assertEqual(response, {"status": "ok"})
 
+    def test_mcp_check_rejects_private_url(self) -> None:
+        """Э1.3: a private/internal URL is refused before any network call."""
+        response = self.handler._mcp_check({"url": "https://10.0.0.5/mcp", "transport": "http"})
+
+        self.assertEqual(response, {"ok": False, "error": "url_not_allowed"})
+
+    def test_mcp_check_lists_tools_on_success(self) -> None:
+        """Э1.3: a reachable server yields ok:true with its tool names."""
+        async def fake_list(spec: object) -> list[dict[str, str]]:
+            return [{"name": "search", "description": "find things"}]
+
+        with mock.patch("ai_agent.agents.runtime._list_mcp_tools", new=fake_list):
+            response = self.handler._mcp_check(
+                {"url": "https://93.184.216.34/mcp", "transport": "http"}
+            )
+
+        self.assertTrue(response["ok"])
+        self.assertEqual(response["tools"], [{"name": "search", "description": "find things"}])
+
+    def test_mcp_check_failure_hides_secrets_and_traces(self) -> None:
+        """Э1.3: a connection failure becomes ok:false with only the error class —
+        never a stack trace and never the auth header."""
+        import json
+
+        async def boom(spec: object) -> list[dict[str, str]]:
+            raise ConnectionError("connect using Bearer sekret failed at line 42")
+
+        with mock.patch("ai_agent.agents.runtime._list_mcp_tools", new=boom):
+            response = self.handler._mcp_check(
+                {"url": "https://93.184.216.34/mcp", "transport": "http", "auth_header": "Bearer sekret"}
+            )
+
+        self.assertFalse(response["ok"])
+        self.assertEqual(response["error"], "ConnectionError")
+        blob = json.dumps(response)
+        self.assertNotIn("sekret", blob)
+        self.assertNotIn("Traceback", blob)
+
     def test_classify_risk_endpoint(self) -> None:
         """The classify-risk route should return a risk response."""
         response = self.handler._classify_risk({"message_text": "Please send the invoice today."})

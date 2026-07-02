@@ -32,6 +32,7 @@ from .schemas import (
     parse_topic_tagging_request,
     parse_typed_extraction_request,
 )
+from .agents.runtime import check_mcp_server
 from .service import AIService, build_service
 
 
@@ -102,6 +103,7 @@ class AIHTTPHandler(BaseHTTPRequestHandler):
             "/ai/tag-topic": self._tag_topic,
             "/ai/rerank-facts": self._rerank_facts,
             "/ai/synthesize-pattern": self._synthesize_pattern,
+            "/ai/mcp-check": self._mcp_check,
         }
         route = routes.get(self.path)
         if route is None:
@@ -135,6 +137,16 @@ class AIHTTPHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: object) -> None:
         """Suppress default noisy request logging for tests and local runs."""
         return
+
+    def _mcp_check(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Probe an MCP server and list its tools (Э1.3). Stateless: no DB, no
+        LLM. Always returns 200 with an {ok, tools|error} body — connection and
+        protocol failures become ok:false, never a 5xx or a leaked secret."""
+        return check_mcp_server(
+            url=str(payload.get("url", "")),
+            transport=str(payload.get("transport", "http")),
+            auth_header=str(payload.get("auth_header", "")),
+        )
 
     def _process_message(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self.service.process_message(parse_process_message_request(payload)).to_dict()

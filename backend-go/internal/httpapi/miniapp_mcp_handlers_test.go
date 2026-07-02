@@ -124,8 +124,14 @@ func TestMCPServerHandlersRoundTripDB(t *testing.T) {
 		t.Fatalf("list missing created server: %s", res.Body.String())
 	}
 
-	// Grant a role access with an allow-list, then read it back.
-	res = miniappRequest(t, server, http.MethodPost, "/api/v1/roles", `{"name":"MCP Role","description":"d"}`)
+	// Grant a role access with an allow-list, then read it back. A unique role
+	// name keeps reruns from colliding on the (tenant,name) unique constraint.
+	roleName := fmt.Sprintf("MCP Role %d", time.Now().UnixNano())
+	res = miniappRequest(t, server, http.MethodPost, "/api/v1/roles",
+		fmt.Sprintf(`{"name":%q,"description":"d"}`, roleName))
+	if res.Code != http.StatusOK {
+		t.Fatalf("create role status=%d body=%s", res.Code, res.Body.String())
+	}
 	var role roleJSON
 	decodeBody(t, res, &role)
 	t.Cleanup(func() { _, _ = db.Exec(`DELETE FROM ai_roles WHERE id=$1`, role.ID) })
@@ -145,5 +151,16 @@ func TestMCPServerHandlersRoundTripDB(t *testing.T) {
 	res = miniappRequest(t, server, http.MethodDelete, fmt.Sprintf("/api/v1/mcp-servers/%d", created.ID), "")
 	if res.Code != http.StatusOK {
 		t.Fatalf("delete status=%d body=%s", res.Code, res.Body.String())
+	}
+}
+
+// Э1.3: the check proxy returns 503 when no AI service is configured, before any
+// store access.
+func TestMCPCheckWithoutAIServiceReturns503(t *testing.T) {
+	repo := store.NewRepository()
+	server := NewServer(core.NewService(repo, nil, nil)) // no WithAIBaseURL => aiBaseURL == ""
+	res := miniappRequest(t, server, http.MethodPost, "/api/v1/mcp-servers/1/check", "")
+	if res.Code != http.StatusServiceUnavailable {
+		t.Fatalf("check without ai service status=%d body=%s", res.Code, res.Body.String())
 	}
 }
