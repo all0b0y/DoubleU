@@ -13,6 +13,11 @@ import (
 // returns the stored record with its ID populated.
 func (r *Repository) SaveAIRole(role AIRoleRecord) AIRoleRecord {
 	if r.db != nil {
+		telegramUserID := ""
+		if strings.HasPrefix(role.TenantID, "tenant:user:") {
+			telegramUserID = strings.TrimPrefix(role.TenantID, "tenant:user:")
+		}
+		r.ensureTenant(role.TenantID, telegramUserID)
 		err := r.db.QueryRow(
 			`INSERT INTO ai_roles (
 			   tenant_id, name, description, speaking_style, goals, constraints_text,
@@ -40,6 +45,7 @@ func (r *Repository) SaveAIRole(role AIRoleRecord) AIRoleRecord {
 			role.SpeakAsOwner, role.ModelTier, role.ModelName, encodeRoleToolSettings(role.ToolSettings),
 		).Scan(&role.ID)
 		if err != nil {
+			r.logWriteError("save_ai_role", role.TenantID, "", err)
 			return AIRoleRecord{}
 		}
 		return cloneAIRoleRecord(role)

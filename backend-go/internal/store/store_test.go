@@ -1,6 +1,9 @@
 package store
 
 import (
+	"database/sql"
+	"fmt"
+	"os"
 	"testing"
 	"time"
 
@@ -157,6 +160,102 @@ func TestAIRoleToolSettingsRoundTrip(t *testing.T) {
 	decoded := decodeRoleToolSettings(encoded)
 	if len(decoded) != 1 || decoded["memory.save_fact"] {
 		t.Fatalf("tool settings jsonb round-trip failed: %s -> %+v", encoded, decoded)
+	}
+}
+
+func TestSaveAIRoleCreatesMissingTenantInPostgres(t *testing.T) {
+	dsn := os.Getenv("DATABASE_URL_TEST")
+	if dsn == "" {
+		t.Skip("DATABASE_URL_TEST not set")
+	}
+
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	if err := db.Ping(); err != nil {
+		_ = db.Close()
+		t.Fatalf("ping: %v", err)
+	}
+
+	schema := fmt.Sprintf("test_role_tenant_%d", time.Now().UnixNano())
+	if _, err := db.Exec(fmt.Sprintf(`CREATE SCHEMA %q`, schema)); err != nil {
+		_ = db.Close()
+		t.Fatalf("create schema: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = db.Exec(fmt.Sprintf(`DROP SCHEMA %q CASCADE`, schema))
+		_ = db.Close()
+	})
+	if _, err := db.Exec(fmt.Sprintf(`SET search_path TO %q, public`, schema)); err != nil {
+		t.Fatalf("set search_path: %v", err)
+	}
+	if _, err := db.Exec(`
+		CREATE TABLE users (
+		  id               TEXT PRIMARY KEY,
+		  telegram_user_id TEXT UNIQUE,
+		  created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+		  updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+		);
+		CREATE TABLE tenants (
+		  id            TEXT PRIMARY KEY,
+		  owner_user_id TEXT REFERENCES users(id) ON DELETE RESTRICT,
+		  name          TEXT NOT NULL,
+		  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+		  updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+		);
+		CREATE TABLE ai_roles (
+		  id                      BIGSERIAL PRIMARY KEY,
+		  tenant_id               TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+		  name                    TEXT NOT NULL,
+		  description             TEXT NOT NULL DEFAULT '',
+		  speaking_style          TEXT NOT NULL DEFAULT '',
+		  goals                   TEXT NOT NULL DEFAULT '',
+		  constraints_text        TEXT NOT NULL DEFAULT '',
+		  context_notes           TEXT NOT NULL DEFAULT '',
+		  custom_fields           JSONB NOT NULL DEFAULT '[]'::jsonb,
+		  rich_formatting_enabled BOOLEAN,
+		  streaming_enabled       BOOLEAN,
+		  speak_as_owner          BOOLEAN NOT NULL DEFAULT true,
+		  model_tier              TEXT NOT NULL DEFAULT 'balanced',
+		  model_name              TEXT NOT NULL DEFAULT '',
+		  tool_settings           JSONB NOT NULL DEFAULT '{}'::jsonb,
+		  created_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
+		  updated_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
+		  UNIQUE (tenant_id, name)
+		);
+	`); err != nil {
+		t.Fatalf("create test tables: %v", err)
+	}
+
+	repo := NewRepository()
+	repo.db = db
+	tenantID := "tenant:user:770055005"
+	saved := repo.SaveAIRole(AIRoleRecord{
+		TenantID:    tenantID,
+		Name:        "Менеджер",
+		Description: "d",
+		ModelTier:   "balanced",
+	})
+	if saved.ID == 0 {
+		t.Fatal("role was not saved")
+	}
+
+	var ownerUserID string
+	if err := db.QueryRow(`SELECT owner_user_id FROM tenants WHERE id = $1`, tenantID).Scan(&ownerUserID); err != nil {
+		t.Fatalf("tenant not created: %v", err)
+	}
+	if ownerUserID != "user:770055005" {
+		t.Fatalf("owner_user_id = %q, want user:770055005", ownerUserID)
+	}
+	var telegramUserID string
+	if err := db.QueryRow(`SELECT telegram_user_id FROM users WHERE id = $1`, ownerUserID).Scan(&telegramUserID); err != nil {
+		t.Fatalf("owner user not created: %v", err)
+	}
+	if telegramUserID != "770055005" {
+		t.Fatalf("telegram_user_id = %q, want 770055005", telegramUserID)
 	}
 }
 
