@@ -562,7 +562,19 @@ func (s *Service) memoryRoleContextForEvent(event contracts.NormalizedTelegramEv
 	if transport != contracts.TransportBot {
 		return 0, false
 	}
-	return s.activeRoleContextIDForEvent(event), true
+	// Role-scoping only applies once a concrete bot role context is active. A bot
+	// whose role was bound before the role-context feature (or with no role at
+	// all) has active_role_context_id=0, and every write for it lands at
+	// role_context_id=0. The role-scoped readers intentionally return nothing for
+	// a zero context, so claiming roleScoped here would blank that bot's entire
+	// memory even though its history exists. Fall back to the broad (legacy)
+	// readers instead — symmetric with the zero-context writes — so isolation
+	// engages only when a real context exists, never erases memory in its absence.
+	roleContextID := s.activeRoleContextIDForEvent(event)
+	if roleContextID == 0 {
+		return 0, false
+	}
+	return roleContextID, true
 }
 
 // recentMessagesForMemoryEvent keeps bot lifecycle reads inside the active role

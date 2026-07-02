@@ -184,6 +184,54 @@ func TestMemoryEventReadsUseActiveRoleContext(t *testing.T) {
 	}
 }
 
+// A bot whose role was bound before the role-context feature has
+// active_role_context_id=0; its messages are stored at role_context_id=0. The
+// context build must still surface that history via the broad readers instead of
+// blanking memory just because no concrete role context is active.
+func TestConversationContextBotWithoutActiveRoleContextUsesBroadReads(t *testing.T) {
+	const tenantID = "tenant:user:77"
+	const botID int64 = 555
+	chatID := contracts.BotChatID("555", "42")
+	base := time.Date(2026, 6, 30, 12, 0, 0, 0, time.UTC)
+
+	repo := store.NewRepository()
+	// Bot has a role assigned but NO active role context (legacy data path).
+	repo.SaveUserBot(store.UserBotRecord{
+		TenantID: tenantID, BotID: botID, BotUsername: "helper_bot", Token: "secret", AIRoleID: 2,
+	})
+	repo.SaveChat(store.ChatRecord{TenantID: tenantID, ChatID: chatID, DisplayName: "Bot chat", Transport: contracts.TransportBot})
+	repo.SaveMessage(contracts.NormalizedTelegramEvent{
+		EventID:         "legacy-old",
+		TenantID:        tenantID,
+		ChatID:          chatID,
+		SourceMessageID: "legacy-old",
+		SenderID:        "contact",
+		MessageText:     "legacy task list message",
+		MessageType:     "text",
+		CreatedAt:       base,
+		Transport:       contracts.TransportBot,
+		BotID:           "555",
+	})
+
+	svc := newTestService(repo, &fakeAI{}, &fakeSender{})
+	parts, records := svc.conversationContextAndMessages(context.Background(), contracts.NormalizedTelegramEvent{
+		EventID:         "legacy-current",
+		TenantID:        tenantID,
+		ChatID:          chatID,
+		SourceMessageID: "legacy-current",
+		SenderID:        "contact",
+		MessageText:     "current legacy message",
+		MessageType:     "text",
+		CreatedAt:       base.Add(time.Minute),
+		Transport:       contracts.TransportBot,
+		BotID:           "555",
+	}, "owner", 20)
+	assertContainsAll(t, strings.Join(parts, "\n"), "legacy task list message")
+	if len(records) != 1 {
+		t.Fatalf("legacy bot records = %+v, want one broad-read message", records)
+	}
+}
+
 func TestConversationContextNonBotRemainsUnscoped(t *testing.T) {
 	const tenantID = "tenant:user:77"
 	const chatID = "42"
