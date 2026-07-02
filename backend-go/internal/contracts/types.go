@@ -511,6 +511,14 @@ type MCPServerSpec struct {
 	AllowedTools []string `json:"allowed_tools,omitempty"`
 }
 
+// SkillSpec is the level-1 (progressive-disclosure) view of one skill enabled
+// for a role: name + description only. The full body is fetched on demand via
+// the load_skill tool, never carried in the role wire payload (Г4).
+type SkillSpec struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+}
+
 // AIRoleCustomField is an owner-defined extra attribute on a role. Title and
 // Description are required; Context is optional reference text for that field.
 type AIRoleCustomField struct {
