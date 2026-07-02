@@ -180,6 +180,22 @@
     pass-rate delta < −2 pp ИЛИ любой проваленной injection-пробе. Diff через `scripts/promptfoo-diff.py`.
   - Future: live-provider eval за лейблом `eval:live` (нужен budget cap + secret).
 
+### DATA — seed/schema drift ломает `migration-seed-smoke.sh` на чистой БД
+
+- **`infra/seed/001_contract_scenarios.sql` рассинхронизирован с консолидированной схемой
+  (migration 100_clean_schema_v2) в нескольких местах** — `scripts/migration-seed-smoke.sh`
+  падает на свежей БД (`docker compose down -v` → smoke). Подтверждено 2026-07-02:
+  (1) строка 56 — `INSERT INTO chats (... relationship_type ...)`, но `relationship_type`
+  принадлежит `contact_profiles`, а не `chats` (у `chats` такого столбца нет);
+  (2) строка 276 — `ON CONFLICT (tenant_id, scope_kind, COALESCE(chat_id,''), fact_type,
+  subject, normalized_fact_hash) WHERE ...` по `semantic_facts` не совпадает ни с одним
+  реальным partial-unique-индексом схемы. Вероятно есть и дальше по файлу. Введено при
+  переписывании сида под консолидированную схему (commit `620fa31`), но не сверено построчно
+  с фактическими `CREATE TABLE`/`CREATE UNIQUE INDEX`. Не связано с MCP/Skills-планом —
+  обнаружено при прогоне DoD Э0.4 (контейнерное укрепление). Чинить отдельной задачей:
+  построчно выровнять сид по схеме и добить smoke до зелёного (нужно сверить каждый
+  `ON CONFLICT` с точной сигнатурой индекса). _Найдено 2026-07-02._
+
 ### DOCS — недостающие runbook'и / конфиги
 
 - `docs/runbooks/litellm-runbook.md` — добавление model-алиасов, ротация ключей, инспекция spend. _(нет)_

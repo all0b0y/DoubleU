@@ -1,4 +1,5 @@
-FROM python:3.12-alpine
+# Pinned by index (multi-arch) digest for python:3.12-alpine.
+FROM python:3.12-alpine@sha256:6d43704baacd1bfbe7c295d7f13079d5d8104ed33568873133f8fc69980419df
 
 WORKDIR /app
 COPY ai-python/ /app/
@@ -49,5 +50,15 @@ RUN set -eu; \
       > /app/fallback_ai_service.py
 
 EXPOSE 8090
+# Least privilege: run as a non-root system user (mirrors Dockerfile.backend-go).
+# /app is COPYed as root and world-readable by default, so no chown is required;
+# the app only reads from /app at runtime.
+RUN addgroup -S app && adduser -S app -G app
+# Don't write .pyc files: under a read-only rootfs the interpreter cannot create
+# __pycache__ next to source, which would spam errors. HOME points at the tmpfs
+# /tmp so any transient cache (pip, importlib) has a writable location.
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    HOME=/tmp
+USER app
 HEALTHCHECK --interval=10s --timeout=3s --retries=12 CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=2).read()" || exit 1
 CMD ["sh", "-c", "if [ -f ai_agent/__main__.py ]; then python -m ai_agent; else python /app/fallback_ai_service.py; fi"]
