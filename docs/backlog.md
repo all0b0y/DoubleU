@@ -136,6 +136,17 @@
   (`setBotRole`). Найдено при разборе бага role_context_policy (2026-06-30). Удалить клиентский
   метод и оценить, нужен ли ещё сам HTTP-роут, или он тоже сирота.
 
+### TOOLS — MCP: SSRF-валидация URL перед публичным конфиг-API
+
+- **`mcp_servers.url` нигде не валидируется** — Python `_resolve_mcp_toolsets`
+  ([`runtime.py`](../ai-python/ai_agent/agents/runtime.py)) подключается к любому URL из БД
+  (`RoleMCPServers` в [`store.go`](../backend-go/internal/store/store.go)). Пока записи создаются
+  только оператором через SQL, поверхность закрыта, но **до** появления пользовательского
+  CRUD-API/UI для MCP-серверов обязателен egress-контроль: запрет private/link-local/loopback
+  диапазонов и internal-хостов docker-сети (postgres, redis, ai-service), allow-list схем (https),
+  плюс обёртка результатов MCP-инструментов как untrusted input (XML-теги) против prompt-injection
+  через tool results. Найдено при анализе MCP/Skills архитектуры 2026-07-02.
+
 ### TOOLS — integration-инструмент не реализован
 
 - **Commit 5 спины Tools-платформы не сделан.** План
