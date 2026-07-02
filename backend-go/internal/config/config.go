@@ -2,6 +2,8 @@
 package config
 
 import (
+	"encoding/base64"
+	"fmt"
 	"os"
 	"strconv"
 	"time"
@@ -28,6 +30,29 @@ type Config struct {
 	// (voice/photo/document). Default true; set MEDIA_EXTRACTION_ENABLED=false to
 	// disable all media provider calls (cost control).
 	MediaExtractionEnabled bool
+	// MCPSecretsKey is the 32-byte AES-256 key used to encrypt MCP auth headers
+	// at rest. Nil when MCP_SECRETS_KEY is unset (encryption disabled). Populated
+	// by the serve path via ParseMCPSecretsKey — never decoded silently, so an
+	// invalid key fails startup rather than corrupting stored secrets.
+	MCPSecretsKey []byte
+}
+
+// ParseMCPSecretsKey decodes the base64 MCP_SECRETS_KEY into a 32-byte AES-256
+// key. An empty value yields (nil, nil) — encryption stays off. A malformed or
+// wrong-length value is a hard error so startup fails loudly; the error never
+// includes the key material itself.
+func ParseMCPSecretsKey(raw string) ([]byte, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	key, err := base64.StdEncoding.DecodeString(raw)
+	if err != nil {
+		return nil, fmt.Errorf("MCP_SECRETS_KEY is not valid base64")
+	}
+	if len(key) != 32 {
+		return nil, fmt.Errorf("MCP_SECRETS_KEY must decode to exactly 32 bytes, got %d", len(key))
+	}
+	return key, nil
 }
 
 // Load reads configuration from environment variables.

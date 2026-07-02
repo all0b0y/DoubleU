@@ -153,6 +153,13 @@
     pin'а резолвленного IP + проверки на уровне dial (custom `DialContext`/resolver), либо
     egress-прокси с allow-list. Дешёвая литеральная проверка в `_resolve_mcp_toolsets`
     (Python) DNS не делает и rebinding не ловит. _Записано 2026-07-02 (Э0.1)._
+  - **Перешифровать legacy `auth_header` и дропнуть plaintext-колонку.** Э0.3 добавил
+    `auth_header_enc` (AES-256-GCM) и переключил запись на него (`auth_header=NULL`), но
+    старые строки с plaintext `auth_header` продолжают читаться для обратной совместимости
+    ([`store.go`](../backend-go/internal/store/store.go) `RoleMCPServers` COALESCE-ветка).
+    Хвост: одноразовый ре-энкрипт legacy-строк (прочитать plaintext → `SaveMCPServer` заново)
+    и `ALTER TABLE mcp_servers DROP COLUMN auth_header` отдельной миграцией, когда plaintext
+    больше нигде не нужен. _Записано 2026-07-02 (Э0.3)._
 
 ### TOOLS — integration-инструмент не реализован
 

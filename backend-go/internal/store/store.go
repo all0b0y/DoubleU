@@ -2,7 +2,13 @@
 package store
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
 	"database/sql"
+	"errors"
+	"fmt"
+	"io"
 	"log/slog"
 	"sync"
 	"time"
@@ -11,6 +17,53 @@ import (
 
 	"doubleu/backend-go/internal/contracts"
 )
+
+// errMissingSecretsKey is returned when a caller tries to persist a non-empty
+// secret but no encryption key was injected — encryption is mandatory, so we
+// fail closed rather than fall back to plaintext.
+var errMissingSecretsKey = errors.New("cannot store secret: MCP_SECRETS_KEY is not configured")
+
+// encryptSecret seals plaintext with AES-256-GCM and returns nonce||ciphertext.
+// A fresh random nonce is prepended to every value (crypto/rand), so the same
+// header encrypts to a different blob each time.
+func encryptSecret(key []byte, plaintext string) ([]byte, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return nil, err
+	}
+	// Seal appends the ciphertext to nonce, yielding nonce||ciphertext||tag.
+	return gcm.Seal(nonce, nonce, []byte(plaintext), nil), nil
+}
+
+// decryptSecret reverses encryptSecret. Returns an error (never a partial or
+// plaintext value) if the key is wrong or the blob is malformed/truncated.
+func decryptSecret(key, blob []byte) (string, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return "", err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
+	if len(blob) < gcm.NonceSize() {
+		return "", fmt.Errorf("mcp auth ciphertext is too short")
+	}
+	nonce, ciphertext := blob[:gcm.NonceSize()], blob[gcm.NonceSize():]
+	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return "", err
+	}
+	return string(plaintext), nil
+}
 
 // FormAnswer pairs one questionnaire question with the contact's answer to it.
 type FormAnswer struct {
@@ -94,6 +147,10 @@ type Repository struct {
 	// halfvecOK is true when pgvector ≥ 0.7 provides the halfvec type, so
 	// vector queries can target the HNSW expression indexes (MEM-7).
 	halfvecOK bool
+	// secretsKey is the 32-byte AES-256 key encrypting MCP auth headers at rest
+	// (Э0.3). Nil disables encryption; SaveMCPServer then refuses to store a
+	// non-empty header (fail closed). Injected via SetSecretsKey, never global.
+	secretsKey []byte
 }
 
 // SetLogger overrides the repository logger (MEM-10 write-path observability).
@@ -101,6 +158,14 @@ func (r *Repository) SetLogger(logger *slog.Logger) {
 	if logger != nil {
 		r.logger = logger
 	}
+}
+
+// SetSecretsKey injects the AES-256 key used to encrypt/decrypt MCP auth headers
+// at rest (Э0.3). Mirrors SetLogger's post-construction injection so the key is
+// an instance dependency, not package-global state (charter). A nil key leaves
+// encryption disabled.
+func (r *Repository) SetSecretsKey(key []byte) {
+	r.secretsKey = key
 }
 
 // logWriteError records a failed memory-layer write. Memory writes are
@@ -260,7 +325,7 @@ func (r *Repository) RoleMCPServers(roleID int64) []contracts.MCPServerSpec {
 		return nil
 	}
 	rows, err := r.db.Query(
-		`SELECT s.name, s.transport, s.url, COALESCE(s.auth_header,''), a.allowed_tools
+		`SELECT s.name, s.transport, s.url, COALESCE(s.auth_header,''), s.auth_header_enc, a.allowed_tools
 		   FROM role_mcp_access a
 		   JOIN mcp_servers s ON s.id = a.mcp_server_id
 		  WHERE a.role_id = $1 AND s.enabled`,
@@ -273,36 +338,68 @@ func (r *Repository) RoleMCPServers(roleID int64) []contracts.MCPServerSpec {
 	var specs []contracts.MCPServerSpec
 	for rows.Next() {
 		var spec contracts.MCPServerSpec
+		var plaintext string
+		var enc []byte
 		var allowed pq.StringArray
-		if rows.Scan(&spec.Name, &spec.Transport, &spec.URL, &spec.AuthHeader, &allowed) == nil {
-			spec.AllowedTools = []string(allowed)
-			specs = append(specs, spec)
+		if rows.Scan(&spec.Name, &spec.Transport, &spec.URL, &plaintext, &enc, &allowed) != nil {
+			continue
 		}
+		// Prefer the encrypted header; fall back to a legacy plaintext row that
+		// predates encryption. A decrypt failure yields an empty header (the
+		// server degrades to unauthenticated) rather than a leaked/garbled value.
+		switch {
+		case len(enc) > 0 && len(r.secretsKey) > 0:
+			if header, derr := decryptSecret(r.secretsKey, enc); derr == nil {
+				spec.AuthHeader = header
+			} else {
+				r.logWriteError("decrypt_mcp_auth", "", "", derr)
+			}
+		default:
+			spec.AuthHeader = plaintext
+		}
+		spec.AllowedTools = []string(allowed)
+		specs = append(specs, spec)
 	}
 	return specs
 }
 
 // SaveMCPServer upserts a tenant's MCP server (by tenant+name) and returns its
-// id. Minimal seeding helper; owner-facing registration is deferred (#7).
-func (r *Repository) SaveMCPServer(tenantID, name, transport, url, authHeader string) int64 {
+// id. The auth header, when present, is encrypted at rest (Э0.3): it is written
+// only to auth_header_enc and the legacy plaintext column is cleared. Fails
+// closed — a non-empty header with no configured key is an error, never a
+// plaintext write.
+func (r *Repository) SaveMCPServer(tenantID, name, transport, url, authHeader string) (int64, error) {
 	if r.db == nil {
-		return 0
+		return 0, nil
+	}
+	var enc []byte
+	if authHeader != "" {
+		if len(r.secretsKey) == 0 {
+			return 0, errMissingSecretsKey
+		}
+		var err error
+		if enc, err = encryptSecret(r.secretsKey, authHeader); err != nil {
+			return 0, err
+		}
 	}
 	var id int64
+	// New writes never populate the plaintext auth_header column; enc holds the
+	// only copy. Legacy plaintext rows keep working via RoleMCPServers' COALESCE.
 	err := r.db.QueryRow(
-		`INSERT INTO mcp_servers (tenant_id, name, transport, url, auth_header)
-		 VALUES ($1,$2,$3,$4, NULLIF($5,''))
+		`INSERT INTO mcp_servers (tenant_id, name, transport, url, auth_header, auth_header_enc)
+		 VALUES ($1,$2,$3,$4, NULL, $5)
 		 ON CONFLICT (tenant_id, name)
 		 DO UPDATE SET transport = EXCLUDED.transport, url = EXCLUDED.url,
-		               auth_header = EXCLUDED.auth_header, enabled = true
+		               auth_header = NULL, auth_header_enc = EXCLUDED.auth_header_enc,
+		               enabled = true
 		 RETURNING id`,
-		tenantID, name, transport, url, authHeader,
+		tenantID, name, transport, url, enc,
 	).Scan(&id)
 	if err != nil {
 		r.logWriteError("save_mcp_server", tenantID, "", err)
-		return 0
+		return 0, err
 	}
-	return id
+	return id, nil
 }
 
 // SetRoleMCPAccess grants a role access to a server with an optional tool

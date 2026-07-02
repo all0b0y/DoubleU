@@ -61,6 +61,13 @@ func main() {
 			configureTelegramBot(logger, botSender, cfg.PublicWebhookURL, cfg.TelegramWebhookSecret)
 		}
 	}
+	mcpSecretsKey, err := config.ParseMCPSecretsKey(os.Getenv("MCP_SECRETS_KEY"))
+	if err != nil {
+		// Fail closed: a set-but-invalid key must not silently disable encryption.
+		logger.Error("invalid MCP_SECRETS_KEY", "error", err)
+		os.Exit(1)
+	}
+	cfg.MCPSecretsKey = mcpSecretsKey
 	repository := store.NewRepository()
 	repository.SetLogger(logger)
 	storage := "memory"
@@ -81,6 +88,9 @@ func main() {
 	} else {
 		logger.Warn("DATABASE_URL not set — using in-memory storage, all state will be lost on restart")
 	}
+	// After any reassignment to the Postgres repo: inject the at-rest secrets key
+	// so MCP auth headers are encrypted on write (nil key => encryption disabled).
+	repository.SetSecretsKey(mcpSecretsKey)
 	obsShutdown, err := observability.Init(context.Background(), logger, flags)
 	if err != nil {
 		logger.Error("observability sink init failed", "error", err)

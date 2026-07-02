@@ -46,6 +46,8 @@ services:
       TELEGRAM_WEBHOOK_SECRET: ${TELEGRAM_WEBHOOK_SECRET:-}
       TELEGRAM_AUTO_SETUP: ${TELEGRAM_AUTO_SETUP:-false}
       MINIAPP_DIR: /app/miniapp
+      # AES-256 key (base64, 32 bytes) encrypting MCP auth headers at rest (Э0.3).
+      MCP_SECRETS_KEY: ${MCP_SECRETS_KEY:-}
       # LLM Safety & Observability flags (Phase 0–5).  All default safe-off.
       SAFETY_INPUT_ENABLED: ${SAFETY_INPUT_ENABLED:-false}
       SAFETY_OUTPUT_ENABLED: ${SAFETY_OUTPUT_ENABLED:-false}
