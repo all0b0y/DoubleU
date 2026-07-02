@@ -1,10 +1,11 @@
 {
-  "version": "0.8.0",
+  "version": "0.9.0",
   "tool_categories": [
     "read",
     "schedule",
     "integration",
-    "interaction"
+    "interaction",
+    "skills"
   ],
   "llm_purposes": [
     "draft",
