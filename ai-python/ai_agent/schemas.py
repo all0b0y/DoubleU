@@ -210,6 +210,18 @@ class MCPServerSpecData(JsonDataclass):
 
 
 @dataclass(frozen=True)
+class SkillSpecData(JsonDataclass):
+    """Level-1 (name+description) view of a skill enabled for the role (Г4).
+
+    The full body is fetched on demand via the ``load_skill`` tool, never carried
+    in the role payload.
+    """
+
+    name: str = ""
+    description: str = ""
+
+
+@dataclass(frozen=True)
 class AIRoleData(JsonDataclass):
     """Owner-authored AI persona assigned to the chat.
 
@@ -231,6 +243,8 @@ class AIRoleData(JsonDataclass):
     custom_fields: tuple[AIRoleCustomFieldData, ...] = field(default_factory=tuple)
     # MCP servers this role may call (#7); empty means no external tools.
     mcp_servers: tuple[MCPServerSpecData, ...] = field(default_factory=tuple)
+    # Level-1 views of the skills enabled for this role (Г4); empty means none.
+    skills: tuple[SkillSpecData, ...] = field(default_factory=tuple)
     # speak_as_owner=True (default): AI impersonates the owner — contact thinks
     # they are talking to a human.  False: AI responds as the role persona
     # itself (assistant / companion); no owner impersonation.
@@ -888,6 +902,7 @@ def _parse_ai_role(raw: Any) -> AIRoleData | None:
         context=str(raw.get("context", "")).strip(),
         custom_fields=_parse_role_custom_fields(raw.get("custom_fields")),
         mcp_servers=_parse_mcp_servers(raw.get("mcp_servers")),
+        skills=_parse_skills(raw.get("skills")),
         speak_as_owner=speak_as_owner,
         model_tier=model_tier,
         model_name=str(raw.get("model_name", "")).strip(),
@@ -921,6 +936,24 @@ def _parse_mcp_servers(raw: Any) -> tuple[MCPServerSpecData, ...]:
             )
         )
     return tuple(servers)
+
+
+def _parse_skills(raw: Any) -> tuple[SkillSpecData, ...]:
+    """Parse the optional skills list; entries without a name are dropped. A
+    missing key yields an empty tuple, so older Go backends stay compatible."""
+    if not isinstance(raw, list):
+        return ()
+    skills: list[SkillSpecData] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name", "")).strip()
+        if not name:
+            continue
+        skills.append(
+            SkillSpecData(name=name, description=str(item.get("description", "")).strip())
+        )
+    return tuple(skills)
 
 
 def _parse_role_custom_fields(raw: Any) -> tuple[AIRoleCustomFieldData, ...]:

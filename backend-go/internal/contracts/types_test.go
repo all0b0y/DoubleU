@@ -2,6 +2,7 @@ package contracts
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 )
@@ -137,5 +138,33 @@ func TestAIProcessMessageScheduledJobsJSONRoundTrip(t *testing.T) {
 		job.Payload["text"] != "Позвонить клиенту" || job.CreatedBy != "ai" ||
 		job.IdempotencyKey != "scheduler:key" {
 		t.Fatalf("scheduled job round-trip = %+v", job)
+	}
+}
+
+// Э4.3: AIRole.Skills serialises under "skills" (level-1 name+description) and
+// round-trips; omitempty keeps it out of the payload when a role has no skills.
+func TestAIRoleSkillsRoundTrip(t *testing.T) {
+	role := AIRole{
+		Name:   "r",
+		Skills: []SkillSpec{{Name: "reminders", Description: "how to phrase"}},
+	}
+	blob, err := json.Marshal(role)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(blob), `"skills":[{"name":"reminders","description":"how to phrase"}]`) {
+		t.Fatalf("skills not serialised as expected: %s", blob)
+	}
+	var back AIRole
+	if err := json.Unmarshal(blob, &back); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(back.Skills) != 1 || back.Skills[0].Name != "reminders" || back.Skills[0].Description != "how to phrase" {
+		t.Fatalf("skills round-trip mismatch: %+v", back.Skills)
+	}
+	// omitempty: a role with no skills does not emit the key.
+	empty, _ := json.Marshal(AIRole{Name: "r"})
+	if strings.Contains(string(empty), "skills") {
+		t.Fatalf("empty skills must be omitted: %s", empty)
 	}
 }

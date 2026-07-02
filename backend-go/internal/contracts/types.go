@@ -481,6 +481,10 @@ type AIRole struct {
 	// MCPServers are the external MCP toolsets this role may call (#7). Resolved
 	// from role_mcp_access + mcp_servers; empty means the role has no tools.
 	MCPServers []MCPServerSpec `json:"mcp_servers,omitempty"`
+	// Skills are the level-1 (name+description) views of the skills enabled for
+	// this role (Г4). Resolved from role_skills + skills; the full body is fetched
+	// on demand by the load_skill tool, never carried here.
+	Skills []SkillSpec `json:"skills,omitempty"`
 	// SpeakAsOwner controls the AI persona frame. true (default) = impersonate
 	// the owner — the contact perceives the reply as written by a human.
 	// false = the AI responds as the role itself (assistant / companion

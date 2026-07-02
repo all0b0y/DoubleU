@@ -460,6 +460,7 @@ func (s *Service) aiRoleFor(tenantID, chatID string) *contracts.AIRole {
 		Context:       role.Context,
 		CustomFields:  role.CustomFields,
 		MCPServers:    s.repository.RoleMCPServers(role.ID),
+		Skills:        s.repository.RoleSkills(role.ID),
 		SpeakAsOwner:  role.SpeakAsOwner,
 		ModelTier:     role.ModelTier,
 		ModelName:     role.ModelName,

@@ -249,6 +249,18 @@ components:
               title: { type: string }
               description: { type: string }
               context: { type: string }
+        skills:
+          type: array
+          description: >
+            Level-1 (name+description) views of the skills enabled for this role
+            (Г4). The full body is fetched on demand by the load_skill tool and
+            is never included here.
+          items:
+            type: object
+            required: [name, description]
+            properties:
+              name: { type: string }
+              description: { type: string }
     AIProcessMessageRequest:
       type: object
       required: [request_id, event, chat_settings, memory_context]

@@ -1261,6 +1261,27 @@ def test_record_run_attaches_mcp_server_names_only() -> None:
     assert "authorization" not in blob and "bearer" not in blob and "https://" not in blob
 
 
+def test_parse_ai_role_skills() -> None:
+    """Э4.3: skills parse into level-1 specs; a missing key yields an empty tuple
+    (backward compatible with older Go backends), and entries without a name drop."""
+    from ai_agent.schemas import _parse_ai_role
+
+    assert _parse_ai_role({"name": "r"}).skills == ()
+
+    role = _parse_ai_role(
+        {
+            "name": "r",
+            "skills": [
+                {"name": "reminders", "description": "how to phrase reminders"},
+                {"description": "no name — dropped"},
+            ],
+        }
+    )
+    assert len(role.skills) == 1
+    assert role.skills[0].name == "reminders"
+    assert role.skills[0].description == "how to phrase reminders"
+
+
 def test_record_decision_relabels_trace_with_outcome() -> None:
     """The request trace must be re-labelled with the final decision so an
     auto-sent reply is distinguishable from an owner draft (it is opened under
