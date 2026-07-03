@@ -45,6 +45,7 @@ LLM → tool (пишет в AgentDeps) → DraftOutcome → AIProcessMessageResp
 | `scheduler.create_reminder` | schedule | ❌ | `schedule_tools.py` | `scheduled_jobs` |
 | `scheduler.list_reminders` | schedule | ❌ | `schedule_tools.py` | request `existing_scheduled_jobs` |
 | `scheduler.cancel_reminder` | schedule | ❌ | `schedule_tools.py` | `scheduled_jobs` (CancelJob) |
+| `skills.load_skill` | skills | ✅ | `skill_tools.py` | `skills` (читает `body` включённого навыка роли) |
 
 ### Применимость (prompt policy)
 
@@ -71,6 +72,7 @@ UI/Go-видимый, policy — расширенная применимость
 | `list_reminders` | нужно сослаться на напоминание или узнать id перед отменой | роль не включает list_reminders — придёт пусто независимо от данных | `none` | `Активных напоминаний нет.` — действительно нет pending |
 | `cancel_reminder` | id известен (из `list_reminders`) и явно просят отменить | id не известен — не угадывай номер | `staged_schedule` | `error: no pending reminder with id N` — неверный/чужой id |
 | `send_message` | в одном ходе нужно разделить РАЗНЫЕ по характеру части на отдельные сообщения | ответ — одна цельная реплика; вопрос с кнопками (это `ask_questions`) | `staged_delivery` | `ModelRetry` при пустом тексте/лимите — не тихий провал |
+| `load_skill` | в промпте перечислен навык, релевантный ходу, и нужна его процедура/детали | ни один навык из списка не относится к вопросу — не выдумывай навык | `none` | `<skill>…</skill>` с телом; `навык не найден` — навыка нет в списке роли |
 
 ---
 
@@ -191,6 +193,26 @@ receive-ключ не сталкивался с ответом-триггеро�
 оборачивает каждый в `FilteredToolset` с allow-list, и полностью отключает их при
 `no_memory`/`private` (внешний инструмент мог бы утащить содержимое чата). Это не
 часть `TOOL_CATALOG` — это per-role расширение.
+
+**Control plane (Г1):** owner CRUD через `/api/v1/mcp-servers` (`miniapp_mcp_handlers.go`);
+`auth_header` шифруется at rest (AES-256-GCM, ключ `MCP_SECRETS_KEY`, `store.go`);
+URL проходит SSRF-гард (`mcp_url_guard.go`: только https, запрет private/loopback/link-local
+и docker-хостов); результаты каждого MCP-инструмента оборачиваются в
+`<untrusted_tool_result>` (`sanitize_toolset.py`). Проверка сервера и листинг инструментов —
+`POST /ai/mcp-check` (Python) через прокси `apiCheckMCPServer` (Go). Имена подключённых
+серверов пишутся в run-trace (`_record_run`, только name).
+
+## Навыки роли (`skills.load_skill`, Г4)
+
+Skill = owner-authored запись в `skills` (`tenant_id NULL` = глобальный first-party,
+виден всем; привязка к роли — `role_skills`). Progressive disclosure: **уровень 1**
+(name+description) идёт в `tool_policy` промпта writer'а из `ai_role.skills`; **уровень 2**
+(тело) писатель тянет `load_skill` — но только для навыка из `deps.enabled_skill_names`
+(включённого у роли), иначе «навык не найден». Writer-only (оркестратор навыки не видит,
+как `delivery_toolset`), обёрнут `DedupToolset`, **не** гейтится `no_memory`/`private`
+(это контент владельца, как `role.context`, а не память чата и не внешний вызов).
+Исполняемых скриптов нет (осознанное ограничение фазы). Owner CRUD — `/api/v1/skills`
+(`miniapp_skills_handlers.go`); импорт из URL — вторая итерация (см. `docs/backlog.md`).
 
 ---
 

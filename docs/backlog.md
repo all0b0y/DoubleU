@@ -138,14 +138,14 @@
 
 ### TOOLS — MCP: SSRF-валидация URL перед публичным конфиг-API
 
-- **`mcp_servers.url` нигде не валидируется** — Python `_resolve_mcp_toolsets`
-  ([`runtime.py`](../ai-python/ai_agent/agents/runtime.py)) подключается к любому URL из БД
-  (`RoleMCPServers` в [`store.go`](../backend-go/internal/store/store.go)). Пока записи создаются
-  только оператором через SQL, поверхность закрыта, но **до** появления пользовательского
-  CRUD-API/UI для MCP-серверов обязателен egress-контроль: запрет private/link-local/loopback
-  диапазонов и internal-хостов docker-сети (postgres, redis, ai-service), allow-list схем (https),
-  плюс обёртка результатов MCP-инструментов как untrusted input (XML-теги) против prompt-injection
-  через tool results. Найдено при анализе MCP/Skills архитектуры 2026-07-02.
+- ✅ **ЗАКРЫТО (2026-07-02, план MCP control plane Э0.1–Э1.5).** До публичного CRUD-API для
+  MCP-серверов требовался egress-контроль — он реализован: `ValidateMCPServerURL`
+  ([`mcp_url_guard.go`](../backend-go/internal/httpapi/mcp_url_guard.go), только https, запрет
+  private/link-local/loopback/ULA и docker-хостов) на границе httpapi + дешёвая defense-in-depth
+  проверка в `_resolve_mcp_toolsets`; результаты MCP оборачиваются как untrusted
+  (`UntrustedResultToolset`, [`sanitize_toolset.py`](../ai-python/ai_agent/agents/sanitize_toolset.py));
+  `auth_header` шифруется at rest (AES-256-GCM, Э0.3). Остаётся только остаточный риск ниже
+  (DNS-rebinding) и хвост по legacy-перешифровке.
   - **Остаточный риск — DNS rebinding (не закрыт в этой итерации).** `ValidateMCPServerURL`
     ([`mcp_url_guard.go`](../backend-go/internal/httpapi/mcp_url_guard.go)) резолвит хост в
     момент валидации, но pydantic-ai MCP-клиент ре-резолвит его при подключении — злонамеренный
@@ -160,6 +160,17 @@
     Хвост: одноразовый ре-энкрипт legacy-строк (прочитать plaintext → `SaveMCPServer` заново)
     и `ALTER TABLE mcp_servers DROP COLUMN auth_header` отдельной миграцией, когда plaintext
     больше нигде не нужен. _Записано 2026-07-02 (Э0.3)._
+
+### SKILLS — импорт из URL (вторая итерация, Э4.9)
+
+- **Импорт skill из URL (`SKILL.md`) — НЕ сделан осознанно.** Схема `skills` уже несёт задел
+  (`source_url`, `content_hash`, migration 121), так что повторная миграция не нужна. Флоу второй
+  итерации: fetch `SKILL.md` (с тем же egress-контролем, что MCP — SSRF-гард) → парс frontmatter
+  (name/description/body) → `content_hash` → **обязательное подтверждение владельцем ДО включения**.
+  Импортированный skill = prompt injection по определению: пока Э4.6 кладёт метаданные навыка в
+  trusted-часть промпта, это верно ТОЛЬКО для owner/first-party навыков; импортированные обязаны
+  пройти owner-review, прежде чем попасть в `role_skills` и, значит, в промпт. Также рассмотреть
+  DNS-rebinding-защиту для fetch (тот же остаточный риск, что у MCP выше). _Записано 2026-07-02._
 
 ### TOOLS — integration-инструмент не реализован
 

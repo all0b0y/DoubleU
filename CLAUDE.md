@@ -60,12 +60,21 @@ This file defines the mandatory rules for all AI agents (Claude Code and similar
 | `scheduler.create_reminder` | `agents/schedule_tools.py` | `scheduled_jobs[]` | `saveAIScheduledJobs` → `scheduled_jobs` |
 | `scheduler.list_reminders` | `agents/schedule_tools.py` | req `existing_scheduled_jobs[]` | `existingScheduledJobsFor` (read) |
 | `scheduler.cancel_reminder` | `agents/schedule_tools.py` | `cancelled_job_ids[]` | `cancelAIScheduledJobs` → `CancelJob` |
+| `skills.load_skill` | `agents/skill_tools.py` | req `ai_role.skills[]` (level-1) | `RoleSkills` → `skills`/`role_skills` (тело читает сам Python) |
 
 - **Анкета (`ask_questions`):** агент готовит пул из 1–6 вопросов; бот задаёт их **по одному**
   (кнопка-подсказка или ответ своими словами). Ответы копятся в `interaction_forms` (один активный
   на чат, TTL 24ч); после ВСЕХ вопросов Q&A уходит в ИИ как один ход. Callback — `qf:{form}:{q}:{slot}`.
 - **Планировщик:** create/list/cancel; `existing_scheduled_jobs` шлётся в запрос только когда роль
   включает list/cancel. Категория `schedule` гейтится `no_memory`/`private`.
+- **Навыки (`load_skill`, Г4):** progressive disclosure — уровень 1 (name+description) идёт в промпт
+  writer'а из `ai_role.skills`; уровень 2 (тело) писатель тянет инструментом `load_skill` **только**
+  для включённого навыка роли (`deps.enabled_skill_names`). Skill = запись в `skills` (tenant_id NULL =
+  глобальный first-party); привязка к роли — `role_skills`. Writer-only (оркестратор навыки не видит),
+  НЕ гейтится privacy (owner-контент, как `role.context`). Исполняемых скриптов нет.
+- **MCP control plane (Г1):** owner CRUD для `mcp_servers` (`miniapp_mcp_handlers.go`), `auth_header`
+  шифруется at rest (AES-256-GCM, `MCP_SECRETS_KEY`), SSRF-гард на URL (`mcp_url_guard.go`), результаты
+  MCP оборачиваются как untrusted (`sanitize_toolset.py`). Проверка сервера — `POST /ai/mcp-check`.
 
 ## Refactoring & Backlog
 
