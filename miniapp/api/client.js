@@ -91,6 +91,22 @@ export const api = {
   },
   updateBotSettings: (botId, data) => request('PATCH', `/api/v1/bots/${botId}/role`, data),
   disconnectBot: (botId)         => request('DELETE', `/api/v1/bots/${botId}`),
+
+  // MCP servers (external tools) — owner CRUD + per-role access
+  mcpServers:      ()                => request('GET',    '/api/v1/mcp-servers'),
+  createMCPServer: (data)            => request('POST',   '/api/v1/mcp-servers', data),
+  updateMCPServer: (id, data)        => request('PUT',    `/api/v1/mcp-servers/${id}`, data),
+  deleteMCPServer: (id)              => request('DELETE', `/api/v1/mcp-servers/${id}`),
+  checkMCPServer:  (id)              => request('POST',   `/api/v1/mcp-servers/${id}/check`),
+  roleMCP:         (roleId)          => request('GET',    `/api/v1/roles/${roleId}/mcp`),
+  setRoleMCP:      (roleId, servers) => request('PUT',    `/api/v1/roles/${roleId}/mcp`, { servers }),
+
+  // Skills (owner-authored content layer) — CRUD + per-role selection
+  skills:          ()                => request('GET',    '/api/v1/skills'),
+  createSkill:     (data)            => request('POST',   '/api/v1/skills', data),
+  updateSkill:     (id, data)        => request('PUT',    `/api/v1/skills/${id}`, data),
+  deleteSkill:     (id)              => request('DELETE', `/api/v1/skills/${id}`),
+  setRoleSkills:   (roleId, ids)     => request('PUT',    `/api/v1/roles/${roleId}/skills`, { skill_ids: ids }),
 };
 
 /** Open an SSE stream; returns the EventSource. Caller owns closing it. */

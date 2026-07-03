@@ -172,6 +172,17 @@
   пройти owner-review, прежде чем попасть в `role_skills` и, значит, в промпт. Также рассмотреть
   DNS-rebinding-защиту для fetch (тот же остаточный риск, что у MCP выше). _Записано 2026-07-02._
 
+### UI — per-role picker для MCP-серверов и навыков
+
+- **Экран `role-tools.js` не даёт выбирать, какие MCP-серверы и навыки включены у роли.**
+  Реализованы standalone-экраны управления (`mcp-servers.js`, `skills.js`), вход из «Я», и
+  тумблер `load_skill` (категория `skills` в `CATEGORY_META`). Но выбор конкретных серверов
+  (`PUT /roles/{id}/mcp`, с allowed_tools из `/check`) и конкретных навыков
+  (`PUT /roles/{id}/skills`) пока доступен только через API — виджеты выбора внутри
+  `role-tools.js` не добавлены. Бэкенд-ручки готовы (`apiSetRoleMCP`/`apiSetRoleSkills`,
+  `roleMCP`/`setRoleMCP`/`setRoleSkills` в `client.js`). Для skills-пикера с текущим состоянием
+  нужен ещё `GET /roles/{id}/skills` (сейчас есть только PUT). _Записано 2026-07-03._
+
 ### TOOLS — integration-инструмент не реализован
 
 - **Commit 5 спины Tools-платформы не сделан.** План

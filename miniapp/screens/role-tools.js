@@ -7,6 +7,7 @@ const CATEGORY_META = {
   schedule:    { label: 'расписание', icon: '◷' },
   integration: { label: 'интеграции', icon: '↗' },
   interaction: { label: 'взаимодействие', icon: '◇' },
+  skills:      { label: 'навыки', icon: '✦' },
 };
 
 function esc(value) {

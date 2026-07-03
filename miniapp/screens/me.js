@@ -255,6 +255,26 @@ export function renderMe(navigate) {
         </div>
 
         <div class="st-section">
+          <p class="st-section-label">конфигурация ролей</p>
+          <div class="st-card">
+            <div class="st-row st-row-link" id="btn-nav-skills">
+              <span class="st-row-icon">✦</span>
+              <div class="st-row-body">
+                <p class="st-row-title">навыки</p>
+                <p class="st-row-desc">инструкции, которые роль подгружает по теме</p>
+              </div>
+            </div>
+            <div class="st-row st-row-link" id="btn-nav-mcp">
+              <span class="st-row-icon">↗</span>
+              <div class="st-row-body">
+                <p class="st-row-title">внешние инструменты (MCP)</p>
+                <p class="st-row-desc">серверы инструментов, доступные ролям</p>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="st-section">
           <p class="st-section-label">опасная зона</p>
           <div class="st-card">
             <div class="st-row st-row-danger" id="btn-forget-all">
@@ -362,6 +382,9 @@ export function renderMe(navigate) {
         btn.textContent = 'Сохранить'; btn.disabled = false;
       }
     });
+
+    el.querySelector('#btn-nav-skills')?.addEventListener('click', () => navigate('/skills'));
+    el.querySelector('#btn-nav-mcp')?.addEventListener('click', () => navigate('/mcp-servers'));
 
     // Forget-all: reveal the typed-phrase confirmation, same contract as the bot.
     el.querySelector('#btn-forget-all')?.addEventListener('click', () => {
