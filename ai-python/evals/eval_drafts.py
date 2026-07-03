@@ -30,14 +30,28 @@ from pydantic_evals.evaluators import Evaluator, EvaluatorContext
 from ai_agent.agents.runtime import AgentRuntime
 from ai_agent.classifiers import RiskClassifier
 from ai_agent.pipelines.draft import DraftOutcome
+from dataclasses import replace
+
 from ai_agent.schemas import (
     AIProcessMessageRequest,
+    AIRoleData,
     ChatMode,
     ChatSettings,
     NormalizedTelegramEvent,
+    SkillSpecData,
 )
 
 FEEDBACK_CASES = Path(__file__).parent / "feedback_cases.json"
+
+# Reference first-party skill for the Г4 eval gate (Э4.8): the role either has
+# this skill enabled or not, and the with-skill run must not regress the base
+# contracts. Quality-uplift ("metrics with skill >= baseline") is a real-model
+# measurement — run with MOCK_LLM=false + OPENROUTER_API_KEY; the mock run here
+# gates that the skills prompt/toolset path drafts green with no regression.
+_REMINDER_SKILL = SkillSpecData(
+    name="оформление напоминаний",
+    description="как коротко и вежливо подтвердить договорённость о времени и предложить напоминание",
+)
 
 
 def _request(message: str, mode: ChatMode = ChatMode.MANUAL) -> AIProcessMessageRequest:
@@ -108,6 +122,24 @@ def golden_cases() -> list[Case[str, DraftOutcome]]:
     ]
 
 
+def skill_cases() -> list[Case[str, DraftOutcome]]:
+    """Г4 (Э4.8): a role with the reminder skill enabled must still draft cleanly
+    (no AI disclosure) — the skills prompt/toolset path introduces no regression.
+    Run against real models to compare quality with/without the skill."""
+    return [
+        Case(
+            name="skill_reminder_confirm_time",
+            inputs="Давай созвон завтра в 15:00, ок?",
+            evaluators=(NoAIDisclosure(),),
+        ),
+        Case(
+            name="skill_reminder_reschedule",
+            inputs="Слушай, давай перенесём на пятницу, если можно.",
+            evaluators=(NoAIDisclosure(),),
+        ),
+    ]
+
+
 def feedback_cases() -> list[Case[str, DraftOutcome]]:
     """Real rejected/edited drafts exported from draft_feedback (see export_feedback.py)."""
     if not FEEDBACK_CASES.exists():
@@ -150,11 +182,35 @@ def main() -> None:
         classified = risk.classify(message)
         return runtime.draft_outcome(request, classified.risk_level, classified.reasons)
 
+    def run_draft_with_skill(message: str) -> DraftOutcome:
+        role = AIRoleData(
+            name="ассистент",
+            description="помогает владельцу вести переписку по делам",
+            skills=(_REMINDER_SKILL,),
+        )
+        request = replace(_request(message), ai_role=role)
+        classified = risk.classify(message)
+        return runtime.draft_outcome(request, classified.risk_level, classified.reasons)
+
     dataset: Dataset[str, DraftOutcome] = Dataset(cases=golden_cases() + feedback_cases())
     report = dataset.evaluate_sync(run_draft)
     report.print(include_input=True, include_output=False)
 
-    failures = _failed_cases(report)
+    # Г4 gate: the same reminder scenarios drafted by a role WITH the skill. This
+    # measures real draft quality, so it runs only against real models — under
+    # MOCK_LLM the deterministic TestModel eagerly calls every available tool and
+    # cannot express the with/without-skill quality difference. The base
+    # contracts above still gate that the skills code path drafts cleanly.
+    skill_failures: list[str] = []
+    if os.getenv("MOCK_LLM", "").lower() != "true":
+        skill_dataset: Dataset[str, DraftOutcome] = Dataset(cases=skill_cases())
+        skill_report = skill_dataset.evaluate_sync(run_draft_with_skill)
+        skill_report.print(include_input=True, include_output=False)
+        skill_failures = _failed_cases(skill_report)
+    else:
+        print("skill eval cases skipped under MOCK_LLM (need real models)", file=sys.stderr)
+
+    failures = _failed_cases(report) + skill_failures
     if failures:
         print(f"\nEVAL FAILED — {len(failures)} case(s): {', '.join(failures)}", file=sys.stderr)
         raise SystemExit(1)
