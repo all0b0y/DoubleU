@@ -68,15 +68,21 @@ function timezoneOptionsHTML(current) {
 }
 
 function suggestionCardHTML(s) {
+  // Auto-applied updates (auto-learn on) are already saved — offer an undo.
+  // Pending ones (auto-learn off for the role) still need manual review.
+  const icon = s.auto_applied ? '🧠' : '💡';
+  const actions = s.auto_applied
+    ? `<button class="suggestion-btn reject" data-sg-action="revert">↩ Откатить</button>`
+    : `<button class="suggestion-btn accept" data-sg-action="accept">✅ Принять</button>
+       <button class="suggestion-btn reject" data-sg-action="reject">✖ Отклонить</button>`;
   return `
     <div class="suggestion-card" data-suggestion-id="${s.id}">
       <p class="suggestion-card-title">
-        💡 <b>${esc(s.chat_display_name)}</b>: ${esc(s.field_label)} → <b>${esc(s.suggested_value)}</b>
+        ${icon} <b>${esc(s.chat_display_name)}</b>: ${esc(s.field_label)} → <b>${esc(s.suggested_value)}</b>
       </p>
       ${s.rationale ? `<p class="suggestion-card-rationale">${esc(s.rationale)}</p>` : ''}
       <div class="suggestion-card-actions">
-        <button class="suggestion-btn accept" data-sg-action="accept">✅ Принять</button>
-        <button class="suggestion-btn reject" data-sg-action="reject">✖ Отклонить</button>
+        ${actions}
       </div>
     </div>`;
 }
@@ -113,6 +119,8 @@ export function renderMe(navigate) {
   // The me-screen bot section is single-bot; with multibot we show the tenant's
   // first bot. Kept here so the role-picker handler (in wire()) has its bot id.
   let currentBot = { connected: false };
+  // Personal-bot allowlist (Telegram user ids), loaded only when personal mode is on.
+  let botAllowlist = [];
 
   function personalConnectionHTML(me) {
     const status = me?.connection?.status || 'not_found';
@@ -169,6 +177,46 @@ export function renderMe(navigate) {
           Эта роль применяется ко всем чатам бота.
         </div>
       </div>`;
+  }
+
+  // Personal-bot mode: the bot answers only the owner + an allowlist of Telegram
+  // user ids; everyone else gets a one-time stub. The allowlist editor appears
+  // only while the toggle is on.
+  function botPersonalModeHTML(bot) {
+    if (!bot?.connected) return '';
+    const on = !!bot.personal_mode;
+    return `
+      <div class="st-divider"></div>
+      <div class="st-row" style="padding:12px 14px;cursor:default;">
+        <div class="st-row-body">
+          <p class="st-row-title">личный бот</p>
+          <p class="st-row-desc">отвечает только тебе и разрешённым — остальным заглушка</p>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="f-personal-mode" ${on ? 'checked' : ''}>
+          <div class="toggle-track"></div>
+          <div class="toggle-knob"></div>
+        </label>
+      </div>
+      ${on ? `
+      <div class="field-group" style="padding:0 14px 12px;">
+        <div class="field-label">кому ещё отвечать (Telegram ID)</div>
+        <div id="allowlist-items">
+          ${botAllowlist.length ? botAllowlist.map(id => `
+            <div class="st-row" style="padding:6px 0;cursor:default;">
+              <div class="st-row-body"><p class="st-row-title" style="font-size:13px;">${esc(id)}</p></div>
+              <button class="btn btn-secondary" data-allow-remove="${esc(id)}" style="padding:4px 10px;font-size:12px;">убрать</button>
+            </div>
+          `).join('') : `<p style="font-size:12px;color:var(--muted);margin:4px 0;">пока только владелец</p>`}
+        </div>
+        <div style="display:flex;gap:8px;margin-top:8px;">
+          <input class="field-input" id="allowlist-input" inputmode="numeric" placeholder="напр. 770055005" style="flex:1;">
+          <button class="btn btn-secondary" id="btn-allow-add" style="padding:6px 14px;">добавить</button>
+        </div>
+        <div style="font-size:11px;color:var(--muted);line-height:1.4;margin-top:6px;">
+          Числовой Telegram ID пользователя. Владелец всегда получает ответы.
+        </div>
+      </div>` : ''}`;
   }
 
   function renderContent(me, suggestions, bot) {
@@ -303,7 +351,7 @@ export function renderMe(navigate) {
 
         <div class="st-section">
           <p class="st-section-label">боты</p>
-          <div class="st-card">${botConnectionHTML(bot)}${botRolePickerHTML(bot)}</div>
+          <div class="st-card">${botConnectionHTML(bot)}${botRolePickerHTML(bot)}${botPersonalModeHTML(bot)}</div>
         </div>
 
       </div>`;
@@ -352,6 +400,55 @@ export function renderMe(navigate) {
             card.querySelectorAll('button').forEach(b => { b.disabled = false; b.style.opacity = ''; });
           }
         });
+      });
+    });
+
+    // Personal-bot mode toggle (instant save; reload to reveal/hide the allowlist).
+    el.querySelector('#f-personal-mode')?.addEventListener('change', async (e) => {
+      twa?.HapticFeedback?.selectionChanged();
+      const checked = e.target.checked;
+      try {
+        currentBot = await api.updateBotSettings(currentBot.bot_id, { personal_mode: checked });
+        twa?.HapticFeedback?.notificationOccurred('success');
+        load();
+      } catch (err) {
+        e.target.checked = !checked;
+        twa?.HapticFeedback?.notificationOccurred('error');
+        twa?.showAlert(`Ошибка: ${err.message}`);
+      }
+    });
+
+    // Allowlist: add a Telegram user id.
+    const addAllow = async () => {
+      const input = el.querySelector('#allowlist-input');
+      const id = (input?.value || '').trim();
+      if (!/^\d+$/.test(id)) {
+        twa?.showAlert('Введите числовой Telegram ID.');
+        return;
+      }
+      try {
+        await api.addBotAllowUser(currentBot.bot_id, id);
+        twa?.HapticFeedback?.notificationOccurred('success');
+        load();
+      } catch (err) {
+        twa?.showAlert(`Ошибка: ${err.message}`);
+      }
+    };
+    el.querySelector('#btn-allow-add')?.addEventListener('click', addAllow);
+    el.querySelector('#allowlist-input')?.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); addAllow(); }
+    });
+
+    // Allowlist: remove a user id.
+    el.querySelectorAll('[data-allow-remove]').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        twa?.HapticFeedback?.impactOccurred('light');
+        try {
+          await api.removeBotAllowUser(currentBot.bot_id, btn.dataset.allowRemove);
+          load();
+        } catch (err) {
+          twa?.showAlert(`Ошибка: ${err.message}`);
+        }
       });
     });
 
@@ -421,6 +518,13 @@ export function renderMe(navigate) {
       settings = settingsData || {};
       roles = rolesData.roles || [];
       currentBot = (botsData.bots && botsData.bots[0]) || { connected: false };
+      // The allowlist is only meaningful (and only rendered) in personal mode.
+      if (currentBot.connected && currentBot.personal_mode) {
+        const allow = await api.botAllowlist(currentBot.bot_id).catch(() => ({ allowed_users: [] }));
+        botAllowlist = allow.allowed_users || [];
+      } else {
+        botAllowlist = [];
+      }
       renderContent(me, suggestionsData.suggestions || [], currentBot);
     } catch (err) {
       el.querySelector('#me-scroll').innerHTML = `

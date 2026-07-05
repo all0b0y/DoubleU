@@ -68,6 +68,15 @@ export function renderSkills(navigate) {
 
   const addForm = `
     <div class="st-section">
+      <p class="st-section-label">сгенерировать навык</p>
+      <div class="st-card" style="padding:12px;display:flex;flex-direction:column;gap:8px;">
+        <textarea id="sk-gen" class="input" rows="3" maxlength="8000"
+          placeholder="Опишите навык своими словами (можно надиктовать голосом через микрофон клавиатуры) — ИИ оформит его."></textarea>
+        <button id="sk-gen-btn" class="btn btn-primary">✨ Сгенерировать</button>
+        <p class="st-row-desc">черновик подставится в поля ниже — проверьте и сохраните.</p>
+      </div>
+    </div>
+    <div class="st-section">
       <p class="st-section-label">добавить навык</p>
       <div class="st-card" style="padding:12px;display:flex;flex-direction:column;gap:8px;">
         <input id="sk-name" class="input" placeholder="имя (до 64 символов)" maxlength="64">
@@ -113,6 +122,26 @@ export function renderSkills(navigate) {
         ${addForm}
       </div>`;
       bind(scroll);
+      scroll.querySelector('#sk-gen-btn').addEventListener('click', async () => {
+        const genBtn = scroll.querySelector('#sk-gen-btn');
+        const text = scroll.querySelector('#sk-gen').value.trim();
+        if (!text) { twa?.showAlert('Опишите навык, который нужно создать.'); return; }
+        genBtn.disabled = true;
+        genBtn.textContent = '✨ Генерирую…';
+        try {
+          const draft = await api.draftSkill({ text });
+          scroll.querySelector('#sk-name').value = draft.name || '';
+          scroll.querySelector('#sk-desc').value = draft.description || '';
+          scroll.querySelector('#sk-body').value = draft.body || '';
+          twa?.HapticFeedback?.notificationOccurred('success');
+        } catch (err) {
+          twa?.HapticFeedback?.notificationOccurred('error');
+          twa?.showAlert(`Ошибка: ${err.message}`);
+        } finally {
+          genBtn.disabled = false;
+          genBtn.textContent = '✨ Сгенерировать';
+        }
+      });
       scroll.querySelector('#sk-add').addEventListener('click', async () => {
         const body = {
           name: scroll.querySelector('#sk-name').value.trim(),

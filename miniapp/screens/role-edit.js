@@ -135,6 +135,31 @@ export function renderRoleEdit(navigate, roleId) {
       </div>`;
   }
 
+  // auto_learn_profile toggle: ON (default) = AI-detected profile updates apply
+  // automatically and are revertible from «Обо мне»; OFF = they wait for manual
+  // approval. Mirrors AIRole.auto_learn_profile on the backend.
+  function autoLearnSection() {
+    const autoLearn = role.auto_learn_profile !== false; // default ON
+    return `
+      <div class="st-section">
+        <p class="st-section-label">память профиля</p>
+        <div class="st-card">
+          <div class="st-row" style="cursor:default;">
+            <span class="st-row-icon">🧠</span>
+            <div class="st-row-body">
+              <p class="st-row-title">Автообучение профиля собеседника</p>
+              <p class="st-row-desc">Вкл: ИИ сам обновляет профиль (тон, обращение, язык…) по ходу общения; изменения можно откатить в «Обо мне». Выкл: обновления ждут вашего подтверждения.</p>
+            </div>
+            <label class="toggle">
+              <input type="checkbox" id="f-auto-learn-profile" ${autoLearn ? 'checked' : ''}>
+              <div class="toggle-track"></div>
+              <div class="toggle-knob"></div>
+            </label>
+          </div>
+        </div>
+      </div>`;
+  }
+
   function deliverySettingsHTML() {
     return `
       <div class="st-section">
@@ -337,6 +362,7 @@ export function renderRoleEdit(navigate, roleId) {
         </div>
 
         ${speakAsSection()}
+        ${autoLearnSection()}
         ${modelSettingsHTML()}
         ${deliverySettingsHTML()}
 
@@ -595,6 +621,7 @@ export function renderRoleEdit(navigate, roleId) {
       rich_formatting_enabled: modeToNullableBool(el.querySelector('#f-rich-formatting')?.value),
       streaming_enabled:       modeToNullableBool(el.querySelector('#f-streaming')?.value),
       speak_as_owner:  el.querySelector('#f-speak-as-owner')?.checked ?? true,
+      auto_learn_profile: el.querySelector('#f-auto-learn-profile')?.checked ?? true,
       model_tier:      modelTierForName(selectedModel),
       model_name:      selectedModel,
     };

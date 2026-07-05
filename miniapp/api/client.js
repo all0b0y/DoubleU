@@ -93,6 +93,11 @@ export const api = {
   updateBotSettings: (botId, data) => request('PATCH', `/api/v1/bots/${botId}/role`, data),
   disconnectBot: (botId)         => request('DELETE', `/api/v1/bots/${botId}`),
 
+  // Personal-bot allowlist (Telegram user ids the personal bot also serves)
+  botAllowlist:       (botId)         => request('GET',    `/api/v1/bots/${botId}/allowlist`),
+  addBotAllowUser:    (botId, userId) => request('POST',   `/api/v1/bots/${botId}/allowlist`, { telegram_user_id: userId }),
+  removeBotAllowUser: (botId, userId) => request('DELETE', `/api/v1/bots/${botId}/allowlist/${encodeURIComponent(userId)}`),
+
   // MCP servers (external tools) — owner CRUD + per-role access
   mcpServers:      ()                => request('GET',    '/api/v1/mcp-servers'),
   createMCPServer: (data)            => request('POST',   '/api/v1/mcp-servers', data),
@@ -104,6 +109,8 @@ export const api = {
 
   // Skills (owner-authored content layer) — CRUD + per-role selection
   skills:          ()                => request('GET',    '/api/v1/skills'),
+  // Author a skill draft from free text / voice / a chat; returns {name,description,body}.
+  draftSkill:      (payload)         => request('POST',   '/api/v1/skills/draft', payload),
   createSkill:     (data)            => request('POST',   '/api/v1/skills', data),
   updateSkill:     (id, data)        => request('PUT',    `/api/v1/skills/${id}`, data),
   deleteSkill:     (id)              => request('DELETE', `/api/v1/skills/${id}`),
