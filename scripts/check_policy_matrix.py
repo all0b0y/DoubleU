@@ -32,9 +32,6 @@ EXPECTED_CHAT_MODES = ["disabled", "silent", "manual", "semi_auto", "auto"]
 EXPECTED_PRIVACY_FLAGS = ["no_memory", "no_training", "private", "no_summary"]
 EXPECTED_RISK_LEVELS = ["low", "medium", "high", "critical"]
 
-SEMI_AUTO_MIN = 0.85
-AUTO_MIN = 0.92
-
 
 REQUIRED_SECURITY_CASES: dict[str, str] = {
     "prompt_injection_no_memory_leak": (
@@ -146,6 +143,16 @@ def privacy_flag_sets() -> list[tuple[str, ...]]:
 
 
 def expected_policy(chat_mode: str, risk_level: str, privacy_flags: tuple[str, ...]) -> tuple[tuple[str, ...], str]:
+    """Owner risk-tolerance policy (2026-07-04).
+
+    Per chat mode the owner chooses how much risk auto-sends:
+    MANUAL drafts everything; SEMI_AUTO auto-sends low/medium and holds high;
+    AUTO auto-sends low/medium/high. CRITICAL is handled rather than blocked —
+    sensitive personal data is redacted at ingestion, so the only critical signal
+    that reaches the decision is sexual content, which auto-replies with a neutral
+    redirect; a credential the redactor missed has no safe reply and falls back to
+    the owner. DISABLED/SILENT/MANUAL and PRIVATE chats never auto-reply.
+    """
     flags = set(privacy_flags)
 
     if chat_mode == "disabled":
@@ -154,26 +161,26 @@ def expected_policy(chat_mode: str, risk_level: str, privacy_flags: tuple[str, .
     if chat_mode == "silent":
         return ("observe", "ignore"), "silent mode may observe only"
 
+    # MANUAL and PRIVATE defer to the owner for every risk level, so they are
+    # resolved before the risk gates below.
+    if chat_mode == "manual":
+        return ("draft",), "manual mode always drafts"
+
     if "private" in flags:
         return ("draft", "ask_owner", "ignore"), "private chats require owner control"
 
     if risk_level == "critical":
-        return ("ignore", "ask_owner"), "critical risk must not generate unsupervised replies"
-
-    if risk_level == "high":
-        return ("draft",), "high risk is draft only"
-
-    if risk_level == "medium":
-        return ("draft",), "medium risk drafts by default"
-
-    if chat_mode == "manual":
-        return ("draft",), "manual mode always drafts"
-
-    if chat_mode == "semi_auto":
-        return ("draft", "auto_reply"), f"semi_auto may auto reply only when confidence >= {SEMI_AUTO_MIN}"
+        return ("auto_reply", "ask_owner", "ignore"), (
+            "critical is handled: neutral auto-reply, or owner backstop when no safe reply exists"
+        )
 
     if chat_mode == "auto":
-        return ("draft", "auto_reply"), f"auto may auto reply only when confidence >= {AUTO_MIN}"
+        return ("auto_reply", "draft"), "auto auto-sends low/medium/high risk"
+
+    if chat_mode == "semi_auto":
+        if risk_level == "high":
+            return ("draft",), "semi_auto holds high risk for a draft"
+        return ("auto_reply", "draft"), "semi_auto auto-sends low/medium risk"
 
     raise AssertionError(f"Unhandled policy inputs: {chat_mode=} {risk_level=} {privacy_flags=}")
 

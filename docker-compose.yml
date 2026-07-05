@@ -22,7 +22,7 @@ services:
     image: redis:7-alpine
     ports:
       # Bind only to loopback — cache/queue must not be reachable off-host.
-      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+      - "127.0.0.1:${REDIS_PORT:-6380}:6380"
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
       - redis_data:/data
@@ -114,9 +114,13 @@ services:
       PROMPT_OUTPUT_MODE_REASONING: ${PROMPT_OUTPUT_MODE_REASONING:-}
       PROMPT_OUTPUT_MODE_AGENTIC: ${PROMPT_OUTPUT_MODE_AGENTIC:-}
       OPENROUTER_TIMEOUT_SECONDS: ${OPENROUTER_TIMEOUT_SECONDS:-30}
-      # Wall-clock budget for one two-stage draft (orchestrator + writer). A long
-      # answer can exceed the old 90s default and silently fall to error_fallback.
-      AGENT_RUN_TIMEOUT_SECONDS: ${AGENT_RUN_TIMEOUT_SECONDS:-150}
+      # Coarse runaway backstop for any agent coroutine. The writer is streamed
+      # with its own inactivity timeout (WRITER_STREAM_IDLE_TIMEOUT_SECONDS), so a
+      # large-but-progressing reply is no longer bounded by this wall-clock budget;
+      # keep it generous so it never truncates a healthy streaming draft.
+      AGENT_RUN_TIMEOUT_SECONDS: ${AGENT_RUN_TIMEOUT_SECONDS:-600}
+      # Abort the streamed writer only after this many seconds with no new token.
+      WRITER_STREAM_IDLE_TIMEOUT_SECONDS: ${WRITER_STREAM_IDLE_TIMEOUT_SECONDS:-45}
       OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
       OPENROUTER_APP_NAME: ${OPENROUTER_APP_NAME:-DoubleU}
       OPENROUTER_APP_URL: ${OPENROUTER_APP_URL:-}

@@ -28,18 +28,33 @@ def test_policy_matrix_covers_all_modes_risks_and_privacy_sets() -> None:
     assert {case.privacy_flags for case in cases} == set(check_policy_matrix.privacy_flag_sets())
 
 
-def test_policy_matrix_has_no_unsafe_auto_reply_paths() -> None:
+def test_policy_matrix_matches_owner_risk_policy() -> None:
+    """The owner risk-tolerance policy (2026-07-04), asserted invariant-by-invariant.
+
+    Modes/chats that must NEVER auto-reply stay locked; the risk tolerances that
+    DO auto-send (auto: low/med/high; semi: low/med) are asserted positively so a
+    future regression that silently narrows or widens them is caught.
+    """
     for case in check_policy_matrix.generate_policy_cases():
         flags = set(case.privacy_flags)
+        allowed = set(case.allowed_decisions)
 
-        if case.chat_mode in {"disabled", "silent", "manual"}:
-            assert "auto_reply" not in case.allowed_decisions, case.case_id
+        # Never-auto surfaces stay locked regardless of risk.
+        if case.chat_mode in {"disabled", "silent", "manual"} or "private" in flags:
+            assert "auto_reply" not in allowed, case.case_id
+            continue
 
-        if case.risk_level in {"medium", "high", "critical"}:
-            assert "auto_reply" not in case.allowed_decisions, case.case_id
-
-        if "private" in flags:
-            assert "auto_reply" not in case.allowed_decisions, case.case_id
+        if case.risk_level == "critical":
+            # Handled by a neutral auto-reply, with an owner/ignore backstop; never a plain draft.
+            assert "auto_reply" in allowed and "draft" not in allowed, case.case_id
+        elif case.chat_mode == "auto":
+            # AUTO auto-sends every non-critical risk (low/medium/high).
+            assert "auto_reply" in allowed, case.case_id
+        elif case.chat_mode == "semi_auto":
+            if case.risk_level == "high":
+                assert allowed == {"draft"}, case.case_id
+            else:
+                assert "auto_reply" in allowed, case.case_id
 
 
 def test_required_security_abuse_cases_are_explicit() -> None:
