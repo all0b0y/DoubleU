@@ -48,6 +48,8 @@ type botStatusPayload struct {
 	AIRole                *botRolePayload `json:"ai_role,omitempty"`
 	RichFormattingEnabled *bool           `json:"rich_formatting_enabled"`
 	StreamingEnabled      *bool           `json:"streaming_enabled"`
+	// PersonalMode: when true the bot answers only the owner + allowlist.
+	PersonalMode bool `json:"personal_mode"`
 }
 
 func (s *Server) botStatusFor(record store.UserBotRecord, connected bool) botStatusPayload {
@@ -61,6 +63,7 @@ func (s *Server) botStatusFor(record store.UserBotRecord, connected bool) botSta
 		Status:                record.Status,
 		RichFormattingEnabled: cloneBoolPtr(record.RichFormattingEnabled),
 		StreamingEnabled:      cloneBoolPtr(record.StreamingEnabled),
+		PersonalMode:          record.PersonalMode,
 	}
 	if record.AIRoleID != 0 {
 		if role, ok := s.service.Repository().AIRoleByID(record.TenantID, record.AIRoleID); ok {
@@ -98,6 +101,7 @@ func (s *Server) apiSetBotRole(w http.ResponseWriter, r *http.Request) {
 		RoleContextPolicy     string             `json:"role_context_policy"`
 		RichFormattingEnabled optionalBoolPatch  `json:"rich_formatting_enabled"`
 		StreamingEnabled      optionalBoolPatch  `json:"streaming_enabled"`
+		PersonalMode          optionalBoolPatch  `json:"personal_mode"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
@@ -142,6 +146,10 @@ func (s *Server) apiSetBotRole(w http.ResponseWriter, r *http.Request) {
 		s.service.Repository().SetUserBotDeliverySettings(
 			tenantID, botID, record.RichFormattingEnabled, record.StreamingEnabled,
 		)
+	}
+	if payload.PersonalMode.Present {
+		record.PersonalMode = boolOrDefault(payload.PersonalMode.Value, record.PersonalMode)
+		s.service.Repository().SetUserBotPersonalMode(tenantID, botID, record.PersonalMode)
 	}
 	if s.hub != nil {
 		// Bot role governs every chat of that bot — refresh open chat lists/settings.
@@ -192,6 +200,82 @@ func (s *Server) apiDisconnectBot(w http.ResponseWriter, r *http.Request) {
 	}
 	s.bots.DisconnectBot(tenantID, botID)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "disconnected"})
+}
+
+// apiListBotAllowlist returns the Telegram user ids a personal bot also serves
+// (besides the owner, who is always served and never listed here).
+func (s *Server) apiListBotAllowlist(w http.ResponseWriter, r *http.Request) {
+	tenantID := tenantFromContext(r.Context())
+	botID, err := strconv.ParseInt(r.PathValue("bot_id"), 10, 64)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid bot_id"})
+		return
+	}
+	if _, ok := s.service.Repository().UserBotByID(tenantID, botID); !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "no such bot"})
+		return
+	}
+	users := s.service.Repository().BotAllowedUsers(tenantID, botID)
+	if users == nil {
+		users = []string{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"allowed_users": users})
+}
+
+// apiAddBotAllowlist adds one Telegram user id to a personal bot's allowlist.
+func (s *Server) apiAddBotAllowlist(w http.ResponseWriter, r *http.Request) {
+	defer r.Body.Close()
+	tenantID := tenantFromContext(r.Context())
+	botID, err := strconv.ParseInt(r.PathValue("bot_id"), 10, 64)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid bot_id"})
+		return
+	}
+	if _, ok := s.service.Repository().UserBotByID(tenantID, botID); !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "no such bot"})
+		return
+	}
+	var payload struct {
+		TelegramUserID string `json:"telegram_user_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	userID := strings.TrimSpace(payload.TelegramUserID)
+	// Telegram user ids are numeric; reject anything else so a username or typo
+	// never silently lands in the allowlist and fails to match event.SenderID.
+	if _, err := strconv.ParseInt(userID, 10, 64); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "telegram_user_id must be a numeric Telegram user id"})
+		return
+	}
+	s.service.Repository().AddBotAllowedUser(tenantID, botID, userID)
+	users := s.service.Repository().BotAllowedUsers(tenantID, botID)
+	if users == nil {
+		users = []string{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"allowed_users": users})
+}
+
+// apiRemoveBotAllowlist drops one Telegram user id from a personal bot's allowlist.
+func (s *Server) apiRemoveBotAllowlist(w http.ResponseWriter, r *http.Request) {
+	tenantID := tenantFromContext(r.Context())
+	botID, err := strconv.ParseInt(r.PathValue("bot_id"), 10, 64)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid bot_id"})
+		return
+	}
+	userID := strings.TrimSpace(r.PathValue("user_id"))
+	if userID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "user_id is required"})
+		return
+	}
+	s.service.Repository().RemoveBotAllowedUser(tenantID, botID, userID)
+	users := s.service.Repository().BotAllowedUsers(tenantID, botID)
+	if users == nil {
+		users = []string{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"allowed_users": users})
 }
 
 // apiGetIngestionMode returns the tenant's effective ingestion mode.

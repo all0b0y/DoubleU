@@ -392,6 +392,38 @@ func TestSuggestionAcceptAppliesProfileField(t *testing.T) {
 	}
 }
 
+// TestSuggestionRevertUndoesAutoApplied covers the auto-learn UX: an
+// auto-applied suggestion surfaces as revertible in the inbox, and the revert
+// action restores the prior profile value.
+func TestSuggestionRevertUndoesAutoApplied(t *testing.T) {
+	repo := store.NewRepository()
+	repo.SaveChat(store.ChatRecord{TenantID: testTenant, ChatID: "42", DisplayName: "Иван"})
+	repo.SaveContactProfile(contracts.ContactProfile{TenantID: testTenant, ChatID: "42", Tone: "neutral"})
+	id := repo.SaveProfileSuggestion(store.ProfileSuggestionRecord{
+		TenantID: testTenant, ChatID: "42", FieldName: "tone", SuggestedValue: "дружеский",
+	})
+	if id == 0 {
+		t.Fatalf("failed to seed suggestion")
+	}
+	if n, err := repo.AutoApplyProfileSuggestions(testTenant, "42"); err != nil || n != 1 {
+		t.Fatalf("auto-apply n=%d err=%v", n, err)
+	}
+	server := NewServer(core.NewService(repo, nil, nil))
+
+	res := miniappRequest(t, server, http.MethodGet, "/api/v1/suggestions", "")
+	if body := res.Body.String(); !strings.Contains(body, `"auto_applied":true`) {
+		t.Fatalf("revertable suggestion not surfaced: %s", body)
+	}
+
+	res = miniappRequest(t, server, http.MethodPost, fmt.Sprintf("/api/v1/suggestions/%d/action", id), `{"action":"revert"}`)
+	if res.Code != http.StatusOK {
+		t.Fatalf("revert status = %d body=%s", res.Code, res.Body.String())
+	}
+	if profile, _ := repo.ContactProfile(testTenant, "42"); profile.Tone != "neutral" {
+		t.Fatalf("profile tone = %q, want restored to neutral", profile.Tone)
+	}
+}
+
 func TestFactsListAndDelete(t *testing.T) {
 	repo := store.NewRepository()
 	factID := repo.SaveSemanticFact(store.SemanticFactRecord{

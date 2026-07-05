@@ -835,6 +835,7 @@ type telegramBusinessConn struct {
 type telegramMessage struct {
 	MessageID            int64             `json:"message_id"`
 	BusinessConnectionID string            `json:"business_connection_id"`
+	MediaGroupID         string            `json:"media_group_id"`
 	Chat                 telegramChat      `json:"chat"`
 	From                 telegramUser      `json:"from"`
 	Text                 string            `json:"text"`
@@ -905,6 +906,12 @@ type MediaDescriptor struct {
 	MimeType string
 	FileSize int64
 	Duration int64 // seconds; voice/audio only, 0 otherwise
+	// GroupID is Telegram's media_group_id: non-empty when this attachment is one
+	// item of an album (several photos/documents sent as a single message). All
+	// items of the same album share the value, so the ingestion layer can coalesce
+	// them into one AI turn instead of treating each file/photo in isolation. Empty
+	// for a standalone attachment.
+	GroupID string
 }
 
 // telegramFile holds the Telegram file fields shared by voice, audio, document
@@ -921,18 +928,25 @@ type telegramFile struct {
 // Photos arrive as an ascending-size array, so the largest (last) size is chosen
 // for best extraction quality. Caption text is handled separately by the caller.
 func extractMedia(m *telegramMessage) *MediaDescriptor {
+	var descriptor *MediaDescriptor
 	switch {
 	case len(m.Photo) > 0:
-		return fileDescriptor("photo", &m.Photo[len(m.Photo)-1])
+		descriptor = fileDescriptor("photo", &m.Photo[len(m.Photo)-1])
 	case m.Voice != nil:
-		return fileDescriptor("voice", m.Voice)
+		descriptor = fileDescriptor("voice", m.Voice)
 	case m.Audio != nil:
-		return fileDescriptor("audio", m.Audio)
+		descriptor = fileDescriptor("audio", m.Audio)
 	case m.Document != nil:
-		return fileDescriptor("document", m.Document)
+		descriptor = fileDescriptor("document", m.Document)
 	default:
 		return nil
 	}
+	// media_group_id lives on the message, not the file sub-object, so stamp it
+	// here: it lets the caller recognise album items that belong together.
+	if descriptor != nil {
+		descriptor.GroupID = m.MediaGroupID
+	}
+	return descriptor
 }
 
 // fileDescriptor decodes a Telegram file sub-object into a MediaDescriptor,

@@ -34,6 +34,11 @@ type UserBotRecord struct {
 	// Nil delivery toggles inherit role/owner defaults; non-nil values override them.
 	RichFormattingEnabled *bool
 	StreamingEnabled      *bool
+	// PersonalMode makes the bot answer only the owner and an explicit allowlist
+	// (personal_bot_allowed_users); every other sender gets a one-time stub reply,
+	// then silence. Default false — behaviour is unchanged until the owner opts in.
+	// Managed via SetUserBotPersonalMode so re-register/offset writes preserve it.
+	PersonalMode bool
 }
 
 // botStoreKey is the in-memory map key for a single bot registration. A tenant
@@ -67,6 +72,11 @@ func (r *Repository) SaveUserBot(record UserBotRecord) {
 		}
 		if record.StreamingEnabled == nil {
 			record.StreamingEnabled = cloneBoolPtr(existing.StreamingEnabled)
+		}
+		// personal_mode is not written by the INSERT below (re-register preserves it
+		// in the DB via the untouched column); mirror that in memory.
+		if !record.PersonalMode {
+			record.PersonalMode = existing.PersonalMode
 		}
 	}
 	r.userBots[key] = record
@@ -146,7 +156,7 @@ func scanUserBot(sc rowScanner) (UserBotRecord, bool) {
 	var streaming sql.NullBool
 	if err := sc.Scan(
 		&rec.TenantID, &rec.BotID, &rec.BotUsername, &rec.Token, &rec.Status, &rec.LastUpdateOffset,
-		&roleID, &activeRoleContextID, &richFormatting, &streaming,
+		&roleID, &activeRoleContextID, &richFormatting, &streaming, &rec.PersonalMode,
 	); err != nil {
 		return UserBotRecord{}, false
 	}
@@ -157,7 +167,7 @@ func scanUserBot(sc rowScanner) (UserBotRecord, bool) {
 	return rec, true
 }
 
-const userBotColumns = `tenant_id, bot_id, bot_username, token, status, last_update_offset, COALESCE(ai_role_id, 0), COALESCE(active_role_context_id, 0), rich_formatting_enabled, streaming_enabled`
+const userBotColumns = `tenant_id, bot_id, bot_username, token, status, last_update_offset, COALESCE(ai_role_id, 0), COALESCE(active_role_context_id, 0), rich_formatting_enabled, streaming_enabled, COALESCE(personal_mode, false)`
 
 // UserBotByID returns one specific bot of the tenant.
 func (r *Repository) UserBotByID(tenantID string, botID int64) (UserBotRecord, bool) {

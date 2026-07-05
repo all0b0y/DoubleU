@@ -230,6 +230,10 @@ type AIRoleRecord struct {
 	// SpeakAsOwner mirrors contracts.AIRole.SpeakAsOwner. true (default) = the
 	// AI impersonates the owner; false = the AI responds as the role persona.
 	SpeakAsOwner bool
+	// AutoLearnProfile controls whether AI-proposed profile-field updates are
+	// applied automatically (true, default) or wait in the owner-review queue
+	// (false). Go-only policy flag — never sent to the AI service. Migration 123.
+	AutoLearnProfile bool
 	// ModelTier is the LLM quality tier for draft generation: "fast",
 	// "balanced" (default), or "smart". Empty = use the DRAFT task model.
 	ModelTier string

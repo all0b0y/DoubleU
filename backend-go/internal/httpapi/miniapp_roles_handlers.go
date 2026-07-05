@@ -49,6 +49,9 @@ type roleJSON struct {
 	// SpeakAsOwner: true = reply as the owner (personal-chat impersonation);
 	// false = reply as the bot/role persona.
 	SpeakAsOwner bool `json:"speak_as_owner"`
+	// AutoLearnProfile: true (default) = AI-proposed profile updates apply
+	// automatically (revertible); false = they wait for manual owner review.
+	AutoLearnProfile bool `json:"auto_learn_profile"`
 	// ModelTier selects the LLM quality tier: "fast", "balanced" (default), or "smart".
 	ModelTier string `json:"model_tier,omitempty"`
 	// ModelName optionally pins a concrete model within ModelTier.
@@ -77,6 +80,7 @@ func roleToJSON(role store.AIRoleRecord) roleJSON {
 		RichFormattingEnabled: cloneBoolPtr(role.RichFormattingEnabled),
 		StreamingEnabled:      cloneBoolPtr(role.StreamingEnabled),
 		SpeakAsOwner:          role.SpeakAsOwner,
+		AutoLearnProfile:      role.AutoLearnProfile,
 		ModelTier:             role.ModelTier,
 		ModelName:             role.ModelName,
 		ToolSettings:          toolSettings,
@@ -98,6 +102,9 @@ type roleRequest struct {
 	// SpeakAsOwner is a pointer so an omitted field keeps the create-time
 	// default (true) / the existing value on update, rather than forcing false.
 	SpeakAsOwner *bool `json:"speak_as_owner"`
+	// AutoLearnProfile is a pointer so an omitted field keeps the create-time
+	// default (true) / the existing value on update.
+	AutoLearnProfile *bool `json:"auto_learn_profile"`
 	// ModelTier selects the LLM quality tier: "fast", "balanced", or "smart".
 	// Absent means keep the existing value (update) or "balanced" (create).
 	ModelTier *string `json:"model_tier"`
@@ -361,6 +368,7 @@ func (s *Server) apiCreateRole(w http.ResponseWriter, r *http.Request) {
 		RichFormattingEnabled: req.RichFormattingEnabled.Apply(nil),
 		StreamingEnabled:      req.StreamingEnabled.Apply(nil),
 		SpeakAsOwner:          boolOrDefault(req.SpeakAsOwner, true),
+		AutoLearnProfile:      boolOrDefault(req.AutoLearnProfile, true),
 		ModelTier:             stringOrDefault(req.ModelTier, "balanced"),
 		ModelName:             stringOrDefault(req.ModelName, ""),
 		ToolSettings:          toolSettingsOrDefault(req.ToolSettings, nil),
@@ -413,6 +421,7 @@ func (s *Server) apiUpdateRole(w http.ResponseWriter, r *http.Request) {
 		RichFormattingEnabled: req.RichFormattingEnabled.Apply(existing.RichFormattingEnabled),
 		StreamingEnabled:      req.StreamingEnabled.Apply(existing.StreamingEnabled),
 		SpeakAsOwner:          boolOrDefault(req.SpeakAsOwner, existing.SpeakAsOwner),
+		AutoLearnProfile:      boolOrDefault(req.AutoLearnProfile, existing.AutoLearnProfile),
 		ModelTier:             stringOrDefault(req.ModelTier, existing.ModelTier),
 		ModelName:             stringOrDefault(req.ModelName, existing.ModelName),
 		ToolSettings:          toolSettingsOrDefault(req.ToolSettings, existing.ToolSettings),
@@ -523,7 +532,11 @@ func (s *Server) apiAssignChatRole(w http.ResponseWriter, r *http.Request) {
 func (s *Server) apiSuggestions(w http.ResponseWriter, r *http.Request) {
 	tenantID := tenantFromContext(r.Context())
 	chatID := r.PathValue("chat_id")
-	pending := s.service.Repository().PendingSuggestions(tenantID, chatID)
+	repo := s.service.Repository()
+	// Pending rows exist only for roles with auto-learn off (manual review);
+	// auto-applied rows are surfaced as revertible so the owner can undo.
+	pending := repo.PendingSuggestions(tenantID, chatID)
+	revertable := repo.RevertableSuggestions(tenantID, chatID)
 	type suggestionItem struct {
 		ID              int64  `json:"id"`
 		ChatID          string `json:"chat_id"`
@@ -533,27 +546,43 @@ func (s *Server) apiSuggestions(w http.ResponseWriter, r *http.Request) {
 		SuggestedValue  string `json:"suggested_value"`
 		Rationale       string `json:"rationale,omitempty"`
 		CreatedAt       string `json:"created_at"`
+		AutoApplied     bool   `json:"auto_applied"`
 	}
-	items := make([]suggestionItem, 0, len(pending))
-	for _, sg := range pending {
-		chatName := sg.ChatID
-		if chat, ok := s.service.Repository().ChatBySelector(tenantID, sg.ChatID); ok && chat.DisplayName != "" {
-			chatName = chat.DisplayName
+	nameCache := make(map[string]string)
+	chatName := func(id string) string {
+		if v, ok := nameCache[id]; ok {
+			return v
 		}
+		name := id
+		if chat, ok := repo.ChatBySelector(tenantID, id); ok && chat.DisplayName != "" {
+			name = chat.DisplayName
+		}
+		nameCache[id] = name
+		return name
+	}
+	toItem := func(sg store.ProfileSuggestionRecord, autoApplied bool) suggestionItem {
 		label := bot.SuggestionFieldLabels[sg.FieldName]
 		if label == "" {
 			label = sg.FieldName
 		}
-		items = append(items, suggestionItem{
+		return suggestionItem{
 			ID:              sg.ID,
 			ChatID:          sg.ChatID,
-			ChatDisplayName: chatName,
+			ChatDisplayName: chatName(sg.ChatID),
 			FieldName:       sg.FieldName,
 			FieldLabel:      label,
 			SuggestedValue:  sg.SuggestedValue,
 			Rationale:       sg.Rationale,
 			CreatedAt:       sg.CreatedAt.UTC().Format("2006-01-02T15:04:05Z"),
-		})
+			AutoApplied:     autoApplied,
+		}
+	}
+	items := make([]suggestionItem, 0, len(pending)+len(revertable))
+	for _, sg := range pending {
+		items = append(items, toItem(sg, false))
+	}
+	for _, sg := range revertable {
+		items = append(items, toItem(sg, true))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"suggestions": items})
 }
@@ -567,18 +596,26 @@ func (s *Server) apiSuggestionAction(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 	var req struct {
-		Action string `json:"action"` // "accept" | "reject"
+		Action string `json:"action"` // "accept" | "reject" | "revert"
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	if req.Action != "accept" && req.Action != "reject" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "action must be accept or reject"})
+	repo := s.service.Repository()
+	var actErr error
+	switch req.Action {
+	case "accept", "reject":
+		actErr = repo.ResolveSuggestion(tenantID, id, req.Action == "accept")
+	case "revert":
+		// Undo an auto-applied suggestion, restoring the prior profile value.
+		actErr = repo.RevertSuggestion(tenantID, id)
+	default:
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "action must be accept, reject or revert"})
 		return
 	}
-	if err := s.service.Repository().ResolveSuggestion(tenantID, id, req.Action == "accept"); err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+	if actErr != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": actErr.Error()})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": req.Action + "ed"})

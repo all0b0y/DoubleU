@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"time"
 
@@ -11,6 +12,47 @@ import (
 	tracepkg "doubleu/backend-go/internal/trace"
 )
 
+// aiProcessMaxAttempts bounds process-message tries. A second attempt only runs
+// for a transient failure — see processMessageWithRetry.
+const aiProcessMaxAttempts = 2
+
+// processMessageWithRetry calls the AI process-message endpoint, retrying once on
+// a transient failure so a momentary blip (ai-service restart, connection reset,
+// a fast 5xx) does not cost the contact their reply. A deadline-exceeded is NOT
+// retried: it means the model is genuinely slow, so a fresh attempt would only
+// run out the clock again and double the wait — the caller's graceful notice
+// covers that case instead.
+func (s *Service) processMessageWithRetry(ctx context.Context, event contracts.NormalizedTelegramEvent, request contracts.AIProcessMessageRequest) (contracts.AIProcessMessageResponse, error) {
+	var proposal contracts.AIProcessMessageResponse
+	var err error
+	for attempt := 1; attempt <= aiProcessMaxAttempts; attempt++ {
+		proposal, err = s.ai.ProcessMessage(ctx, request)
+		if err == nil {
+			return proposal, nil
+		}
+		if attempt == aiProcessMaxAttempts || isTimeoutError(err) || ctx.Err() != nil {
+			break
+		}
+		s.logger.Warn("ai analysis transient failure; retrying",
+			"tenant_id", event.TenantID, "chat_id", event.ChatID,
+			"attempt", attempt, "error", err)
+	}
+	return proposal, err
+}
+
+// isTimeoutError reports whether err is a client/context timeout (the model was
+// simply too slow) rather than a transient, fast-failing error worth retrying.
+func isTimeoutError(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var timeoutErr interface{ Timeout() bool }
+	if errors.As(err, &timeoutErr) {
+		return timeoutErr.Timeout()
+	}
+	return false
+}
+
 // processContactMessage is the transport-agnostic inbound pipeline shared by
 // the Business webhook path and the bot polling path: persist → dedupe →
 // episode upkeep → debounce → AI call → policy decision → dispatch.
@@ -18,6 +60,16 @@ import (
 // owner-facing draft explaining why replies are blocked (Business-specific
 // can_reply permission).
 func (s *Service) processContactMessage(ctx context.Context, event contracts.NormalizedTelegramEvent, ownerID string, replyBlockNote string) (InboundResult, error) {
+	// Redact credentials/PII before the message is stored, sent to the AI,
+	// extracted into memory, or embedded — the single choke point both transports
+	// funnel through (owner policy, 2026-07-04). Doing it here means the model
+	// never sees the raw secret and so cannot echo it.
+	if redacted, ok := redactSecrets(event.MessageText); ok {
+		event.MessageText = redacted
+		s.logger.Info("secrets redacted from inbound message",
+			"tenant_id", event.TenantID, "chat_id", event.ChatID,
+			"source_message_id", event.SourceMessageID)
+	}
 	settings := s.repository.ChatSettings(event.TenantID, event.ChatID)
 	roleContextID := s.activeRoleContextIDForEvent(event)
 	s.repository.SaveChat(store.ChatRecord{
@@ -303,7 +355,7 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 		"privacy_flags", settings.PrivacyFlags,
 		"memory_context_count", len(request.MemoryContext),
 	)
-	proposal, err := s.ai.ProcessMessage(ctx, request)
+	proposal, err := s.processMessageWithRetry(ctx, event, request)
 	if s.notify != nil {
 		s.notify(event.TenantID, "ai_done", map[string]any{"chat_id": event.ChatID})
 	}
@@ -328,6 +380,22 @@ func (s *Service) processContactMessage(ctx context.Context, event contracts.Nor
 	// so it never adds latency to the reply path (see backlog §7.1).
 	if !settings.PrivacyFlags.Contains(contracts.PrivacyNoMemory) && !s.pythonOwnsMemory() {
 		s.saveExtractedFactsWithRoleContext(event, proposal.MemoryUsed, roleContextID)
+	}
+	// Auto-apply AI-proposed profile-field updates when the role opts in (the
+	// default) and memory is allowed. The suggest_profile_update tool has already
+	// committed any suggestions to the DB during process-message, so they are
+	// visible here. Best-effort: a failure never blocks the reply. When the role
+	// has auto-learn off, suggestions stay pending for manual owner review.
+	if !settings.PrivacyFlags.Contains(contracts.PrivacyNoMemory) {
+		if role, ok := s.resolveRole(event.TenantID, event.ChatID); !ok || role.AutoLearnProfile {
+			if n, err := s.repository.AutoApplyProfileSuggestions(event.TenantID, event.ChatID); err != nil {
+				s.logger.Warn("auto-apply profile suggestions failed",
+					"tenant_id", event.TenantID, "chat_id", event.ChatID, "error", err)
+			} else if n > 0 {
+				s.logger.Info("auto-applied profile suggestions",
+					"tenant_id", event.TenantID, "chat_id", event.ChatID, "count", n)
+			}
+		}
 	}
 	s.logger.Info("ai analysis completed",
 		"tenant_id", event.TenantID,

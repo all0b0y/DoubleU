@@ -107,6 +107,38 @@ func TestHTTPClientDraftRoleContract(t *testing.T) {
 	}
 }
 
+func TestHTTPClientDraftSkillContract(t *testing.T) {
+	client := NewHTTPClient("http://ai-service", &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path != "/ai/draft-skill" {
+			return responseWithStatus(http.StatusNotFound, "not found"), nil
+		}
+		var request map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if request["text"] != "Как отвечать на возражения" || len(request) != 1 {
+			t.Fatalf("draft-skill request contract = %#v", request)
+		}
+		var body bytes.Buffer
+		_ = json.NewEncoder(&body).Encode(DraftSkillResponse{
+			Name:        "работа-с-возражениями",
+			Description: "Как отвечать на ценовые возражения.",
+			Body:        "## Когда применять\n...",
+		})
+		return responseWithStatus(http.StatusOK, body.String()), nil
+	})})
+
+	response, err := client.DraftSkill(
+		context.Background(), DraftSkillRequest{Text: "Как отвечать на возражения"},
+	)
+	if err != nil {
+		t.Fatalf("draft skill: %v", err)
+	}
+	if response.Name != "работа-с-возражениями" || response.Body == "" {
+		t.Fatalf("draft-skill response contract = %+v", response)
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {

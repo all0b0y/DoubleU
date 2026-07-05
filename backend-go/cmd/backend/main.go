@@ -110,12 +110,11 @@ func main() {
 	var service *core.Service
 	botManager := botservice.NewManager(repository,
 		botservice.HandlerFuncs{Message: botservice.HandlerFunc(func(ctx context.Context, event contracts.NormalizedTelegramEvent, media *telegram.MediaDescriptor) error {
-			// Turn any voice/photo/document into text before AI processing so the
-			// agent stays text-only (media -> text). Best-effort: never blocks the
-			// message on extraction failure.
-			event = service.EnrichBotMedia(ctx, event, media)
-			_, err := service.HandleBotMessage(ctx, event)
-			return err
+			// Coalesce the items of a Telegram album (same media_group_id) into one
+			// turn, then turn any voice/photo/document into text before AI processing
+			// so the agent stays text-only (media -> text). Best-effort: never blocks
+			// the message on extraction failure.
+			return service.HandleBotMediaGroup(ctx, event, media)
 		}), Callback: func(ctx context.Context, callback telegram.CallbackQueryUpdate, tenantID, botID string) error {
 			_, err := service.HandleBotCallbackQuery(ctx, callback, tenantID, botID)
 			return err
@@ -126,6 +125,9 @@ func main() {
 	)
 	mediaCfg := core.DefaultMediaConfig()
 	mediaCfg.Enabled = cfg.MediaExtractionEnabled
+	if cfg.MediaGroupWindow > 0 {
+		mediaCfg.GroupWindow = cfg.MediaGroupWindow
+	}
 	service = core.NewService(repository, ai, sender,
 		core.WithLogger(logger),
 		core.WithReplyDelay(cfg.ReplyDelay),
@@ -135,6 +137,7 @@ func main() {
 		core.WithAIMemorySource(string(flags.AIMemorySource)),
 		core.WithReflectionMode(string(flags.ReflectionMode)),
 		core.WithMediaConfig(mediaCfg),
+		core.WithPersonalBotStubText(cfg.PersonalBotStubText),
 	)
 	server := httpapi.NewServer(service,
 		httpapi.WithHub(hub),

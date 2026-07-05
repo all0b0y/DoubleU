@@ -128,6 +128,7 @@ func (s *Server) routes() {
 
 	// Skills (owner-authored content layer) — CRUD plus per-role selection.
 	s.mux.HandleFunc("GET /api/v1/skills", s.tmaAuth(s.apiListSkills))
+	s.mux.HandleFunc("POST /api/v1/skills/draft", s.tmaAuth(s.apiDraftSkill))
 	s.mux.HandleFunc("POST /api/v1/skills", s.tmaAuth(s.apiCreateSkill))
 	s.mux.HandleFunc("PUT /api/v1/skills/{skill_id}", s.tmaAuth(s.apiUpdateSkill))
 	s.mux.HandleFunc("DELETE /api/v1/skills/{skill_id}", s.tmaAuth(s.apiDeleteSkill))
@@ -159,6 +160,9 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/v1/bots", s.tmaAuth(s.apiRegisterBot))
 	s.mux.HandleFunc("PATCH /api/v1/bots/{bot_id}/role", s.tmaAuth(s.apiSetBotRole))
 	s.mux.HandleFunc("PUT /api/v1/bots/{bot_id}/role", s.tmaAuth(s.apiSetBotRole))
+	s.mux.HandleFunc("GET /api/v1/bots/{bot_id}/allowlist", s.tmaAuth(s.apiListBotAllowlist))
+	s.mux.HandleFunc("POST /api/v1/bots/{bot_id}/allowlist", s.tmaAuth(s.apiAddBotAllowlist))
+	s.mux.HandleFunc("DELETE /api/v1/bots/{bot_id}/allowlist/{user_id}", s.tmaAuth(s.apiRemoveBotAllowlist))
 	s.mux.HandleFunc("DELETE /api/v1/bots/{bot_id}", s.tmaAuth(s.apiDisconnectBot))
 	s.mux.HandleFunc("GET /api/v1/settings/ingestion-mode", s.tmaAuth(s.apiGetIngestionMode))
 	s.mux.HandleFunc("PUT /api/v1/settings/ingestion-mode", s.tmaAuth(s.apiSetIngestionMode))

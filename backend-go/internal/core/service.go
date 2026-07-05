@@ -55,48 +55,44 @@ func (DecisionEngine) Decide(settings contracts.ChatSettings, proposal contracts
 	if settings.Mode == contracts.ChatModeSilent {
 		return contracts.DecisionObserve, "chat_silent"
 	}
-	if proposal.RiskLevel == contracts.RiskCritical {
-		// OwnerNote carries the owner-facing warning (ARCH-1); ResponseText is a
-		// legacy fallback for AI services that still put the warning there. In
-		// both cases the text is owner-only and never sendable to the contact.
-		if strings.TrimSpace(proposal.OwnerNote) == "" && strings.TrimSpace(proposal.ResponseText) == "" {
-			return contracts.DecisionIgnore, "critical_risk_no_safe_draft"
-		}
-		return contracts.DecisionAskOwner, "critical_risk_owner_required"
-	}
-	if proposal.RiskLevel == contracts.RiskHigh {
-		return contracts.DecisionDraft, "high_risk_draft_only"
-	}
-	if proposal.RiskLevel == contracts.RiskMedium {
-		return contracts.DecisionDraft, "medium_risk_draft_default"
-	}
+	// MANUAL mode and PRIVATE chats always defer to the owner: every message is
+	// drafted for manual review regardless of risk (owner policy, 2026-07-04).
 	if settings.Mode == contracts.ChatModeManual {
 		return contracts.DecisionDraft, "manual_mode_owner_required"
 	}
 	if settings.PrivacyFlags.Contains(contracts.PrivacyPrivate) {
 		return contracts.DecisionDraft, "private_chat_blocks_auto_reply"
 	}
-	// AUTO mode: the owner explicitly opts into unsupervised replies and accepts
-	// the risk, so the confidence gate is removed — every low-risk message
-	// auto-sends (owner decision, 2026-06-16). MEDIUM/HIGH/CRITICAL risk already
-	// returned a draft/ask_owner above, so only low risk reaches here. The empty
-	// guard keeps a model that produced no text from sending a blank message.
-	if settings.Mode == contracts.ChatModeAuto {
+	// CRITICAL risk is handled, not blocked. Sensitive personal data is redacted
+	// upstream at ingestion (redactSecrets), so the only critical signal that
+	// survives is sexual content — answered with a gentle neutral auto-reply. If
+	// the AI produced no sendable text (empty ResponseText, e.g. the unredacted-
+	// secret backstop that sets OwnerNote only), it is held for the owner instead
+	// of sending a blank message.
+	if proposal.RiskLevel == contracts.RiskCritical {
 		if strings.TrimSpace(proposal.ResponseText) == "" {
-			return contracts.DecisionDraft, "auto_mode_no_reply_text"
+			if strings.TrimSpace(proposal.OwnerNote) == "" {
+				return contracts.DecisionIgnore, "critical_risk_no_safe_draft"
+			}
+			return contracts.DecisionAskOwner, "critical_risk_owner_required"
 		}
-		return contracts.DecisionAutoReply, "auto_mode_low_risk_send"
+		return contracts.DecisionAutoReply, "critical_risk_neutral_reply"
 	}
-	// SEMI-AUTO (and any other mode) still defer to the AI's auto-reply request
-	// and the confidence threshold: send only when the model is confident.
-	if proposal.Decision != contracts.DecisionAutoReply {
-		return contracts.DecisionDraft, "ai_did_not_request_auto_reply"
+	// Empty guard: a model that produced no text must never send a blank reply.
+	if strings.TrimSpace(proposal.ResponseText) == "" {
+		return contracts.DecisionDraft, "no_reply_text"
 	}
-	if settings.Mode == contracts.ChatModeSemiAuto {
-		if proposal.Confidence >= contracts.SemiAutoMinConfidence {
-			return contracts.DecisionAutoReply, "semi_auto_confidence_met"
+	// Risk-tolerance by mode (owner policy, 2026-07-04):
+	//   AUTO      — auto-sends LOW/MEDIUM/HIGH.
+	//   SEMI_AUTO — auto-sends LOW/MEDIUM; holds HIGH for a draft.
+	switch settings.Mode {
+	case contracts.ChatModeAuto:
+		return contracts.DecisionAutoReply, "auto_mode_send"
+	case contracts.ChatModeSemiAuto:
+		if proposal.RiskLevel == contracts.RiskHigh {
+			return contracts.DecisionDraft, "semi_auto_high_risk_draft"
 		}
-		return contracts.DecisionDraft, "semi_auto_confidence_below_threshold"
+		return contracts.DecisionAutoReply, "semi_auto_send"
 	}
 	return contracts.DecisionDraft, "safe_default_draft"
 }
@@ -161,6 +157,15 @@ type Service struct {
 	// mediaLimiters gives each tenant a token bucket over media extraction so a
 	// media flood cannot run up provider cost. Keyed by tenant id; built lazily.
 	mediaLimiters sync.Map
+	// mediaGroups buffers the in-flight items of Telegram albums (attachments
+	// sharing a media_group_id) so they coalesce into one AI turn. Keyed by
+	// tenant|chat|group; entries are short-lived (one debounce window). The mutex
+	// guards both the map and each buffer's item slice/timer.
+	mediaGroupsMu sync.Mutex
+	mediaGroups   map[string]*mediaGroupBuffer
+	// personalBotStubText is the branded reply a personal-mode bot sends once to a
+	// non-allowed sender. Empty falls back to defaultPersonalBotStubText.
+	personalBotStubText string
 	// defaultIngestionMode applies to tenants that have not chosen a mode
 	// explicitly (env INGESTION_MODE_DEFAULT; "bot" while the Business path
 	// is shelved).
@@ -348,6 +353,16 @@ func WithMediaConfig(cfg MediaConfig) Option {
 	}
 }
 
+// WithPersonalBotStubText overrides the branded reply a personal-mode bot sends
+// to a non-allowed sender. Empty keeps the built-in default.
+func WithPersonalBotStubText(text string) Option {
+	return func(service *Service) {
+		if strings.TrimSpace(text) != "" {
+			service.personalBotStubText = text
+		}
+	}
+}
+
 // NewService creates a backend core service.
 func NewService(repository *store.Repository, ai aiclient.Client, sender telegram.Sender, options ...Option) *Service {
 	if repository == nil {
@@ -372,6 +387,7 @@ func NewService(repository *store.Repository, ai aiclient.Client, sender telegra
 		chatRate:             defaultChatRate,
 		chatBurst:            defaultChatBurst,
 		media:                DefaultMediaConfig(),
+		mediaGroups:          make(map[string]*mediaGroupBuffer),
 	}
 	for _, option := range options {
 		option(service)

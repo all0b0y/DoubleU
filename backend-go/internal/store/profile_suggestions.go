@@ -4,6 +4,8 @@ import (
 	"database/sql"
 	"fmt"
 	"time"
+
+	"doubleu/backend-go/internal/contracts"
 )
 
 // ============================================================
@@ -20,8 +22,68 @@ type ProfileSuggestionRecord struct {
 	FieldName      string
 	SuggestedValue string
 	Rationale      string
-	Status         string // pending | accepted | rejected | expired
+	Status         string // pending | accepted | rejected | expired | reverted
 	CreatedAt      time.Time
+	// AutoApplied is true for suggestions applied by the auto-learn path (no
+	// owner review); such rows are revertible via RevertSuggestion.
+	AutoApplied bool
+	// PreviousValue is the profile field's value captured at auto-apply time,
+	// so a revert can restore it (empty = the field was unset).
+	PreviousValue string
+}
+
+// profileFieldValue reads one whitelisted profile field by name; unknown names
+// yield "" (callers whitelist-check via suggestionProfileFields first).
+func profileFieldValue(p contracts.ContactProfile, field string) string {
+	switch field {
+	case "relationship_type":
+		return p.RelationshipType
+	case "preferred_address":
+		return p.PreferredAddress
+	case "language":
+		return p.Language
+	case "tone":
+		return p.Tone
+	case "gender":
+		return p.Gender
+	}
+	return ""
+}
+
+// setProfileFieldValue writes one whitelisted profile field by name.
+func setProfileFieldValue(p *contracts.ContactProfile, field, value string) {
+	switch field {
+	case "relationship_type":
+		p.RelationshipType = value
+	case "preferred_address":
+		p.PreferredAddress = value
+	case "language":
+		p.Language = value
+	case "tone":
+		p.Tone = value
+	case "gender":
+		p.Gender = value
+	}
+}
+
+// applyProfileFieldTx ensures the profile row exists and sets one whitelisted
+// column within tx. Callers MUST validate fieldName against
+// suggestionProfileFields before calling — fieldName lands in an identifier
+// position, so an unvalidated value would be a SQL-injection vector.
+func applyProfileFieldTx(tx *sql.Tx, tenantID, chatID, fieldName, value string) error {
+	if _, err := tx.Exec(
+		`INSERT INTO contact_profiles (tenant_id, chat_id)
+		 VALUES ($1, $2) ON CONFLICT (tenant_id, chat_id) DO NOTHING`,
+		tenantID, chatID,
+	); err != nil {
+		return err
+	}
+	_, err := tx.Exec(
+		fmt.Sprintf(`UPDATE contact_profiles SET %s = $3, updated_at = now()
+		  WHERE tenant_id = $1 AND chat_id = $2`, fieldName),
+		tenantID, chatID, value,
+	)
+	return err
 }
 
 // suggestionProfileFields whitelists the contact_profiles columns a suggestion
@@ -137,18 +199,7 @@ func (r *Repository) ResolveSuggestion(tenantID string, id int64, accept bool) e
 		if accept {
 			profile, _ := r.ContactProfile(tenantID, resolved.ChatID)
 			profile.TenantID, profile.ChatID = tenantID, resolved.ChatID
-			switch resolved.FieldName {
-			case "relationship_type":
-				profile.RelationshipType = resolved.SuggestedValue
-			case "preferred_address":
-				profile.PreferredAddress = resolved.SuggestedValue
-			case "language":
-				profile.Language = resolved.SuggestedValue
-			case "tone":
-				profile.Tone = resolved.SuggestedValue
-			case "gender":
-				profile.Gender = resolved.SuggestedValue
-			}
+			setProfileFieldValue(&profile, resolved.FieldName, resolved.SuggestedValue)
 			r.SaveContactProfile(profile)
 		}
 		return nil
@@ -173,21 +224,7 @@ func (r *Repository) ResolveSuggestion(tenantID string, id int64, accept bool) e
 			_ = tx.Rollback()
 			return fmt.Errorf("suggestion field %q is not allowed", fieldName)
 		}
-		// Ensure the profile row exists, then set the single whitelisted column.
-		if _, err := tx.Exec(
-			`INSERT INTO contact_profiles (tenant_id, chat_id)
-			 VALUES ($1, $2) ON CONFLICT (tenant_id, chat_id) DO NOTHING`,
-			tenantID, chatID,
-		); err != nil {
-			_ = tx.Rollback()
-			return err
-		}
-		// fieldName is whitelist-validated above — safe in identifier position.
-		if _, err := tx.Exec(
-			fmt.Sprintf(`UPDATE contact_profiles SET %s = $3, updated_at = now()
-			  WHERE tenant_id = $1 AND chat_id = $2`, fieldName),
-			tenantID, chatID, value,
-		); err != nil {
+		if err := applyProfileFieldTx(tx, tenantID, chatID, fieldName, value); err != nil {
 			_ = tx.Rollback()
 			return err
 		}
@@ -202,6 +239,238 @@ func (r *Repository) ResolveSuggestion(tenantID string, id int64, accept bool) e
 		delete(r.contactProfiles, chatKey(tenantID, chatID))
 		r.mu.Unlock()
 	}
+	return nil
+}
+
+// RevertableSuggestions returns the most recent auto-applied (still-accepted)
+// suggestion per field for a chat (or the whole tenant when chatID is empty),
+// so the Mini App can offer an undo. Only the latest per field is returned —
+// older rows carry a stale previous_value and must not be surfaced for revert.
+func (r *Repository) RevertableSuggestions(tenantID, chatID string) []ProfileSuggestionRecord {
+	if r.db == nil {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		latest := make(map[string]ProfileSuggestionRecord)
+		for _, s := range r.profileSuggestions {
+			if s.TenantID == tenantID && s.Status == "accepted" && s.AutoApplied &&
+				(chatID == "" || s.ChatID == chatID) {
+				key := s.ChatID + "\x00" + s.FieldName
+				if prev, ok := latest[key]; !ok || s.ID > prev.ID {
+					latest[key] = s
+				}
+			}
+		}
+		result := make([]ProfileSuggestionRecord, 0, len(latest))
+		for _, s := range latest {
+			result = append(result, s)
+		}
+		return result
+	}
+	rows, err := r.db.Query(
+		`SELECT DISTINCT ON (chat_id, field_name)
+		        id, tenant_id, chat_id, field_name, suggested_value #>> '{}',
+		        COALESCE(rationale,''), status, created_at
+		   FROM contact_profile_suggestions
+		  WHERE tenant_id = $1 AND ($2 = '' OR chat_id = $2)
+		    AND status = 'accepted' AND auto_applied = true
+		  ORDER BY chat_id, field_name, reviewed_at DESC`,
+		tenantID, chatID,
+	)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	result := make([]ProfileSuggestionRecord, 0)
+	for rows.Next() {
+		var s ProfileSuggestionRecord
+		s.AutoApplied = true
+		if rows.Scan(&s.ID, &s.TenantID, &s.ChatID, &s.FieldName, &s.SuggestedValue,
+			&s.Rationale, &s.Status, &s.CreatedAt) == nil {
+			result = append(result, s)
+		}
+	}
+	return result
+}
+
+// AutoApplyProfileSuggestions applies every pending suggestion for a chat
+// straight to contact_profiles, marking each accepted+auto_applied and
+// capturing the pre-change value for a later revert. This is the auto-learn
+// path (no owner review); callers gate it on the role's AutoLearnProfile flag
+// and on privacy. Idempotent: only pending→accepted transitions happen, so a
+// re-run applies nothing. Returns the number of suggestions applied.
+func (r *Repository) AutoApplyProfileSuggestions(tenantID, chatID string) (int, error) {
+	if r.db == nil {
+		return r.autoApplyProfileSuggestionsInMemory(tenantID, chatID), nil
+	}
+	// Collect pending rows first; database/sql forbids other statements on the
+	// same tx while a result set is open.
+	rows, err := r.db.Query(
+		`SELECT id, field_name, suggested_value #>> '{}'
+		   FROM contact_profile_suggestions
+		  WHERE tenant_id = $1 AND chat_id = $2 AND status = 'pending'
+		  ORDER BY created_at ASC`,
+		tenantID, chatID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	type pending struct {
+		id    int64
+		field string
+		value string
+	}
+	var todo []pending
+	for rows.Next() {
+		var p pending
+		if err := rows.Scan(&p.id, &p.field, &p.value); err == nil {
+			todo = append(todo, p)
+		}
+	}
+	rows.Close()
+
+	applied := 0
+	for _, p := range todo {
+		if !suggestionProfileFields[p.field] {
+			continue // defence-in-depth; SaveProfileSuggestion already whitelists
+		}
+		tx, err := r.db.Begin()
+		if err != nil {
+			return applied, err
+		}
+		// Snapshot the current value (whitelisted field) for revert.
+		var prev sql.NullString
+		if err := tx.QueryRow(
+			fmt.Sprintf(`SELECT %s FROM contact_profiles WHERE tenant_id = $1 AND chat_id = $2`, p.field),
+			tenantID, chatID,
+		).Scan(&prev); err != nil && err != sql.ErrNoRows {
+			_ = tx.Rollback()
+			return applied, err
+		}
+		res, err := tx.Exec(
+			`UPDATE contact_profile_suggestions
+			    SET status = 'accepted', auto_applied = true,
+			        previous_value = to_jsonb($3::text), reviewed_at = now()
+			  WHERE tenant_id = $1 AND id = $2 AND status = 'pending'`,
+			tenantID, p.id, nullableString(prev.String),
+		)
+		if err != nil {
+			_ = tx.Rollback()
+			return applied, err
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			// Lost the race (already resolved) — skip without applying.
+			_ = tx.Rollback()
+			continue
+		}
+		if err := applyProfileFieldTx(tx, tenantID, chatID, p.field, p.value); err != nil {
+			_ = tx.Rollback()
+			return applied, err
+		}
+		if err := tx.Commit(); err != nil {
+			return applied, err
+		}
+		applied++
+	}
+	if applied > 0 {
+		r.invalidateContextScore(tenantID, chatID)
+		r.mu.Lock()
+		delete(r.contactProfiles, chatKey(tenantID, chatID))
+		r.mu.Unlock()
+	}
+	return applied, nil
+}
+
+// autoApplyProfileSuggestionsInMemory is the r.db == nil path for tests.
+func (r *Repository) autoApplyProfileSuggestionsInMemory(tenantID, chatID string) int {
+	type pending struct {
+		idx   int
+		field string
+		value string
+	}
+	r.mu.Lock()
+	var todo []pending
+	for i := range r.profileSuggestions {
+		s := &r.profileSuggestions[i]
+		if s.TenantID == tenantID && s.ChatID == chatID && s.Status == "pending" &&
+			suggestionProfileFields[s.FieldName] {
+			todo = append(todo, pending{idx: i, field: s.FieldName, value: s.SuggestedValue})
+		}
+	}
+	r.mu.Unlock()
+
+	applied := 0
+	for _, p := range todo {
+		profile, _ := r.ContactProfile(tenantID, chatID)
+		profile.TenantID, profile.ChatID = tenantID, chatID
+		prev := profileFieldValue(profile, p.field)
+		setProfileFieldValue(&profile, p.field, p.value)
+		r.SaveContactProfile(profile)
+		r.mu.Lock()
+		r.profileSuggestions[p.idx].Status = "accepted"
+		r.profileSuggestions[p.idx].AutoApplied = true
+		r.profileSuggestions[p.idx].PreviousValue = prev
+		r.mu.Unlock()
+		applied++
+	}
+	return applied
+}
+
+// RevertSuggestion undoes an auto-applied suggestion: it restores the profile
+// field to the value captured at apply time and marks the row 'reverted'. Only
+// accepted+auto_applied rows are revertible (owner-accepted rows are not).
+func (r *Repository) RevertSuggestion(tenantID string, id int64) error {
+	if r.db == nil {
+		r.mu.Lock()
+		var target *ProfileSuggestionRecord
+		for i := range r.profileSuggestions {
+			s := &r.profileSuggestions[i]
+			if s.TenantID == tenantID && s.ID == id && s.Status == "accepted" && s.AutoApplied {
+				s.Status = "reverted"
+				target = s
+				break
+			}
+		}
+		r.mu.Unlock()
+		if target == nil {
+			return fmt.Errorf("auto-applied suggestion %d not found", id)
+		}
+		profile, _ := r.ContactProfile(tenantID, target.ChatID)
+		profile.TenantID, profile.ChatID = tenantID, target.ChatID
+		setProfileFieldValue(&profile, target.FieldName, target.PreviousValue)
+		r.SaveContactProfile(profile)
+		return nil
+	}
+	tx, err := r.db.Begin()
+	if err != nil {
+		return err
+	}
+	var chatID, fieldName string
+	var prev sql.NullString
+	if err := tx.QueryRow(
+		`UPDATE contact_profile_suggestions
+		    SET status = 'reverted', reviewed_at = now()
+		  WHERE tenant_id = $1 AND id = $2 AND status = 'accepted' AND auto_applied = true
+		  RETURNING chat_id, field_name, previous_value #>> '{}'`,
+		tenantID, id,
+	).Scan(&chatID, &fieldName, &prev); err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("auto-applied suggestion %d not found: %w", id, err)
+	}
+	if !suggestionProfileFields[fieldName] {
+		_ = tx.Rollback()
+		return fmt.Errorf("suggestion field %q is not allowed", fieldName)
+	}
+	if err := applyProfileFieldTx(tx, tenantID, chatID, fieldName, prev.String); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	r.invalidateContextScore(tenantID, chatID)
+	r.mu.Lock()
+	delete(r.contactProfiles, chatKey(tenantID, chatID))
+	r.mu.Unlock()
 	return nil
 }
 

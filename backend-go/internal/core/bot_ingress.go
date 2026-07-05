@@ -40,6 +40,11 @@ func (s *Service) HandleBotMessage(ctx context.Context, event contracts.Normaliz
 		"bot_id", event.BotID,
 		"source_message_id", event.SourceMessageID,
 	)
+	// Personal-bot mode: a bot the owner marked "personal" answers only the owner
+	// and its allowlist; anyone else gets a one-time stub and is never processed.
+	if result, intercepted := s.personalBotIntercept(ctx, event, ownerID); intercepted {
+		return result, nil
+	}
 	return s.processContactMessage(ctx, event, ownerID, "")
 }
 

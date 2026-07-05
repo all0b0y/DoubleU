@@ -71,6 +71,20 @@ func (s *Service) sendRecipientWithMarkup(ctx context.Context, event contracts.N
 		}
 		return s.sendRichRecipient(ctx, sender, msg)
 	}
+	// Plain format: the model is asked to reply without rich markup, but it still
+	// occasionally emits stray markdown (**bold**, ### heading) that would leak as
+	// raw tokens into the chat. Run it through the HTML converter and switch to
+	// parse_mode=HTML ONLY when the conversion actually changed something —
+	// otherwise send the text verbatim with no parse_mode, exactly as before.
+	// MarkdownToHTML only transforms matched constructs, so an ordinary plain reply
+	// (incl. incidental "5 * 5" or snake_case) is returned unchanged and takes the
+	// verbatim path.
+	if html := telegram.MarkdownToHTML(msg.Text); html != msg.Text {
+		htmlMsg := msg
+		htmlMsg.Text = html
+		htmlMsg.ParseMode = "HTML"
+		return sendMessage(ctx, sender, htmlMsg)
+	}
 	return sendMessage(ctx, sender, msg)
 }
 

@@ -31,6 +31,11 @@ type MediaConfig struct {
 	// fall back to a placeholder rather than triggering a provider call.
 	RatePerSec float64
 	Burst      int
+	// GroupWindow is how long the ingestion layer waits for more items of the same
+	// Telegram album (media_group_id) before processing them as one AI turn. It
+	// only needs to bridge the sub-second delivery gap between an album's updates,
+	// which Telegram sends as separate messages with no "album complete" signal.
+	GroupWindow time.Duration
 }
 
 // DefaultMediaConfig returns production defaults: extraction on, caps aligned
@@ -43,6 +48,7 @@ func DefaultMediaConfig() MediaConfig {
 		MaxAudioSeconds: 300,
 		RatePerSec:      1,
 		Burst:           5,
+		GroupWindow:     defaultMediaGroupWindow,
 	}
 }
 

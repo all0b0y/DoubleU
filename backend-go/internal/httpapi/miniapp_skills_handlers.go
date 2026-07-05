@@ -1,12 +1,16 @@
 package httpapi
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"unicode/utf8"
 
+	"doubleu/backend-go/internal/aiclient"
 	"doubleu/backend-go/internal/store"
 )
 
@@ -65,6 +69,129 @@ func (s *Server) apiListSkills(w http.ResponseWriter, r *http.Request) {
 		out = append(out, skillToJSON(rec))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"skills": out})
+}
+
+// skillDraftRequest is the authoring payload: exactly one source — free text,
+// a voice recording, or a chat to learn from.
+type skillDraftRequest struct {
+	Text        string `json:"text"`
+	AudioBase64 string `json:"audio_base64"`
+	MimeType    string `json:"mime_type"`
+	ChatID      string `json:"chat_id"` // "learn a skill from this chat"
+}
+
+// apiDraftSkill generates an editable skill draft from a description (text or
+// voice) or from a chat's history, without persisting anything. Only the
+// existing create endpoint saves the final skill. Mirrors apiDraftRole.
+func (s *Server) apiDraftSkill(w http.ResponseWriter, r *http.Request) {
+	if s.aiBaseURL == "" {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "ai service not configured"})
+		return
+	}
+	tenantID := tenantFromContext(r.Context())
+	defer r.Body.Close()
+	var req skillDraftRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	req.Text = strings.TrimSpace(req.Text)
+	req.AudioBase64 = strings.TrimSpace(req.AudioBase64)
+	req.MimeType = strings.TrimSpace(req.MimeType)
+	req.ChatID = strings.TrimSpace(req.ChatID)
+
+	// Exactly one source of truth.
+	provided := 0
+	for _, present := range []bool{req.Text != "", req.AudioBase64 != "", req.ChatID != ""} {
+		if present {
+			provided++
+		}
+	}
+	if provided != 1 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "provide exactly one of text, audio_base64 or chat_id"})
+		return
+	}
+	if len([]rune(req.Text)) > roleDraftTextMaxRunes {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "text is too long (max 8000 characters)"})
+		return
+	}
+	if len(req.AudioBase64) > roleDraftAudioMaxB64 {
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "audio is too large"})
+		return
+	}
+	if req.AudioBase64 != "" {
+		if req.MimeType == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "mime_type is required for audio"})
+			return
+		}
+		if _, err := base64.StdEncoding.DecodeString(req.AudioBase64); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "audio_base64 is invalid"})
+			return
+		}
+	}
+
+	client := aiclient.NewHTTPClient(s.aiBaseURL, &http.Client{Timeout: roleDraftHTTPTimeout})
+	source := req.Text
+	switch {
+	case req.AudioBase64 != "":
+		extracted, err := client.ExtractMedia(r.Context(), aiclient.ExtractMediaRequest{
+			Kind: "voice", DataBase64: req.AudioBase64, MimeType: req.MimeType,
+		})
+		if err != nil {
+			slog.WarnContext(r.Context(), "skill audio transcription failed",
+				"tenant_id", tenantID, "mime_type", req.MimeType, "error", err)
+			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "audio transcription failed"})
+			return
+		}
+		source = strings.TrimSpace(extracted.Text)
+		if source == "" {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "audio contains no recognizable speech"})
+			return
+		}
+	case req.ChatID != "":
+		source = s.chatSkillSource(tenantID, req.ChatID)
+		if source == "" {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "not enough chat history to learn a skill"})
+			return
+		}
+	}
+
+	draft, err := client.DraftSkill(r.Context(), aiclient.DraftSkillRequest{Text: source})
+	if err != nil {
+		slog.WarnContext(r.Context(), "skill drafting failed", "tenant_id", tenantID, "error", err)
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "skill drafting failed"})
+		return
+	}
+	if msg := validateSkillInput(draft.Name, draft.Description, draft.Body); msg != "" {
+		slog.WarnContext(r.Context(), "skill drafting returned invalid data", "tenant_id", tenantID, "reason", msg)
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "ai returned an invalid skill draft"})
+		return
+	}
+	writeJSON(w, http.StatusOK, skillJSON{
+		Name: draft.Name, Description: draft.Description, Body: draft.Body, Enabled: true,
+	})
+}
+
+// chatSkillSource assembles a compact digest of a chat's recent episode
+// summaries as authoring source for "learn a skill from this chat". Capped to
+// the draft text limit so the AI request stays within bounds.
+func (s *Server) chatSkillSource(tenantID, chatID string) string {
+	summaries := s.service.Repository().EpisodeSummaries(tenantID, chatID, 10)
+	var b strings.Builder
+	for _, su := range summaries {
+		content := strings.TrimSpace(su.Content)
+		if content == "" {
+			continue
+		}
+		b.WriteString("- ")
+		b.WriteString(content)
+		b.WriteString("\n")
+	}
+	digest := strings.TrimSpace(b.String())
+	if runes := []rune(digest); len(runes) > roleDraftTextMaxRunes {
+		digest = string(runes[:roleDraftTextMaxRunes])
+	}
+	return digest
 }
 
 func (s *Server) apiCreateSkill(w http.ResponseWriter, r *http.Request) {

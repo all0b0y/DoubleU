@@ -123,6 +123,12 @@ type Repository struct {
 	// (user_bots table / tenants.ingestion_mode column in Postgres mode).
 	userBots    map[string]UserBotRecord
 	tenantModes map[string]contracts.IngestionMode
+	// personal-bot mode in-memory fallbacks (migration 122): the per-bot
+	// allowlist of Telegram user ids, and the set of contacts already shown the
+	// stub. botAllowedUsers is keyed by botStoreKey → set of telegram ids;
+	// personalStubShown by tenantID+"#"+chatID.
+	botAllowedUsers   map[string]map[string]struct{}
+	personalStubShown map[string]struct{}
 	// roleContexts are reusable bot memory contexts keyed by bot and nullable role.
 	roleContexts   map[int64]RoleContextRecord
 	roleContextSeq int64
@@ -217,6 +223,8 @@ func NewRepository() *Repository {
 		unclaimedChats:      make(map[string]UnclaimedChatRecord),
 		userBots:            make(map[string]UserBotRecord),
 		tenantModes:         make(map[string]contracts.IngestionMode),
+		botAllowedUsers:     make(map[string]map[string]struct{}),
+		personalStubShown:   make(map[string]struct{}),
 		roleContexts:        make(map[int64]RoleContextRecord),
 		pendingInputs:       make(map[string]contracts.PendingInput),
 		contactProfiles:     make(map[string]contracts.ContactProfile),

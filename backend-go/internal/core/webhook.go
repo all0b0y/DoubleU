@@ -236,6 +236,12 @@ func (s *Service) HandleTelegramWebhook(ctx context.Context, payload []byte, ten
 			Status:               "pending",
 		})
 		if event.TenantID != "" {
+			// Redact credentials/PII before the unclaimed chat's history + passive
+			// fact extraction persist it (owner policy, 2026-07-04) — the claimed
+			// path redacts in processContactMessage instead.
+			if redacted, ok := redactSecrets(event.MessageText); ok {
+				event.MessageText = redacted
+			}
 			// Owner is known: persist the chat row + message so history survives claim.
 			s.repository.SaveChat(store.ChatRecord{
 				TenantID:             event.TenantID,

@@ -193,6 +193,21 @@ func (c *HTTPClient) DraftRole(ctx context.Context, request DraftRoleRequest) (D
 	return response, nil
 }
 
+// DraftSkill calls the Python AI /ai/draft-skill endpoint to generate an
+// editable skill draft from a free-text/transcribed description.
+func (c *HTTPClient) DraftSkill(ctx context.Context, request DraftSkillRequest) (DraftSkillResponse, error) {
+	var response DraftSkillResponse
+	if c.baseURL == "" {
+		return response, fmt.Errorf("ai base url is empty")
+	}
+	draftCtx, cancel := context.WithTimeout(ctx, draftRoleTimeout)
+	defer cancel()
+	if err := c.postJSON(draftCtx, "/ai/draft-skill", request, &response); err != nil {
+		return response, err
+	}
+	return response, nil
+}
+
 func (c *HTTPClient) postJSON(ctx context.Context, path string, input any, output any) error {
 	body, err := json.Marshal(input)
 	if err != nil {

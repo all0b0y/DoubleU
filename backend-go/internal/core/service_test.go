@@ -68,26 +68,45 @@ func TestDecisionEngineContractCombinations(t *testing.T) {
 					if !final.IsValid() {
 						t.Fatalf("invalid final decision for proposed=%s mode=%s privacy=%v risk=%s reason=%s", proposed, mode, privacy, risk, reason)
 					}
-					if final == contracts.DecisionAutoReply {
-						if risk != contracts.RiskLow {
-							t.Fatalf("auto_reply allowed for non-low risk: %s", risk)
+					// AI-driven short-circuits win over mode/risk policy.
+					if proposed == contracts.DecisionErrorFallback {
+						if final != contracts.DecisionErrorFallback {
+							t.Fatalf("error_fallback proposal should stay error_fallback, got %s", final)
 						}
-						if mode != contracts.ChatModeSemiAuto && mode != contracts.ChatModeAuto {
-							t.Fatalf("auto_reply allowed for mode %s", mode)
-						}
-						if privacy.Contains(contracts.PrivacyPrivate) {
-							t.Fatalf("auto_reply allowed for private chat")
-						}
-						// SEMI_AUTO still defers to the AI's auto-reply request; AUTO
-						// does not — the owner accepted unsupervised replies, so a
-						// low-risk message auto-sends regardless of the AI proposal.
-						if mode == contracts.ChatModeSemiAuto && proposed != contracts.DecisionAutoReply {
-							t.Fatalf("semi-auto auto_reply allowed without AI auto proposal")
-						}
+						continue
 					}
-					if risk == contracts.RiskCritical && proposed != contracts.DecisionIgnore && proposed != contracts.DecisionErrorFallback && mode != contracts.ChatModeDisabled && mode != contracts.ChatModeSilent {
-						if final != contracts.DecisionAskOwner {
-							t.Fatalf("critical risk should ask owner, got %s", final)
+					if proposed == contracts.DecisionIgnore {
+						if final != contracts.DecisionIgnore {
+							t.Fatalf("ignore proposal should stay ignore, got %s", final)
+						}
+						continue
+					}
+					// Owner policy (2026-07-04): never-auto surfaces stay locked for
+					// every risk level.
+					if mode == contracts.ChatModeDisabled || mode == contracts.ChatModeSilent ||
+						mode == contracts.ChatModeManual || privacy.Contains(contracts.PrivacyPrivate) {
+						if final == contracts.DecisionAutoReply {
+							t.Fatalf("auto_reply on locked surface mode=%s privacy=%v", mode, privacy)
+						}
+						continue
+					}
+					// Non-manual, non-private AUTO/SEMI_AUTO with a non-empty reply.
+					switch risk {
+					case contracts.RiskCritical:
+						// Handled by a neutral auto-reply (sexual redirect).
+						if final != contracts.DecisionAutoReply {
+							t.Fatalf("critical risk should auto-reply, got %s", final)
+						}
+					case contracts.RiskHigh:
+						if mode == contracts.ChatModeAuto && final != contracts.DecisionAutoReply {
+							t.Fatalf("auto high risk should auto-reply, got %s", final)
+						}
+						if mode == contracts.ChatModeSemiAuto && final != contracts.DecisionDraft {
+							t.Fatalf("semi_auto high risk should draft, got %s", final)
+						}
+					default: // low, medium — auto-send in both auto and semi_auto.
+						if final != contracts.DecisionAutoReply {
+							t.Fatalf("low/medium risk should auto-reply in mode %s, got %s", mode, final)
 						}
 					}
 				}

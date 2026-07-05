@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -30,6 +31,14 @@ type Config struct {
 	// (voice/photo/document). Default true; set MEDIA_EXTRACTION_ENABLED=false to
 	// disable all media provider calls (cost control).
 	MediaExtractionEnabled bool
+	// MediaGroupWindow is how long ingestion waits for more items of the same
+	// Telegram album before processing them as one AI turn. Override with
+	// MEDIA_GROUP_WINDOW_SECONDS; zero falls back to the core default.
+	MediaGroupWindow time.Duration
+	// PersonalBotStubText is the branded reply a personal bot sends (once) to a
+	// non-allowed sender. Override with PERSONAL_BOT_STUB_TEXT; empty falls back
+	// to the core default.
+	PersonalBotStubText string
 	// MCPSecretsKey is the 32-byte AES-256 key used to encrypt MCP auth headers
 	// at rest. Nil when MCP_SECRETS_KEY is unset (encryption disabled). Populated
 	// by the serve path via ParseMCPSecretsKey — never decoded silently, so an
@@ -63,8 +72,14 @@ func Load() Config {
 			timeout = time.Duration(seconds) * time.Second
 		}
 	}
-	// AI calls hit an LLM which can take 30-60s; give them a separate, longer timeout.
-	aiTimeout := 90 * time.Second
+	// AI calls hit an LLM which can be slow. The Python writer is now streamed
+	// with its own inactivity timeout, so it self-limits on a genuine stall and a
+	// large-but-progressing reply completes however long it takes. This client cap
+	// is therefore a coarse runaway backstop, set generously so it never truncates
+	// a healthy streaming draft. The call is async (a reply goroutine, not the
+	// webhook), so the headroom costs no user-facing latency. Override with
+	// AI_TIMEOUT_SECONDS.
+	aiTimeout := 600 * time.Second
 	if raw := os.Getenv("AI_TIMEOUT_SECONDS"); raw != "" {
 		if seconds, err := strconv.Atoi(raw); err == nil && seconds > 0 {
 			aiTimeout = time.Duration(seconds) * time.Second
@@ -74,6 +89,13 @@ func Load() Config {
 	if raw := os.Getenv("REPLY_DELAY_SECONDS"); raw != "" {
 		if seconds, err := strconv.Atoi(raw); err == nil && seconds >= 0 {
 			replyDelay = time.Duration(seconds) * time.Second
+		}
+	}
+	// Zero means "use the core default"; a valid positive value overrides it.
+	var mediaGroupWindow time.Duration
+	if raw := os.Getenv("MEDIA_GROUP_WINDOW_SECONDS"); raw != "" {
+		if seconds, err := strconv.Atoi(raw); err == nil && seconds > 0 {
+			mediaGroupWindow = time.Duration(seconds) * time.Second
 		}
 	}
 	return Config{
@@ -90,6 +112,8 @@ func Load() Config {
 		MiniAppDir:             valueOrDefault(os.Getenv("MINIAPP_DIR"), "./miniapp"),
 		IngestionModeDefault:   valueOrDefault(os.Getenv("INGESTION_MODE_DEFAULT"), "bot"),
 		MediaExtractionEnabled: boolWithDefault(os.Getenv("MEDIA_EXTRACTION_ENABLED"), true),
+		MediaGroupWindow:       mediaGroupWindow,
+		PersonalBotStubText:    strings.TrimSpace(os.Getenv("PERSONAL_BOT_STUB_TEXT")),
 	}
 }
 
