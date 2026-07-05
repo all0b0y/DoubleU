@@ -161,6 +161,6 @@ def test_suggest_profile_update_stages_pending_once(scope) -> None:
         return first, second
 
     first, second = run_tool(stage_twice)
-    assert first.startswith("staged for owner review")
-    # 016 unique-pending constraint: the duplicate is rejected, not double-staged.
-    assert second == "an identical suggestion is already pending"
+    assert first.startswith("profile update recorded")
+    # 016 unique-pending constraint: the duplicate is rejected, not double-recorded.
+    assert second == "an identical profile update is already recorded"

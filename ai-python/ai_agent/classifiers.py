@@ -71,18 +71,25 @@ class RiskClassifier:
         re.IGNORECASE,
     )
 
-    def classify(self, message_text: str) -> RiskResponse:
-        """Return a risk level and concise reasons for the supplied message."""
+    def classify(self, message_text: str, message_type: str = "text") -> RiskResponse:
+        """Return a risk level and concise reasons for the supplied message.
+
+        ``message_type`` is the inbound attachment kind (text/photo/voice/
+        audio/document). It gates the *topical* keyword rules below: a
+        ``document`` is reference material the owner forwarded for the agent to
+        analyze, so its business/legal/financial vocabulary is descriptive — not
+        a risky request directed at the owner — and must not permanently lock
+        every document out of auto-reply. Hard-safety signals (prompt injection,
+        sexual content, credential/PII leakage) stay in force for all content,
+        including document bodies, because those are sensitive regardless of
+        whether the text was typed or extracted from an attachment.
+        """
         reasons: list[str] = []
         level = RiskLevel.LOW
 
+        # --- Hard-safety signals: always applied, any content source. ---
         if contains_prompt_injection(message_text):
             reasons.append("prompt_injection_attempt")
-            level = RiskLevel.HIGH
-
-        # Profanity/obscene language: high risk — owner should decide how to respond.
-        if self._PROFANITY_RE.search(message_text):
-            reasons.append("profanity_or_obscene_language")
             level = _max_risk(level, RiskLevel.HIGH)
 
         # Sexual content: critical — must be handled manually by owner.
@@ -94,17 +101,28 @@ class RiskClassifier:
             reasons.append("sensitive_credentials_or_financial_data")
             level = _max_risk(level, RiskLevel.CRITICAL)
 
-        if self._FINANCIAL_RE.search(message_text):
-            reasons.append("financial_commitment")
-            level = _max_risk(level, RiskLevel.HIGH)
+        # --- Topical signals: a risky *request from the contact*. Skipped for
+        # forwarded documents, whose vocabulary is descriptive reference text.
+        # Still applied to typed text, captions, voice and image content. ---
+        if message_type != "document":
+            # Aggression/profanity is a *signal* that the current approach isn't
+            # landing — not a blocking risk (owner decision). Tag it so the writer
+            # can adjust tone, but never escalate the level: an angry contact still
+            # gets an auto-reply in auto/semi rather than being held for the owner.
+            if self._PROFANITY_RE.search(message_text):
+                reasons.append("aggression_signal")
 
-        if self._LEGAL_RE.search(message_text):
-            reasons.append("legal_or_contractual_topic")
-            level = _max_risk(level, RiskLevel.HIGH)
+            if self._FINANCIAL_RE.search(message_text):
+                reasons.append("financial_commitment")
+                level = _max_risk(level, RiskLevel.HIGH)
 
-        if self._URGENCY_RE.search(message_text):
-            reasons.append("time_sensitive_or_escalation")
-            level = _max_risk(level, RiskLevel.MEDIUM)
+            if self._LEGAL_RE.search(message_text):
+                reasons.append("legal_or_contractual_topic")
+                level = _max_risk(level, RiskLevel.HIGH)
+
+            if self._URGENCY_RE.search(message_text):
+                reasons.append("time_sensitive_or_escalation")
+                level = _max_risk(level, RiskLevel.MEDIUM)
 
         if not reasons:
             reasons.append("routine_message")

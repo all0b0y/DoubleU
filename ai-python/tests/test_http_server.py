@@ -168,6 +168,13 @@ class HTTPServerTests(unittest.TestCase):
         )
         self.assertFalse(response["blocked_by_privacy"])
 
+    def test_draft_skill_endpoint_matches_contract_shape(self) -> None:
+        """The draft-skill route parses the request and returns the frozen shape."""
+        response = self.handler._draft_skill({"text": "Как отвечать на возражения по цене"})
+        self.assertEqual(set(response), {"name", "description", "body"})
+        self.assertTrue(response["name"])
+        self.assertTrue(response["body"])
+
     def test_synthesize_pattern_respects_no_memory(self) -> None:
         """no_memory chats must never be reflected on."""
         response = self.handler._synthesize_pattern(

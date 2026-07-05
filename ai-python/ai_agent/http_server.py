@@ -21,6 +21,7 @@ from .safety.output import OutputSafetyScanner
 from .schemas import (
     parse_embed_texts_request,
     parse_draft_role_request,
+    parse_draft_skill_request,
     parse_extract_media_request,
     parse_intent_request,
     parse_memory_request,
@@ -99,6 +100,7 @@ class AIHTTPHandler(BaseHTTPRequestHandler):
             "/ai/embed-texts": self._embed_texts,
             "/ai/extract-media": self._extract_media,
             "/ai/draft-role": self._draft_role,
+            "/ai/draft-skill": self._draft_skill,
             "/ai/summarize-chat": self._summarize_chat,
             "/ai/tag-topic": self._tag_topic,
             "/ai/rerank-facts": self._rerank_facts,
@@ -172,6 +174,9 @@ class AIHTTPHandler(BaseHTTPRequestHandler):
     def _draft_role(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self.service.draft_role(parse_draft_role_request(payload)).to_dict()
 
+    def _draft_skill(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self.service.draft_skill(parse_draft_skill_request(payload)).to_dict()
+
     def _summarize_chat(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self.service.summarize_chat(parse_summary_request(payload)).to_dict()
 
@@ -195,6 +200,7 @@ class AIHTTPHandler(BaseHTTPRequestHandler):
         "/ai/embed-texts": LLMPurpose.EMBED,
         "/ai/extract-media": LLMPurpose.EXTRACT,
         "/ai/draft-role": LLMPurpose.DRAFT,
+        "/ai/draft-skill": LLMPurpose.DRAFT,
         "/ai/summarize-chat": LLMPurpose.SUMMARIZE,
         "/ai/tag-topic": LLMPurpose.EXTRACT,
         "/ai/rerank-facts": LLMPurpose.EXTRACT,
@@ -348,7 +354,7 @@ def _request_summary(path: str, payload: dict[str, Any]) -> dict[str, Any]:
     # Elide raw media bytes from the request preview: base64 blobs are large and
     # are private user content, not useful in logs.
     preview = payload
-    if path == "/ai/draft-role" and "text" in preview:
+    if path in ("/ai/draft-role", "/ai/draft-skill") and "text" in preview:
         preview = {**preview, "text": f"<{len(str(payload.get('text', '')))} chars>"}
     for field_name in ("data_base64", "audio_base64"):
         if field_name in preview:
@@ -384,8 +390,8 @@ def _response_summary(path: str, payload: dict[str, Any], response: dict[str, An
         "memory_used_count": len(response.get("memory_used", []) or []),
         "latency_ms": round(latency_ms, 1),
         "response_body_preview": (
-            "<role draft omitted>"
-            if path == "/ai/draft-role"
+            "<draft omitted>"
+            if path in ("/ai/draft-role", "/ai/draft-skill")
             else _truncate(json.dumps(response, ensure_ascii=False), 2000)
         ),
     }

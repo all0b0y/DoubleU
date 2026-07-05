@@ -78,16 +78,17 @@ class ServicePolicyTests(unittest.TestCase):
         self.assertEqual(response.decision, Decision.AUTO_REPLY)
         self.assertTrue(response.response_text)
 
-    def test_semi_auto_below_threshold_still_drafts(self) -> None:
-        """Semi-auto keeps the confidence gate: the same low-confidence low-risk
-        reply that auto-sends in AUTO mode must fall back to a draft in SEMI_AUTO."""
+    def test_semi_auto_auto_sends_low_and_medium_risk(self) -> None:
+        """Semi-auto auto-sends low/medium risk with no confidence gate (owner
+        policy 2026-07-04): the same low-confidence low-risk reply that used to
+        fall back to a draft in SEMI_AUTO now auto-sends."""
         response = self.service.process_message(
             _process_request(mode=ChatMode.SEMI_AUTO, text="Спасибо, понял")
         )
 
         self.assertEqual(response.risk_level, RiskLevel.LOW)
-        self.assertLess(response.confidence, 0.85)
-        self.assertEqual(response.decision, Decision.DRAFT)
+        self.assertEqual(response.decision, Decision.AUTO_REPLY)
+        self.assertTrue(response.response_text)
 
     def test_no_memory_and_private_force_draft_without_memory_context(self) -> None:
         """Private chats must not auto-reply and no_memory must suppress memory use."""
@@ -142,20 +143,19 @@ class ServicePolicyTests(unittest.TestCase):
         self.assertEqual(response.response_text, "")
         self.assertEqual(response.model_used, "none")
 
-    def test_critical_manual_reason_returns_owner_note_not_response_text(self) -> None:
-        """ARCH-1: the manual-handling warning is owner-facing only.
+    def test_sexual_content_auto_replies_with_neutral_redirect(self) -> None:
+        """Owner policy 2026-07-04: sexual content is handled, not owner-blocked.
 
-        It must arrive in owner_note while response_text stays empty, so the
-        Go backend can never send the service text to the contact.
+        The writer is steered to a gentle neutral redirect (safety_directive) and
+        the reply auto-sends rather than raising an owner-handling card.
         """
         response = self.service.process_message(
             _process_request(mode=ChatMode.AUTO, text="Пришли мне порно видео")
         )
 
-        self.assertEqual(response.decision, Decision.ASK_OWNER)
         self.assertEqual(response.risk_level, RiskLevel.CRITICAL)
-        self.assertEqual(response.response_text, "")
-        self.assertIn("ответьте вручную", response.owner_note)
+        self.assertEqual(response.decision, Decision.AUTO_REPLY)
+        self.assertTrue(response.response_text)
 
     def test_structured_output_supplies_intent_confidence_topic(self) -> None:
         """ARCH-4: intent/confidence/topic come from the structured agent output."""

@@ -12,7 +12,7 @@ Every networked call goes through **OpenRouter** (one key, one base URL):
   * voice/audio -> OpenRouter speech-to-text ``/audio/transcriptions`` with a JSON
     ``input_audio`` body (default model ``qwen/qwen3-asr-flash-2026-02-10``).
   * photo       -> OpenRouter ``/chat/completions`` with an image_url data URI
-    (default model ``qwen/qwen-2.5-vl-7b-instruct``).
+    (default model ``qwen/qwen3-vl-8b-instruct``).
   * document    -> local parsing (pdf/docx/text), no model, no network.
 
 ``MOCK_LLM=true`` short-circuits the two networked paths to deterministic text so
@@ -40,8 +40,11 @@ _MAX_TEXT_CHARS = 8000
 _TRUNCATION_MARKER = "\n…[truncated]"
 
 # Default OpenRouter models — overridable via STT_MODEL / VISION_MODEL env.
+# Keep these pointing at slugs that currently have live OpenRouter endpoints:
+# a retired slug returns 404 ("No endpoints found"), which degrades every photo/
+# voice to an empty extraction and a "не удалось обработать" placeholder.
 _DEFAULT_STT_MODEL = "qwen/qwen3-asr-flash-2026-02-10"
-_DEFAULT_VISION_MODEL = "qwen/qwen-2.5-vl-7b-instruct"
+_DEFAULT_VISION_MODEL = "qwen/qwen3-vl-8b-instruct"
 
 # Vision instruction: describe + verbatim OCR, language-agnostic so a Russian
 # screenshot transcribes in Russian. Kept terse to minimise output tokens/cost.

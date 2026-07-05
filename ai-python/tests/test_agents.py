@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
+from pydantic_ai import Agent
 from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
@@ -39,6 +40,7 @@ from ai_agent.schemas import (
     ChatSettings,
     ChatSummaryRequest,
     DraftRoleRequest,
+    DraftSkillRequest,
     FeedbackItem,
     NormalizedTelegramEvent,
     PrivacyFlag,
@@ -125,6 +127,13 @@ def make_runtime(**models) -> AgentRuntime:
                 "goals": "Решать вопросы.",
                 "constraints": "Не выдумывать факты.",
                 "custom_fields": [],
+            }
+        ),
+        "skill_draft_model": structured(
+            {
+                "name": "работа-с-возражениями",
+                "description": "Как отвечать на ценовые возражения.",
+                "body": "## Когда применять\nКлиент сомневается.\n\n## Процедура\n1. Уточни.\n2. Обоснуй.",
             }
         ),
     }
@@ -1800,10 +1809,27 @@ def _role_draft_call(runtime: AgentRuntime) -> None:
     runtime.draft_role(DraftRoleRequest(text="Консультант по продажам"))
 
 
+def _skill_draft_call(runtime: AgentRuntime) -> None:
+    runtime.draft_skill(DraftSkillRequest(text="Как отвечать на возражения по цене"))
+
+
+def test_draft_skill_returns_structured_skill() -> None:
+    """draft_skill turns a free-text description into a valid skill draft."""
+    runtime = make_runtime()
+    result = runtime.draft_skill(DraftSkillRequest(text="Как отвечать на возражения по цене"))
+    assert result.name and result.description and result.body
+    assert len(result.name) <= 64
+    assert len(result.description) <= 500
+    assert len(result.body) <= 20000
+
+
 @pytest.mark.parametrize(
     "call",
-    [_extract_call, _summarize_call, _topic_call, _rerank_call, _pattern_call, _role_draft_call],
-    ids=["extract", "summarize", "topic", "rerank", "pattern", "role_draft"],
+    [
+        _extract_call, _summarize_call, _topic_call, _rerank_call,
+        _pattern_call, _role_draft_call, _skill_draft_call,
+    ],
+    ids=["extract", "summarize", "topic", "rerank", "pattern", "role_draft", "skill_draft"],
 )
 def test_auxiliary_tasks_record_a_non_empty_rendered_prompt_contract(call) -> None:
     """2.2: extraction/summary/topic/rerank/pattern/role_draft now render
@@ -1816,3 +1842,51 @@ def test_auxiliary_tasks_record_a_non_empty_rendered_prompt_contract(call) -> No
         call(runtime)
     prompt = sink.generations[-1]["prompt"]
     assert "<prompt_contract>" in prompt
+
+
+# --------------------------------------------------------------------------- #
+# Writer streaming — inactivity timeout (agent.iter) replaces total-time timer
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_writer_stream_assembles_full_output_from_chunks() -> None:
+    """The streamed writer run assembles the model's chunks into the final output."""
+    async def ok_stream(messages, info: AgentInfo):
+        for chunk in ("He", "ll", "o"):
+            yield chunk
+
+    model = FunctionModel(
+        lambda m, i: ModelResponse(parts=[TextPart(content="Hello")]),
+        stream_function=ok_stream,
+    )
+    agent = Agent(model, output_type=str)
+    result = await AgentRuntime._run_agent_streaming(agent, "hi", {}, idle_timeout=5.0)
+    assert result.output == "Hello"
+
+
+@pytest.mark.asyncio
+async def test_writer_stream_aborts_a_stalled_generation() -> None:
+    """A model that produces no token within the idle window is aborted, not awaited
+    to some far larger total-time budget."""
+    async def stalled_stream(messages, info: AgentInfo):
+        await asyncio.sleep(5.0)  # far beyond the idle window; never yields in time
+        yield "too late"
+
+    model = FunctionModel(
+        lambda m, i: ModelResponse(parts=[TextPart(content="x")]),
+        stream_function=stalled_stream,
+    )
+    agent = Agent(model, output_type=str)
+    with pytest.raises(TimeoutError):
+        await AgentRuntime._run_agent_streaming(agent, "hi", {}, idle_timeout=0.2)
+
+
+@pytest.mark.asyncio
+async def test_writer_stream_falls_back_when_model_cannot_stream() -> None:
+    """A non-streaming model (FunctionModel without a stream_function) still yields a
+    validated result via the non-streaming fallback path."""
+    model = FunctionModel(lambda m, i: ModelResponse(parts=[TextPart(content="plain")]))
+    agent = Agent(model, output_type=str)
+    result = await AgentRuntime._run_agent_streaming(agent, "hi", {}, idle_timeout=5.0)
+    assert result.output == "plain"

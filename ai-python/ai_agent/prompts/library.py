@@ -49,6 +49,7 @@ def draft_spec(
     feedback_hint: str,
     two_stage: bool = False,
     current_time: datetime | None = None,
+    safety_directive: str | None = None,
 ) -> PromptSpec:
     """Build the draft call's :class:`PromptSpec` — replaces ``_compose_base_instruction``.
 
@@ -119,6 +120,11 @@ def draft_spec(
         constraints.append(
             f"Инструкция владельца ({priority_scope}, выполни обязательно): {owner_instruction}"
         )
+    # Handled-risk directive (sexual redirect / aggression de-escalation) sits at
+    # the top of the safety order: it must win over role goals so a flirty or
+    # hostile message is redirected rather than engaged.
+    if safety_directive:
+        constraints.append(f"ВАЖНО (безопасность, выполни обязательно): {safety_directive}")
     interaction_available = draft_pipeline._interaction_available(request)
     if interaction_available:
         constraints.append(draft_pipeline._interaction_instruction())
@@ -392,5 +398,34 @@ def role_draft_spec() -> PromptSpec:
             " поля; у каждого такого поля должны быть title и description.",
             "Не выдумывай факты о бизнесе, ценах или людях.",
             "Пиши весь черновик на языке исходного описания.",
+        ),
+    )
+
+
+def skill_draft_spec() -> PromptSpec:
+    """Build the voice/text skill-authoring call's :class:`PromptSpec`.
+
+    The owner's free-text/transcribed description (or a chat digest) is untrusted
+    and travels as the per-call user payload, never as ``context`` here. The
+    output is a reusable *skill* — guidance the writer follows, not executable
+    code — so the standards below shape a tight, actionable procedure.
+    """
+    return PromptSpec(
+        role="Ты — помощник по созданию навыка (skill) для AI-роли бота.",
+        task=(
+            "Из свободного описания (или выжимки из переписки) оформи ОДИН"
+            " переиспользуемый навык: короткое имя, ёмкое описание и структурное"
+            " тело с процедурой, которой ассистент будет следовать, отвечая по теме."
+        ),
+        constraints=(
+            "name: коротко, в нижнем регистре через дефис, до 64 символов, без пробелов.",
+            "description: ОДНО предложение, до 500 символов, называет способность (что"
+            " навык позволяет), а не реализацию; без маркетинга; не повторяет имя навыка.",
+            "body: структурный markdown с секциями «## Когда применять», «## Процедура»"
+            " (нумерованные шаги) и, если уместно, «## Подводные камни». До 20000 символов.",
+            "Навык — это ИНСТРУКЦИЯ, а не код: не предлагай исполняемых скриптов и не"
+            " выдумывай инструменты, которых нет.",
+            "Не выдумывай факты о бизнесе, ценах, людях или API.",
+            "Пиши весь навык на языке исходного описания.",
         ),
     )

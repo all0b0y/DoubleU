@@ -672,6 +672,54 @@ class NormalizeRichMarkdownTests(unittest.TestCase):
         text = "# Title\n\nContent."
         self.assertEqual(self._norm(text), text)
 
+    def test_glued_table_rows_are_split_onto_separate_lines(self) -> None:
+        """A table with separator+rows glued onto one line is rebuilt row-per-line.
+
+        This is the real failure mode from production: Telegram's rich parser
+        rendered the whole thing as literal ``|`` text because the rows were not
+        newline-separated.
+        """
+        glued = (
+            "| Блок | Что сделать | Зачем |\n"
+            "|---|---|---| | 1 | Сегменты | Привязать | | 2 | Потоки | Разметить |"
+        )
+        result = self._norm(glued)
+        # Each data row now sits on its own line.
+        self.assertIn("| 1 | Сегменты | Привязать |", result)
+        self.assertIn("| 2 | Потоки | Разметить |", result)
+        # No line still carries two rows' worth of pipes glued together.
+        for line in result.splitlines():
+            self.assertLessEqual(line.count("|"), 4, line)
+
+    def test_table_width_follows_separator_not_short_header(self) -> None:
+        """When the header is missing a column the separator's width wins, so the
+        4-value data rows are not mis-split into the header's 3 columns."""
+        glued = (
+            "| Блок | Что | Зачем |\n"
+            "|---|---|---|---| | 1 | A | B | C | | 2 | D | E | F |"
+        )
+        result = self._norm(glued)
+        self.assertIn("| 1 | A | B | C |", result)
+        self.assertIn("| 2 | D | E | F |", result)
+
+    def test_wellformed_table_is_untouched_and_idempotent(self) -> None:
+        """A correctly formatted table (incl. a blank cell) must pass through as-is."""
+        table = "| A | B |\n|---|---|\n| 1 |  |\n|  | 4 |"
+        first = self._norm(table)
+        self.assertEqual(first, table)
+        self.assertEqual(self._norm(first), first)
+
+    def test_markdown_table_validator_flags_inconsistent_widths(self) -> None:
+        """The validator reports a table whose separator/rows disagree in width."""
+        broken = "| A | B |\n|---|---|---|\n| 1 | 2 | 3 |"
+        self.assertTrue(draft_pipeline._markdown_table_issues(broken))
+        self.assertFalse(draft_pipeline._markdown_table_issues("| A | B |\n|---|---|\n| 1 | 2 |"))
+
+    def test_repair_then_validate_leaves_no_residual_issues(self) -> None:
+        """After normalize repairs a glued table, the validator finds nothing left."""
+        glued = "| Блок | Что | Зачем |\n|---|---|---|---| | 1 | A | B | C | | 2 | D | E | F |"
+        self.assertFalse(draft_pipeline._markdown_table_issues(self._norm(glued)))
+
     def test_formatting_line_enforces_heading_rules(self) -> None:
         """The output-format rules forbid # on the same line as text or emoji."""
         role = AIRoleData(name="r", description="d")

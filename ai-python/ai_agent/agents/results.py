@@ -280,6 +280,20 @@ class RoleDraft(BaseModel):
     custom_fields: tuple[RoleDraftCustomField, ...] = ()
 
 
+class SkillDraft(BaseModel):
+    """An owner-editable skill draft generated from a free-text/voice description.
+
+    Field bounds mirror the ``skills`` table (migration 121) so a draft always
+    fits the create form: name <=64, description <=500, body <=20000.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    name: str = Field(min_length=1, max_length=64)
+    description: str = Field(min_length=1, max_length=500)
+    body: str = Field(min_length=1, max_length=20000)
+
+
 class SummaryResult(BaseModel):
     """Episode/chat summary with actionable follow-ups (ARCH-10)."""
 

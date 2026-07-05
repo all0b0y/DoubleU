@@ -38,6 +38,7 @@ from urllib.parse import urlsplit
 
 import asyncpg
 from pydantic_ai import Agent, PromptedOutput, RunContext, UsageLimits
+from pydantic_ai.exceptions import UserError
 from pydantic_ai.toolsets import CombinedToolset, FilteredToolset
 
 from ..classifiers import TypedMemoryExtractor
@@ -59,6 +60,8 @@ from ..schemas import (
     ChatSummaryResponse,
     DraftRoleRequest,
     DraftRoleResponse,
+    DraftSkillRequest,
+    SkillDraftResponse,
     EmbedTextsRequest,
     MCPServerSpecData,
     ModelTask,
@@ -113,6 +116,7 @@ from .results import (
     ResponsePlan,
     RoleDraft,
     ScheduledJob,
+    SkillDraft,
     SummaryResult,
     TopicResult,
 )
@@ -334,6 +338,16 @@ _CRITIC_RISKS = (RiskLevel.MEDIUM, RiskLevel.HIGH)
 # to still kill a runaway loop (which runs into the dozens). Env-tunable.
 _DRAFT_TOOL_CALLS_LIMIT = int(os.getenv("DRAFT_TOOL_CALLS_LIMIT", "12").strip() or "12")
 
+# The writer is streamed (agent.iter) so its liveness is judged by *inactivity*,
+# not total elapsed time: a large reply that keeps producing tokens completes no
+# matter how long it takes, while a genuinely stalled generation is aborted after
+# this many seconds without a single new token/event. This replaces reliance on
+# the coarse AGENT_RUN_TIMEOUT_SECONDS / Go AITimeout for the draft path, which
+# cut off big-but-progressing replies. Env-tunable.
+_WRITER_STREAM_IDLE_TIMEOUT = float(
+    os.getenv("WRITER_STREAM_IDLE_TIMEOUT_SECONDS", "45").strip() or "45"
+)
+
 # Tighter ceiling for the orchestrator specifically (2.5 call budget): its job
 # is bounded by design — gather only what the writer is missing — so a
 # runaway loop should be killed well before the writer's 12-call backstop. The
@@ -444,6 +458,7 @@ class AgentRuntime:
         rerank_model: object | None = None,
         pattern_model: object | None = None,
         role_draft_model: object | None = None,
+        skill_draft_model: object | None = None,
         query_embedder_factory: Callable[[], EmbedderCallable] | None = None,
     ) -> None:
         """Build agents and start the loop thread.
@@ -602,6 +617,17 @@ class AgentRuntime:
 
         @self._role_draft_agent.instructions
         def _role_draft_agent_instructions(ctx: RunContext[AgentDeps]) -> str:
+            return ctx.deps.system_instruction
+
+        self._skill_draft_agent: Agent[AgentDeps, SkillDraft] = Agent(
+            skill_draft_model or build_model(AgentTask.SKILL_DRAFT),
+            deps_type=AgentDeps,
+            output_type=SkillDraft,
+            retries=1,
+        )
+
+        @self._skill_draft_agent.instructions
+        def _skill_draft_agent_instructions(ctx: RunContext[AgentDeps]) -> str:
             return ctx.deps.system_instruction
 
     # ------------------------------------------------------------------ infra
@@ -862,7 +888,7 @@ class AgentRuntime:
         for attempt in range(1, self._draft_max_attempts + 1):
             try:
                 return self._run(
-                    self._draft_async(request, risk_level, ctx, repair_hint=repair_hint)
+                    self._draft_async(request, risk_level, ctx, risk_reasons, repair_hint=repair_hint)
                 )
             except SafetyBlocked as exc:
                 return draft_pipeline.DraftOutcome(
@@ -1070,6 +1096,7 @@ class AgentRuntime:
         *,
         orchestrator_bundle: tuple[str, ...] | None,
         current_time: datetime | None,
+        risk_reasons: tuple[str, ...] = (),
     ) -> tuple[str, str]:
         """Build the writer's (system_prompt, user_payload) pair via the Prompt Contract.
 
@@ -1101,6 +1128,7 @@ class AgentRuntime:
             feedback_hint=feedback_hint,
             two_stage=orchestrator_bundle is not None,
             current_time=current_time,
+            safety_directive=draft_pipeline.safety_directive_for(risk_reasons),
         )
         rendered = render_prompt(spec, family)
         prompt_context = list(clean_memory)
@@ -1109,11 +1137,66 @@ class AgentRuntime:
             prompt_context.append("[СОБРАННЫЙ КОНТЕКСТ ОРКЕСТРАТОРА]\n" + bundle)
         return self._prompt_builder.build(rendered, request.event.message_text, tuple(prompt_context))
 
+    @staticmethod
+    async def _run_agent_streaming(agent: Agent, payload: str, run_kwargs: dict, idle_timeout: float):
+        """Run a pydantic-ai agent via ``iter()``, streaming token events so the
+        call's liveness is bounded by *inactivity* rather than total elapsed time.
+
+        Every graph node and every streamed model event resets an idle deadline;
+        if no event arrives within ``idle_timeout`` the run is cancelled and
+        ``TimeoutError`` is raised (``draft_outcome`` already treats that as a
+        draft failure → retry / graceful notice). ``iter()`` is what ``run()``
+        uses internally, so tools still execute, ``deps`` is populated identically
+        and the final output is validated — we only gain per-event visibility.
+        Returns the ``AgentRunResult`` (``.output``, ``.usage``), same as ``run()``.
+        """
+        loop = asyncio.get_event_loop()
+        last_activity = loop.time()
+
+        async def _drive():
+            nonlocal last_activity
+            async with agent.iter(payload, **run_kwargs) as run:
+                async for node in run:
+                    last_activity = loop.time()
+                    if Agent.is_model_request_node(node):
+                        try:
+                            async with node.stream(run.ctx) as stream:
+                                async for _event in stream:
+                                    last_activity = loop.time()
+                        except (UserError, AssertionError):
+                            # The model can't stream (a non-streaming provider
+                            # raises UserError; a test FunctionModel without a
+                            # stream_function asserts). The node still executes
+                            # non-streaming as the loop advances, so degrade
+                            # cleanly to a blocking turn.
+                            pass
+                return run.result
+
+        drive_task = asyncio.ensure_future(_drive())
+        try:
+            while True:
+                remaining = idle_timeout - (loop.time() - last_activity)
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"writer stalled: no stream activity for {idle_timeout:.0f}s"
+                    )
+                done, _ = await asyncio.wait({drive_task}, timeout=remaining)
+                if drive_task in done:
+                    return drive_task.result()
+        finally:
+            if not drive_task.done():
+                drive_task.cancel()
+                try:
+                    await drive_task
+                except BaseException:  # noqa: BLE001 — cleanup only; original error propagates
+                    pass
+
     async def _draft_async(
         self,
         request: AIProcessMessageRequest,
         risk_level: RiskLevel,
         ctx: LLMCallContext,
+        risk_reasons: tuple[str, ...] = (),
         *,
         repair_hint: str = "",
     ) -> draft_pipeline.DraftOutcome:
@@ -1153,7 +1236,10 @@ class AgentRuntime:
             orchestrator_bundle = self._orchestrator_bundle(orchestrated)
         current_time = parse_current_time(request.current_time) or datetime.now(timezone.utc)
         system_prompt, user_payload = self._build_draft_prompt_contract(
-            request, orchestrator_bundle=orchestrator_bundle, current_time=current_time
+            request,
+            orchestrator_bundle=orchestrator_bundle,
+            current_time=current_time,
+            risk_reasons=risk_reasons,
         )
         if repair_hint:
             system_prompt = f"{system_prompt}\n\n{repair_hint}"
@@ -1246,7 +1332,11 @@ class AgentRuntime:
         writer_model_settings = model_settings_for(decision, capabilities_for(decision.selected_model_slug))
         if writer_model_settings:
             run_kwargs["model_settings"] = writer_model_settings
-        result = await self._draft_agent.run(user_payload, **run_kwargs)
+        # Stream the writer (agent.iter) so a large-but-progressing reply is not
+        # killed by a total-time timer; an inactivity watchdog is the real guard.
+        result = await self._run_agent_streaming(
+            self._draft_agent, user_payload, run_kwargs, _WRITER_STREAM_IDLE_TIMEOUT
+        )
         drafted: DraftResult = result.output
         # Hybrid: both stages may schedule jobs; dedupe by the content-based
         # idempotency_key so a reminder produced in both stages is sent to Go once.
@@ -1498,6 +1588,48 @@ class AgentRuntime:
                 )
                 for item in drafted.custom_fields
             ),
+        )
+
+    def draft_skill(self, request: DraftSkillRequest) -> SkillDraftResponse:
+        """Generate a structured, owner-editable skill from free text/voice."""
+        ctx = current_context()
+        try:
+            return self._run(self._draft_skill_async(request, ctx))
+        except Exception as exc:  # noqa: BLE001 - convert agent failures at the contract boundary
+            raise RuntimeError(f"skill draft agent failed: {exc}") from exc
+
+    async def _draft_skill_async(
+        self, request: DraftSkillRequest, ctx: LLMCallContext
+    ) -> SkillDraftResponse:
+        family = resolve_family(model_name_for(AgentTask.SKILL_DRAFT))
+        rendered = render_prompt(prompt_library.skill_draft_spec(), family)
+        system_prompt, user_payload = self._prompt_builder.build(rendered, request.text)
+        system_prompt, user_payload = self._scan_input(
+            system_prompt, user_payload, ModelTask.DRAFT_REPLY, ctx
+        )
+        deps = self._deps_for(
+            ctx.tenant_id,
+            ctx.chat_id,
+            (),
+            system_instruction=system_prompt,
+            pool=None,
+        )
+        result = await self._skill_draft_agent.run(user_payload, deps=deps)
+        drafted: SkillDraft = result.output
+        usage = self._usage_of(result)
+        self._record_run(
+            ctx,
+            AgentTask.SKILL_DRAFT,
+            system_prompt,
+            user_payload,
+            drafted.model_dump_json(),
+            usage,
+            (),
+        )
+        return SkillDraftResponse(
+            name=drafted.name.strip(),
+            description=drafted.description.strip(),
+            body=drafted.body.strip(),
         )
 
     # ------------------------------------------------------------- extraction
@@ -1859,9 +1991,13 @@ def build_runtime(
     # only fall back to lexical ILIKE when an embed call yields nothing.
     mock_llm = os.getenv("MOCK_LLM", "true").strip().lower() in ("1", "true", "yes", "on")
     embedder_factory = None if mock_llm else _build_query_embedder
-    # Two-stage drafting (orchestrator + writer) over a long answer can run for
-    # over a minute; the default 90s silently fell to error_fallback. Env-tunable.
-    run_timeout = float(os.getenv("AGENT_RUN_TIMEOUT_SECONDS", "150").strip() or "150")
+    # Coarse runaway backstop for every agent coroutine (see AgentRuntime._run).
+    # The writer — the one call that can legitimately run for minutes on a large
+    # reply — is streamed with its own inactivity timeout
+    # (_WRITER_STREAM_IDLE_TIMEOUT), so this is no longer the primary cutoff and
+    # is set generously to avoid capping a healthy, steadily-streaming draft.
+    # Env-tunable.
+    run_timeout = float(os.getenv("AGENT_RUN_TIMEOUT_SECONDS", "600").strip() or "600")
     return AgentRuntime(
         database_url=database_url,
         input_safety=input_safety,

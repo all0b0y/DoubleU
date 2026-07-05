@@ -651,6 +651,27 @@ class DraftRoleResponse(JsonDataclass):
     custom_fields: tuple[AIRoleCustomFieldData, ...] = field(default_factory=tuple)
 
 
+@dataclass(frozen=True)
+class DraftSkillRequest(JsonDataclass):
+    """Request body for `/ai/draft-skill`."""
+
+    text: str
+    trace_id: str = ""
+
+
+@dataclass(frozen=True)
+class SkillDraftResponse(JsonDataclass):
+    """Generated skill fields returned by `/ai/draft-skill`.
+
+    The draft is returned to the owner for review and is only persisted when the
+    owner saves it through the existing skills-create path — never here.
+    """
+
+    name: str
+    description: str
+    body: str
+
+
 def parse_process_message_request(payload: dict[str, Any]) -> AIProcessMessageRequest:
     """Parse a process-message JSON object into a typed request."""
     event = payload.get("event") or {}
@@ -836,6 +857,16 @@ def parse_draft_role_request(payload: dict[str, Any]) -> DraftRoleRequest:
     if len(text) > 8000:
         raise ValueError("text is too long (max 8000 characters)")
     return DraftRoleRequest(text=text, trace_id=str(payload.get("trace_id", "")))
+
+
+def parse_draft_skill_request(payload: dict[str, Any]) -> DraftSkillRequest:
+    """Parse and validate a free-text/transcribed skill description."""
+    text = str(payload.get("text", "")).strip()
+    if not text:
+        raise ValueError("text is required")
+    if len(text) > 8000:
+        raise ValueError("text is too long (max 8000 characters)")
+    return DraftSkillRequest(text=text, trace_id=str(payload.get("trace_id", "")))
 
 
 def _parse_contact_profile(raw: Any) -> ContactProfileData | None:

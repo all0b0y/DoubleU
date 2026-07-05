@@ -5,13 +5,6 @@ from __future__ import annotations
 from ..schemas import ChatMode, Decision, PrivacyFlag, RiskLevel
 
 
-# Confidence threshold gating auto-reply in SEMI_AUTO.  Kept here so the policy
-# is reviewable in one place rather than scattered through the service.  AUTO has
-# no threshold by design: the owner opting into auto mode accepts unsupervised
-# replies (owner decision, 2026-06-16), so only the deterministic risk gates and
-# the MANUAL/PRIVATE blocks above guard it — see :func:`decide`.
-SEMI_AUTO_MIN = 0.85
-
 # Deterministic ceilings on confidence per risk level.  The LLM never raises
 # them: a self-assessed confidence is always capped by the risk classifier so
 # the policy in :func:`decide` cannot auto-reply on risky messages.
@@ -28,30 +21,38 @@ def decide(
     risk_level: RiskLevel,
     confidence: float,
 ) -> Decision:
-    """Map (mode, privacy, risk, confidence) to a deterministic :class:`Decision`.
+    """Map (mode, privacy, risk) to a deterministic :class:`Decision`.
 
-    Critical risk always escalates to the owner; medium/high always drafts.
-    PRIVATE chats and MANUAL mode never auto-reply even at high confidence.
+    Risk-tolerance is owner-chosen per chat mode (owner policy, 2026-07-04):
+
+    * MANUAL   — always drafts; the owner sends every message by hand.
+    * SEMI_AUTO — auto-sends LOW/MEDIUM risk; holds HIGH for a draft.
+    * AUTO     — auto-sends LOW/MEDIUM/HIGH risk.
+
+    CRITICAL is not blocked but *handled*: sensitive personal data is redacted
+    upstream (Go ingestion) before it ever reaches here, so the only critical
+    signal that survives is sexual content, which auto-replies with a gentle
+    neutral redirect (see :func:`ai_agent.pipelines.draft.safety_directive_for`).
+    PRIVATE chats and MANUAL mode never auto-reply. ``confidence`` is no longer a
+    gate — it is reported for observability only.
     """
     if mode == ChatMode.DISABLED:
         return Decision.IGNORE
     if mode == ChatMode.SILENT:
         return Decision.OBSERVE
-    if risk_level == RiskLevel.CRITICAL:
-        return Decision.ASK_OWNER
-    if risk_level in (RiskLevel.MEDIUM, RiskLevel.HIGH):
-        return Decision.DRAFT
     if mode == ChatMode.MANUAL or PrivacyFlag.PRIVATE in privacy_flags:
         return Decision.DRAFT
-    # AUTO mode: the owner explicitly opts into unsupervised replies and accepts
-    # the risk, so there is no confidence gate — every low-risk message
-    # auto-sends (owner decision, 2026-06-16). MEDIUM/HIGH/CRITICAL risk already
-    # returned a draft/ask_owner above, so only low risk reaches here. SEMI_AUTO
-    # keeps the confidence threshold: send only when the model is confident.
+    # CRITICAL (post-redaction: sexual content) auto-replies with a neutral
+    # deflection — safe to send unsupervised because the reply de-escalates
+    # rather than engages. MANUAL/PRIVATE already returned a draft above.
+    if risk_level == RiskLevel.CRITICAL:
+        return Decision.AUTO_REPLY
     if mode == ChatMode.AUTO:
         return Decision.AUTO_REPLY
-    if mode == ChatMode.SEMI_AUTO and confidence >= SEMI_AUTO_MIN:
-        return Decision.AUTO_REPLY
+    if mode == ChatMode.SEMI_AUTO:
+        if risk_level in (RiskLevel.LOW, RiskLevel.MEDIUM):
+            return Decision.AUTO_REPLY
+        return Decision.DRAFT
     return Decision.DRAFT
 
 

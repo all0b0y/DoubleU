@@ -46,9 +46,12 @@ from .schemas import (
     Decision,
     DraftRoleRequest,
     DraftRoleResponse,
+    DraftSkillRequest,
+    SkillDraftResponse,
     EmbedTextsRequest,
     EmbedTextsResponse,
     ExtractMediaRequest,
+    RiskLevel,
     ExtractMediaResponse,
     IntentRequest,
     IntentResponse,
@@ -159,6 +162,10 @@ class AIService:
         """Generate an editable AI-role draft from a free-text description."""
         return self._agents.draft_role(request)
 
+    def draft_skill(self, request: DraftSkillRequest) -> SkillDraftResponse:
+        """Generate an editable skill draft from a free-text/voice description."""
+        return self._agents.draft_skill(request)
+
     def tag_topic(self, request: TopicTaggingRequest) -> TopicTaggingResponse:
         """Return a short topic label for the active conversation episode."""
         return self._agents.tag_topic(request)
@@ -179,7 +186,9 @@ class AIService:
         produced it (ARCH-4), with the regex classifier + synthetic confidence
         as the fallback.
         """
-        risk_response = self._risk_classifier.classify(request.event.message_text)
+        risk_response = self._risk_classifier.classify(
+            request.event.message_text, request.event.message_type
+        )
         intent_response = self._intent_classifier.classify(request.event.message_text)
         no_memory = PrivacyFlag.NO_MEMORY in request.chat_settings.privacy_flags
 
@@ -212,6 +221,17 @@ class AIService:
                 risk_response.risk_level,
                 confidence,
             )
+            # Critical risk auto-replies only when there is a safe reply to send
+            # (sexual content → neutral deflection). A critical signal with no
+            # generated text is the owner-backstop (e.g. an unredacted credential):
+            # hand it to the owner, or ignore when there is not even a note. This
+            # mirrors the Go DecisionEngine so both layers agree.
+            if (
+                risk_response.risk_level == RiskLevel.CRITICAL
+                and decision == Decision.AUTO_REPLY
+                and not outcome.text
+            ):
+                decision = Decision.ASK_OWNER if outcome.owner_note else Decision.IGNORE
         except RuntimeError as exc:
             logger.exception("draft agent failed — falling back to error_fallback: %s", exc)
             outcome = draft.DraftOutcome(text="", model_used="none", usage=Usage())

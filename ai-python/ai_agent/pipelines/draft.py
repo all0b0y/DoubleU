@@ -20,6 +20,7 @@ context of the current chat.
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
@@ -41,10 +42,38 @@ from ..schemas import (
 )
 
 
-# Risk reasons that signal the message must be handled manually by the owner.
-# When matched, the draft path returns a canned owner-facing notification
-# instead of generating a reply.
-_MANUAL_REASONS = frozenset({"profanity_or_obscene_language", "sexual_content"})
+logger = logging.getLogger(__name__)
+
+
+# Writer directives for *handled* risk signals — the message is neither blocked
+# nor sent verbatim, it is answered a particular way. Keyed by the classifier
+# reason so the map stays general: the model still writes the actual contextual
+# reply; the directive only steers HOW (de-escalate / redirect), so this is
+# policy text, not a canned per-message answer.
+_SAFETY_DIRECTIVES: dict[str, str] = {
+    "sexual_content": (
+        "Собеседник затрагивает интимную или сексуальную тему. Мягко, уважительно"
+        " и без осуждения переведи разговор на нейтральную тему; не поддерживай и"
+        " не развивай её."
+    ),
+    "aggression_signal": (
+        "Собеседник раздражён или агрессивен — это сигнал, что предыдущий подход"
+        " не сработал. Сохраняй спокойный доброжелательный тон, не зеркаль"
+        " агрессию; мягко уточни, что не так, и предложи помощь."
+    ),
+}
+
+
+def safety_directive_for(risk_reasons: tuple[str, ...]) -> str | None:
+    """Return the writer directive for handled-risk signals, or ``None``.
+
+    Maps classifier reasons (sexual content, aggression) to a high-priority
+    instruction on *how* to reply. It shapes tone/approach only — the model
+    still writes the actual contextual message — so it is general policy, not a
+    canned per-case answer.
+    """
+    parts = [_SAFETY_DIRECTIVES[r] for r in risk_reasons if r in _SAFETY_DIRECTIVES]
+    return " ".join(parts) if parts else None
 
 # Owner-attached role reference material is truncated to this many characters
 # before prompt injection so it cannot crowd out the conversation context.
@@ -120,14 +149,21 @@ def preflight_outcome(
     if mode in (ChatMode.DISABLED, ChatMode.SILENT):
         return DraftOutcome(text="", model_used="none", usage=Usage())
 
-    if risk_level == RiskLevel.CRITICAL and _MANUAL_REASONS & set(risk_reasons):
-        if "sexual_content" in risk_reasons:
-            note = "⚠️ Сообщение интимного характера. ИИ не формирует ответ — ответьте вручную."
-        else:
-            note = "⚠️ Сообщение содержит нецензурную лексику. ИИ не формирует ответ — ответьте вручную или проигнорируйте."
-        return DraftOutcome(text="", model_used="none", usage=Usage(), owner_note=note)
     if risk_level == RiskLevel.CRITICAL:
-        return DraftOutcome(text="", model_used="none", usage=Usage())
+        # Sexual content is handled, not blocked: the writer is steered to a
+        # gentle neutral redirect (safety_directive_for) instead of engaging, so
+        # let the LLM draft run and auto-reply. Any OTHER surviving critical
+        # signal — e.g. a credential the upstream ingestion redactor missed — has
+        # no safe unsupervised reply, so it is held for the owner with a
+        # contact-invisible note (ARCH-1).
+        if "sexual_content" in risk_reasons:
+            return None
+        return DraftOutcome(
+            text="",
+            model_used="none",
+            usage=Usage(),
+            owner_note="⚠️ Сообщение содержит чувствительные данные. ИИ не формирует ответ — проверьте вручную.",
+        )
     return None
 
 
@@ -314,9 +350,135 @@ def normalize_rich_markdown(text: str) -> str:
     # onto its own paragraph.  The replacement preserves the preceding character
     # and inserts exactly one blank line.
     text = _HEADING_INLINE_RE.sub(r"\1\n\n\2", text)
+    # Repair GFM tables the model emitted on too few lines (rows/separator glued
+    # onto one physical line) before the newline collapse below runs.
+    text = _repair_markdown_tables(text)
+    # Post-repair validation: surface any table the repair could not fully fix so
+    # a recurring model formatting bug is visible in logs (delivery still proceeds
+    # with the best-effort text — the scope is internal assembly, not re-sending).
+    issues = _markdown_table_issues(text)
+    if issues:
+        logger.warning("rich markdown table issues after repair", extra={"issues": issues})
     # Collapse three or more newlines to exactly two.
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text
+
+
+def _markdown_table_issues(text: str) -> list[str]:
+    """Return structural problems with any GFM table in ``text`` (empty = clean).
+
+    Runs AFTER ``_repair_markdown_tables`` to catch what repair could not fix. A
+    valid table region is: a header row, a separator row of the same width, and
+    data rows all of that width. Reuses the same cell/line helpers as the repair,
+    so it is structural (no per-message heuristics).
+    """
+    if "|" not in text:
+        return []
+    issues: list[str] = []
+    lines = text.split("\n")
+    i = 0
+    while i < len(lines):
+        if not _looks_like_table_line(lines[i]):
+            i += 1
+            continue
+        j = i
+        while j < len(lines) and _looks_like_table_line(lines[j]):
+            j += 1
+        region = lines[i:j]
+        i = j
+        widths = [len(_table_cells(line)) for line in region]
+        has_separator = any(
+            all(_is_separator_cell(c) for c in _table_cells(line)) for line in region
+        )
+        if has_separator and len(set(widths)) > 1:
+            issues.append(f"inconsistent column widths {sorted(set(widths))}")
+    return issues
+
+
+def _table_cells(line: str) -> list[str]:
+    """Split one physical table line into trimmed cells (outer pipes dropped)."""
+    return [c.strip() for c in line.strip().strip("|").split("|")]
+
+
+def _is_separator_cell(cell: str) -> bool:
+    """True for a GFM alignment cell (only dashes/colons), e.g. ``---`` or ``:-:``."""
+    cell = cell.strip()
+    return cell != "" and set(cell) <= {"-", ":"}
+
+
+def _repair_markdown_tables(text: str) -> str:
+    """Rebuild GFM tables whose rows were emitted on too few lines.
+
+    Models sometimes drop the newlines between a table's separator and its data
+    rows, gluing them onto one physical line
+    (``| a | b |`` / ``|---|---|---| | 1 | x | | 2 | y |``). Telegram's rich
+    parser then renders the whole thing as literal ``|`` text. This detects such
+    a table region (a run of pipe-lines that contains a separator) and, only when
+    it is *malformed* (some line's cell count ≠ the header width), flattens every
+    cell and regroups them into header + one clean row per line. Well-formed
+    tables — including ones with intentional blank cells, whose every line already
+    matches the header width — are left byte-for-byte untouched, so this is
+    idempotent.
+    """
+    if "|" not in text:
+        return text
+    lines = text.split("\n")
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        if not _looks_like_table_line(lines[i]):
+            out.append(lines[i])
+            i += 1
+            continue
+        j = i
+        while j < len(lines) and _looks_like_table_line(lines[j]):
+            j += 1
+        region = lines[i:j]
+        out.extend(_rebuild_table_region(region))
+        i = j
+    return "\n".join(out)
+
+
+def _looks_like_table_line(line: str) -> bool:
+    """A line that is a table row candidate: trimmed, wrapped in pipes."""
+    t = line.strip()
+    return len(t) > 2 and t.startswith("|") and t.endswith("|")
+
+
+def _rebuild_table_region(region: list[str]) -> list[str]:
+    """Return the region unchanged if well-formed, else a rebuilt table."""
+    header = _table_cells(region[0])
+    if not header:
+        return region
+    # Flatten every cell after the header, preserving order.
+    rest: list[str] = []
+    for line in region[1:]:
+        rest.extend(_table_cells(line))
+    # The leading run of blank/alignment cells is the separator; its dash-cell
+    # count is the authoritative column width in GFM (the header may be missing a
+    # column, as when the model forgets the "#" heading but writes 4 dashes).
+    k = 0
+    while k < len(rest) and (rest[k] == "" or _is_separator_cell(rest[k])):
+        k += 1
+    sep_width = sum(1 for c in rest[:k] if _is_separator_cell(c))
+    if sep_width == 0:
+        return region  # no separator → not a table we should touch
+    width = max(sep_width, len(header))
+    # Well-formed: header width matches the separator and every line already has
+    # exactly `width` cells → leave it byte-for-byte (keeps intentional blanks).
+    if len(header) == width and all(len(_table_cells(line)) == width for line in region):
+        return region
+    # Malformed: regroup the data cells into rows of `width`. Blank cells are the
+    # `| |` row-boundary artefacts of the glued-together rows, so they are
+    # dropped — malformed model tables do not carry intentional empty cells.
+    data = [c for c in rest[k:] if c != ""]
+    header += [""] * (width - len(header))
+    rebuilt = ["| " + " | ".join(header) + " |", "|" + "---|" * width]
+    for start in range(0, len(data), width):
+        row = data[start:start + width]
+        row += [""] * (width - len(row))
+        rebuilt.append("| " + " | ".join(row) + " |")
+    return rebuilt
 
 
 def _greeting_rule(memory_context: tuple[str, ...]) -> str:

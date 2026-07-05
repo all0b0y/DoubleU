@@ -115,6 +115,13 @@ def make_test_runtime(**overrides) -> AgentRuntime:
                 ],
             }
         ),
+        "skill_draft_model": structured(
+            {
+                "name": "работа-с-возражениями",
+                "description": "Как отвечать на ценовые возражения клиента.",
+                "body": "## Когда применять\nКлиент сомневается в цене.\n\n## Процедура\n1. Уточни причину.\n2. Покажи ценность.",
+            }
+        ),
     }
     defaults.update(overrides)
     return AgentRuntime(run_timeout_seconds=10, **defaults)
