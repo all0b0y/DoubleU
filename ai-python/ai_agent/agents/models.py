@@ -45,6 +45,7 @@ class AgentTask(str, Enum):
     REFLECT = "reflect"
     ROLE_DRAFT = "role_draft"
     SKILL_DRAFT = "skill_draft"
+    SKILL_IMPROVE = "skill_improve"
 
 
 class ModelTier(str, Enum):
@@ -82,6 +83,7 @@ _TASK_ENV = {
     AgentTask.REFLECT: "MODEL_CHEAP",
     AgentTask.ROLE_DRAFT: "MODEL_CHEAP",
     AgentTask.SKILL_DRAFT: "MODEL_CHEAP",
+    AgentTask.SKILL_IMPROVE: "MODEL_CHEAP",
 }
 
 

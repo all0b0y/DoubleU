@@ -22,6 +22,7 @@ from .schemas import (
     parse_embed_texts_request,
     parse_draft_role_request,
     parse_draft_skill_request,
+    parse_improve_skill_request,
     parse_extract_media_request,
     parse_intent_request,
     parse_memory_request,
@@ -101,6 +102,7 @@ class AIHTTPHandler(BaseHTTPRequestHandler):
             "/ai/extract-media": self._extract_media,
             "/ai/draft-role": self._draft_role,
             "/ai/draft-skill": self._draft_skill,
+            "/ai/improve-skill": self._improve_skill,
             "/ai/summarize-chat": self._summarize_chat,
             "/ai/tag-topic": self._tag_topic,
             "/ai/rerank-facts": self._rerank_facts,
@@ -177,6 +179,9 @@ class AIHTTPHandler(BaseHTTPRequestHandler):
     def _draft_skill(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self.service.draft_skill(parse_draft_skill_request(payload)).to_dict()
 
+    def _improve_skill(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self.service.improve_skill(parse_improve_skill_request(payload)).to_dict()
+
     def _summarize_chat(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self.service.summarize_chat(parse_summary_request(payload)).to_dict()
 
@@ -201,6 +206,7 @@ class AIHTTPHandler(BaseHTTPRequestHandler):
         "/ai/extract-media": LLMPurpose.EXTRACT,
         "/ai/draft-role": LLMPurpose.DRAFT,
         "/ai/draft-skill": LLMPurpose.DRAFT,
+        "/ai/improve-skill": LLMPurpose.DRAFT,
         "/ai/summarize-chat": LLMPurpose.SUMMARIZE,
         "/ai/tag-topic": LLMPurpose.EXTRACT,
         "/ai/rerank-facts": LLMPurpose.EXTRACT,
@@ -356,6 +362,11 @@ def _request_summary(path: str, payload: dict[str, Any]) -> dict[str, Any]:
     preview = payload
     if path in ("/ai/draft-role", "/ai/draft-skill") and "text" in preview:
         preview = {**preview, "text": f"<{len(str(payload.get('text', '')))} chars>"}
+    if path == "/ai/improve-skill":
+        # The skill body and signal are large owner/chat content — elide them.
+        for field_name in ("body", "signal"):
+            if field_name in preview:
+                preview = {**preview, field_name: f"<{len(str(payload.get(field_name, '')))} chars>"}
     for field_name in ("data_base64", "audio_base64"):
         if field_name in preview:
             preview = {
@@ -391,7 +402,7 @@ def _response_summary(path: str, payload: dict[str, Any], response: dict[str, An
         "latency_ms": round(latency_ms, 1),
         "response_body_preview": (
             "<draft omitted>"
-            if path in ("/ai/draft-role", "/ai/draft-skill")
+            if path in ("/ai/draft-role", "/ai/draft-skill", "/ai/improve-skill")
             else _truncate(json.dumps(response, ensure_ascii=False), 2000)
         ),
     }

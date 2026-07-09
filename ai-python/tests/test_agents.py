@@ -41,6 +41,7 @@ from ai_agent.schemas import (
     ChatSummaryRequest,
     DraftRoleRequest,
     DraftSkillRequest,
+    ImproveSkillRequest,
     FeedbackItem,
     NormalizedTelegramEvent,
     PrivacyFlag,
@@ -1813,6 +1814,13 @@ def _skill_draft_call(runtime: AgentRuntime) -> None:
     runtime.draft_skill(DraftSkillRequest(text="Как отвечать на возражения по цене"))
 
 
+def _skill_improve_call(runtime: AgentRuntime) -> None:
+    runtime.improve_skill(ImproveSkillRequest(
+        name="работа-с-возражениями", description="d", body="старое тело",
+        signal="Загрузок: 3. Не понравилось: 2.",
+    ))
+
+
 def test_draft_skill_returns_structured_skill() -> None:
     """draft_skill turns a free-text description into a valid skill draft."""
     runtime = make_runtime()
@@ -1823,13 +1831,24 @@ def test_draft_skill_returns_structured_skill() -> None:
     assert len(result.body) <= 20000
 
 
+def test_improve_skill_returns_structured_skill() -> None:
+    """improve_skill rewrites a skill from its signal into a valid skill shape."""
+    runtime = make_runtime()
+    result = runtime.improve_skill(ImproveSkillRequest(
+        name="работа-с-возражениями", description="d", body="старое тело",
+        signal="Загрузок: 5. Понравилось: 1. Не понравилось: 4.",
+    ))
+    assert result.name and result.description and result.body
+    assert len(result.body) <= 20000
+
+
 @pytest.mark.parametrize(
     "call",
     [
         _extract_call, _summarize_call, _topic_call, _rerank_call,
-        _pattern_call, _role_draft_call, _skill_draft_call,
+        _pattern_call, _role_draft_call, _skill_draft_call, _skill_improve_call,
     ],
-    ids=["extract", "summarize", "topic", "rerank", "pattern", "role_draft", "skill_draft"],
+    ids=["extract", "summarize", "topic", "rerank", "pattern", "role_draft", "skill_draft", "skill_improve"],
 )
 def test_auxiliary_tasks_record_a_non_empty_rendered_prompt_contract(call) -> None:
     """2.2: extraction/summary/topic/rerank/pattern/role_draft now render

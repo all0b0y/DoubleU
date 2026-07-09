@@ -661,15 +661,27 @@ class DraftSkillRequest(JsonDataclass):
 
 @dataclass(frozen=True)
 class SkillDraftResponse(JsonDataclass):
-    """Generated skill fields returned by `/ai/draft-skill`.
+    """Generated skill fields returned by `/ai/draft-skill` and `/ai/improve-skill`.
 
     The draft is returned to the owner for review and is only persisted when the
-    owner saves it through the existing skills-create path — never here.
+    owner saves it through the existing skills-create/update path — never here.
     """
 
     name: str
     description: str
     body: str
+
+
+@dataclass(frozen=True)
+class ImproveSkillRequest(JsonDataclass):
+    """Request body for `/ai/improve-skill`: the current skill plus a usage/
+    feedback signal digest assembled by the backend."""
+
+    name: str
+    description: str
+    body: str
+    signal: str = ""
+    trace_id: str = ""
 
 
 def parse_process_message_request(payload: dict[str, Any]) -> AIProcessMessageRequest:
@@ -867,6 +879,23 @@ def parse_draft_skill_request(payload: dict[str, Any]) -> DraftSkillRequest:
     if len(text) > 8000:
         raise ValueError("text is too long (max 8000 characters)")
     return DraftSkillRequest(text=text, trace_id=str(payload.get("trace_id", "")))
+
+
+def parse_improve_skill_request(payload: dict[str, Any]) -> ImproveSkillRequest:
+    """Parse and validate a skill-improvement request (current skill + signal)."""
+    name = str(payload.get("name", "")).strip()
+    body = str(payload.get("body", "")).strip()
+    if not name or not body:
+        raise ValueError("name and body are required")
+    if len(body) > 20000:
+        raise ValueError("body is too long (max 20000 characters)")
+    return ImproveSkillRequest(
+        name=name,
+        description=str(payload.get("description", "")).strip(),
+        body=body,
+        signal=str(payload.get("signal", "")).strip()[:4000],
+        trace_id=str(payload.get("trace_id", "")),
+    )
 
 
 def _parse_contact_profile(raw: Any) -> ContactProfileData | None:

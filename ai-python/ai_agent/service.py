@@ -47,6 +47,7 @@ from .schemas import (
     DraftRoleRequest,
     DraftRoleResponse,
     DraftSkillRequest,
+    ImproveSkillRequest,
     SkillDraftResponse,
     EmbedTextsRequest,
     EmbedTextsResponse,
@@ -165,6 +166,10 @@ class AIService:
     def draft_skill(self, request: DraftSkillRequest) -> SkillDraftResponse:
         """Generate an editable skill draft from a free-text/voice description."""
         return self._agents.draft_skill(request)
+
+    def improve_skill(self, request: ImproveSkillRequest) -> SkillDraftResponse:
+        """Rewrite a skill from its current text plus a usage/feedback signal."""
+        return self._agents.improve_skill(request)
 
     def tag_topic(self, request: TopicTaggingRequest) -> TopicTaggingResponse:
         """Return a short topic label for the active conversation episode."""

@@ -175,6 +175,15 @@ class HTTPServerTests(unittest.TestCase):
         self.assertTrue(response["name"])
         self.assertTrue(response["body"])
 
+    def test_improve_skill_endpoint_matches_contract_shape(self) -> None:
+        """The improve-skill route parses the request and returns the frozen shape."""
+        response = self.handler._improve_skill({
+            "name": "работа-с-возражениями", "description": "d",
+            "body": "старое тело", "signal": "Загрузок: 3. Не понравилось: 2.",
+        })
+        self.assertEqual(set(response), {"name", "description", "body"})
+        self.assertTrue(response["body"])
+
     def test_synthesize_pattern_respects_no_memory(self) -> None:
         """no_memory chats must never be reflected on."""
         response = self.handler._synthesize_pattern(

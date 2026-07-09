@@ -61,6 +61,7 @@ from ..schemas import (
     DraftRoleRequest,
     DraftRoleResponse,
     DraftSkillRequest,
+    ImproveSkillRequest,
     SkillDraftResponse,
     EmbedTextsRequest,
     MCPServerSpecData,
@@ -1625,6 +1626,46 @@ class AgentRuntime:
             drafted.model_dump_json(),
             usage,
             (),
+        )
+        return SkillDraftResponse(
+            name=drafted.name.strip(),
+            description=drafted.description.strip(),
+            body=drafted.body.strip(),
+        )
+
+    def improve_skill(self, request: ImproveSkillRequest) -> SkillDraftResponse:
+        """Rewrite a skill to fix issues its usage/feedback signal reveals."""
+        ctx = current_context()
+        try:
+            return self._run(self._improve_skill_async(request, ctx))
+        except Exception as exc:  # noqa: BLE001 - convert agent failures at the contract boundary
+            raise RuntimeError(f"skill improve agent failed: {exc}") from exc
+
+    async def _improve_skill_async(
+        self, request: ImproveSkillRequest, ctx: LLMCallContext
+    ) -> SkillDraftResponse:
+        family = resolve_family(model_name_for(AgentTask.SKILL_IMPROVE))
+        rendered = render_prompt(prompt_library.skill_improve_spec(), family)
+        content = (
+            f"[ТЕКУЩИЙ НАВЫК]\nname: {request.name}\n"
+            f"description: {request.description}\nbody:\n{request.body}\n\n"
+            f"[СИГНАЛ ИСПОЛЬЗОВАНИЯ И ОБРАТНОЙ СВЯЗИ]\n{request.signal or 'нет данных'}"
+        )
+        system_prompt, user_payload = self._prompt_builder.build(rendered, content)
+        system_prompt, user_payload = self._scan_input(
+            system_prompt, user_payload, ModelTask.DRAFT_REPLY, ctx
+        )
+        deps = self._deps_for(
+            ctx.tenant_id, ctx.chat_id, (), system_instruction=system_prompt, pool=None,
+        )
+        # Reuse the skill-draft agent: same SkillDraft output shape, the improvement
+        # standards ride in the rendered system prompt.
+        result = await self._skill_draft_agent.run(user_payload, deps=deps)
+        drafted: SkillDraft = result.output
+        usage = self._usage_of(result)
+        self._record_run(
+            ctx, AgentTask.SKILL_IMPROVE, system_prompt, user_payload,
+            drafted.model_dump_json(), usage, (),
         )
         return SkillDraftResponse(
             name=drafted.name.strip(),
