@@ -139,6 +139,36 @@ func TestHTTPClientDraftSkillContract(t *testing.T) {
 	}
 }
 
+func TestHTTPClientImproveSkillContract(t *testing.T) {
+	client := NewHTTPClient("http://ai-service", &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path != "/ai/improve-skill" {
+			return responseWithStatus(http.StatusNotFound, "not found"), nil
+		}
+		var request map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if request["name"] != "работа-с-возражениями" || request["signal"] == "" {
+			t.Fatalf("improve-skill request contract = %#v", request)
+		}
+		var body bytes.Buffer
+		_ = json.NewEncoder(&body).Encode(DraftSkillResponse{
+			Name: "работа-с-возражениями", Description: "Лучше отвечать на возражения.", Body: "## Процедура\nобновлено",
+		})
+		return responseWithStatus(http.StatusOK, body.String()), nil
+	})})
+
+	response, err := client.ImproveSkill(context.Background(), ImproveSkillRequest{
+		Name: "работа-с-возражениями", Description: "d", Body: "old", Signal: "Загрузок: 3",
+	})
+	if err != nil {
+		t.Fatalf("improve skill: %v", err)
+	}
+	if response.Body != "## Процедура\nобновлено" {
+		t.Fatalf("improve-skill response contract = %+v", response)
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {

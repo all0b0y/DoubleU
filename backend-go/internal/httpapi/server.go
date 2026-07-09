@@ -132,6 +132,9 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/v1/skills", s.tmaAuth(s.apiCreateSkill))
 	s.mux.HandleFunc("PUT /api/v1/skills/{skill_id}", s.tmaAuth(s.apiUpdateSkill))
 	s.mux.HandleFunc("DELETE /api/v1/skills/{skill_id}", s.tmaAuth(s.apiDeleteSkill))
+	s.mux.HandleFunc("POST /api/v1/skills/{skill_id}/improve", s.tmaAuth(s.apiImproveSkill))
+	s.mux.HandleFunc("GET /api/v1/skills/{skill_id}/versions", s.tmaAuth(s.apiSkillVersions))
+	s.mux.HandleFunc("POST /api/v1/skills/{skill_id}/revert", s.tmaAuth(s.apiRevertSkill))
 	s.mux.HandleFunc("PUT /api/v1/roles/{role_id}/skills", s.tmaAuth(s.apiSetRoleSkills))
 
 	// AI profile suggestions: tenant-wide inbox and per-chat list.

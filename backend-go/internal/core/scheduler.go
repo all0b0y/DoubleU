@@ -18,12 +18,20 @@ func (s *Service) StartScheduler(ctx context.Context) {
 		return
 	}
 	s.runSchedulerOnce(ctx)
+	// The autonomous skill curator (increment 1b) runs on a much slower cadence
+	// than the 45s job tick — improving skills is an LLM call, not a heartbeat.
+	curationInterval, _, _ := skillCurationConfig()
+	lastCuration := s.now()
 	ticker := time.NewTicker(45 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
 			s.runSchedulerOnce(ctx)
+			if s.now().Sub(lastCuration) >= curationInterval {
+				s.curateSkillsOnce(ctx)
+				lastCuration = s.now()
+			}
 		case <-ctx.Done():
 			return
 		}

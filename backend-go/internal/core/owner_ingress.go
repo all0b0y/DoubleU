@@ -90,6 +90,10 @@ func (s *Service) handleOwnerMessage(ctx context.Context, msg telegram.OwnerMess
 				FeedbackText: msg.Text,
 				CreatedAt:    s.now(),
 			})
+			// Attribute the negative signal to whichever skills that turn loaded.
+			if d, ok := s.repository.Draft(pending.DraftID); ok {
+				s.repository.RecordSkillFeedbackForTurn(tenantID, msg.ChatID, d.SourceMessageID, "down")
+			}
 		}
 		_ = s.sender.SendMessage(ctx, telegram.OutboundMessage{
 			TenantID: tenantID,

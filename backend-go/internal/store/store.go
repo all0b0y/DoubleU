@@ -113,6 +113,10 @@ type Repository struct {
 	businessConnections map[string]BusinessConnectionRecord
 	pendingInputs       map[string]contracts.PendingInput
 	draftFeedbacks      []contracts.DraftFeedback
+	// skill self-improvement in-memory fallbacks (migration 124): per-load usage
+	// telemetry and immutable body versions.
+	skillUsage    []SkillUsageRecord
+	skillVersions []SkillVersionRecord
 	contactProfiles     map[string]contracts.ContactProfile
 	messageCounts       map[string]int
 	connectionByUser    map[string]string

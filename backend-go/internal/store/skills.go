@@ -85,12 +85,44 @@ func (r *Repository) SkillsForTenant(tenantID string) []SkillRecord {
 	return out
 }
 
+// Skill returns one skill visible to the tenant (its own or a global) by id.
+// Global is set for first-party (tenant_id NULL) rows, which are read-only.
+func (r *Repository) Skill(tenantID string, id int64) (SkillRecord, bool) {
+	if r.db == nil {
+		return SkillRecord{}, false
+	}
+	var rec SkillRecord
+	var tid sql.NullString
+	err := r.db.QueryRow(
+		`SELECT id, tenant_id, name, description, body, source_url, content_hash, enabled, created_at
+		   FROM skills WHERE id = $1 AND (tenant_id IS NULL OR tenant_id = $2)`,
+		id, tenantID,
+	).Scan(&rec.ID, &tid, &rec.Name, &rec.Description, &rec.Body,
+		&rec.SourceURL, &rec.ContentHash, &rec.Enabled, &rec.CreatedAt)
+	if err != nil {
+		return SkillRecord{}, false
+	}
+	rec.Global = !tid.Valid
+	rec.TenantID = tid.String
+	return rec, true
+}
+
 // UpdateSkill edits a tenant-owned skill in place by id (Э4.7). Scoped by
 // tenant_id, so globals (tenant_id NULL) and other tenants' rows never match;
 // an unmatched id/tenant is ErrSkillNotFound.
 func (r *Repository) UpdateSkill(tenantID string, id int64, name, description, body string, enabled bool) error {
 	if r.db == nil {
 		return nil
+	}
+	// Snapshot the CURRENT body before overwriting, so a revert can restore the
+	// pre-edit state — including the very first edit of a skill created before
+	// versioning existed (migration 124). The current live body is always the
+	// skill row; versions hold prior states.
+	var oldBody string
+	if err := r.db.QueryRow(
+		`SELECT body FROM skills WHERE id=$1 AND tenant_id=$2`, id, tenantID,
+	).Scan(&oldBody); err == nil {
+		r.SaveSkillVersion(id, oldBody, "owner")
 	}
 	res, err := r.db.Exec(
 		`UPDATE skills SET name=$1, description=$2, body=$3, enabled=$4

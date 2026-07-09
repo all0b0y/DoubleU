@@ -208,6 +208,21 @@ func (c *HTTPClient) DraftSkill(ctx context.Context, request DraftSkillRequest) 
 	return response, nil
 }
 
+// ImproveSkill calls the Python AI /ai/improve-skill endpoint to rewrite a skill
+// from its current text plus a usage/feedback signal.
+func (c *HTTPClient) ImproveSkill(ctx context.Context, request ImproveSkillRequest) (DraftSkillResponse, error) {
+	var response DraftSkillResponse
+	if c.baseURL == "" {
+		return response, fmt.Errorf("ai base url is empty")
+	}
+	improveCtx, cancel := context.WithTimeout(ctx, draftRoleTimeout)
+	defer cancel()
+	if err := c.postJSON(improveCtx, "/ai/improve-skill", request, &response); err != nil {
+		return response, err
+	}
+	return response, nil
+}
+
 func (c *HTTPClient) postJSON(ctx context.Context, path string, input any, output any) error {
 	body, err := json.Marshal(input)
 	if err != nil {

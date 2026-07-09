@@ -106,6 +106,21 @@ type SkillDrafter interface {
 	DraftSkill(ctx context.Context, request DraftSkillRequest) (DraftSkillResponse, error)
 }
 
+// ImproveSkillRequest asks the AI service to rewrite a skill given its current
+// text and a usage/feedback signal digest.
+type ImproveSkillRequest struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Body        string `json:"body"`
+	Signal      string `json:"signal,omitempty"`
+	TraceID     string `json:"trace_id,omitempty"`
+}
+
+// ImproveSkill is implemented by AI clients that rewrite skills from feedback.
+type ImproveSkiller interface {
+	ImproveSkill(ctx context.Context, request ImproveSkillRequest) (DraftSkillResponse, error)
+}
+
 // RoleDrafter is implemented by AI clients that generate role form drafts.
 type RoleDrafter interface {
 	DraftRole(ctx context.Context, request DraftRoleRequest) (DraftRoleResponse, error)

@@ -80,6 +80,7 @@ func (s *Service) HandleApprovalCallback(ctx context.Context, payload contracts.
 			ResponseText: draft.ResponseText,
 			CreatedAt:    now,
 		})
+		s.repository.RecordSkillFeedbackForTurn(draft.TenantID, draft.ChatID, draft.SourceMessageID, "up")
 		if s.scoreSender != nil {
 			s.scoreSender.SendOwnerFeedback(ctx, draft.TraceID, "up", "")
 		}
@@ -122,6 +123,7 @@ func (s *Service) HandleApprovalCallback(ctx context.Context, payload contracts.
 				ResponseText: draft.ResponseText,
 				CreatedAt:    now,
 			})
+			s.repository.RecordSkillFeedbackForTurn(draft.TenantID, draft.ChatID, draft.SourceMessageID, "down")
 			if s.scoreSender != nil {
 				s.scoreSender.SendOwnerFeedback(ctx, draft.TraceID, "down", "")
 			}
@@ -174,6 +176,7 @@ func (s *Service) HandleApprovalCallback(ctx context.Context, payload contracts.
 			ResponseText: draft.ResponseText,
 			CreatedAt:    now,
 		})
+		s.repository.RecordSkillFeedbackForTurn(draft.TenantID, draft.ChatID, draft.SourceMessageID, "up")
 		if s.scoreSender != nil {
 			s.scoreSender.SendOwnerFeedback(ctx, draft.TraceID, "up", "")
 		}
@@ -188,6 +191,7 @@ func (s *Service) HandleApprovalCallback(ctx context.Context, payload contracts.
 			ResponseText: draft.ResponseText,
 			CreatedAt:    now,
 		})
+		s.repository.RecordSkillFeedbackForTurn(draft.TenantID, draft.ChatID, draft.SourceMessageID, "down")
 		if s.scoreSender != nil {
 			s.scoreSender.SendOwnerFeedback(ctx, draft.TraceID, "down", "")
 		}

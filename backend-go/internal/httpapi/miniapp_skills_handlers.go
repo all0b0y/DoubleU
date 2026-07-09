@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -192,6 +193,107 @@ func (s *Server) chatSkillSource(tenantID, chatID string) string {
 		digest = string(runes[:roleDraftTextMaxRunes])
 	}
 	return digest
+}
+
+// apiImproveSkill rewrites a skill from its usage/feedback signal and returns
+// the proposal for owner review — it never persists. The owner saves via the
+// existing update path (which snapshots a version).
+func (s *Server) apiImproveSkill(w http.ResponseWriter, r *http.Request) {
+	if s.aiBaseURL == "" {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "ai service not configured"})
+		return
+	}
+	tenantID := tenantFromContext(r.Context())
+	id, err := strconv.ParseInt(r.PathValue("skill_id"), 10, 64)
+	if err != nil || id == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid skill_id"})
+		return
+	}
+	skill, ok := s.service.Repository().Skill(tenantID, id)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "skill not found"})
+		return
+	}
+	sig := s.service.Repository().SkillSignal(id)
+	signalText := fmt.Sprintf(
+		"Загрузок навыка: %d. Ответы понравились владельцу: %d. Не понравились: %d.",
+		sig.Loads, sig.Positive, sig.Negative,
+	)
+	client := aiclient.NewHTTPClient(s.aiBaseURL, &http.Client{Timeout: roleDraftHTTPTimeout})
+	draft, err := client.ImproveSkill(r.Context(), aiclient.ImproveSkillRequest{
+		Name: skill.Name, Description: skill.Description, Body: skill.Body, Signal: signalText,
+	})
+	if err != nil {
+		slog.WarnContext(r.Context(), "skill improvement failed", "tenant_id", tenantID, "skill_id", id, "error", err)
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "skill improvement failed"})
+		return
+	}
+	if msg := validateSkillInput(draft.Name, draft.Description, draft.Body); msg != "" {
+		slog.WarnContext(r.Context(), "skill improvement returned invalid data", "tenant_id", tenantID, "reason", msg)
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "ai returned an invalid skill"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"proposal": skillJSON{ID: id, Name: draft.Name, Description: draft.Description, Body: draft.Body, Enabled: skill.Enabled, Global: skill.Global},
+		"signal":   map[string]int{"loads": sig.Loads, "positive": sig.Positive, "negative": sig.Negative},
+	})
+}
+
+// apiSkillVersions lists a skill's body-version history (newest first).
+func (s *Server) apiSkillVersions(w http.ResponseWriter, r *http.Request) {
+	tenantID := tenantFromContext(r.Context())
+	id, err := strconv.ParseInt(r.PathValue("skill_id"), 10, 64)
+	if err != nil || id == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid skill_id"})
+		return
+	}
+	if _, ok := s.service.Repository().Skill(tenantID, id); !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "skill not found"})
+		return
+	}
+	type versionJSON struct {
+		ID        int64  `json:"id"`
+		Author    string `json:"author"`
+		Body      string `json:"body"`
+		CreatedAt string `json:"created_at"`
+	}
+	recs := s.service.Repository().SkillVersions(id)
+	out := make([]versionJSON, 0, len(recs))
+	for _, v := range recs {
+		out = append(out, versionJSON{
+			ID: v.ID, Author: v.Author, Body: v.Body,
+			CreatedAt: v.CreatedAt.UTC().Format("2006-01-02T15:04:05Z"),
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"versions": out})
+}
+
+// apiRevertSkill restores a tenant-owned skill's body to a prior version.
+func (s *Server) apiRevertSkill(w http.ResponseWriter, r *http.Request) {
+	tenantID := tenantFromContext(r.Context())
+	id, err := strconv.ParseInt(r.PathValue("skill_id"), 10, 64)
+	if err != nil || id == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid skill_id"})
+		return
+	}
+	defer r.Body.Close()
+	var req struct {
+		VersionID int64 `json:"version_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.VersionID == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "version_id is required"})
+		return
+	}
+	if err := s.service.Repository().RevertSkillToVersion(tenantID, id, req.VersionID); err != nil {
+		if errors.Is(err, store.ErrSkillNotFound) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "skill or version not found"})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to revert skill"})
+		return
+	}
+	skill, _ := s.service.Repository().Skill(tenantID, id)
+	writeJSON(w, http.StatusOK, skillToJSON(skill))
 }
 
 func (s *Server) apiCreateSkill(w http.ResponseWriter, r *http.Request) {

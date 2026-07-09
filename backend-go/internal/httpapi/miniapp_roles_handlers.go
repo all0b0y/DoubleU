@@ -52,6 +52,9 @@ type roleJSON struct {
 	// AutoLearnProfile: true (default) = AI-proposed profile updates apply
 	// automatically (revertible); false = they wait for manual owner review.
 	AutoLearnProfile bool `json:"auto_learn_profile"`
+	// AutoImproveSkills: false (default) = the role's skills are only improved on
+	// owner request; true = the autonomous curator may rewrite them (revertible).
+	AutoImproveSkills bool `json:"auto_improve_skills"`
 	// ModelTier selects the LLM quality tier: "fast", "balanced" (default), or "smart".
 	ModelTier string `json:"model_tier,omitempty"`
 	// ModelName optionally pins a concrete model within ModelTier.
@@ -81,6 +84,7 @@ func roleToJSON(role store.AIRoleRecord) roleJSON {
 		StreamingEnabled:      cloneBoolPtr(role.StreamingEnabled),
 		SpeakAsOwner:          role.SpeakAsOwner,
 		AutoLearnProfile:      role.AutoLearnProfile,
+		AutoImproveSkills:     role.AutoImproveSkills,
 		ModelTier:             role.ModelTier,
 		ModelName:             role.ModelName,
 		ToolSettings:          toolSettings,
@@ -105,6 +109,9 @@ type roleRequest struct {
 	// AutoLearnProfile is a pointer so an omitted field keeps the create-time
 	// default (true) / the existing value on update.
 	AutoLearnProfile *bool `json:"auto_learn_profile"`
+	// AutoImproveSkills is a pointer so an omitted field keeps the create-time
+	// default (false) / the existing value on update.
+	AutoImproveSkills *bool `json:"auto_improve_skills"`
 	// ModelTier selects the LLM quality tier: "fast", "balanced", or "smart".
 	// Absent means keep the existing value (update) or "balanced" (create).
 	ModelTier *string `json:"model_tier"`
@@ -369,6 +376,7 @@ func (s *Server) apiCreateRole(w http.ResponseWriter, r *http.Request) {
 		StreamingEnabled:      req.StreamingEnabled.Apply(nil),
 		SpeakAsOwner:          boolOrDefault(req.SpeakAsOwner, true),
 		AutoLearnProfile:      boolOrDefault(req.AutoLearnProfile, true),
+		AutoImproveSkills:     boolOrDefault(req.AutoImproveSkills, false),
 		ModelTier:             stringOrDefault(req.ModelTier, "balanced"),
 		ModelName:             stringOrDefault(req.ModelName, ""),
 		ToolSettings:          toolSettingsOrDefault(req.ToolSettings, nil),
@@ -422,6 +430,7 @@ func (s *Server) apiUpdateRole(w http.ResponseWriter, r *http.Request) {
 		StreamingEnabled:      req.StreamingEnabled.Apply(existing.StreamingEnabled),
 		SpeakAsOwner:          boolOrDefault(req.SpeakAsOwner, existing.SpeakAsOwner),
 		AutoLearnProfile:      boolOrDefault(req.AutoLearnProfile, existing.AutoLearnProfile),
+		AutoImproveSkills:     boolOrDefault(req.AutoImproveSkills, existing.AutoImproveSkills),
 		ModelTier:             stringOrDefault(req.ModelTier, existing.ModelTier),
 		ModelName:             stringOrDefault(req.ModelName, existing.ModelName),
 		ToolSettings:          toolSettingsOrDefault(req.ToolSettings, existing.ToolSettings),

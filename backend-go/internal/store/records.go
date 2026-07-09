@@ -234,6 +234,10 @@ type AIRoleRecord struct {
 	// applied automatically (true, default) or wait in the owner-review queue
 	// (false). Go-only policy flag — never sent to the AI service. Migration 123.
 	AutoLearnProfile bool
+	// AutoImproveSkills opts the role's skills into the autonomous curator
+	// (false, default): a periodic sweep rewrites skills the bot uses and the
+	// owner dislikes, as revertible curator versions. Go-only. Migration 124.
+	AutoImproveSkills bool
 	// ModelTier is the LLM quality tier for draft generation: "fast",
 	// "balanced" (default), or "smart". Empty = use the DRAFT task model.
 	ModelTier string
