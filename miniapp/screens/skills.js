@@ -62,7 +62,12 @@ export function renderSkills(navigate) {
           : `<div style="display:flex;gap:8px;">
                <button class="btn btn-primary" data-save="${s.id}" style="flex:1">Сохранить</button>
                <button class="btn btn-secondary" data-del="${s.id}" style="flex:1">Удалить</button>
-             </div>`}
+             </div>
+             <div style="display:flex;gap:8px;">
+               <button class="btn btn-secondary" data-improve="${s.id}" style="flex:1">♻️ Улучшить</button>
+               <button class="btn btn-secondary" data-versions="${s.id}" style="flex:1">⏱ Версии</button>
+             </div>
+             <div class="sk-versions" data-versions-for="${s.id}"></div>`}
       </div>`;
   }
 
@@ -106,6 +111,42 @@ export function renderSkills(navigate) {
       if (!(await confirmAsync('Удалить навык?'))) return;
       try { await api.deleteSkill(b.dataset.del); load(); }
       catch (err) { twa?.showAlert(`Ошибка: ${err.message}`); }
+    }));
+    root.querySelectorAll('[data-improve]').forEach(b => b.addEventListener('click', async () => {
+      const id = b.dataset.improve;
+      const card = root.querySelector(`[data-skill="${id}"]`);
+      b.disabled = true; b.textContent = '♻️ Думаю…';
+      try {
+        const { proposal, signal } = await api.improveSkill(id);
+        // Fill the fields with the proposal; owner reviews and presses Сохранить.
+        card.querySelector('[data-f="description"]').value = proposal.description || '';
+        card.querySelector('[data-f="body"]').value = proposal.body || '';
+        twa?.HapticFeedback?.notificationOccurred('success');
+        twa?.showAlert(`Предложено улучшение (загрузок: ${signal.loads}, 👍 ${signal.positive} / 👎 ${signal.negative}). Проверьте и нажмите «Сохранить».`);
+      } catch (err) {
+        twa?.HapticFeedback?.notificationOccurred('error');
+        twa?.showAlert(`Ошибка: ${err.message}`);
+      } finally { b.disabled = false; b.textContent = '♻️ Улучшить'; }
+    }));
+    root.querySelectorAll('[data-versions]').forEach(b => b.addEventListener('click', async () => {
+      const id = b.dataset.versions;
+      const box = root.querySelector(`[data-versions-for="${id}"]`);
+      if (box.innerHTML) { box.innerHTML = ''; return; } // toggle off
+      try {
+        const { versions } = await api.skillVersions(id);
+        box.innerHTML = versions.length
+          ? versions.map(v => `
+              <div class="st-row" style="cursor:default;gap:8px;">
+                <div class="st-row-body"><p class="st-row-desc">${esc(v.author)} · ${esc(v.created_at)}</p></div>
+                <button class="btn btn-secondary" data-revert="${id}" data-ver="${v.id}">Откатить</button>
+              </div>`).join('')
+          : `<p class="st-row-desc">версий пока нет</p>`;
+        box.querySelectorAll('[data-revert]').forEach(rb => rb.addEventListener('click', async () => {
+          if (!(await confirmAsync('Откатить навык к этой версии?'))) return;
+          try { await api.revertSkill(rb.dataset.revert, Number(rb.dataset.ver)); load(); }
+          catch (err) { twa?.showAlert(`Ошибка: ${err.message}`); }
+        }));
+      } catch (err) { twa?.showAlert(`Ошибка: ${err.message}`); }
     }));
   }
 

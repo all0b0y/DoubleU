@@ -160,6 +160,31 @@ export function renderRoleEdit(navigate, roleId) {
       </div>`;
   }
 
+  // auto_improve_skills toggle: OFF (default) = skills improve only on your
+  // request; ON = an autonomous curator rewrites skills the bot uses and you
+  // dislike, as revertible versions. Mirrors AIRole.auto_improve_skills.
+  function autoImproveSection() {
+    const on = role.auto_improve_skills === true; // default OFF
+    return `
+      <div class="st-section">
+        <p class="st-section-label">навыки</p>
+        <div class="st-card">
+          <div class="st-row" style="cursor:default;">
+            <span class="st-row-icon">♻️</span>
+            <div class="st-row-body">
+              <p class="st-row-title">Автоулучшение навыков</p>
+              <p class="st-row-desc">Вкл: ИИ сам дорабатывает навыки, которые часто применяются и получают негативную реакцию (изменения обратимы в «Навыках»). Выкл: только по вашей кнопке «Улучшить».</p>
+            </div>
+            <label class="toggle">
+              <input type="checkbox" id="f-auto-improve-skills" ${on ? 'checked' : ''}>
+              <div class="toggle-track"></div>
+              <div class="toggle-knob"></div>
+            </label>
+          </div>
+        </div>
+      </div>`;
+  }
+
   function deliverySettingsHTML() {
     return `
       <div class="st-section">
@@ -363,6 +388,7 @@ export function renderRoleEdit(navigate, roleId) {
 
         ${speakAsSection()}
         ${autoLearnSection()}
+        ${autoImproveSection()}
         ${modelSettingsHTML()}
         ${deliverySettingsHTML()}
 
@@ -622,6 +648,7 @@ export function renderRoleEdit(navigate, roleId) {
       streaming_enabled:       modeToNullableBool(el.querySelector('#f-streaming')?.value),
       speak_as_owner:  el.querySelector('#f-speak-as-owner')?.checked ?? true,
       auto_learn_profile: el.querySelector('#f-auto-learn-profile')?.checked ?? true,
+      auto_improve_skills: el.querySelector('#f-auto-improve-skills')?.checked ?? false,
       model_tier:      modelTierForName(selectedModel),
       model_name:      selectedModel,
     };

@@ -114,6 +114,10 @@ export const api = {
   createSkill:     (data)            => request('POST',   '/api/v1/skills', data),
   updateSkill:     (id, data)        => request('PUT',    `/api/v1/skills/${id}`, data),
   deleteSkill:     (id)              => request('DELETE', `/api/v1/skills/${id}`),
+  // Self-improvement: propose an improved body from usage/feedback signal; versions + revert.
+  improveSkill:    (id)              => request('POST',   `/api/v1/skills/${id}/improve`),
+  skillVersions:   (id)              => request('GET',    `/api/v1/skills/${id}/versions`),
+  revertSkill:     (id, versionId)   => request('POST',   `/api/v1/skills/${id}/revert`, { version_id: versionId }),
   setRoleSkills:   (roleId, ids)     => request('PUT',    `/api/v1/roles/${roleId}/skills`, { skill_ids: ids }),
 };
 
